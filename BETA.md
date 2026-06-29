@@ -64,6 +64,57 @@ This stops and removes all containers and volumes.
 ./beta-setup.sh
 ```
 
+## Solana wallet login (beta)
+
+This beta server includes the server-issued wallet challenge from `urnetwork/server#402`. Wallet login and wallet network creation do **not** require email or phone verification.
+
+### Get a challenge
+
+```bash
+curl -s -X POST http://74.50.11.113:8080/auth/wallet-challenge \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Expected response:
+```json
+{
+  "challenge": "...",
+  "timestamp": 1234567890,
+  "expires_in": 300,
+  "message_template": "Sign in to URnetwork\nChallenge: ...\nTimestamp: ..."
+}
+```
+
+### Web dashboard
+
+Use the beta dashboard repo to sign in with Phantom/Solflare:
+
+- Repo: https://github.com/Ryanmello07/urnetwork-webmanager-beta
+- Branch: `beta/main`
+
+```bash
+git clone https://github.com/Ryanmello07/urnetwork-webmanager-beta.git
+cd urnetwork-webmanager-beta
+npm install
+VITE_API_BASE=http://74.50.11.113:8080 npm run dev
+```
+
+The dashboard already defaults to the public beta server IP, but you can override it with `VITE_API_BASE`.
+
+### Connect client
+
+The forked `connect` repository (`github.com/Ryanmello07/connect`) is the **client library**.
+
+- Branch: `beta/custom-server`
+- Default URLs point to the public beta server:
+  ```go
+  apiUrl := "http://74.50.11.113:8080"
+  connectUrl := "ws://74.50.11.113:5080/"
+  ```
+
+Install scripts (`Provider_Install_Linux.sh`, PowerShell scripts) now fetch from `Ryanmello07/connect` releases.
+
 ## Connecting a custom client
 
 The forked `connect` repository (`github.com/Ryanmello07/connect`) is the **client library**. You do not need to run it as a service. Build your client against that library and point it at the beta server:
@@ -81,10 +132,12 @@ Or pass `--api_url` and `--connect_url` to the `provider` / `connectctl` binarie
 |---|---|---|
 | `/status` | GET | Health/version check |
 | `/hello` | GET | Basic hello endpoint |
+| `/auth/wallet-challenge` | POST | Request a Solana wallet sign-in challenge |
 | `/auth/network-check` | POST | Check if a network name exists |
-| `/auth/network-create` | POST | Create a beta network |
-| `/auth/verify-send` | POST | Request an auth code (no email is actually sent in beta) |
-| `/auth/verify` | POST | Verify an auth code |
+| `/auth/network-create` | POST | Create a beta network (Solana wallet supported) |
+| `/auth/login` | POST | Log in (Solana wallet supported) |
+| `/auth/verify-send` | POST | Request an auth code — **disabled in beta** |
+| `/auth/verify` | POST | Verify an auth code — **disabled in beta** |
 | `/connect` | GET/POST | Auth endpoint used by clients before opening the WebSocket |
 | `/` on connect service | WebSocket upgrade | Client connect tunnel |
 
@@ -93,6 +146,7 @@ Or pass `--api_url` and `--connect_url` to the `provider` / `connectctl` binarie
 - Postgres database with all migrations applied.
 - Redis session/cache store.
 - JWT auth using locally-generated keys.
+- **Solana wallet login and network creation** via server-issued challenge (`/auth/wallet-challenge`).
 - Core network, device, client, and provider-location APIs.
 - Connect WebSocket upgrade and internal resident exchange.
 - IP geolocation using the free GeoLite2-City MMDB.
@@ -101,6 +155,7 @@ Or pass `--api_url` and `--connect_url` to the `provider` / `connectctl` binarie
 
 Anything that needs an external account or paid key will return an error or no-op if called:
 
+- Email/phone verification (`/auth/verify-send`, `/auth/verify`, password reset)
 - Stripe (`/pay/stripe`, `/stripe/*`)
 - Apple App Store (`/apple/notification`)
 - Google Play (`/pay/play`)
