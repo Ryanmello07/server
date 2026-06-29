@@ -1,0 +1,3 @@
+# beta test proxy signing config
+secrets:
+  - "beta-test-proxy-secret"
