@@ -82,10 +82,11 @@ services:
       BRINGYOUR_POSTGRES_HOSTNAME: postgres
       BRINGYOUR_REDIS_HOSTNAME: redis
       WARP_HOME: /srv/warp
-      WARP_PORTS: "80:5080,5080:15080"
+      WARP_PORTS: "80:5080,15080:15080"
     command: ["connect", "--port=80"]
     ports:
       - "5080:80"
+      - "15080:15080"
     depends_on:
       postgres:
         condition: service_healthy

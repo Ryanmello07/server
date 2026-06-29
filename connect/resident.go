@@ -210,8 +210,9 @@ func DefaultExchangeSettingsWithBufferSize(bufferSize int) *ExchangeSettings {
 		// this is set high enough to limit the number of parallel contracts and avoid contract spam
 		MinContractTransferByteCount: ByteCount(64 * 1024),
 
+		// beta: use a non-conflicting internal exchange port
 		// this must match the warp `settings.yml` for the environment
-		StartInternalPort: 5080,
+		StartInternalPort: 15080,
 
 		MaxConcurrentForwardsPerResident: 8 * 1024,
 
