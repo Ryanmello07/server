@@ -1,6 +1,8 @@
 # URnetwork Beta Test Environment
 
-A self-contained, local-only URnetwork server for testing the API and connect WebSocket path with a custom `connect` client. No Stripe, Apple, Google, Circle, Brevo, Helius/Solana, AWS/email, or payout integrations are required.
+A self-contained URnetwork beta server for testing the API and connect WebSocket path with a custom `connect` client. No Stripe, Apple, Google, Circle, Brevo, Helius/Solana, AWS/email, or payout integrations are required.
+
+This beta server auto-detects its public IP and binds the API/connect services so they can be used from another machine.
 
 ## Quick start
 
@@ -9,10 +11,41 @@ cd /root/urnetwork/server   # or wherever you cloned the fork
 ./beta-setup.sh
 ```
 
-After a few minutes (initial Docker build + MMDB download), you will have:
+After a few minutes (initial Docker build + MMDB download), you will have endpoints printed like:
 
-- **API server:** http://127.0.0.1:8080
-- **Connect WebSocket:** ws://127.0.0.1:5080/
+```
+Beta network running:
+  API:     http://74.50.11.113:8080
+  Connect: ws://74.50.11.113:5080/
+
+To use from another machine, open TCP ports 8080, 5080, and 15080.
+```
+
+(`74.50.11.113` is the current host's public IP; yours will differ.)
+
+### Firewall / public access
+
+The beta server binds ports on all interfaces (`0.0.0.0`). To reach it from another machine, ensure the host firewall allows inbound traffic on:
+
+- `8080/tcp` — API
+- `5080/tcp` — client WebSocket
+- `15080/tcp` — internal exchange (only needed if you run multiple connect instances)
+
+Example with `ufw`:
+
+```bash
+sudo ufw allow 8080/tcp
+sudo ufw allow 5080/tcp
+sudo ufw allow 15080/tcp
+```
+
+### Disabling public access
+
+Set `PUBLIC_IP=127.0.0.1` before running `./beta-setup.sh` to keep the server local-only:
+
+```bash
+PUBLIC_IP=127.0.0.1 ./beta-setup.sh
+```
 
 ## Stop the environment
 
@@ -36,9 +69,11 @@ This stops and removes all containers and volumes.
 The forked `connect` repository (`github.com/Ryanmello07/connect`) is the **client library**. You do not need to run it as a service. Build your client against that library and point it at the beta server:
 
 ```go
-apiUrl := "http://127.0.0.1:8080"
-connectUrl := "ws://127.0.0.1:5080/"
+apiUrl := "http://74.50.11.113:8080"     // replace with your beta-server public IP
+connectUrl := "ws://74.50.11.113:5080/" // replace with your beta-server public IP
 ```
+
+Or pass `--api_url` and `--connect_url` to the `provider` / `connectctl` binaries.
 
 ### Core API routes useful for testing
 

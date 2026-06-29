@@ -34,9 +34,14 @@ else
 fi
 
 # Build and start the Docker Compose stack.
-echo "Bringing beta environment up..."
+echo "Detecting public IP..."
+PUBLIC_IP="${PUBLIC_IP:-$(curl -s icanhazip.com || curl -s ifconfig.me || echo "127.0.0.1")}"
+export PUBLIC_IP
+echo "Using PUBLIC_IP=$PUBLIC_IP"
+
+echo "Building beta server image..."
 docker compose -f docker-compose.beta.yml down -v 2>/dev/null || true
-docker compose -f docker-compose.beta.yml build
+docker compose -f docker-compose.beta.yml build --no-cache
 
 echo "Starting Postgres and Redis..."
 docker compose -f docker-compose.beta.yml up -d postgres redis
@@ -54,5 +59,7 @@ docker compose -f docker-compose.beta.yml up -d api connect
 
 echo
 echo "Beta network running:"
-echo "  API:     http://127.0.0.1:8080"
-echo "  Connect: ws://127.0.0.1:5080/"
+echo "  API:     http://$PUBLIC_IP:8080"
+echo "  Connect: ws://$PUBLIC_IP:5080/"
+echo
+echo "To use from another machine, open TCP ports 8080, 5080, and 15080."

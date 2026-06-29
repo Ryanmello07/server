@@ -52,7 +52,8 @@ services:
       WARP_BLOCK: local
       WARP_SERVICE: api
       WARP_VERSION: 0.0.0-beta
-      WARP_HOST: 127.0.0.1
+      # Beta: bind to the public host IP so external clients can reach the API.
+      WARP_HOST: "${PUBLIC_IP:-127.0.0.1}"
       BRINGYOUR_POSTGRES_HOSTNAME: postgres
       BRINGYOUR_REDIS_HOSTNAME: redis
       WARP_HOME: /srv/warp
@@ -78,7 +79,8 @@ services:
       WARP_BLOCK: local
       WARP_SERVICE: connect
       WARP_VERSION: 0.0.0-beta
-      WARP_HOST: 127.0.0.1
+      # Beta: bind to the public host IP so external clients can reach the connect websocket.
+      WARP_HOST: "${PUBLIC_IP:-127.0.0.1}"
       BRINGYOUR_POSTGRES_HOSTNAME: postgres
       BRINGYOUR_REDIS_HOSTNAME: redis
       WARP_HOME: /srv/warp
