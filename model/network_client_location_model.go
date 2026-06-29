@@ -1755,6 +1755,9 @@ func loadInitialClientLocations(ctx context.Context) (initialClientLocations *In
 		cmd := r.Get(ctx, initialClientLocationsKey())
 
 		initialClientLocationsBytes, _ := cmd.Bytes()
+		if len(initialClientLocationsBytes) == 0 {
+			return
+		}
 		b := bytes.NewBuffer(initialClientLocationsBytes)
 		e := gob.NewDecoder(b)
 		var initialClientLocations_ InitialClientLocations
@@ -1951,16 +1954,18 @@ func GetProviderLocations(
 
 	// the caller ip is used to match against provider excluded lists
 	clientIp, _, err := session.ParseClientIpPort()
-	if err != nil {
-		return nil, err
-	}
 
-	ipInfo, err := server.GetIpInfo(clientIp)
-	if err != nil {
-		return nil, err
+	var clientLocationId server.Id
+	if err == nil {
+		ipInfo, err := server.GetIpInfo(clientIp)
+		if err == nil {
+			clientLocationId = countryCodeLocationIds()[ipInfo.CountryCode]
+		} else {
+			glog.V(2).Infof("[GetProviderLocations] could not get ip info for %s: %s\n", clientIp, err)
+		}
+	} else {
+		glog.V(2).Infof("[GetProviderLocations] could not parse client ip: %s\n", err)
 	}
-
-	clientLocationId := countryCodeLocationIds()[ipInfo.CountryCode]
 
 	initialClientLocations, err := loadInitialClientLocations(session.Ctx)
 	if err != nil {
