@@ -1,25 +1,5 @@
-**/bin
-**/build
-**/.DS_Store
-**/test.out
-**/profile
-**/*.test
-
-# binaries
-client/build
-bringyourctl/bringyourctl
-cli/api/api
-cli/mcp/mcp
-cli/taskworker/taskworker
-gpt/gpt
-cli/connect/connect
-connect/connect.test
-connect/profile
-cli/proxy/proxy
-main
-
-temp/*
-
-.vscode/*
-.direnv
-
+# Beta environment generated secrets and databases
+beta-vault/config/mmdb/*.mmdb
+beta-vault/config/arindb/*.mmdb
+beta-vault/vault/tls/**/*.pem
+beta-vault/vault/tls/**/*.pub.pem
