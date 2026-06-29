@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,11 +93,12 @@ Options:
 		IdleTimeout:     5 * time.Minute,
 		ShutdownTimeout: 30 * time.Second,
 	}
+	corsHandler := withCors(router.NewRouter(ctx, routes))
 
 	err = server.HttpListenAndServeWithReusePort(
 		ctx,
 		net.JoinHostPort(listenIpv4, strconv.Itoa(listenPort)),
-		router.NewRouter(ctx, routes),
+		corsHandler,
 		reusePort,
 		httpServerOptions,
 	)
@@ -103,4 +106,29 @@ Options:
 		panic(err)
 	}
 	glog.Infof("[api]close\n")
+}
+
+// withCors wraps a handler so browsers running the dashboard can call the beta
+// API cross-origin. In production the API is behind a CDN that adds CORS
+// headers; the beta server exposes the API directly, so we add them here.
+func withCors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			// treat empty origin as a same-site/non-browser request
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		if strings.EqualFold(r.Method, http.MethodOptions) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
