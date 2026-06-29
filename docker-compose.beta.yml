@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    # No host port binding; only needed inside the Docker network.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    # No host port binding; only needed inside the Docker network.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build:
+      context: ../
+      dockerfile: server/Dockerfile.beta
+    environment:
+      WARP_ENV: local
+      WARP_BLOCK: local
+      WARP_SERVICE: bringyourctl
+      WARP_VERSION: 0.0.0-beta
+      WARP_HOST: 127.0.0.1
+      BRINGYOUR_POSTGRES_HOSTNAME: postgres
+      BRINGYOUR_REDIS_HOSTNAME: redis
+      WARP_HOME: /srv/warp
+    command: ["bringyourctl", "db", "migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./beta-vault:/srv/warp:ro
+
+  api:
+    build:
+      context: ../
+      dockerfile: server/Dockerfile.beta
+    environment:
+      WARP_ENV: local
+      WARP_BLOCK: local
+      WARP_SERVICE: api
+      WARP_VERSION: 0.0.0-beta
+      WARP_HOST: 127.0.0.1
+      BRINGYOUR_POSTGRES_HOSTNAME: postgres
+      BRINGYOUR_REDIS_HOSTNAME: redis
+      WARP_HOME: /srv/warp
+    command: ["api", "--port=8080"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./beta-vault:/srv/warp:ro
+
+  connect:
+    build:
+      context: ../
+      dockerfile: server/Dockerfile.beta
+    environment:
+      WARP_ENV: local
+      WARP_BLOCK: local
+      WARP_SERVICE: connect
+      WARP_VERSION: 0.0.0-beta
+      WARP_HOST: 127.0.0.1
+      BRINGYOUR_POSTGRES_HOSTNAME: postgres
+      BRINGYOUR_REDIS_HOSTNAME: redis
+      WARP_HOME: /srv/warp
+      WARP_PORTS: "80:5080,5080:15080"
+    command: ["connect", "--port=80"]
+    ports:
+      - "5080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./beta-vault:/srv/warp:ro
+
+volumes:
+  postgres_data:

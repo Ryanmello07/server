@@ -1,5 +1,8 @@
-.direnv
-.autobeam
-.git
-.github
-.gitignore
+# Ignore build artifacts and local test outputs
+*.test
+/tmp/
+/profile/
+*.log
+.DS_Store
+.env
+.terraform/

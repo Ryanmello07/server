@@ -176,6 +176,7 @@ type schemaType string
 const (
 	schemaTypeDbIpEnterprise schemaType = "DBIP-Location-ISP (compat=Enterprise)"
 	schemaTypeIpInfoCoreData schemaType = "ipinfo bundle_location_core.mmdb"
+	schemaTypeGeoLite2City   schemaType = "GeoLite2-City"
 	schemaTypeArinDb         schemaType = "urnetwork arindb"
 )
 
@@ -230,7 +231,7 @@ type IpInfo struct {
 
 func (self *IpInfo) UnmarshalMaxMindDB(d *mmdbdata.Decoder) error {
 	switch self.schemaType {
-	case schemaTypeDbIpEnterprise:
+	case schemaTypeDbIpEnterprise, schemaTypeGeoLite2City:
 		return self.unmarshalDbIp(d)
 	case schemaTypeIpInfoCoreData:
 		return self.unmarshalIpInfo(d)
