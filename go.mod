@@ -16,6 +16,7 @@ require (
 	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mailgun/proxyproto v1.0.0
+	github.com/maxmind/mmdbwriter v1.2.0
 	github.com/modelcontextprotocol/go-sdk v1.3.0
 	github.com/mozillazg/go-unidecode v0.2.0
 	github.com/nyaruka/phonenumbers v1.6.5
@@ -107,6 +108,7 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
+	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
