@@ -1971,6 +1971,9 @@ func GetProviderLocations(
 	if err != nil {
 		return nil, err
 	}
+	if initialClientLocations == nil {
+		initialClientLocations = &InitialClientLocations{}
+	}
 
 	locationIds := []server.Id{}
 	for _, clientLocation := range initialClientLocations.Locations {
