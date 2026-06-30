@@ -1,5 +1,9 @@
 # Beta environment generated secrets and databases
-beta-vault/config/mmdb/*.mmdb
-beta-vault/config/arindb/*.mmdb
+beta-vault/config/**/*.mmdb
 beta-vault/vault/tls/**/*.pem
 beta-vault/vault/tls/**/*.pub.pem
+beta-vault/beta-secrets.env
+beta-vault/vault/*.yml
+# Keep .example templates tracked
+!beta-vault/vault/*.yml.example
+plans/

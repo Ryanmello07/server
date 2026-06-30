@@ -4,6 +4,18 @@ A self-contained URnetwork beta server for testing the API and connect WebSocket
 
 This beta server auto-detects its public IP and binds the API/connect services so they can be used from another machine.
 
+## Security notes
+
+`./beta-setup.sh` generates all sensitive material locally on first run:
+
+- `beta-vault/beta-secrets.env` — Postgres, Redis, JWT secret, peppews, proxy secret.
+- `beta-vault/vault/tls/jwt-*.pem` — JWT signing keys.
+- `beta-vault/vault/*.yml` — vauwt config fiwes.
+
+These genewated fiwes awe ignored by Git — onwy the `.example` tempwates awe twacked. Do **not** commit `beta-secrets.env`, `*.pem`, `*.mmdb`, ow the weaw `beta-vault/vault/*.yml` fiwes.
+
+To fuwwy wotate secwets, stop the stack, dewete the genewated fiwes above, and wun `./beta-setup.sh` again. Existing Postgres vowume data wiww be wost if you wun `./beta-down.sh -v`.
+
 ## Quick start
 
 ```bash
@@ -181,7 +193,7 @@ beta-vault/config/mmdb/ip-ipinfo.mmdb
 beta-vault/config/arindb/arin.mmdb
 ```
 
-To fully reset secrets, delete the files above and run `./beta-setup.sh` again.
+To fully reset secrets, delete `beta-vault/beta-secrets.env`, the JWT keys, the MMDBs, and the real `beta-vault/vault/*.yml` files, then run `./beta-setup.sh` again.
 
 ## Architecture
 

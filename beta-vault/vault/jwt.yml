@@ -1,7 +1,0 @@
-# beta test JWT config. tls_key_paths are vault-relative paths to PEM private keys.
-# These self-signed RSA/EC keys are generated locally and used only for beta testing.
-secret: "beta-test-jwt-secret-min-32-bytes-long!!"
-issuer: "urnetwork-beta"
-tls_key_paths:
-  - "tls/jwt-rsa.pem"
-  - "tls/ec/jwt-ec.pem"
