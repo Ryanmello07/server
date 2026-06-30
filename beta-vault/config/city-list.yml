@@ -1,0 +1,115 @@
+AU:
+  New South Wales:
+  - Sydney
+  Victoria:
+  - Melbourne
+BR:
+  Rio de Janeiro:
+  - Rio de Janeiro
+  "S\xE3o Paulo":
+  - "S\xE3o Paulo"
+CA:
+  British Columbia:
+  - Vancouver
+  Ontario:
+  - Toronto
+  Quebec:
+  - Montreal
+CH:
+  Zurich:
+  - Zurich
+DE:
+  Bavaria:
+  - Munich
+  Berlin:
+  - Berlin
+  Hesse:
+  - Frankfurt
+DK:
+  Capital Region:
+  - Copenhagen
+ES:
+  Madrid:
+  - Madrid
+FI:
+  Uusimaa:
+  - Helsinki
+FR:
+  "\xCEle-de-France":
+  - Paris
+GB:
+  England:
+  - London
+  - Manchester
+  Scotland:
+  - Edinburgh
+HK:
+  Hong Kong:
+  - Hong Kong
+IE:
+  Dublin:
+  - Dublin
+IN:
+  Karnataka:
+  - Bangalore
+  Maharashtra:
+  - Mumbai
+  Telangana:
+  - Hyderabad
+IT:
+  Lazio:
+  - Rome
+  Lombardy:
+  - Milan
+JP:
+  Osaka:
+  - Osaka
+  Tokyo:
+  - Tokyo
+KR:
+  Seoul:
+  - Seoul
+MX:
+  Mexico City:
+  - Mexico City
+NL:
+  North Holland:
+  - Amsterdam
+'NO':
+  Oslo:
+  - Oslo
+NZ:
+  Auckland:
+  - Auckland
+PL:
+  Masovian:
+  - Warsaw
+SE:
+  Stockholm:
+  - Stockholm
+SG:
+  Singapore:
+  - Singapore
+TW:
+  Taipei:
+  - Taipei
+US:
+  California:
+  - Los Angeles
+  - San Francisco
+  - San Jose
+  Florida:
+  - Miami
+  Georgia:
+  - Atlanta
+  Illinois:
+  - Chicago
+  New York:
+  - New York City
+  Texas:
+  - Dallas
+  - Houston
+  Virginia:
+  - Ashburn
+  Washington:
+  - Seattle

@@ -47,6 +47,28 @@ services:
     volumes:
       - ./beta-vault:/srv/warp:ro
 
+  taskworker:
+    build:
+      context: ../
+      dockerfile: server/Dockerfile.beta
+    environment:
+      WARP_ENV: local
+      WARP_BLOCK: local
+      WARP_SERVICE: taskworker
+      WARP_VERSION: 0.0.0-beta
+      WARP_HOST: 127.0.0.1
+      BRINGYOUR_POSTGRES_HOSTNAME: postgres
+      BRINGYOUR_REDIS_HOSTNAME: redis
+      WARP_HOME: /srv/warp
+    command: ["taskworker", "--count=2", "--batch_size=2"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./beta-vault:/srv/warp:ro
+
   api:
     build:
       context: ../
