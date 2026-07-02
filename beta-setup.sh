@@ -124,8 +124,10 @@ export PUBLIC_IP
 echo "Using PUBLIC_IP=$PUBLIC_IP"
 
 echo "Building beta server image..."
-docker compose -f docker-compose.beta.yml down -v 2>/dev/null || true
-docker compose -f docker-compose.beta.yml build --no-cache
+# Stop only containers, never the named data volume. This keeps Postgres data
+# across updates. To intentionally wipe the database, run `./beta-down.sh -v`.
+docker compose -f docker-compose.beta.yml down 2>/dev/null || true
+docker compose -f docker-compose.beta.yml build
 
 echo "Starting Postgres and Redis..."
 docker compose -f docker-compose.beta.yml up -d postgres redis
@@ -138,8 +140,8 @@ done
 echo "Running migrations..."
 docker compose -f docker-compose.beta.yml run --rm migrate
 
-echo "Starting API and Connect services..."
-docker compose -f docker-compose.beta.yml up -d api connect
+echo "Starting API, Connect, and Taskworker services..."
+docker compose -f docker-compose.beta.yml up -d api connect taskworker
 
 echo
 echo "Beta network running:"
@@ -148,4 +150,6 @@ echo "  Connect: ws://$PUBLIC_IP:5080/"
 echo
 echo "All generated secrets live in $SECRETS_FILE and beta-vault/vault/*.yml"
 echo "These files are NOT tracked by git."
+echo "Postgres data is preserved across ./beta-setup.sh runs in the named volume."
+echo "To intentionally wipe the database, run ./beta-down.sh -v."
 echo "To use from another machine, open TCP ports 8080, 5080, and 15080."
