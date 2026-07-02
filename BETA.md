@@ -140,19 +140,25 @@ This also removes the Postgres volume. Use this when you want a completely fresh
 
 ### Rebuild after code changes
 
-`beta-setup.sh` is idempotent. Run it again to rebuild images, regenerate missing secrets, and restart services:
+`beta-setup.sh` is idempotent and preserves data. Re-running it rebuilds images, regenerates any missing secrets, and restarts services without touching the Postgres volume:
 
 ```bash
-./beta-down.sh
 ./beta-setup.sh
 ```
 
-If you only changed code and want to keep data and secrets:
+To wipe the database and start fresh, run:
 
 ```bash
-./beta-down.sh              # keep volume
+./beta-down.sh -v
+./beta-setup.sh
+```
+
+If you only changed code and want to keep data and secrets without running the full setup script:
+
+```bash
+./beta-down.sh              # keeps volume
 docker compose -f docker-compose.beta.yml build --no-cache
-docker compose -f docker-compose.beta.yml up -d api connect
+docker compose -f docker-compose.beta.yml up -d api connect taskworker
 ```
 
 ### View logs
