@@ -214,13 +214,11 @@ func (self *TestEnv) setup() func() {
 		_, err := conn.Exec(
 			ctx,
 			fmt.Sprintf(
-				`
-					CREATE DATABASE %s
+				`CREATE DATABASE %s
 					WITH
 						OWNER=%s
 						ENCODING=UTF8
-						LC_COLLATE='en_US.UTF-8'
-						LC_CTYPE='en_US.UTF-8'
+						LOCALE='en_US.UTF-8'
 						TEMPLATE='template0'
 				`,
 				testPgDbName,
