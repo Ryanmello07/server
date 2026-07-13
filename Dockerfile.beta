@@ -12,6 +12,7 @@ COPY ./proxy /workspace/proxy
 COPY ./sdk /workspace/sdk
 COPY ./glog /workspace/glog
 COPY ./userwireguard /workspace/userwireguard
+COPY ./sn /workspace/sn
 
 WORKDIR /workspace/server
 RUN go mod tidy && CGO_ENABLED=0 go build -o /out/ ./...
