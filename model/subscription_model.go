@@ -29,12 +29,17 @@ type ByteCount = int64
 const Kib = ByteCount(1024)
 const Mib = ByteCount(1024 * 1024)
 const Gib = ByteCount(1024 * 1024 * 1024)
+const Tib = ByteCount(1024 * 1024 * 1024 * 1024)
 
 type Priority = uint32
 
 const UnpaidPriority = 0
 const PaidPriority = 100
 const TrustedPriority = 200
+
+// closed contracts that have not been bundled into a completed payout after
+// this long will not be paid; `RemoveCompletedContracts` hard deletes them
+const StragglerContractExpiration = 90 * 24 * time.Hour
 
 func ByteCountHumanReadable(count ByteCount) string {
 	trimFloatString := func(value float64, precision int, suffix string) string {
@@ -215,7 +220,12 @@ type TransferBalance struct {
 	SubsidyNetRevenue NanoCents `json:"subsidy_net_revenue_nano_cents,omitempty"`
 	BalanceByteCount  ByteCount `json:"balance_byte_count"`
 	PurchaseToken     string    `json:"purchase_token,omitempty"`
-	Paid              bool      `json:"paid,omitempty"`
+	// Paid means the balance carries revenue. It is NOT the same as Pro: a data
+	// code is paid but data-only.
+	Paid bool `json:"paid,omitempty"`
+	// Pro means the balance carries the Pro entitlement. A network is Pro iff it
+	// has an in-window balance with this set -- see pro_model.go.
+	Pro bool `json:"pro,omitempty"`
 }
 
 func GetActiveTransferBalances(ctx context.Context, networkId server.Id) []*TransferBalance {
@@ -234,7 +244,8 @@ func GetActiveTransferBalances(ctx context.Context, networkId server.Id) []*Tran
                     start_balance_byte_count,
                     net_revenue_nano_cents,
                     balance_byte_count,
-                    paid
+                    paid,
+                    pro
                 FROM transfer_balance
                 WHERE
                     network_id = $1 AND
@@ -257,6 +268,7 @@ func GetActiveTransferBalances(ctx context.Context, networkId server.Id) []*Tran
 					&transferBalance.NetRevenue,
 					&transferBalance.BalanceByteCount,
 					&transferBalance.Paid,
+					&transferBalance.Pro,
 				))
 				transferBalances = append(transferBalances, transferBalance)
 			}
@@ -595,6 +607,14 @@ func releaseNetEscrowForContract(ctx context.Context, contractId server.Id) {
 	})
 }
 
+// AddTransferBalanceInTx adds a balance, taking the Pro entitlement from
+// transferBalance.Pro.
+//
+// Pro is set EXPLICITLY here rather than left to the column default (which is true,
+// so that the migration keeps existing subscribers Pro). Relying on the default would
+// mean any new caller silently grants Pro -- which is exactly how a data-only
+// purchase could end up upgrading a network for free. Callers must say what they mean:
+// subscription activation sets Pro: true, and data purchases leave it false.
 func AddTransferBalanceInTx(ctx context.Context, tx server.PgTx, transferBalance *TransferBalance) {
 	balanceId := server.NewId()
 
@@ -610,9 +630,10 @@ func AddTransferBalanceInTx(ctx context.Context, tx server.PgTx, transferBalance
                     balance_byte_count,
                     net_revenue_nano_cents,
                     purchase_token,
-                    subsidy_net_revenue_nano_cents
+                    subsidy_net_revenue_nano_cents,
+                    pro
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             `,
 		balanceId,
 		transferBalance.NetworkId,
@@ -623,6 +644,7 @@ func AddTransferBalanceInTx(ctx context.Context, tx server.PgTx, transferBalance
 		transferBalance.NetRevenue,
 		transferBalance.PurchaseToken,
 		transferBalance.SubsidyNetRevenue,
+		transferBalance.Pro,
 	))
 
 	transferBalance.BalanceId = balanceId
@@ -632,6 +654,18 @@ func AddTransferBalance(ctx context.Context, transferBalance *TransferBalance) {
 	server.Tx(ctx, func(tx server.PgTx) {
 		AddTransferBalanceInTx(ctx, tx, transferBalance)
 	})
+
+	if transferBalance.Pro {
+		// The balance is committed, so refresh the entitlement cache HERE rather than
+		// making every caller remember to. A Pro balance that does not read as Pro
+		// until the cache expires is exactly the flaky upgrade we are avoiding: the
+		// "false" cached before the purchase would keep being served, leaving a user
+		// who just paid on the free plan for up to ProCacheTtl.
+		//
+		// Callers that add a Pro balance inside their OWN tx (AddTransferBalanceInTx,
+		// AddProTransferBalanceInTx) must do this themselves once it commits.
+		UpdateProNetwork(ctx, transferBalance.NetworkId)
+	}
 }
 
 // TODO GetLastTransferData returns the transfer data with
@@ -679,6 +713,9 @@ func AddBasicTransferBalanceInTx(
 ) (returnErr error) {
 	balanceId := server.NewId()
 
+	// pro = false: this is the unpaid, data-only grant path (the daily free-tier
+	// grant and referral bonuses). It must never confer Pro -- see pro_model.go.
+	// For a Pro grant use AddProTransferBalanceInTx.
 	_, err := tx.Exec(
 		ctx,
 		`
@@ -689,9 +726,10 @@ func AddBasicTransferBalanceInTx(
                     end_time,
                     start_balance_byte_count,
                     net_revenue_nano_cents,
-                    balance_byte_count
+                    balance_byte_count,
+                    pro
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $5)
+                VALUES ($1, $2, $3, $4, $5, $6, $5, false)
             `,
 		balanceId,
 		networkId,
@@ -708,6 +746,49 @@ func AddBasicTransferBalanceInTx(
 }
 
 // add balance to a network at no cost
+// AddProTransferBalanceInTx grants one network a Pro balance for the window. The
+// balance carries pro = true, which is what confers the Pro entitlement -- see
+// pro_model.go. The caller must refresh the Pro cache (UpdateProNetwork) once the
+// tx commits, so the upgrade is visible immediately.
+func AddProTransferBalanceInTx(
+	tx server.PgTx,
+	ctx context.Context,
+	networkId server.Id,
+	transferBalance ByteCount,
+	startTime time.Time,
+	endTime time.Time,
+) (returnErr error) {
+	balanceId := server.NewId()
+
+	_, err := tx.Exec(
+		ctx,
+		`
+                INSERT INTO transfer_balance (
+                    balance_id,
+                    network_id,
+                    start_time,
+                    end_time,
+                    start_balance_byte_count,
+                    net_revenue_nano_cents,
+                    balance_byte_count,
+                    pro
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $5, true)
+            `,
+		balanceId,
+		networkId,
+		startTime,
+		endTime,
+		transferBalance,
+		NanoCents(0),
+	)
+	if err != nil {
+		returnErr = err
+	}
+
+	return
+}
+
 func AddBasicTransferBalance(
 	ctx context.Context,
 	networkId server.Id,
@@ -2029,8 +2110,8 @@ func GetOpenContractIds(
 ) map[server.Id][]ContractParty {
 	contractIdPartialCloseParties := map[server.Id][]ContractParty{}
 
-	server.Tx(ctx, func(tx server.PgTx) {
-		result, err := tx.Query(
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
 			ctx,
 			`
                 SELECT
@@ -2097,8 +2178,8 @@ func GetExpiredOpenContractIds(
 ) map[server.Id]bool {
 	contractIdPartialCloseParties := map[server.Id]map[ContractParty]bool{}
 
-	server.Tx(ctx, func(tx server.PgTx) {
-		result, err := tx.Query(
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
 			ctx,
 			`
                 SELECT
@@ -2186,8 +2267,8 @@ func GetOpenContractIdsForSourceOrDestination(
 ) map[TransferPair]map[server.Id]ContractParty {
 	pairContractIdPartialCloseParties := map[TransferPair]map[server.Id]ContractParty{}
 
-	server.Tx(ctx, func(tx server.PgTx) {
-		result, err := tx.Query(
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
 			ctx,
 			`
                 SELECT
@@ -2914,6 +2995,10 @@ const SubscriptionMarketStripe = "stripe"
 const SubscriptionMarketSolana = "solana"
 const SubscriptionMarketManual = "manual"
 
+// an agent paid inline over x402 (HTTP 402), settled through the Stripe facilitator.
+// See controller/x402_controller.go.
+const SubscriptionMarketX402 = "x402"
+
 type SubscriptionRenewal struct {
 	NetworkId          server.Id
 	SubscriptionType   SubscriptionType
@@ -3012,72 +3097,48 @@ func HasSubscriptionRenewal(
 	return active, market
 }
 
+// IsPro reports whether a network currently holds the Pro entitlement.
+//
+// This is a thin wrapper for the many existing callers that hold a *server.Id;
+// pro_model.go is where Pro is actually tracked (an in-window transfer_balance
+// with pro = true, cached per network in redis). Do not reimplement this check --
+// in particular, "has any paid balance" is NOT Pro, because data codes create paid
+// balances and are data-only.
 func IsPro(
 	ctx context.Context,
 	networkId *server.Id,
 ) bool {
-
-	// todo:
-	// instead of checking if PAID, add a column 'is_pro'
-	//
-	// In some cases, like Apple TestFlight or Stripe promo codes,
-	// we want to mark the user as pro even if payment is 0
-
-	isPro := false
-
-	server.Tx(ctx, func(tx server.PgTx) {
-		result, err := tx.Query(
-			ctx,
-			`
-            SELECT
-                balance_id,
-                paid
-            FROM transfer_balance
-            WHERE
-                network_id = $1 AND
-                active = true
-        `,
-			networkId,
-		)
-
-		server.WithPgResult(result, err, func() {
-			for result.Next() {
-				var balanceId server.Id
-				var paid bool
-
-				server.Raise(result.Scan(
-					&balanceId,
-					&paid,
-				))
-				if paid {
-					// check if any active paid balance exists
-					isPro = true
-					break
-				}
-			}
-		})
-
-	})
-
-	return isPro
-
+	if networkId == nil {
+		return false
+	}
+	return IsProNetwork(ctx, *networkId)
 }
 
-func AddRefreshTransferBalanceToAllNetworks(
+// AddProTransferBalanceToAllNetworks grants the Pro data allowance to every network
+// with an active supporter subscription, for the window [startTime, endTime).
+//
+// The balance carries pro = true, so THIS GRANT is what makes a network Pro for the
+// period (see pro_model.go). It also carries the subscription's revenue pro-rated to
+// the grant window, which drives provider subsidy accounting: a yearly subscription
+// contributes roughly 1/12 of its revenue to each monthly grant.
+//
+// Eligibility comes from subscription_renewal, NOT from the pro column -- otherwise
+// the grant would renew its own entitlement forever and a lapsed subscription would
+// never drop to free.
+//
+// The Pro cache is refreshed for every granted network so the upgrade is visible
+// immediately instead of after ProCacheTtl.
+func AddProTransferBalanceToAllNetworks(
 	ctx context.Context,
 	startTime time.Time,
 	endTime time.Time,
-	supporterTransferBalances map[bool]ByteCount,
+	balanceByteCount ByteCount,
 ) (addedTransferBalances map[server.Id]ByteCount) {
 	addedTransferBalances = map[server.Id]ByteCount{}
 
-	type supporterStatus struct {
-		supporter           bool
-		netRevenueNanoCents NanoCents
-	}
-
 	server.Tx(ctx, func(tx server.PgTx) {
-		networkSupporterStatuses := map[server.Id]supporterStatus{}
+		// network_id -> subscription revenue pro-rated to this grant window
+		supporters := map[server.Id]NanoCents{}
 
 		result, err := tx.Query(
 			ctx,
@@ -3089,7 +3150,7 @@ func AddRefreshTransferBalanceToAllNetworks(
 					subscription_renewal.end_time
 				FROM network
 
-				LEFT JOIN subscription_renewal ON
+				INNER JOIN subscription_renewal ON
 					subscription_renewal.network_id = network.network_id AND
 					subscription_renewal.subscription_type = $1 AND
 					subscription_renewal.start_time <= $2 AND
@@ -3101,30 +3162,27 @@ func AddRefreshTransferBalanceToAllNetworks(
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
 				var networkId server.Id
-				var netRevenueNanoCents *NanoCents
-				var supporterStartTime *time.Time
-				var supporterEndTime *time.Time
+				var netRevenueNanoCents NanoCents
+				var supporterStartTime time.Time
+				var supporterEndTime time.Time
 				server.Raise(result.Scan(
 					&networkId,
 					&netRevenueNanoCents,
 					&supporterStartTime,
 					&supporterEndTime,
 				))
-				status := supporterStatus{
-					supporter: false,
+
+				subsidyNetRevenue := NanoCents(0)
+				if supporterDuration := supporterEndTime.Sub(supporterStartTime); 0 < supporterDuration {
+					fraction := float64(endTime.Sub(startTime)) / float64(supporterDuration)
+					subsidyNetRevenue = NanoCents(fraction * float64(netRevenueNanoCents))
 				}
-				if netRevenueNanoCents != nil {
-					supportDurationFraction := float64(endTime.Sub(startTime)/time.Second) / float64(supporterEndTime.Sub(*supporterStartTime)/time.Second)
-					status.supporter = true
-					status.netRevenueNanoCents = NanoCents(supportDurationFraction * float64(*netRevenueNanoCents))
-				}
-				networkSupporterStatuses[networkId] = status
+				supporters[networkId] = subsidyNetRevenue
 			}
 		})
 
 		server.BatchInTx(ctx, tx, func(batch server.PgBatch) {
-			for networkId, status := range networkSupporterStatuses {
-				balanceByteCount := supporterTransferBalances[status.supporter]
+			for networkId, subsidyNetRevenue := range supporters {
 				batch.Queue(
 					`
 		                INSERT INTO transfer_balance (
@@ -3135,22 +3193,104 @@ func AddRefreshTransferBalanceToAllNetworks(
 		                    start_balance_byte_count,
 		                    net_revenue_nano_cents,
 		                    subsidy_net_revenue_nano_cents,
-		                    balance_byte_count
+		                    balance_byte_count,
+		                    pro
 		                )
-		                VALUES ($1, $2, $3, $4, $5, $6, $7, $5)
+		                VALUES ($1, $2, $3, $4, $5, $6, $7, $5, true)
 		            `,
 					server.NewId(),
 					networkId,
 					startTime,
 					endTime,
 					balanceByteCount,
-					0,
-					status.netRevenueNanoCents,
+					NanoCents(0),
+					subsidyNetRevenue,
 				)
 				addedTransferBalances[networkId] = balanceByteCount
 			}
 		})
 	})
+
+	networkIds := make([]server.Id, 0, len(addedTransferBalances))
+	for networkId := range addedTransferBalances {
+		networkIds = append(networkIds, networkId)
+	}
+	UpdateProNetworks(ctx, networkIds...)
+
+	return
+}
+
+// AddFreeTransferBalanceToAllNetworks grants the free-tier data allowance to every
+// network WITHOUT an active supporter subscription, for the window
+// [startTime, endTime). The balance is unpaid and carries pro = false, so the free
+// grant can never confer Pro.
+func AddFreeTransferBalanceToAllNetworks(
+	ctx context.Context,
+	startTime time.Time,
+	endTime time.Time,
+	balanceByteCount ByteCount,
+) (addedTransferBalances map[server.Id]ByteCount) {
+	addedTransferBalances = map[server.Id]ByteCount{}
+
+	server.Tx(ctx, func(tx server.PgTx) {
+		networkIds := []server.Id{}
+
+		result, err := tx.Query(
+			ctx,
+			`
+				SELECT
+					network.network_id
+				FROM network
+
+				LEFT JOIN subscription_renewal ON
+					subscription_renewal.network_id = network.network_id AND
+					subscription_renewal.subscription_type = $1 AND
+					subscription_renewal.start_time <= $2 AND
+					$2 < subscription_renewal.end_time
+
+				WHERE subscription_renewal.network_id IS NULL
+			`,
+			SubscriptionTypeSupporter,
+			server.NowUtc(),
+		)
+		server.WithPgResult(result, err, func() {
+			for result.Next() {
+				var networkId server.Id
+				server.Raise(result.Scan(&networkId))
+				networkIds = append(networkIds, networkId)
+			}
+		})
+
+		server.BatchInTx(ctx, tx, func(batch server.PgBatch) {
+			for _, networkId := range networkIds {
+				batch.Queue(
+					`
+		                INSERT INTO transfer_balance (
+		                    balance_id,
+		                    network_id,
+		                    start_time,
+		                    end_time,
+		                    start_balance_byte_count,
+		                    net_revenue_nano_cents,
+		                    subsidy_net_revenue_nano_cents,
+		                    balance_byte_count,
+		                    pro
+		                )
+		                VALUES ($1, $2, $3, $4, $5, $6, $7, $5, false)
+		            `,
+					server.NewId(),
+					networkId,
+					startTime,
+					endTime,
+					balanceByteCount,
+					NanoCents(0),
+					NanoCents(0),
+				)
+				addedTransferBalances[networkId] = balanceByteCount
+			}
+		})
+	})
+
 	return
 }
 
@@ -3192,26 +3332,48 @@ func RemoveCompletedContracts(ctx context.Context, minTime time.Time) {
 		})
 	})
 
-	server.MaintenanceTx(ctx, func(tx server.PgTx) {
+	// each removal below deletes a bounded batch of candidate contracts and
+	// cascades contract_close/transfer_escrow/transfer_escrow_sweep for those
+	// same contract ids in one statement, so dependent rows never linger as
+	// orphans. The candidate subqueries deliberately have no DISTINCT and no
+	// ORDER BY: any batch will do for retention, duplicate candidate rows are
+	// harmless in DELETE ... USING (a row deletes once), and without a sort the
+	// scan stops as soon as LIMIT candidates are found instead of materializing
+	// every eligible contract. SweepOrphanContractData is the low-cadence
+	// safety net for orphans from any other path (e.g. crashes mid-statement
+	// from older releases).
 
-		// remove completed transfer contracts
+	// remove completed transfer contracts.
+	// driven from transfer_escrow_sweep (not account_payment) because sweeps
+	// are deleted here as they are processed, so the scan is bounded by the
+	// live sweep set; completed payments accumulate forever
+	server.MaintenanceTx(ctx, func(tx server.PgTx) {
 		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
-			DELETE FROM transfer_contract
-		    USING (
-		    	SELECT
-				    DISTINCT contract_id
-				FROM account_payment
-				INNER JOIN transfer_escrow_sweep ON
-				    transfer_escrow_sweep.payment_id = account_payment.payment_id
-
+			WITH candidate AS (
+				SELECT transfer_escrow_sweep.contract_id
+				FROM transfer_escrow_sweep
+				INNER JOIN account_payment ON
+				    account_payment.payment_id = transfer_escrow_sweep.payment_id
 				WHERE account_payment.completed AND account_payment.complete_time <= $1
-				ORDER BY contract_id
 				LIMIT $2
-		    ) t
-			WHERE
-			    transfer_contract.contract_id = t.contract_id
+			), deleted_close AS (
+				DELETE FROM contract_close
+				USING candidate
+				WHERE contract_close.contract_id = candidate.contract_id
+			), deleted_escrow AS (
+				DELETE FROM transfer_escrow
+				USING candidate
+				WHERE transfer_escrow.contract_id = candidate.contract_id
+			), deleted_sweep AS (
+				DELETE FROM transfer_escrow_sweep
+				USING candidate
+				WHERE transfer_escrow_sweep.contract_id = candidate.contract_id
+			)
+			DELETE FROM transfer_contract
+			USING candidate
+			WHERE transfer_contract.contract_id = candidate.contract_id
 			`,
 			minTime.UTC(),
 			maxRowCount,
@@ -3226,20 +3388,29 @@ func RemoveCompletedContracts(ctx context.Context, minTime time.Time) {
 		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
-			DELETE FROM transfer_contract
-			USING (
-				SELECT
-					DISTINCT transfer_contract.contract_id
+			WITH candidate AS (
+				SELECT transfer_contract.contract_id
 				FROM transfer_contract
-				LEFT JOIN transfer_escrow_sweep ON transfer_escrow_sweep.contract_id = transfer_contract.contract_id
 				WHERE
 					transfer_contract.create_time < $1 AND
 					transfer_contract.open = false AND
-					transfer_escrow_sweep.contract_id IS NULL
-				ORDER BY contract_id
+					NOT EXISTS (
+						SELECT 1 FROM transfer_escrow_sweep
+						WHERE transfer_escrow_sweep.contract_id = transfer_contract.contract_id
+					)
 				LIMIT $2
-			) t
-			WHERE transfer_contract.contract_id = t.contract_id
+			), deleted_close AS (
+				DELETE FROM contract_close
+				USING candidate
+				WHERE contract_close.contract_id = candidate.contract_id
+			), deleted_escrow AS (
+				DELETE FROM transfer_escrow
+				USING candidate
+				WHERE transfer_escrow.contract_id = candidate.contract_id
+			)
+			DELETE FROM transfer_contract
+			USING candidate
+			WHERE transfer_contract.contract_id = candidate.contract_id
 			`,
 			minTime.UTC(),
 			maxRowCount,
@@ -3247,73 +3418,146 @@ func RemoveCompletedContracts(ctx context.Context, minTime time.Time) {
 
 	}, server.TxReadCommitted)
 
+	// remove straggler contracts that never made it into a completed payout.
+	// The normal path removes a contract group ~7 days after its payment
+	// completes; a contract still here after `StragglerContractExpiration` has
+	// a sweep whose payment is stuck (planned but never completed, or planned
+	// and canceled without a completed re-plan) and will not be paid. Deleting
+	// the sweep here is safe for a payment that later completes anyway:
+	// CompletePayment reads only account_payment (amounts are fixed at plan
+	// time), which is never deleted.
+	stragglerMinTime := server.NowUtc().Add(-StragglerContractExpiration)
 	server.MaintenanceTx(ctx, func(tx server.PgTx) {
-
-		// (cascade) remove contract close where the transfer contract no longer exists
 		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
-			DELETE FROM contract_close
-			USING (
-				SELECT
-					DISTINCT contract_close.contract_id
-		    	FROM contract_close
-		        LEFT JOIN transfer_contract ON transfer_contract.contract_id = contract_close.contract_id
-				WHERE transfer_contract.contract_id IS NULL
-				ORDER BY contract_id
-				LIMIT $1
-			) t
-			WHERE contract_close.contract_id = t.contract_id
+			WITH candidate AS (
+				SELECT transfer_contract.contract_id
+				FROM transfer_contract
+				WHERE
+					transfer_contract.create_time < $1 AND
+					transfer_contract.open = false AND
+					NOT EXISTS (
+						SELECT 1
+						FROM transfer_escrow_sweep
+						INNER JOIN account_payment ON
+							account_payment.payment_id = transfer_escrow_sweep.payment_id
+						WHERE
+							transfer_escrow_sweep.contract_id = transfer_contract.contract_id AND
+							account_payment.completed
+					)
+				LIMIT $2
+			), deleted_close AS (
+				DELETE FROM contract_close
+				USING candidate
+				WHERE contract_close.contract_id = candidate.contract_id
+			), deleted_escrow AS (
+				DELETE FROM transfer_escrow
+				USING candidate
+				WHERE transfer_escrow.contract_id = candidate.contract_id
+			), deleted_sweep AS (
+				DELETE FROM transfer_escrow_sweep
+				USING candidate
+				WHERE transfer_escrow_sweep.contract_id = candidate.contract_id
+			)
+			DELETE FROM transfer_contract
+			USING candidate
+			WHERE transfer_contract.contract_id = candidate.contract_id
 			`,
+			stragglerMinTime.UTC(),
 			maxRowCount,
 		))
 
 	}, server.TxReadCommitted)
+}
 
-	server.MaintenanceTx(ctx, func(tx server.PgTx) {
+// SweepOrphanContractData removes contract_close/transfer_escrow/
+// transfer_escrow_sweep rows whose transfer_contract no longer exists.
+// RemoveCompletedContracts cascades these atomically with the contract delete,
+// so this is a low-cadence safety net for orphans left by older releases or
+// interrupted statements, not the primary cleanup mechanism. Each pass deletes
+// in bounded batches (streaming NOT EXISTS scans with LIMIT, no sort) until a
+// batch comes up short.
+func SweepOrphanContractData(ctx context.Context, limit int) (removedCount int64) {
+	removedCount += sweepOrphanBatches(
+		ctx,
+		`
+		DELETE FROM contract_close
+		USING (
+			SELECT contract_id, party
+			FROM contract_close
+			WHERE NOT EXISTS (
+				SELECT 1 FROM transfer_contract
+				WHERE transfer_contract.contract_id = contract_close.contract_id
+			)
+			LIMIT $1
+		) t
+		WHERE
+			contract_close.contract_id = t.contract_id AND
+			contract_close.party = t.party
+		`,
+		limit,
+	)
 
-		// (cascade) remove contract escrow where the transfer contract no longer exists
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-			DELETE FROM transfer_escrow
-			USING (
-				SELECT
-					DISTINCT transfer_escrow.contract_id
-	       		FROM transfer_escrow
-				LEFT JOIN transfer_contract ON transfer_contract.contract_id = transfer_escrow.contract_id
-				WHERE transfer_contract.contract_id IS NULL
-				ORDER BY contract_id
-				LIMIT $1
-			) t
-			WHERE transfer_escrow.contract_id = t.contract_id
-			`,
-			maxRowCount,
-		))
+	removedCount += sweepOrphanBatches(
+		ctx,
+		`
+		DELETE FROM transfer_escrow
+		USING (
+			SELECT contract_id, balance_id
+			FROM transfer_escrow
+			WHERE NOT EXISTS (
+				SELECT 1 FROM transfer_contract
+				WHERE transfer_contract.contract_id = transfer_escrow.contract_id
+			)
+			LIMIT $1
+		) t
+		WHERE
+			transfer_escrow.contract_id = t.contract_id AND
+			transfer_escrow.balance_id = t.balance_id
+		`,
+		limit,
+	)
 
-	}, server.TxReadCommitted)
+	removedCount += sweepOrphanBatches(
+		ctx,
+		`
+		DELETE FROM transfer_escrow_sweep
+		USING (
+			SELECT contract_id, balance_id, network_id
+			FROM transfer_escrow_sweep
+			WHERE NOT EXISTS (
+				SELECT 1 FROM transfer_contract
+				WHERE transfer_contract.contract_id = transfer_escrow_sweep.contract_id
+			)
+			LIMIT $1
+		) t
+		WHERE
+			transfer_escrow_sweep.contract_id = t.contract_id AND
+			transfer_escrow_sweep.balance_id = t.balance_id AND
+			transfer_escrow_sweep.network_id = t.network_id
+		`,
+		limit,
+	)
 
-	server.MaintenanceTx(ctx, func(tx server.PgTx) {
+	return
+}
 
-		// (cascade) remove contract escrow sweep where the transfer contract no longer exists
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-			DELETE FROM transfer_escrow_sweep
-			USING (
-				SELECT
-					DISTINCT transfer_escrow_sweep.contract_id
-			   	FROM transfer_escrow_sweep
-			    LEFT JOIN transfer_contract ON transfer_contract.contract_id = transfer_escrow_sweep.contract_id
-			    WHERE transfer_contract.contract_id IS NULL
-			    ORDER BY contract_id
-			    LIMIT $1
-			) t
-			WHERE transfer_escrow_sweep.contract_id = t.contract_id;
-			`,
-			maxRowCount,
-		))
-	}, server.TxReadCommitted)
+// sweepOrphanBatches repeatedly runs a bounded DELETE (one batch per
+// maintenance tx, so no long lock is held) until a batch deletes fewer than
+// `limit` rows, meaning the orphan set is drained.
+func sweepOrphanBatches(ctx context.Context, sql string, limit int) (removedCount int64) {
+	for {
+		var batchCount int64
+		server.MaintenanceTx(ctx, func(tx server.PgTx) {
+			tag := server.RaisePgResult(tx.Exec(ctx, sql, limit))
+			batchCount = tag.RowsAffected()
+		}, server.TxReadCommitted)
+		removedCount += batchCount
+		if batchCount < int64(limit) {
+			return
+		}
+	}
 }
 
 func GetOpenTransferByteCount(

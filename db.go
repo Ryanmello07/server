@@ -46,6 +46,12 @@ type PgNamedArgs = pgx.NamedArgs
 type PgBatch = *pgx.Batch
 type PgBatchResults = pgx.BatchResults
 
+// PgCanQuery is satisfied by PgConn, PgTx, and any other value that can execute queries.
+// It lets helper functions accept either a raw connection or a transaction uniformly.
+type PgCanQuery interface {
+	Query(ctx context.Context, sql string, args ...any) (PgResult, error)
+}
+
 const TxSerializable = pgx.Serializable
 const TxRepeatableRead = pgx.RepeatableRead
 const TxReadCommitted = pgx.ReadCommitted
@@ -374,6 +380,28 @@ func MaintenanceDb(ctx context.Context, callback func(PgConn), options ...any) {
 }
 
 func Db(ctx context.Context, callback func(PgConn), options ...any) {
+	c := func() {
+		dbWithPool(ctx, safePool, callback, options...)
+	}
+	if glog.V(2) {
+		pc, filename, line, _ := runtime.Caller(1)
+		pcName := runtime.FuncForPC(pc).Name()
+		parts := strings.Split(filename, "/")
+		Trace(
+			fmt.Sprintf("[db] %s %s:%d\n", pcName, parts[len(parts)-1], line),
+			c,
+		)
+	} else {
+		c()
+	}
+}
+
+// ReplicaDb runs a read-only query that tolerates replication delay, such as
+// stats and analytics reads. Queries tagged with this can be offloaded to a
+// read replica when one is attached; until then it uses the primary pool,
+// identical to `Db`. Do not tag reads that must observe the caller's own
+// writes (read-after-write within a request).
+func ReplicaDb(ctx context.Context, callback func(PgConn), options ...any) {
 	c := func() {
 		dbWithPool(ctx, safePool, callback, options...)
 	}

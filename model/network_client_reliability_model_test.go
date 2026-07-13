@@ -234,3 +234,654 @@ func TestAddClientReliabilityStats(t *testing.T) {
 
 	})
 }
+
+// helper to read one client_reliability row back from pg
+func testingGetClientReliabilityRow(
+	ctx context.Context,
+	blockNumber int64,
+	clientAddressHash [32]byte,
+	clientId server.Id,
+) (counters map[string]int64, valid bool, ok bool) {
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			`
+			SELECT
+				connection_new_count,
+				connection_established_count,
+				provide_enabled_count,
+				provide_changed_count,
+				receive_message_count,
+				receive_byte_count,
+				send_message_count,
+				send_byte_count,
+				valid
+			FROM client_reliability
+			WHERE
+				block_number = $1 AND
+				client_address_hash = $2 AND
+				client_id = $3
+			`,
+			blockNumber,
+			clientAddressHash[:],
+			clientId,
+		)
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				counters = map[string]int64{}
+				var connectionNew, connectionEstablished, provideEnabled, provideChanged int64
+				var receiveMessage, receiveByte, sendMessage, sendByte int64
+				server.Raise(result.Scan(
+					&connectionNew,
+					&connectionEstablished,
+					&provideEnabled,
+					&provideChanged,
+					&receiveMessage,
+					&receiveByte,
+					&sendMessage,
+					&sendByte,
+					&valid,
+				))
+				counters["connection_new_count"] = connectionNew
+				counters["connection_established_count"] = connectionEstablished
+				counters["provide_enabled_count"] = provideEnabled
+				counters["provide_changed_count"] = provideChanged
+				counters["receive_message_count"] = receiveMessage
+				counters["receive_byte_count"] = receiveByte
+				counters["send_message_count"] = sendMessage
+				counters["send_byte_count"] = sendByte
+				ok = true
+			}
+		})
+	})
+	return
+}
+
+func testingGetMaxDrainedBlock(ctx context.Context) (maxDrainedBlock int64, ok bool) {
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			`SELECT max_drained_block FROM client_reliability_rollup WHERE singleton_id = 1`,
+		)
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				server.Raise(result.Scan(&maxDrainedBlock))
+				ok = true
+			}
+		})
+	})
+	return
+}
+
+// The announce hot path records to redis; the rollup drains closed blocks into
+// pg with absolute counts. Cover: accumulation across records, the two-block
+// finality rule, idempotent re-drain, redis bucket cleanup, the high-water
+// mark, and the stale-write clamp.
+func TestRecordClientReliabilityStatsRollup(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		ip := netip.MustParseAddr("10.11.12.13")
+		clientAddressHash := server.ClientIpHashForAddr(ip)
+
+		now := server.NowUtc()
+		blockNumber := reliabilityBlockNumber(now)
+
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        3,
+			ReceiveByteCount:           1024,
+			SendMessageCount:           2,
+			SendByteCount:              512,
+		}
+
+		// two records in the same block accumulate in redis
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, now, now, stats)
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, now, now, stats)
+
+		// a range record spanning into the next block duplicates the stats
+		// into each block, matching AddClientReliabilityStatsRange
+		nextBlockTime := now.Add(ReliabilityBlockDuration)
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, now, nextBlockTime, stats)
+
+		// the block is not final yet: a rollup now must not drain it
+		RollupClientReliabilityStats(ctx, now)
+		_, _, ok := testingGetClientReliabilityRow(ctx, blockNumber, clientAddressHash, clientId)
+		assert.Equal(t, ok, false)
+
+		// after two more blocks both written blocks are final
+		later := now.Add(3 * ReliabilityBlockDuration)
+		RollupClientReliabilityStats(ctx, later)
+
+		counters, valid, ok := testingGetClientReliabilityRow(ctx, blockNumber, clientAddressHash, clientId)
+		assert.Equal(t, ok, true)
+		assert.Equal(t, counters["connection_established_count"], int64(3))
+		assert.Equal(t, counters["provide_enabled_count"], int64(3))
+		assert.Equal(t, counters["receive_message_count"], int64(9))
+		assert.Equal(t, counters["receive_byte_count"], int64(3072))
+		assert.Equal(t, counters["send_message_count"], int64(6))
+		assert.Equal(t, counters["send_byte_count"], int64(1536))
+		assert.Equal(t, counters["connection_new_count"], int64(0))
+		assert.Equal(t, valid, true)
+
+		nextCounters, _, ok := testingGetClientReliabilityRow(ctx, blockNumber+1, clientAddressHash, clientId)
+		assert.Equal(t, ok, true)
+		assert.Equal(t, nextCounters["receive_message_count"], int64(3))
+
+		// the drained buckets are removed from redis
+		server.Redis(ctx, func(r server.RedisClient) {
+			members, _ := r.SMembers(ctx, clientReliabilityBlocksKey).Result()
+			assert.Equal(t, len(members), 0)
+			fields, _ := r.HGetAll(ctx, clientReliabilityStatsKey(blockNumber)).Result()
+			assert.Equal(t, len(fields), 0)
+		})
+
+		// re-drain is idempotent (absolute counts)
+		RollupClientReliabilityStats(ctx, later)
+		counters, _, ok = testingGetClientReliabilityRow(ctx, blockNumber, clientAddressHash, clientId)
+		assert.Equal(t, ok, true)
+		assert.Equal(t, counters["receive_message_count"], int64(9))
+
+		// the high-water mark tracks the newest final block, even when idle
+		maxDrainedBlock, ok := testingGetMaxDrainedBlock(ctx)
+		assert.Equal(t, ok, true)
+		assert.Equal(t, maxDrainedBlock, reliabilityBlockNumber(later)-2)
+
+		// a record for a block older than the previous block is dropped, so a
+		// stalled recorder can never write to an already-drained block
+		staleTime := server.NowUtc().Add(-3 * ReliabilityBlockDuration)
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, staleTime, staleTime, stats)
+		server.Redis(ctx, func(r server.RedisClient) {
+			fields, _ := r.HGetAll(ctx, clientReliabilityStatsKey(reliabilityBlockNumber(staleTime))).Result()
+			assert.Equal(t, len(fields), 0)
+		})
+	})
+}
+
+// End to end: record on the hot path, drain with the rollup, then compute
+// scores over the drained blocks. The score windows must clamp to the rollup
+// high-water mark so they only span fully drained blocks.
+func TestRecordClientReliabilityStatsScores(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+
+		// connect the client with a location so
+		// network_client_location_reliability marks it valid
+		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+		clientAddress := "127.0.0.1:20000"
+		connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(ctx, clientId, clientAddress, server.NewId())
+		assert.Equal(t, err, nil)
+		location := &Location{
+			City:        "foo",
+			Region:      "bar",
+			Country:     "United States",
+			CountryCode: "us",
+		}
+		CreateLocation(ctx, location)
+		err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
+		assert.Equal(t, err, nil)
+
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+			ReceiveByteCount:           1024,
+			SendMessageCount:           1,
+			SendByteCount:              1024,
+		}
+
+		now := server.NowUtc()
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, now, now, stats)
+
+		later := now.Add(3 * ReliabilityBlockDuration)
+		RollupClientReliabilityStats(ctx, later)
+
+		UpdateClientReliabilityScores(ctx, later, true)
+
+		lookbackClientScores := GetAllClientReliabilityScores(ctx)
+		found := false
+		for _, clientScores := range lookbackClientScores {
+			if score, ok := clientScores[clientId]; ok {
+				// one valid block, sole client on the ip
+				assert.Equal(t, score.IndependentReliabilityScore, 1.0)
+				assert.Equal(t, score.ReliabilityScore, 1.0)
+				found = true
+			}
+		}
+		assert.Equal(t, found, true)
+	})
+}
+
+// Two stats-valid clients share an ip; one of them is location-invalid
+// (multiple connected ips). The location-invalid client earns no score, but it
+// still dilutes the shared-ip normalization: valid_client_count counts by
+// client_reliability.valid alone, matching the bucket window aggregation.
+func TestClientReliabilityScoreSharedIpNormalization(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		networkId := server.NewId()
+		validClientId := server.NewId()
+		invalidClientId := server.NewId()
+
+		location := &Location{
+			City:        "foo",
+			Region:      "bar",
+			Country:     "United States",
+			CountryCode: "us",
+		}
+		CreateLocation(ctx, location)
+
+		connect := func(clientId server.Id, clientAddress string) [32]byte {
+			connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(ctx, clientId, clientAddress, server.NewId())
+			assert.Equal(t, err, nil)
+			err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
+			assert.Equal(t, err, nil)
+			return clientAddressHash
+		}
+
+		Testing_CreateDevice(ctx, networkId, server.NewId(), validClientId, "", "")
+		Testing_CreateDevice(ctx, networkId, server.NewId(), invalidClientId, "", "")
+
+		sharedAddressHash := connect(validClientId, "10.1.2.3:20000")
+		// the invalid client is connected from two different ips, so its
+		// client_address_hash_count is 2 and its location reliability is
+		// invalid
+		connect(invalidClientId, "10.1.2.3:20001")
+		connect(invalidClientId, "10.99.2.3:20002")
+
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+			ReceiveByteCount:           1024,
+			SendMessageCount:           1,
+			SendByteCount:              1024,
+		}
+
+		n := 4
+		startTime := server.NowUtc()
+		for i := range n {
+			statsTime := startTime.Add(time.Duration(i) * ReliabilityBlockDuration)
+			// both clients report stats-valid blocks on the shared ip
+			AddClientReliabilityStats(ctx, networkId, validClientId, sharedAddressHash, statsTime, stats)
+			AddClientReliabilityStats(ctx, networkId, invalidClientId, sharedAddressHash, statsTime, stats)
+		}
+		endTime := startTime.Add(time.Duration(n) * ReliabilityBlockDuration)
+
+		UpdateClientReliabilityScores(ctx, endTime, true)
+
+		lookbackClientScores := GetAllClientReliabilityScores(ctx)
+		orderedLookbackIndexes := maps.Keys(lookbackClientScores)
+		slices.Sort(orderedLookbackIndexes)
+		clientScores := lookbackClientScores[orderedLookbackIndexes[len(orderedLookbackIndexes)-1]]
+
+		// the location-invalid client earns no score
+		_, ok := clientScores[invalidClientId]
+		assert.Equal(t, ok, false)
+
+		// the valid client's per-block contribution is diluted by the
+		// stats-valid co-client on the same ip: 1/2 per block
+		eps := 0.001
+		score := clientScores[validClientId]
+		assert.Equal(t, score.IndependentReliabilityScore, float64(n))
+		if d := score.ReliabilityScore - float64(n)/2; d < -eps || eps < d {
+			assert.Equal(t, score.ReliabilityScore, float64(n)/2)
+		}
+
+		// the network score and window score aggregate the same dilution
+		UpdateNetworkReliabilityScores(ctx, startTime, endTime, false)
+		networkScores := GetAllNetworkReliabilityScores(ctx)
+		networkScore, ok := networkScores[networkId]
+		assert.Equal(t, ok, true)
+		assert.Equal(t, networkScore.IndependentReliabilityScore, float64(n))
+		if d := networkScore.ReliabilityScore - float64(n)/2; d < -eps || eps < d {
+			assert.Equal(t, networkScore.ReliabilityScore, float64(n)/2)
+		}
+
+		UpdateNetworkReliabilityWindowScores(ctx, endTime, false)
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`
+				SELECT
+					independent_reliability_score,
+					reliability_score
+				FROM network_connection_reliability_window_score
+				WHERE network_id = $1
+				`,
+				networkId,
+			)
+			server.WithPgResult(result, err, func() {
+				assert.Equal(t, result.Next(), true)
+				var independentReliabilityScore float64
+				var reliabilityScore float64
+				server.Raise(result.Scan(&independentReliabilityScore, &reliabilityScore))
+				assert.Equal(t, independentReliabilityScore, float64(n))
+				if d := reliabilityScore - float64(n)/2; d < -eps || eps < d {
+					assert.Equal(t, reliabilityScore, float64(n)/2)
+				}
+			})
+		})
+	})
+}
+
+// The score tables are refreshed by upsert + stale-row delete instead of
+// delete-all + reinsert. When a later refresh window contains no data, every
+// previously written row must be removed as stale.
+func TestReliabilityScoreStaleRowsRemoved(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+
+		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+		connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(ctx, clientId, "10.5.6.7:20000", server.NewId())
+		assert.Equal(t, err, nil)
+		location := &Location{
+			City:        "foo",
+			Region:      "bar",
+			Country:     "United States",
+			CountryCode: "us",
+		}
+		CreateLocation(ctx, location)
+		err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
+		assert.Equal(t, err, nil)
+
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+			ReceiveByteCount:           1024,
+			SendMessageCount:           1,
+			SendByteCount:              1024,
+		}
+
+		startTime := server.NowUtc()
+		AddClientReliabilityStats(ctx, networkId, clientId, clientAddressHash, startTime, stats)
+		endTime := startTime.Add(ReliabilityBlockDuration)
+
+		UpdateClientReliabilityScores(ctx, endTime, true)
+		UpdateNetworkReliabilityScores(ctx, startTime, endTime, false)
+		UpdateNetworkReliabilityWindowScores(ctx, endTime, false)
+
+		clientScores := GetAllClientReliabilityScores(ctx)
+		assert.NotEqual(t, len(clientScores), 0)
+		networkScores := GetAllNetworkReliabilityScores(ctx)
+		_, ok := networkScores[networkId]
+		assert.Equal(t, ok, true)
+
+		// refresh far in the future: every window is past the data, so all
+		// rows must be removed as stale
+		farFuture := endTime.Add(NetworkWindowLookback + 24*time.Hour)
+		UpdateClientReliabilityScores(ctx, farFuture, false)
+		UpdateNetworkReliabilityScores(ctx, farFuture.Add(-time.Hour), farFuture, false)
+		UpdateNetworkReliabilityWindowScores(ctx, farFuture, false)
+
+		lookbackClientScores := GetAllClientReliabilityScores(ctx)
+		for _, clientScores := range lookbackClientScores {
+			assert.Equal(t, len(clientScores), 0)
+		}
+		networkScores = GetAllNetworkReliabilityScores(ctx)
+		assert.Equal(t, len(networkScores), 0)
+
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`SELECT COUNT(*) FROM network_connection_reliability_window_score`,
+			)
+			server.WithPgResult(result, err, func() {
+				assert.Equal(t, result.Next(), true)
+				var count int
+				server.Raise(result.Scan(&count))
+				assert.Equal(t, count, 0)
+			})
+		})
+	})
+}
+
+func testingGetReliabilitySyncRanges(ctx context.Context) (ranges [][2]int64) {
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			`
+			SELECT min_block_number, max_block_number
+			FROM client_reliability_sync
+			ORDER BY min_block_number
+			`,
+		)
+		server.WithPgResult(result, err, func() {
+			for result.Next() {
+				var minBlockNumber int64
+				var maxBlockNumber int64
+				server.Raise(result.Scan(&minBlockNumber, &maxBlockNumber))
+				ranges = append(ranges, [2]int64{minBlockNumber, maxBlockNumber})
+			}
+		})
+	})
+	return
+}
+
+// Coverage range bookkeeping for the drained blocks: contiguous drains extend
+// the newest range, re-drains are no-ops, a drain after lost blocks starts a
+// new range, and the covered count treats pre-first-range blocks as covered
+// while returning 0 for an entirely uncovered window.
+func TestReliabilityCoveredBlockCount(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		covered := func(minBlockNumber int64, maxBlockNumber int64) (coveredBlockCount int64) {
+			server.Tx(ctx, func(tx server.PgTx) {
+				coveredBlockCount = reliabilityCoveredBlockCount(ctx, tx, minBlockNumber, maxBlockNumber)
+			})
+			return
+		}
+
+		b := int64(1000000)
+
+		// no coverage rows at all: the full window width counts
+		assert.Equal(t, covered(b, b+10), int64(10))
+
+		coverClientReliabilityBlock(ctx, b)
+		// contiguous: extends the newest range
+		coverClientReliabilityBlock(ctx, b+1)
+		// re-drain of a covered block: no change
+		coverClientReliabilityBlock(ctx, b+1)
+		// after a gap (blocks b+2..b+4 lost): starts a new range
+		coverClientReliabilityBlock(ctx, b+5)
+
+		assert.Equal(t, testingGetReliabilitySyncRanges(ctx), [][2]int64{{b, b + 1}, {b + 5, b + 5}})
+
+		// blocks before the first range count as covered
+		assert.Equal(t, covered(b-10, b), int64(10))
+		// the lost blocks are uncovered
+		assert.Equal(t, covered(b, b+6), int64(3))
+		assert.Equal(t, covered(b, b+7), int64(3))
+		// an entirely uncovered window returns 0
+		assert.Equal(t, covered(b+2, b+5), int64(0))
+
+		// expiration deletes fully expired ranges and clamps the straddler
+		blockTime := func(blockNumber int64) time.Time {
+			return time.UnixMilli(blockNumber * int64(ReliabilityBlockDuration/time.Millisecond)).UTC()
+		}
+		RemoveOldClientReliabilityStats(ctx, blockTime(b+2).Add(ClientExpiration), 1000)
+		assert.Equal(t, testingGetReliabilitySyncRanges(ctx), [][2]int64{{b + 1, b + 1}, {b + 5, b + 5}})
+	})
+}
+
+// Redis counters lost before the rollup drains them (redis restart/expiry,
+// drain outage) leave blocks outside every coverage range. The score weights
+// normalize by covered blocks only, so the loss must not register as client
+// unreliability.
+func TestClientReliabilityDrainGapExcused(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+
+		// connect the client with a location so
+		// network_client_location_reliability marks it valid
+		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+		connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(ctx, clientId, "127.0.0.1:20000", server.NewId())
+		assert.Equal(t, err, nil)
+		location := &Location{
+			City:        "foo",
+			Region:      "bar",
+			Country:     "United States",
+			CountryCode: "us",
+		}
+		CreateLocation(ctx, location)
+		err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
+		assert.Equal(t, err, nil)
+
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+			ReceiveByteCount:           1024,
+			SendMessageCount:           1,
+			SendByteCount:              1024,
+		}
+
+		base := server.NowUtc()
+
+		// block b0 is recorded and drained
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, base, base, stats)
+		RollupClientReliabilityStats(ctx, base.Add(3*ReliabilityBlockDuration))
+
+		// blocks base+1..base+4 are lost before draining (nothing recorded)
+
+		// block base+5 is recorded and drained
+		b5Time := base.Add(5 * ReliabilityBlockDuration)
+		RecordClientReliabilityStatsRange(ctx, networkId, clientId, clientAddressHash, b5Time, b5Time, stats)
+		scoreTime := base.Add(8 * ReliabilityBlockDuration)
+		RollupClientReliabilityStats(ctx, scoreTime)
+
+		UpdateClientReliabilityScores(ctx, scoreTime, true)
+
+		// the shortest lookback window spans only the lossy region: the client
+		// reported in every covered block there, so its weight is a full 1.0
+		// (without coverage the gap would register as 1 present / 6 blocks)
+		lookbackClientScores := GetAllClientReliabilityScores(ctx)
+		score, ok := lookbackClientScores[0][clientId]
+		assert.Equal(t, ok, true)
+		eps := 0.001
+		assert.Equal(t, score.IndependentReliabilityScore, 1.0)
+		if d := score.IndependentReliabilityWeight - 1.0; d < -eps || eps < d {
+			assert.Equal(t, score.IndependentReliabilityWeight, 1.0)
+		}
+		if d := score.ReliabilityWeight - 1.0; d < -eps || eps < d {
+			assert.Equal(t, score.ReliabilityWeight, 1.0)
+		}
+	})
+}
+
+// The reliability stats wait for the redis->pg drain: a rollup high-water
+// mark that has not advanced recently reads as not synced. Environments where
+// the rollup never runs (fixtures write pg directly) read as synced.
+func TestClientReliabilityRollupSynced(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		now := server.NowUtc()
+
+		// no rollup record yet
+		assert.Equal(t, ClientReliabilityRollupSynced(ctx, now), true)
+
+		RollupClientReliabilityStats(ctx, now)
+		assert.Equal(t, ClientReliabilityRollupSynced(ctx, now), true)
+		assert.Equal(t, ClientReliabilityRollupSynced(ctx, now.Add(ReliabilityRollupStaleAfter+time.Minute)), false)
+	})
+}
+
+// The block validity rule tolerates exactly one reconnect. A reconnect drops
+// the provider's live clients, so it is real user impact: repeated reconnects
+// (flapping) still invalidate the block. But a single reconnect used to
+// invalidate it too, and at the hour threshold one invalid block takes a
+// provider out of the market for an hour — so any handler rotation, mobile
+// blip, or NAT rebind disqualified an otherwise perfect provider.
+func TestClientReliabilityReconnectTolerated(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		networkId := server.NewId()
+		ip := netip.MustParseAddr("10.20.30.40")
+		clientAddressHash := server.ClientIpHashForAddr(ip)
+
+		now := server.NowUtc()
+
+		// each case is one block's accumulated counters
+		validFor := func(stats *ClientReliabilityStats) bool {
+			clientId := server.NewId()
+			AddClientReliabilityStats(ctx, networkId, clientId, clientAddressHash, now, stats)
+			_, valid, ok := testingGetClientReliabilityRow(
+				ctx,
+				reliabilityBlockNumber(now),
+				clientAddressHash,
+				clientId,
+			)
+			assert.Equal(t, ok, true)
+			return valid
+		}
+
+		// steady state: established, providing, passing traffic
+		assert.Equal(t, validFor(&ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+		}), true)
+
+		// one reconnect, then re-established in the same block: tolerated
+		assert.Equal(t, validFor(&ClientReliabilityStats{
+			ConnectionNewCount:         1,
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+		}), true)
+
+		// flapping: two reconnects in one block is still unreliable
+		assert.Equal(t, validFor(&ClientReliabilityStats{
+			ConnectionNewCount:         2,
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+		}), false)
+
+		// a reconnect with no re-established sync in the block (the connection
+		// came back across the block boundary) is still invalid — the hour
+		// threshold carries the slack for this
+		assert.Equal(t, validFor(&ClientReliabilityStats{
+			ConnectionNewCount:  1,
+			ProvideEnabledCount: 1,
+			ReceiveMessageCount: 1,
+		}), false)
+
+		// the other invalidating conditions are unchanged
+		assert.Equal(t, validFor(&ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ProvideChangedCount:        1,
+			ReceiveMessageCount:        1,
+		}), false)
+		assert.Equal(t, validFor(&ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+		}), false)
+	})
+}

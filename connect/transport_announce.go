@@ -251,10 +251,35 @@ func (self *ConnectionAnnounce) run() {
 		glog.Infof("[t][%s]could not connect client. err = %s\n", hex.EncodeToString(clientAddressHash[:]), err)
 		return
 	}
+
+	// verify egress feeder (observed source ip, sn/VALIDATOR.md §8): while
+	// connected, this client's observed address is a candidate provider
+	// egress for `/verify` source-ip attribution. Feed on connect,
+	// ttl-refresh while connected, clear on disconnect. The bijection gate in
+	// the model excludes shared or ambiguous ips (§8.2).
+	verifySettings := model.DefaultVerifySettings()
+	verifyEgressIp, verifyEgressOk := model.ParseVerifyEgressIp(self.clientAddress)
+	if verifyEgressOk {
+		model.FeedVerifyEgress(self.ctx, self.clientId, verifyEgressIp, verifySettings)
+		go server.HandleError(func() {
+			for {
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-time.After(verifySettings.EgressRefreshInterval):
+				}
+				model.FeedVerifyEgress(self.ctx, self.clientId, verifyEgressIp, verifySettings)
+			}
+		}, self.cancel)
+	}
+
 	defer server.HandleError(func() {
 		// note use an uncanceled context for cleanup
 		cleanupCtx := context.Background()
 		model.DisconnectNetworkClient(cleanupCtx, connectionId)
+		if verifyEgressOk {
+			model.ClearVerifyEgress(cleanupCtx, self.clientId, verifyEgressIp)
+		}
 		if glog.V(1) {
 			glog.Infof("[t][%s]disconnect client\n", hex.EncodeToString(clientAddressHash[:]))
 		}
@@ -405,7 +430,11 @@ func (self *ConnectionAnnounce) run() {
 					established = provideEnabled
 					stats.ConnectionNewCount = 1
 				}
-				model.AddClientReliabilityStatsRange(
+				// record to redis only (never pg): the per-sync stats of every
+				// connected provider were the single largest statement load on
+				// the database. RollupClientReliabilityStats drains the redis
+				// counters into `client_reliability` per block.
+				model.RecordClientReliabilityStatsRange(
 					self.ctx,
 					self.networkId,
 					self.clientId,

@@ -3,8 +3,11 @@ package work
 import (
 	"time"
 
+	"github.com/urnetwork/glog"
+
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/controller"
+	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/session"
 	"github.com/urnetwork/server/task"
 )
@@ -41,11 +44,13 @@ func Payout(
 	schedulePayout *SchedulePayoutArgs,
 	clientSession *session.ClientSession,
 ) (*SchedulePayoutResult, error) {
-	// FIXME disable payments until we figure out the account bug
-	// err := controller.SendPayments(clientSession)
-	// if err != nil {
-	// 	return nil, err
-	// }
+	// payouts were disabled while funds were being sent to the wrong wallets.
+	// wallet ownership is now validated at every layer (set/plan/advance) and
+	// submits are idempotent, so payouts are re-enabled.
+	err := controller.SendPayments(clientSession)
+	if err != nil {
+		return nil, err
+	}
 
 	return &SchedulePayoutResult{
 		Success: true,
@@ -111,5 +116,44 @@ func ProcessPendingPayoutsPost(
 	clientSession *session.ClientSession,
 	tx server.PgTx,
 ) error {
+	return nil
+}
+
+type CancelHungAccountPaymentsArgs struct {
+}
+
+type CancelHungAccountPaymentsResult struct {
+}
+
+func ScheduleCancelHungAccountPayments(clientSession *session.ClientSession, tx server.PgTx) {
+	task.ScheduleTaskInTx(
+		tx,
+		CancelHungAccountPayments,
+		&CancelHungAccountPaymentsArgs{},
+		clientSession,
+		task.RunOnce("cancel_hung_account_payments"),
+		task.RunAt(server.NowUtc().Add(24*time.Hour)),
+		task.MaxTime(1*time.Hour),
+	)
+}
+
+func CancelHungAccountPayments(
+	cancelHungAccountPayments *CancelHungAccountPaymentsArgs,
+	clientSession *session.ClientSession,
+) (*CancelHungAccountPaymentsResult, error) {
+	canceledCount := model.CancelHungAccountPayments(clientSession.Ctx, server.NowUtc())
+	if 0 < canceledCount {
+		glog.Infof("[payw]canceled %d hung payments for re-planning.\n", canceledCount)
+	}
+	return &CancelHungAccountPaymentsResult{}, nil
+}
+
+func CancelHungAccountPaymentsPost(
+	cancelHungAccountPayments *CancelHungAccountPaymentsArgs,
+	cancelHungAccountPaymentsResult *CancelHungAccountPaymentsResult,
+	clientSession *session.ClientSession,
+	tx server.PgTx,
+) error {
+	ScheduleCancelHungAccountPayments(clientSession, tx)
 	return nil
 }

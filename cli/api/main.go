@@ -76,6 +76,8 @@ Options:
 
 	server.Warmup()
 
+	server.StartStatsPusher(ctx)
+
 	glog.Infof(
 		"[api]serving %s %s on *:%d\n",
 		server.RequireEnv(),

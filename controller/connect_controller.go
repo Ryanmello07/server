@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/glog"
@@ -37,6 +38,26 @@ var MaxContractTransferByteCount = func() model.ByteCount {
 		2 * settings.ContractManagerSettings.StandardContractTransferByteCount,
 	)
 }()
+
+// urnetwork_connect_transfer_bytes counts bytes transferred on the connect
+// path, summed from the acked byte counts of closed and checkpointed transfer
+// contracts (see CloseContract). the acked byte count reported at each
+// checkpoint is incremental (the contract_close table accumulates it with
+// used_transfer_byte_count + $3), so adding it on every successful close is the
+// running total of transferred bytes. exported to grafana via the default
+// prometheus registry (see server/grafana.go StartStatsPusher)
+var transferByteCounter = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "transfer_bytes",
+		Help:      "Bytes transferred on the connect path, summed from closed and checkpointed transfer contracts",
+	},
+)
+
+func init() {
+	prometheus.MustRegister(transferByteCounter)
+}
 
 type ConnectControlArgs struct {
 	Pack string `json:"pack"`
@@ -162,6 +183,33 @@ func GetProvideRelationship(ctx context.Context, sourceId server.Id, destination
 	return model.GetProvideRelationship(ctx, sourceId, destinationId)
 }
 
+// resolveNonCompanionProvideMode selects the provide mode a non-companion
+// contract is settled under, given the source->destination provideRelationship
+// and the modes the destination advertises (provideModes). It returns
+// companion=true when it falls back to a companion Stream contract, and
+// allowed=false when the destination advertises neither the relationship mode
+// nor Stream (the caller then rejects with NoPermission).
+//
+// The Stream fallback preserves backward compatibility with older clients. Such
+// a client registers only ProvideModeStream, so a same-network return contract
+// (which the provider requests under ProvideModeNetwork) would be rejected here
+// outright, silently blocking its return traffic. Settling it as a companion
+// Stream contract — the return path used before the ProvideModeNetwork
+// optimization — keeps those clients working.
+func resolveNonCompanionProvideMode(
+	provideRelationship model.ProvideMode,
+	provideModes map[model.ProvideMode]bool,
+) (provideMode model.ProvideMode, companion bool, allowed bool) {
+	switch {
+	case provideModes[provideRelationship]:
+		return provideRelationship, false, true
+	case provideModes[model.ProvideModeStream]:
+		return model.ProvideModeStream, true, true
+	default:
+		return provideRelationship, false, false
+	}
+}
+
 func CreateContract(
 	ctx context.Context,
 	clientId server.Id,
@@ -177,15 +225,33 @@ func CreateContract(
 	// companion requests rejected below (which never reach [contract][cert]).
 	glog.V(2).Infof("[contract][req]%s->%s companion=%t\n", clientId, destinationId, createContract.Companion)
 
-	if createContract.Companion {
+	// companion tracks whether this contract is settled as a companion (reply)
+	// contract. It starts from the request flag but may also be set below when we
+	// fall back to a companion contract because the destination does not advertise
+	// the ideal relationship mode.
+	companion := createContract.Companion
 
+	if companion {
 		// companion contracts use `ProvideModeStream`
 		provideMode = model.ProvideModeStream
 
+		// network peers never fall back to stream: when the companion reply
+		// is same-network and the destination advertises the network mode,
+		// settle it as a non-companion network contract (the no-escrow path,
+		// same as the forward direction between network peers)
+		if GetProvideRelationship(ctx, clientId, destinationId) == model.ProvideModeNetwork &&
+			GetProvideModes(ctx, destinationId)[model.ProvideModeNetwork] {
+			glog.V(2).Infof("[contract][network-normalize]%s->%s companion settled as network\n", clientId, destinationId)
+			provideMode = model.ProvideModeNetwork
+			companion = false
+		}
 	} else {
 		provideRelationship := GetProvideRelationship(ctx, clientId, destinationId)
+		provideModes := GetProvideModes(ctx, destinationId)
 
-		if provideModes := GetProvideModes(ctx, destinationId); !provideModes[provideRelationship] {
+		var allowed bool
+		provideMode, companion, allowed = resolveNonCompanionProvideMode(provideRelationship, provideModes)
+		if !allowed {
 			glog.V(2).Infof("[contract][reject]%s->%s no-permission (companion=%t relationship=%d)\n", clientId, destinationId, createContract.Companion, provideRelationship)
 			contractError := protocol.ContractError_NoPermission
 			result := &protocol.CreateContractResult{
@@ -198,8 +264,9 @@ func CreateContract(
 			}
 			return []*protocol.Frame{frame}, nil
 		}
-
-		provideMode = provideRelationship
+		if companion {
+			glog.V(2).Infof("[contract][companion-fallback]%s->%s relationship=%d not provided; using companion Stream\n", clientId, destinationId, provideRelationship)
+		}
 	}
 
 	provideSecretKey, err := model.GetProvideSecretKey(ctx, destinationId, provideMode)
@@ -262,7 +329,7 @@ func CreateContract(
 		return nil, err
 	}
 
-	contractId, transferByteCount, priority, streamId, err := nextContract(ctx, clientId, createContract, provideMode, contractManagerSettings)
+	contractId, transferByteCount, priority, streamId, err := nextContract(ctx, clientId, createContract, companion, provideMode, contractManagerSettings)
 	// server.Logger().Printf("CONTROL CREATE CONTRACT TRANSFER BYTE COUNT %d %d %d\n", model.ByteCount(createContract.TransferByteCount), transferByteCount, uint64(transferByteCount))
 
 	if err != nil {
@@ -295,6 +362,15 @@ func CreateContract(
 	}
 	if streamId != nil {
 		storedContract.StreamId = streamId.Bytes()
+	}
+	// the source's roles and principal are sealed into the signed contract
+	// bytes only when the provide mode is network. For all other provide
+	// modes they are not set.
+	if provideMode == model.ProvideModeNetwork {
+		if identity := model.GetClientIdentity(ctx, clientId); identity != nil {
+			storedContract.Roles = identity.Roles
+			storedContract.Principal = identity.Principal
+		}
 	}
 	storedContractBytes, _ := proto.Marshal(storedContract)
 
@@ -333,6 +409,7 @@ func nextContract(
 	ctx context.Context,
 	clientId server.Id,
 	createContract *protocol.CreateContract,
+	companion bool,
 	provideMode model.ProvideMode,
 	contractManagerSettings *connect.ContractManagerSettings,
 ) (server.Id, model.ByteCount, model.Priority, *server.Id, error) {
@@ -382,7 +459,7 @@ func nextContract(
 		destinationId,
 		intermediaryIds,
 		// companion contracts reply to an existing open contract
-		createContract.Companion,
+		companion,
 		model.ByteCount(createContract.TransferByteCount),
 		provideMode,
 		forceStream,
@@ -638,5 +715,10 @@ func CloseContract(
 	checkpoint := closeContract.Checkpoint
 
 	err := model.CloseContract(ctx, contractId, clientId, usedTransferByteCount, checkpoint)
+	if err == nil {
+		// the acked byte count is incremental per checkpoint, so this sums to
+		// the total transferred bytes (matching the contract_close accumulation)
+		transferByteCounter.Add(float64(usedTransferByteCount))
+	}
 	return err
 }

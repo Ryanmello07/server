@@ -10,6 +10,7 @@ import (
 	// "strconv"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"time"
 
 	// "github.com/urnetwork/glog"
@@ -45,6 +46,10 @@ type WalletAuthArgs struct {
 	Signature  string `json:"wallet_signature,omitempty"`
 	Message    string `json:"wallet_message,omitempty"`
 	Blockchain string `json:"blockchain,omitempty"`
+	// Nonce is a server-issued single-use challenge (see AuthWalletNonceCreate) that
+	// the client must embed in Message and echo here for wallet login, to prevent
+	// signature replay. Optional during client rollout; enforced when present.
+	Nonce string `json:"wallet_nonce,omitempty"`
 }
 
 type AuthLoginArgs struct {
@@ -57,10 +62,28 @@ type AuthLoginArgs struct {
 type AuthLoginResult struct {
 	UserName    *string                 `json:"user_name,omitempty"`
 	UserAuth    *string                 `json:"user_auth,omitempty"`
-	WalletAuth  *WalletAuthArgs         `json:"wallet_login,omitempty"`
+	WalletAuth  *WalletAuthArgs         `json:"wallet_auth,omitempty"`
 	AuthAllowed *[]string               `json:"auth_allowed,omitempty"`
 	Error       *AuthLoginResultError   `json:"error,omitempty"`
 	Network     *AuthLoginResultNetwork `json:"network,omitempty"`
+}
+
+// MarshalJSON dual-emits the deprecated `wallet_login` alias alongside the spec
+// field `wallet_auth` during the rename migration (be lenient in what we send).
+func (r AuthLoginResult) MarshalJSON() ([]byte, error) {
+	type alias AuthLoginResult
+	b, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	if v, ok := m["wallet_auth"]; ok {
+		m["wallet_login"] = v
+	}
+	return json.Marshal(m)
 }
 
 type AuthLoginResultError struct {
@@ -552,6 +575,10 @@ func VerifySignature(blockchain string, publicKey string, message string, signat
 		return VerifyEthereumSignature(publicKey, message, signature)
 	}
 
+	if strings.EqualFold(blockchain, "tao") || strings.EqualFold(blockchain, "bittensor") {
+		return VerifyBittensorSignature(publicKey, message, signature)
+	}
+
 	return false, fmt.Errorf("unsupported blockchain: %s", blockchain)
 
 }
@@ -916,6 +943,13 @@ func AuthVerifyCreateCode(
 		return result, nil
 	}
 
+	// Rate-limit code sends (keyed by user_auth + client address) so an attacker
+	// cannot bomb a target's email/SMS or repeatedly invalidate their pending code.
+	// Each send intentionally consumes attempt budget (not marked success).
+	if _, allow := UserAuthAttempt(userAuth, session); !allow {
+		return nil, maxUserAuthAttemptsError()
+	}
+
 	created := false
 	var verifyCode string
 
@@ -941,13 +975,16 @@ func AuthVerifyCreateCode(
 			return
 		}
 
-		// delete existing codes and create a new code
+		// invalidate existing codes and create a new code.
+		// `used = false` bounds the update to the user's live codes; without it
+		// every code send rewrote the user's entire code history (already-used
+		// rows included), which bloated the table and serialized concurrent sends
 		server.RaisePgResult(tx.Exec(
 			session.Ctx,
 			`
 				UPDATE user_auth_verify
 				SET used = true
-				WHERE user_id = $1
+				WHERE user_id = $1 AND used = false
 			`,
 			userId,
 		))
@@ -1004,6 +1041,13 @@ func AuthPasswordResetCreateCode(
 			},
 		}
 		return result, nil
+	}
+
+	// Rate-limit code sends (keyed by user_auth + client address) so an attacker
+	// cannot bomb a target's email/SMS or repeatedly invalidate their pending code.
+	// Each send intentionally consumes attempt budget (not marked success).
+	if _, allow := UserAuthAttempt(userAuth, session); !allow {
+		return nil, maxUserAuthAttemptsError()
 	}
 
 	created := false
@@ -1177,6 +1221,12 @@ const MaxAuthCodeUses = 100
 type AuthCodeCreateArgs struct {
 	DurationMinutes float64 `json:"duration_minutes,omitempty"`
 	Uses            int     `json:"uses,omitempty"`
+
+	// identity roles and principal carried by logins minted from this code.
+	// Only a network-level non-guest session may set these; when omitted, the
+	// session's own roles and principal are inherited.
+	Roles     []string `json:"roles,omitempty"`
+	Principal string   `json:"principal,omitempty"`
 }
 
 type AuthCodeCreateResult struct {
@@ -1210,6 +1260,16 @@ func AuthCodeCreate(
 	// 	}
 	// 	return
 	// }
+
+	roles, principal, message := validateClientIdentityArgs(codeCreate.Roles, codeCreate.Principal, session)
+	if message != "" {
+		codeCreateResult = &AuthCodeCreateResult{
+			Error: &AuthCodeCreateError{
+				Message: message,
+			},
+		}
+		return
+	}
 
 	server.Tx(session.Ctx, func(tx server.PgTx) {
 		result, err := tx.Query(
@@ -1282,8 +1342,9 @@ func AuthCodeCreate(
 	            create_time,
 	            end_time,
 	            uses,
-	            remaining_uses
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+	            remaining_uses,
+	            principal
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
 			`,
 			authCodeId,
 			session.ByJwt.NetworkId,
@@ -1292,21 +1353,21 @@ func AuthCodeCreate(
 			createTime,
 			endTime,
 			uses,
+			principal,
 		))
 
-		// propagate the auth sessions
-		if 0 < len(session.ByJwt.AuthSessionIds) {
+		if 0 < len(roles) {
 			server.BatchInTx(session.Ctx, tx, func(batch server.PgBatch) {
-				for _, authSessionId := range session.ByJwt.AuthSessionIds {
+				for _, role := range roles {
 					batch.Queue(
 						`
-						INSERT INTO auth_code_session (
+						INSERT INTO auth_code_role (
 							auth_code_id,
-							auth_session_id
+							role
 						) VALUES ($1, $2)
 						`,
 						authCodeId,
-						authSessionId,
+						role,
 					)
 				}
 			})
@@ -1364,9 +1425,9 @@ func RemoveExpiredAuthCodes(ctx context.Context, minTime time.Time) (authCodeCou
 		tx.Exec(
 			ctx,
 			`
-			DELETE FROM auth_code_session
+			DELETE FROM auth_code_role
 			USING temp_auth_code_id
-			WHERE auth_code_session.auth_code_id = temp_auth_code_id.auth_code_id
+			WHERE auth_code_role.auth_code_id = temp_auth_code_id.auth_code_id
 			`,
 		)
 	})
@@ -1377,7 +1438,9 @@ func RemoveExpiredAuthCodes(ctx context.Context, minTime time.Time) (authCodeCou
 func RemoveExpiredVerifyCodes(ctx context.Context, minTime time.Time) {
 	server.Tx(ctx, func(tx server.PgTx) {
 		verifyMinTime := server.NowUtc().Add(-VerifyCodeTimeout)
-		tx.Exec(
+		// raise on error so a silently failing cleanup cannot quietly let the
+		// table grow unbounded again (see AuthVerifyCreateCode)
+		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
 			DELETE FROM user_auth_verify
@@ -1387,7 +1450,7 @@ func RemoveExpiredVerifyCodes(ctx context.Context, minTime time.Time) {
 			`,
 			minTime.UTC(),
 			verifyMinTime.UTC(),
-		)
+		))
 	})
 
 	return
@@ -1420,6 +1483,7 @@ func AuthCodeLogin(
 					auth_code.user_id,
 					auth_code.create_time,
 					auth_code.remaining_uses,
+					auth_code.principal,
 					network.network_name
 
 				FROM auth_code
@@ -1441,6 +1505,7 @@ func AuthCodeLogin(
 		var userId server.Id
 		var createTime time.Time
 		var remainingUses int
+		var principal string
 		var networkName string
 
 		server.WithPgResult(result, err, func() {
@@ -1452,6 +1517,7 @@ func AuthCodeLogin(
 					&userId,
 					&createTime,
 					&remainingUses,
+					&principal,
 					&networkName,
 				)
 			}
@@ -1465,42 +1531,23 @@ func AuthCodeLogin(
 			return
 		}
 
+		roles := []string{}
 		result, err = tx.Query(
 			session.Ctx,
 			`
-				SELECT auth_session_id
-				FROM auth_code_session
+				SELECT role FROM auth_code_role
 				WHERE auth_code_id = $1
+				ORDER BY role
 			`,
 			authCodeId,
 		)
-
-		authSessionIds := []server.Id{}
-
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
-				var authSessionId server.Id
-				result.Scan(&authSessionId)
-				authSessionIds = append(authSessionIds, authSessionId)
+				var role string
+				server.Raise(result.Scan(&role))
+				roles = append(roles, role)
 			}
 		})
-
-		authSessionId := server.NewId()
-		authSessionIds = append(authSessionIds, authSessionId)
-
-		server.RaisePgResult(tx.Exec(
-			session.Ctx,
-			`
-                INSERT INTO auth_session (
-                    auth_session_id,
-                    network_id,
-                    user_id
-                ) VALUES ($1, $2, $3)
-            `,
-			authSessionId,
-			networkId,
-			userId,
-		))
 
 		if 1 < remainingUses {
 			server.RaisePgResult(tx.Exec(
@@ -1528,7 +1575,7 @@ func AuthCodeLogin(
 			server.RaisePgResult(tx.Exec(
 				session.Ctx,
 				`
-					DELETE FROM auth_code_session
+					DELETE FROM auth_code_role
 					WHERE auth_code_id = $1
 				`,
 				authCodeId,
@@ -1549,8 +1596,9 @@ func AuthCodeLogin(
 			createTime,
 			isGuestMode,
 			isPro,
-			authSessionIds...,
 		)
+		byJwt.Roles = roles
+		byJwt.Principal = principal
 
 		codeLoginResult = &AuthCodeLoginResult{
 			ByJwt: byJwt.Sign(),
@@ -1558,27 +1606,6 @@ func AuthCodeLogin(
 	})
 
 	return
-}
-
-func ExpireAllAuth(ctx context.Context, networkId server.Id) {
-	// sessions and auth codes
-
-	server.Tx(ctx, func(tx server.PgTx) {
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-				INSERT INTO auth_session_expiration (
-					network_id,
-					expire_time
-				) VALUES ($1, $2)
-				ON CONFLICT (network_id) DO UPDATE
-				SET
-					expire_time = $2
-			`,
-			networkId,
-			server.NowUtc(),
-		))
-	})
 }
 
 func GetUserAuth(ctx context.Context, networkId server.Id) (userAuth string, returnErr error) {

@@ -78,12 +78,14 @@ func RemoveDisconnectedNetworkClients(
 	removeDisconnectedNetworkClients *RemoveDisconnectedNetworkClientsArgs,
 	clientSession *session.ClientSession,
 ) (*RemoveDisconnectedNetworkClientsResult, error) {
-	// connection rows are kept briefly for diagnostics; clients are reaped
-	// only after 30 days unseen (auth_time), since provisioned child clients
-	// (e.g. proxy devices) cannot recover from a reaped client_id
+	// connection rows are kept briefly for diagnostics; inactive clients are
+	// reaped 30 days after deactivation, since provisioned child clients
+	// (e.g. proxy devices) cannot recover from a reaped client_id; abandoned
+	// top-level clients are marked inactive after 90 days unseen (auth_time)
 	minConnectionTime := server.NowUtc().Add(-8 * time.Hour)
-	minClientTime := server.NowUtc().Add(-30 * 24 * time.Hour)
-	model.RemoveDisconnectedNetworkClients(clientSession.Ctx, minConnectionTime, minClientTime)
+	minClientTime := server.NowUtc().Add(-model.NetworkClientReapAfterDeactivate)
+	minTopLevelAuthTime := server.NowUtc().Add(-model.TopLevelClientIdleExpiration)
+	model.RemoveDisconnectedNetworkClients(clientSession.Ctx, minConnectionTime, minClientTime, minTopLevelAuthTime)
 	return &RemoveDisconnectedNetworkClientsResult{}, nil
 }
 
@@ -94,6 +96,53 @@ func RemoveDisconnectedNetworkClientsPost(
 	tx server.PgTx,
 ) error {
 	ScheduleRemoveDisconnectedNetworkClients(clientSession, tx)
+	return nil
+}
+
+// SweepOrphanNetworkClientData is the low-cadence safety net for orphaned
+// network-client dependent rows. RemoveDisconnectedNetworkClients cascades
+// dependents together with the parent deletes on every run, so this only
+// catches orphans from other deletion paths or older releases. Each pass is a
+// full anti-join scan of the dependent tables, which is why it runs daily and
+// not on the reap cadence.
+
+type SweepOrphanNetworkClientDataArgs struct {
+}
+
+type SweepOrphanNetworkClientDataResult struct {
+	RemovedCount int64 `json:"removed_count"`
+}
+
+func ScheduleSweepOrphanNetworkClientData(clientSession *session.ClientSession, tx server.PgTx) {
+	task.ScheduleTaskInTx(
+		tx,
+		SweepOrphanNetworkClientData,
+		&SweepOrphanNetworkClientDataArgs{},
+		clientSession,
+		task.RunOnce("sweep_orphan_network_client_data"),
+		task.RunAt(server.NowUtc().Add(24*time.Hour)),
+		task.MaxTime(4*time.Hour),
+	)
+}
+
+func SweepOrphanNetworkClientData(
+	sweepOrphanNetworkClientData *SweepOrphanNetworkClientDataArgs,
+	clientSession *session.ClientSession,
+) (*SweepOrphanNetworkClientDataResult, error) {
+	limit := 50000
+	removedCount := model.SweepOrphanNetworkClientData(clientSession.Ctx, limit)
+	return &SweepOrphanNetworkClientDataResult{
+		RemovedCount: removedCount,
+	}, nil
+}
+
+func SweepOrphanNetworkClientDataPost(
+	sweepOrphanNetworkClientData *SweepOrphanNetworkClientDataArgs,
+	sweepOrphanNetworkClientDataResult *SweepOrphanNetworkClientDataResult,
+	clientSession *session.ClientSession,
+	tx server.PgTx,
+) error {
+	ScheduleSweepOrphanNetworkClientData(clientSession, tx)
 	return nil
 }
 

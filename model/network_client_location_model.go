@@ -1292,19 +1292,33 @@ type LocationGroupResult struct {
 }
 
 type LocationResult struct {
-	LocationId   server.Id    `json:"location_id"`
-	LocationType LocationType `json:"location_type"`
-	Name         string       `json:"name"`
-	// FIXME add City, Region, Country names
-	CityLocationId    *server.Id `json:"city_location_id,omitempty"`
-	RegionLocationId  *server.Id `json:"region_location_id,omitempty"`
-	CountryLocationId *server.Id `json:"country_location_id,omitempty"`
-	CountryCode       string     `json:"country_code"`
-	ProviderCount     int        `json:"provider_count,omitempty"`
-	MatchDistance     int        `json:"match_distance,omitempty"`
+	LocationId        server.Id    `json:"location_id"`
+	LocationType      LocationType `json:"location_type"`
+	Name              string       `json:"name"`
+	City              string       `json:"city,omitempty"`
+	Region            string       `json:"region,omitempty"`
+	Country           string       `json:"country,omitempty"`
+	CityLocationId    *server.Id   `json:"city_location_id,omitempty"`
+	RegionLocationId  *server.Id   `json:"region_location_id,omitempty"`
+	CountryLocationId *server.Id   `json:"country_location_id,omitempty"`
+	CountryCode       string       `json:"country_code"`
+	ProviderCount     int          `json:"provider_count,omitempty"`
+	MatchDistance     int          `json:"match_distance,omitempty"`
 
 	Stable        bool `json:"stable"`
 	StrongPrivacy bool `json:"strong_privacy"`
+}
+
+// clientLocationName resolves a parent location id (city/region/country) to its
+// display name from the location set, or "" if the parent is not present.
+func clientLocationName(byId map[server.Id]*ClientLocation, id *server.Id) string {
+	if id == nil {
+		return ""
+	}
+	if cl, ok := byId[*id]; ok {
+		return cl.Name
+	}
+	return ""
 }
 
 type LocationDeviceResult struct {
@@ -1935,6 +1949,12 @@ func FindProviderLocations(
 			}
 		}
 
+		for _, locationResult := range locationResults {
+			locationResult.City = clientLocationName(clientLocations, locationResult.CityLocationId)
+			locationResult.Region = clientLocationName(clientLocations, locationResult.RegionLocationId)
+			locationResult.Country = clientLocationName(clientLocations, locationResult.CountryLocationId)
+		}
+
 		result := &FindLocationsResult{
 			Locations: locationResults,
 			Groups:    []*LocationGroupResult{},
@@ -2020,6 +2040,16 @@ func GetProviderLocations(
 			Promoted:        clientLocationGroup.Promoted,
 		}
 		locationGroupResults = append(locationGroupResults, locationGroupResult)
+	}
+
+	locationsById := map[server.Id]*ClientLocation{}
+	for _, cl := range initialClientLocations.Locations {
+		locationsById[cl.LocationId] = cl
+	}
+	for _, locationResult := range locationResults {
+		locationResult.City = clientLocationName(locationsById, locationResult.CityLocationId)
+		locationResult.Region = clientLocationName(locationsById, locationResult.RegionLocationId)
+		locationResult.Country = clientLocationName(locationsById, locationResult.CountryLocationId)
 	}
 
 	result := &FindLocationsResult{
@@ -2486,9 +2516,17 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	minFilter := filter{
 		maxScore: 2 * scorePerTier,
 	}
+	// keyed by lookback index (see ClientLookbacks): 1 = the hour, 2 = 12h.
+	// The hour threshold is the gate that decides whether a provider is in the
+	// market at all. It sat at 0.99 -- less than one bad block in 60 -- which
+	// left no slack for a reconnect that straddles a block boundary (the block
+	// carrying only the new-connection sync has no established sync, so it is
+	// invalid however tolerant the rule is). 0.95 allows three such blocks an
+	// hour. Repeated reconnects still fail it: they are real user impact, and
+	// `client_reliability_valid` only forgives ONE per block.
 	if NormalNetworkConditions() {
 		minFilter.minIndependentReliabilityWeights = map[int]float64{
-			1: float64(0.99),
+			1: float64(0.95),
 			2: float64(0.7),
 			3: float64(0.6),
 		}
@@ -3018,6 +3056,17 @@ func FindProviders2(
 		}
 	}
 
+	// record provider "search interest": each provider that appeared in this
+	// result gets one match count, accumulated in redis (never pg on this hot
+	// path) and rolled up by RollupSearchProviderStats. Best-effort.
+	if 0 < len(providers) {
+		providerClientIds := make([]server.Id, 0, len(providers))
+		for _, provider := range providers {
+			providerClientIds = append(providerClientIds, provider.ClientId)
+		}
+		RecordProviderSearchMatches(session.Ctx, providerClientIds, server.NowUtc())
+	}
+
 	return &FindProviders2Result{
 		Providers: providers,
 	}, nil
@@ -3035,9 +3084,10 @@ func CreateProviderSpec(
 	createProviderSpec *CreateProviderSpecArgs,
 	session *session.ClientSession,
 ) (*CreateProviderSpecResult, error) {
-	// return &CreateProviderSpecResult{
-	// 	Specs: []*ProviderSpec{},
-	// }, nil
-	// FIXME
-	return nil, fmt.Errorf("Not implemented.")
+	// TODO: parse the free-text query into location/group provider specs.
+	// Until that resolver exists, return an empty (spec-conformant) result
+	// rather than erroring, so the route behaves per the spec shape.
+	return &CreateProviderSpecResult{
+		Specs: []*ProviderSpec{},
+	}, nil
 }

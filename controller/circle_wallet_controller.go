@@ -118,6 +118,14 @@ func WalletValidateAddress(
 	session *session.ClientSession,
 ) (*WalletValidateAddressResult, error) {
 
+	// bittensor addresses are ss58, validated locally (recorded for future
+	// use only; not a payout destination)
+	if strings.EqualFold(walletValidateAddress.Chain, "TAO") || strings.EqualFold(walletValidateAddress.Chain, "BITTENSOR") {
+		return &WalletValidateAddressResult{
+			Valid: model.IsValidBittensorAddress(walletValidateAddress.Address),
+		}, nil
+	}
+
 	if walletValidateAddress.Address == solanaUSDCAddress() {
 		return &WalletValidateAddressResult{
 			Valid: false,
@@ -692,6 +700,12 @@ func CircleWalletWebhook(
 				return nil, fmt.Errorf("no circle user control found")
 			}
 
+			// the wallet must belong to the same circle user as the event,
+			// so that the wallet is never associated to another user's network
+			if circleWallet.UserId != event.UserId {
+				return nil, fmt.Errorf("wallet user does not match event user")
+			}
+
 			blockchain := strings.ToUpper(circleWallet.Blockchain)
 
 			// check for an existing wallet
@@ -727,7 +741,10 @@ func CircleWalletWebhook(
 			// if a payout wallet doesn't exist for the network
 			// set payout wallet
 			if payoutWallet == nil {
-				model.SetPayoutWallet(clientSession.Ctx, userUC.NetworkId, *walletId)
+				err := model.SetPayoutWallet(clientSession.Ctx, userUC.NetworkId, *walletId)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 		}
@@ -1049,7 +1066,10 @@ func handleUser(user model.CircleUC, clientSession *session.ClientSession) error
 
 		// set the payout wallet
 		if i == 0 {
-			model.SetPayoutWallet(clientSession.Ctx, user.NetworkId, *walletId)
+			err := model.SetPayoutWallet(clientSession.Ctx, user.NetworkId, *walletId)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

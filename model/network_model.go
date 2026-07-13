@@ -356,8 +356,10 @@ func NetworkCreate(
 				},
 			}, nil
 		}
-		// Wallet authentication is Solana-only.
-		if parsedBlockchain != SOL {
+		// Wallet authentication supports Solana and Bittensor (TAO) for
+		// network creation. Note this does NOT make Bittensor eligible for
+		// a payout wallet below - payouts remain Solana/Polygon (USDC) only.
+		if parsedBlockchain != SOL && parsedBlockchain != TAO {
 			return &NetworkCreateResult{
 				Error: &NetworkCreateResultError{
 					Message: "400 unsupported blockchain for wallet authentication",
@@ -428,11 +430,18 @@ func NetworkCreate(
 				/**
 				 * Set the payout wallet for the network
 				 */
-				SetPayoutWallet(
-					session.Ctx,
-					networkCreateResult.NetworkId,
-					*walletId,
-				)
+				if walletId != nil {
+					err := SetPayoutWallet(
+						session.Ctx,
+						networkCreateResult.NetworkId,
+						*walletId,
+					)
+					if err != nil {
+						glog.Errorf("[net]could not set payout wallet for network %s: %s\n", networkCreateResult.NetworkId, err)
+					}
+				} else {
+					glog.Errorf("[net]could not create payout wallet for network %s\n", networkCreateResult.NetworkId)
+				}
 			}
 
 			isGuest := false
@@ -1264,6 +1273,26 @@ func UpgradeGuest(
 			/**
 			 * Upgrade from guest from wallet
 			 */
+
+			/**
+			 * verify the wallet signature (proof of key control) before binding the
+			 * wallet address to this account, matching NetworkCreate and handleLoginWallet
+			 */
+			isValid, err := VerifySignature(
+				upgradeGuest.WalletAuth.Blockchain,
+				upgradeGuest.WalletAuth.PublicKey,
+				upgradeGuest.WalletAuth.Message,
+				upgradeGuest.WalletAuth.Signature,
+			)
+			if err != nil || !isValid {
+				result = &UpgradeGuestResult{
+					Error: &UpgradeGuestError{
+						Message: "invalid wallet signature",
+					},
+				}
+				return
+			}
+
 			var userId *server.Id
 
 			userCheck, err := tx.Query(

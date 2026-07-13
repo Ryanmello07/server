@@ -73,8 +73,8 @@ func GetNetworkReferralCode(ctx context.Context, networkId server.Id) *NetworkRe
 
 	var networkReferralCode *NetworkReferralCode
 
-	server.Tx(ctx, func(tx server.PgTx) {
-		result, err := tx.Query(
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
 			ctx,
 			`
 						SELECT
@@ -142,8 +142,6 @@ func ValidateReferralCode(
 	referralCode string,
 ) ValidateReferralCodeResult {
 
-	maxReferrals := 5
-
 	validateResult := ValidateReferralCodeResult{
 		Valid:    false,
 		IsCapped: false,
@@ -198,7 +196,10 @@ func ValidateReferralCode(
 					server.Raise(result.Scan(&count))
 				}
 
-				if count >= maxReferrals {
+				// Ask ReferralsCapped, never MaxReferrals directly: with no pro.yml the
+				// raw cap is 0 and `count >= 0` is always true, so EVERY code would come
+				// back capped. No spec means no cap.
+				if Pro().ReferralsCapped(count) {
 					validateResult.IsCapped = true
 				}
 

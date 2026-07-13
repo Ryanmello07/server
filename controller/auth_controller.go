@@ -39,7 +39,12 @@ func AuthWalletChallenge(
 		Blockchain:    args.Blockchain,
 	}, session.Ctx)
 
-	model.SetWalletAuthChallengeAttemptSuccess(session.Ctx, walletAuthChallengeAttemptId, result.Error == nil)
+	success := result.Error == nil
+	model.SetWalletAuthChallengeAttemptSuccess(session.Ctx, walletAuthChallengeAttemptId, success)
+
+	if !success {
+		return nil, fmt.Errorf("%s", result.Error.Message)
+	}
 
 	return result, nil
 }
@@ -264,7 +269,9 @@ func RefreshToken(session *session.ClientSession) (*RefreshTokenResult, error) {
 		}, nil
 	}
 
-	clientNetworkId, err := model.FindClientNetwork(
+	// active only: a removed client must stop refreshing (the app logs out
+	// on this error), not keep its jwt alive until the row is reaped
+	clientNetworkId, err := model.FindActiveClientNetwork(
 		session.Ctx,
 		*session.ByJwt.ClientId,
 	)

@@ -24,7 +24,6 @@ type SubsidyConfig struct {
 	SubscriptionNetRevenueFraction            float64 `yaml:"subscription_net_revenue_fraction"`
 	MinPayoutUsd                              float64 `yaml:"min_payout_usd"`
 	ActiveUserByteCountThresholdHumanReadable string  `yaml:"active_user_byte_count_threshold"`
-	MaxPayoutUsdPerPaidUser                   float64 `yaml:"max_payout_usd_per_paid_user"`
 	ReferralParentPayoutFraction              float64 `yaml:"referral_parent_payout_fraction"`
 	ReferralChildPayoutFraction               float64 `yaml:"referral_child_payout_fraction"`
 	AccountPointsPerPayout                    int     `yaml:"account_points_per_payout"`
@@ -280,7 +279,12 @@ func GetPendingPaymentsInPlan(ctx context.Context, paymentPlanId server.Id) []*A
 }
 
 func UpdatePaymentWallet(ctx context.Context, paymentId server.Id) {
-	// note the wallet cannot be updated once there is a payment record
+	// note the wallet cannot be updated once there is a payment record or
+	// a submit attempt (idempotency key). A retried submit replays the original
+	// transaction at the processor, so the wallet on record must stay pinned to
+	// the wallet the funds were actually sent to.
+	// note `account_wallet.network_id` must match the payment network,
+	// so that a payout is never redirected to another network's wallet
 	server.Tx(ctx, func(tx server.PgTx) {
 		server.RaisePgResult(tx.Exec(
 			ctx,
@@ -299,11 +303,13 @@ func UpdatePaymentWallet(ctx context.Context, paymentId server.Id) {
 
 			    INNER JOIN account_wallet ON
 			        account_wallet.wallet_id = payout_wallet.wallet_id AND
+			        account_wallet.network_id = account_payment.network_id AND
 			        account_wallet.active = true
 
 		        WHERE
 		        	account_payment.payment_id = $1 AND
 		        	account_payment.payment_record IS NULL AND
+		        	account_payment.circle_idempotency_key IS NULL AND
 		        	account_payment.completed = false AND
 		        	account_payment.canceled = false
 
@@ -313,6 +319,42 @@ func UpdatePaymentWallet(ctx context.Context, paymentId server.Id) {
 			paymentId,
 		))
 	})
+}
+
+// returns the stable idempotency key for submitting this payment to the
+// payment processor. The key is created on the first submit attempt and reused
+// on retries, so a crash between the processor call and `SetPaymentRecord`
+// cannot double-send funds. `RemovePaymentRecord` clears the key so that a
+// failed transaction is retried with a fresh key (a reused key would replay
+// the failed transaction at the processor instead of creating a new one).
+func GetOrCreatePaymentIdempotencyKey(ctx context.Context, paymentId server.Id) (idempotencyKey server.Id, returnErr error) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		result, err := tx.Query(
+			ctx,
+			`
+	            UPDATE account_payment
+	            SET
+	                circle_idempotency_key = COALESCE(circle_idempotency_key, $2)
+	            WHERE
+	                payment_id = $1 AND
+	                NOT completed AND NOT canceled
+	            RETURNING circle_idempotency_key
+	        `,
+			paymentId,
+			server.NewId(),
+		)
+		set := false
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				server.Raise(result.Scan(&idempotencyKey))
+				set = true
+			}
+		})
+		if !set {
+			returnErr = fmt.Errorf("Invalid payment.")
+		}
+	})
+	return
 }
 
 type PaymentPlan struct {
@@ -349,7 +391,113 @@ func PlanPayments(ctx context.Context) (paymentPlan *PaymentPlan, returnErr erro
 }
 
 func PlanPaymentsWithConfig(ctx context.Context, subsidyConfig *SubsidyConfig) (paymentPlan *PaymentPlan, returnErr error) {
-	return CreatePaymentPlan(ctx, subsidyConfig)
+	return CreatePaymentPlan(ctx, subsidyConfig, false, 0)
+}
+
+// PlanPaymentsWithMaxDuration is like PlanPayments but bounds the plan to the
+// first maxDuration of contract close time following the most recent subsidy
+// epoch, so a large backlog since the last payout can be drained in bounded
+// slices instead of one oversized plan that runs out of memory. Each plan
+// records a new subsidy epoch whose end advances the frontier, so calling this
+// repeatedly walks forward through the backlog one slice at a time. maxDuration
+// == 0 is unbounded (identical to PlanPayments).
+func PlanPaymentsWithMaxDuration(ctx context.Context, maxDuration time.Duration) (paymentPlan *PaymentPlan, returnErr error) {
+	return CreatePaymentPlan(ctx, EnvSubsidyConfig(), false, maxDuration)
+}
+
+// PlanPaymentsWithMaxDurationLoop drains the unpaid backlog by planning bounded
+// maxDuration slices back to back until the payout frontier reaches now, so a
+// single command call catches up instead of requiring one invocation per slice.
+//
+// Each slice is planned and committed independently, so progress is durable: a
+// failure only loses the in-flight slice, and everything already committed stays
+// paid (the next call resumes from the advanced frontier). The shared 30-day
+// reliability inputs are refreshed once on the first slice rather than per slice.
+//
+// The loop stops when either:
+//   - a slice advances the frontier to at/after now — the backlog is fully
+//     drained; or
+//   - a slice forms no new subsidy epoch (SubsidyPayment == nil) — nothing left
+//     that can advance the frontier: the remaining window is below the minimum
+//     payout duration, there are no unpaid sweeps, or the next sweeps sit beyond
+//     a gap wider than maxDuration. (The upper bound is capped at now, so the
+//     frontier never lands strictly past now; this no-advance condition is what
+//     ends the drain as it reaches now.)
+//
+// maxDuration <= 0 plans a single unbounded plan, matching
+// PlanPaymentsWithMaxDuration(ctx, 0).
+//
+// onSlice, if non-nil, is invoked after each committed slice (for progress
+// output). The committed plans are returned in order even when an error is
+// returned partway, so callers can report what did complete.
+func PlanPaymentsWithMaxDurationLoop(
+	ctx context.Context,
+	maxDuration time.Duration,
+	onSlice func(*PaymentPlan),
+) ([]*PaymentPlan, error) {
+	if maxDuration <= 0 {
+		plan, err := CreatePaymentPlan(ctx, EnvSubsidyConfig(), false, 0)
+		if err != nil {
+			return nil, err
+		}
+		if onSlice != nil {
+			onSlice(plan)
+		}
+		return []*PaymentPlan{plan}, nil
+	}
+
+	plans := []*PaymentPlan{}
+	var lastFrontier time.Time
+	for i := 0; ; i += 1 {
+		// refresh the shared reliability inputs only on the first slice; the
+		// window is the same for every slice in this drain.
+		plan, err := createPaymentPlan(ctx, EnvSubsidyConfig(), false, maxDuration, i == 0)
+		if err != nil {
+			return plans, err
+		}
+		plans = append(plans, plan)
+		if onSlice != nil {
+			onSlice(plan)
+		}
+
+		// a slice that formed no subsidy epoch cannot advance the frontier, so
+		// this drain has gone as far as it can (see the doc comment).
+		if plan.SubsidyPayment == nil {
+			break
+		}
+		frontier := plan.SubsidyPayment.EndTime
+
+		// defensive: a recorded epoch always ends after the previous frontier, so
+		// this should not trigger — but never replan the same window forever.
+		if !lastFrontier.IsZero() && !frontier.After(lastFrontier) {
+			glog.Infof("[plan]frontier did not advance past %s; stopping drain\n", frontier)
+			break
+		}
+		lastFrontier = frontier
+
+		// the frontier reached now: the backlog is fully drained.
+		if !frontier.Before(server.NowUtc()) {
+			break
+		}
+	}
+	return plans, nil
+}
+
+// PlanPaymentsDryRun computes a payment plan exactly like PlanPayments but
+// persists nothing: no payments are created, no escrow sweeps are marked paid,
+// and no points or reliability multipliers are written. Use it to preview the
+// plan (the wallets and amounts that would be paid) before committing a real
+// plan. Because the reliability inputs are not refreshed for a dry run, the
+// reliability portion of the preview reflects the last reliability refresh
+// rather than a fresh one.
+func PlanPaymentsDryRun(ctx context.Context) (paymentPlan *PaymentPlan, returnErr error) {
+	return CreatePaymentPlan(ctx, EnvSubsidyConfig(), true, 0)
+}
+
+// PlanPaymentsDryRunWithMaxDuration is PlanPaymentsDryRun with the same
+// maxDuration bounding as PlanPaymentsWithMaxDuration.
+func PlanPaymentsDryRunWithMaxDuration(ctx context.Context, maxDuration time.Duration) (paymentPlan *PaymentPlan, returnErr error) {
+	return CreatePaymentPlan(ctx, EnvSubsidyConfig(), true, maxDuration)
 }
 
 func GetSubsidyPayment(ctx context.Context, paymentPlanId server.Id) (paymentPlan *SubsidyPayment) {
@@ -441,7 +589,8 @@ func RemovePaymentRecord(
 			`
                 UPDATE account_payment
                 SET
-                    payment_record = NULL
+                    payment_record = NULL,
+                    circle_idempotency_key = NULL
                 WHERE
                     payment_id = $1 AND
                     NOT completed AND NOT canceled
@@ -509,6 +658,56 @@ func CompletePayment(
             `,
 			paymentId,
 		))
+	})
+	return
+}
+
+// a planned payment that is neither completed nor canceled after this long is
+// hung and will not complete on its own; see `CancelHungAccountPayments`
+const HungPaymentExpiration = 30 * 24 * time.Hour
+
+// CancelHungAccountPayments cancels payments stuck pending for longer than
+// `HungPaymentExpiration`, which releases their sweeps back to the payout
+// planner for a fresh payment (the planner re-selects sweeps whose payment is
+// canceled). This is the first layer of straggler recovery; contracts whose
+// payments keep hanging are hard deleted at `StragglerContractExpiration` as
+// the final backstop. A canceled payment can no longer be completed
+// (CompletePayment guards NOT canceled), so a payment whose external transfer
+// was already initiated (payment_record set) is logged loudly for audit: if
+// that transfer did land out of band, the re-planned sweeps would pay again.
+func CancelHungAccountPayments(ctx context.Context, maxTime time.Time) (canceledCount int64) {
+	minTime := maxTime.Add(-HungPaymentExpiration)
+
+	server.Tx(ctx, func(tx server.PgTx) {
+		result, err := tx.Query(
+			ctx,
+			`
+			UPDATE account_payment
+			SET
+				canceled = true,
+				cancel_time = $2
+			WHERE
+				NOT completed AND
+				NOT canceled AND
+				create_time < $1
+			RETURNING payment_id, payment_record IS NOT NULL
+			`,
+			minTime,
+			server.NowUtc(),
+		)
+		server.WithPgResult(result, err, func() {
+			for result.Next() {
+				var paymentId server.Id
+				var hasPaymentRecord bool
+				server.Raise(result.Scan(&paymentId, &hasPaymentRecord))
+				canceledCount += 1
+				if hasPaymentRecord {
+					glog.Infof("[pay]canceled hung payment %s WITH an initiated payment record; audit the external transfer for double payout\n", paymentId)
+				} else {
+					glog.Infof("[pay]canceled hung payment %s\n", paymentId)
+				}
+			}
+		})
 	})
 	return
 }
@@ -668,7 +867,8 @@ func GetTransferStats(
 
 	var transferStats *TransferStats
 
-	server.Db(ctx, func(conn server.PgConn) {
+	// stats read: tolerates replica delay
+	server.ReplicaDb(ctx, func(conn server.PgConn) {
 		result, err := conn.Query(
 			ctx,
 			`

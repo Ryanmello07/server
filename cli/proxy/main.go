@@ -76,6 +76,8 @@ Options:
 
 	server.Warmup()
 
+	server.StartStatsPusher(ctx)
+
 	proxy.NewSocks5Server(
 		ctx,
 		cancel,
@@ -112,6 +114,10 @@ Options:
 		proxy.InternalApiPort,
 		settings,
 	)
+
+	// the device rpc endpoint (a DeviceRemote such as a browser connects here
+	// directly with the device's signed proxy id to control the hosted device)
+	// is served on GET /device-rpc by the proxy api TLS listener (NewApiServer).
 
 	// if server.RequireEnv() != "local" {
 	// 	newWatchdog(

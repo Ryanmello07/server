@@ -16,12 +16,25 @@ func Routes() []*router.Route {
 		router.NewRoute("GET", "/terms.txt", router.Txt),
 		router.NewRoute("GET", "/vdp.txt", router.Txt),
 		router.NewRoute("GET", "/status", router.WarpStatus),
+		// /stats/last-90 stays up: it serves a redis-exported blob and does not
+		// touch the db.
 		router.NewRoute("GET", "/stats/last-90", handlers.StatsLast90),
-		router.NewRoute("GET", "/stats/providers-overview-last-90", handlers.StatsProvidersOverviewLast90),
+		// /stats/providers-map likewise serves a redis-exported blob (provider
+		// counts by country/region + centroids), refreshed by ExportProvidersMap.
+		router.NewRoute("GET", "/stats/providers-map", handlers.StatsProvidersMap),
+		// The statistics apis below (plus /network/ranking and /transfer/stats
+		// further down) run live aggregates tagged with server.ReplicaDb, so
+		// they offload to a db replica when one is attached.
 		router.NewRoute("GET", "/stats/providers", handlers.StatsProviders),
+		router.NewRoute("POST", "/stats/providers-last-n", handlers.StatsProvidersLastN),
+		router.NewRoute("POST", "/stats/provider-last-n", handlers.StatsProvider),
+		router.NewRoute("POST", "/stats/providers-overview-last-n", handlers.StatsProvidersOverview),
+		// legacy aliases (kept for existing callers during migration)
+		router.NewRoute("GET", "/stats/providers-overview-last-90", handlers.StatsProvidersOverviewLast90),
 		router.NewRoute("POST", "/stats/provider-last-90", handlers.StatsProviderLast90),
 		router.NewRoute("POST", "/stats/leaderboard", handlers.GetLeaderboard),
 		router.NewRoute("POST", "/auth/login", handlers.AuthLogin),
+		router.NewRoute("POST", "/auth/wallet-nonce", handlers.AuthWalletNonce),
 		router.NewRoute("POST", "/auth/login-with-password", handlers.AuthLoginWithPassword),
 		router.NewRoute("POST", "/auth/verify", handlers.AuthVerify),
 		router.NewRoute("POST", "/auth/wallet-challenge", handlers.AuthWalletChallenge),
@@ -40,13 +53,10 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/network/remove-client", handlers.RemoveNetworkClient),
 		router.NewRoute("POST", "/network/remove-clients", handlers.RemoveNetworkClients),
 		router.NewRoute("GET", "/network/clients", handlers.NetworkClients),
+		router.NewRoute("GET", "/network/peers", handlers.NetworkPeers),
 		router.NewRoute("GET", "/network/provider-locations", handlers.NetworkGetProviderLocations),
 		router.NewRoute("POST", "/network/find-provider-locations", handlers.NetworkFindProviderLocations),
-		router.NewRoute("POST", "/network/find-locations", handlers.NetworkFindLocations),
-		router.NewRoute("POST", "/network/find-providers", handlers.NetworkFindProviders),
-		router.NewRoute("POST", "/network/find-providers2", handlers.NetworkFindProviders2),
-		router.NewRoute("POST", "/network/create-provider-spec", handlers.NetworkCreateProviderSpec),
-		router.NewRoute("GET", "/network/user", handlers.GetNetworkUser),
+		router.NewRoute("POST", "/network/find-providers2", handlers.NetworkFindProviders2), router.NewRoute("GET", "/network/user", handlers.GetNetworkUser),
 		router.NewRoute("POST", "/network/user/update", handlers.UpdateNetworkName),
 		router.NewRoute("GET", "/network/ranking", handlers.GetLeaderboardNetworkRanking),
 		router.NewRoute("POST", "/network/ranking-visibility", handlers.SetNetworkLeaderboardPublic),
@@ -70,6 +80,7 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/solana/payment-intent", handlers.CreateSolanaPaymentIntent),
 		router.NewRoute("POST", "/stripe/payment-intent", handlers.CreateStripePaymentIntent),
 		router.NewRoute("POST", "/stripe/customer-portal", handlers.StripeCreateCustomerPortal),
+		router.NewRoute("POST", "/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession),
 		router.NewRoute("GET", "/wallet/balance", handlers.WalletBalance),
 		router.NewRoute("POST", "/wallet/validate-address", handlers.WalletValidateAddress),
 		router.NewRoute("POST", "/wallet/circle-init", handlers.WalletCircleInit),
@@ -78,6 +89,10 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/subscription/check-balance-code", handlers.SubscriptionCheckBalanceCode),
 		router.NewRoute("POST", "/subscription/redeem-balance-code", handlers.SubscriptionRedeemBalanceCode),
 		router.NewRoute("POST", "/subscription/create-payment-id", handlers.SubscriptionCreatePaymentId),
+		// x402: agents pay inline (HTTP 402 + X-PAYMENT). Both 404 while x402 is
+		// not configured/enabled -- see vault/<env>/x402.yml.
+		router.NewRoute("GET", "/x402/skus", handlers.X402Skus),
+		router.NewRoute("POST", "/x402/purchase", handlers.X402Purchase),
 		router.NewRoute("POST", "/device/add", handlers.DeviceAdd),
 		router.NewRoute("POST", "/device/create-share-code", handlers.DeviceCreateShareCode),
 		router.NewRoute("GET", "/device/share-code/([^/]+)/qr.png", handlers.DeviceShareCodeQR),
@@ -91,10 +106,17 @@ func Routes() []*router.Route {
 		router.NewRoute("GET", "/device/associations", handlers.DeviceAssociations),
 		router.NewRoute("POST", "/device/remove-association", handlers.DeviceRemoveAssociation),
 		router.NewRoute("POST", "/device/set-association-name", handlers.DeviceSetAssociationName),
-		router.NewRoute("POST", "/device/set-provide", handlers.DeviceSetProvide),
-		router.NewRoute("POST", "/connect/control", handlers.ConnectControl),
+		router.NewRoute("POST", "/device/set-name", handlers.DeviceSetName), router.NewRoute("POST", "/connect/control", handlers.ConnectControl),
 		// Unauthenticated public-key lookup; see handlers.GetClientKey.
 		router.NewRoute("GET", "/key/([^/]+)", handlers.GetClientKey),
+		// routing verification (sn/VALIDATOR.md); auth is the protocol's own
+		// Ed25519 signatures, not a JWT — see handlers.Verify
+		router.NewRoute("POST", "/verify", handlers.Verify),
+		router.NewRoute("GET", "/verify/keys", handlers.GetVerifyKeys),
+		// subnet control plane (sn/PLAN.md §5, D-13)
+		router.NewRoute("POST", "/sn/wallet", handlers.SnSetWallet),
+		router.NewRoute("GET", "/sn/pool/claim", handlers.SnPoolClaim),
+		router.NewRoute("GET", "/sn/epoch", handlers.SnEpoch),
 		router.NewRoute("GET", "/hello", handlers.Hello),
 		router.NewRoute("POST", "/account/api-key", handlers.CreateApiKey),
 		router.NewRoute("POST", "/account/api-key/remove", handlers.DeleteApiKey),
