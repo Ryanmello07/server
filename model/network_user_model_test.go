@@ -43,7 +43,7 @@ func TestNetworkUser(t *testing.T) {
 		guestUserId := server.NewId()
 		guestNetworkName := "guest_hello_world"
 
-		Testing_CreateGuestNetwork(ctx, guestNetworkId, guestNetworkName, guestUserId)
+		Testing_CreateNetwork(ctx, guestNetworkId, guestNetworkName, guestUserId)
 
 		networkUser = GetNetworkUser(ctx, guestUserId)
 
@@ -51,7 +51,7 @@ func TestNetworkUser(t *testing.T) {
 		assert.Equal(t, networkUser.UserId, guestUserId)
 		assert.Equal(t, networkUser.UserAuth, nil)
 		assert.Equal(t, networkUser.Verified, false)
-		assert.Equal(t, networkUser.AuthType, AuthTypeGuest)
+		assert.Equal(t, networkUser.AuthType, AuthTypeSeedphrase)
 		assert.Equal(t, networkUser.NetworkName, guestNetworkName)
 
 	})

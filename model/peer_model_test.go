@@ -400,7 +400,7 @@ func TestNetworkPeerProfile(t *testing.T) {
 		guestSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: networkId,
 			UserId:    userId,
-			GuestMode: true,
+			GuestMode: false,
 		})
 		authClientResult, err = AuthNetworkClient(
 			&AuthNetworkClientArgs{
