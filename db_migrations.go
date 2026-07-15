@@ -3513,4 +3513,27 @@ var migrations = []any{
             autovacuum_analyze_scale_factor = 0.02
         )
     `),
+
+	// seedphrase auth
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_user_auth_seedphrase (
+            user_id             uuid NOT NULL PRIMARY KEY,
+            seedphrase_lookup   bytea NOT NULL,
+            seedphrase_hash     bytea NOT NULL,
+            seedphrase_salt     bytea NOT NULL,
+            create_time         timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE UNIQUE INDEX IF NOT EXISTS network_user_auth_seedphrase_lookup
+            ON network_user_auth_seedphrase (seedphrase_lookup)
+    `),
+
+	// network name reclaim (1-day cooldown)
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_name_reclaim (
+            old_name         varchar(256) NOT NULL PRIMARY KEY,
+            cool_down_until  timestamp NOT NULL
+        )
+    `),
 }
