@@ -3553,6 +3553,7 @@ var migrations = []any{
             cool_down_until  timestamp NOT NULL
         )
     `),
+
 	// the net-escrow reconcile task (model/subscription_model.go
 	// `openEscrowReservedByBalance`, rescheduled every 5 minutes) sums open
 	// escrow per balance by joining the full transfer_escrow and
@@ -4351,5 +4352,18 @@ var migrations = []any{
 	newSqlMigration(`
         CREATE INDEX IF NOT EXISTS transfer_contract_open_destination_partial
         ON transfer_contract (destination_id) WHERE open
+    `),
+
+	// network create rate limit (5 per IP per day)
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_create_attempt (
+            network_create_attempt_id uuid NOT NULL PRIMARY KEY,
+            client_address_hash       bytea NOT NULL,
+            create_time               timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_create_attempt_hash_time
+            ON network_create_attempt (client_address_hash, create_time)
     `),
 }
