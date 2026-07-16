@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -208,6 +209,73 @@ func TestTask(t *testing.T) {
 		removedCount := RemoveFinishedTasks(ctx, server.NowUtc(), server.NowUtc().Add(-7*24*time.Hour))
 		connect.AssertEqual(t, int(removedCount), netTaskCount)
 		connect.AssertEqual(t, 0, len(ListFinishedTasks(ctx)))
+	})
+}
+
+type Work2Args struct {
+	Tag string
+}
+
+type Work2Result struct {
+}
+
+func Work2(
+	work2 *Work2Args,
+	clientSession *session.ClientSession,
+) (*Work2Result, error) {
+	return &Work2Result{}, nil
+}
+
+func TestScheduleTaskIfAbsent(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+		defer clientSession.Cancel()
+
+		key := RunOnce("test_schedule_task_if_absent", server.NewId())
+
+		scheduled, firstTaskId := ScheduleTaskIfAbsent(
+			Work2,
+			&Work2Args{Tag: "first"},
+			clientSession,
+			key,
+		)
+		connect.AssertEqual(t, scheduled, true)
+
+		scheduledAgain, duplicateTaskId := ScheduleTaskIfAbsent(
+			Work2,
+			&Work2Args{Tag: "second"},
+			clientSession,
+			key,
+		)
+		connect.AssertEqual(t, scheduledAgain, false)
+		connect.AssertEqual(t, duplicateTaskId, server.Id{})
+
+		tasks := GetTasks(ctx, firstTaskId)
+		task, ok := tasks[firstTaskId]
+		if !ok {
+			t.Fatal("first task not found")
+		}
+		var args Work2Args
+		if err := json.Unmarshal([]byte(task.ArgsJson), &args); err != nil {
+			t.Fatal(err)
+		}
+		connect.AssertEqual(t, args.Tag, "first")
+
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected panic for nil runOnce key")
+			}
+		}()
+		server.Tx(ctx, func(tx server.PgTx) {
+			ScheduleTaskInTxIfAbsent(
+				tx,
+				Work2,
+				&Work2Args{Tag: "panic"},
+				clientSession,
+				nil,
+			)
+		})
 	})
 }
 
