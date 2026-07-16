@@ -3532,6 +3532,41 @@ var migrations = []any{
         )
     `),
 
+	// seedphrase auth
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_user_auth_seedphrase (
+            user_id             uuid NOT NULL PRIMARY KEY,
+            seedphrase_lookup   bytea NOT NULL,
+            seedphrase_hash     bytea NOT NULL,
+            seedphrase_salt     bytea NOT NULL,
+            create_time         timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE UNIQUE INDEX IF NOT EXISTS network_user_auth_seedphrase_lookup
+            ON network_user_auth_seedphrase (seedphrase_lookup)
+    `),
+
+	// network name reclaim (1-day cooldown)
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_name_reclaim (
+            old_name         varchar(256) NOT NULL PRIMARY KEY,
+            cool_down_until  timestamp NOT NULL
+        )
+    `),
+
+	// Index for bulk client deactivation via `client_id = ANY($1) AND network_id = $2`.
+	// background task path (RemoveNetworkClientsTask, 200k ids per invocation) use
+	// this predicate. Without this index the query planner must scan for each batch;
+	// at 200k IDs across 20 batches that can cause long lock times on large tables.
+	// On the large existing network_client table this must be built manually with
+	// CREATE INDEX CONCURRENTLY out of band — the IF NOT EXISTS gate makes this
+	// migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_client_network_id_client_id
+        ON network_client (network_id, client_id)
+    `),
+
 	// the net-escrow reconcile task (model/subscription_model.go
 	// `openEscrowReservedByBalance`, rescheduled every 5 minutes) sums open
 	// escrow per balance by joining the full transfer_escrow and
@@ -4330,5 +4365,18 @@ var migrations = []any{
 	newSqlMigration(`
         CREATE INDEX IF NOT EXISTS transfer_contract_open_destination_partial
         ON transfer_contract (destination_id) WHERE open
+    `),
+
+	// network create rate limit (5 per IP per day)
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_create_attempt (
+            network_create_attempt_id uuid NOT NULL PRIMARY KEY,
+            client_address_hash       bytea NOT NULL,
+            create_time               timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_create_attempt_hash_time
+            ON network_create_attempt (client_address_hash, create_time)
     `),
 }

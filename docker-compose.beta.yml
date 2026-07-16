@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     env_file:
       - ./beta-vault/beta-secrets.env
     # No host port binding; only needed inside the Docker network.
@@ -14,6 +15,7 @@ services:
 
   redis:
     image: redis:7
+    restart: unless-stopped
     env_file:
       - ./beta-vault/beta-secrets.env
     command: >
@@ -51,6 +53,7 @@ services:
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
+    restart: unless-stopped
     environment:
       WARP_ENV: local
       WARP_BLOCK: local
@@ -73,6 +76,7 @@ services:
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
+    restart: unless-stopped
     environment:
       WARP_ENV: local
       WARP_BLOCK: local
@@ -100,6 +104,7 @@ services:
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
+    restart: unless-stopped
     environment:
       WARP_ENV: local
       WARP_BLOCK: local

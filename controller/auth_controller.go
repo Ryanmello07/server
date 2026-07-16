@@ -301,11 +301,42 @@ func RefreshToken(session *session.ClientSession) (*RefreshTokenResult, error) {
 		networkId,
 		session.ByJwt.UserId,
 		session.ByJwt.NetworkName,
-		session.ByJwt.GuestMode,
+		false,
 		isPro,
 	)
 
 	return &RefreshTokenResult{
 		ByJwt: byJwt.Client(*session.ByJwt.DeviceId, *session.ByJwt.ClientId).Sign(),
 	}, nil
+}
+
+type AddAuthArgs = model.AddAuthMethod
+type AddAuthResult = model.AddAuthMethodResult
+
+func AddAuth(args AddAuthArgs, session *session.ClientSession) (*AddAuthResult, error) {
+	return model.AddAuth(args, session)
+}
+
+type RemoveAuthArgs struct {
+	AuthType string `json:"auth_type"`
+}
+
+type RemoveAuthResult struct {
+	Error *RemoveAuthError `json:"error,omitempty"`
+}
+
+type RemoveAuthError struct {
+	Message string `json:"message"`
+}
+
+func RemoveAuth(args RemoveAuthArgs, session *session.ClientSession) (*RemoveAuthResult, error) {
+	err := model.RemoveAuth(session.Ctx, session.ByJwt.UserId, args.AuthType)
+	if err != nil {
+		return &RemoveAuthResult{
+			Error: &RemoveAuthError{
+				Message: err.Error(),
+			},
+		}, nil
+	}
+	return &RemoveAuthResult{}, nil
 }

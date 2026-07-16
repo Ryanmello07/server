@@ -204,10 +204,10 @@ func TestDeviceConfirmAdoptWrongSecretRejected(t *testing.T) {
 			if parseErr == nil {
 				t.Fatalf("SECURITY (VDP1): /device/confirm-adopt minted a client JWT with a WRONG "+
 					"adopt_secret — authentication bypass. Minted credential networkId=%s networkName=%q "+
-					"userId=%s guestMode=%v. DeviceConfirmAdopt never references confirmAdopt.AdoptSecret; "+
+					"userId=%s. DeviceConfirmAdopt never references confirmAdopt.AdoptSecret; "+
 					"add `AND adopt_secret = $N` (constant-time) to the device_adopt UPDATE, as "+
 					"DeviceRemoveAdoptCode already does.",
-					byJwt.NetworkId, byJwt.NetworkName, byJwt.UserId, byJwt.GuestMode)
+					byJwt.NetworkId, byJwt.NetworkName, byJwt.UserId)
 			}
 			t.Fatalf("SECURITY (VDP1): /device/confirm-adopt returned a by_client_jwt with a WRONG " +
 				"adopt_secret — authentication bypass.")

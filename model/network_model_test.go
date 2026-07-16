@@ -2,44 +2,13 @@ package model
 
 import (
 	"context"
-	"encoding/base64"
-	"fmt"
-	"regexp"
 	"testing"
 
-	"github.com/gagliardetto/solana-go"
-	"github.com/urnetwork/connect"
+	"github.com/go-playground/assert/v2"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/jwt"
 	"github.com/urnetwork/server/session"
 )
-
-func TestNetworkCreateGuestMode(t *testing.T) {
-	server.DefaultTestEnv().Run(t, func(t testing.TB) {
-		ctx := context.Background()
-
-		networkCreate := NetworkCreateArgs{
-			Terms:     true,
-			GuestMode: true,
-		}
-
-		byJwt := jwt.ByJwt{}
-
-		clientSession := session.Testing_CreateClientSession(ctx, &byJwt)
-
-		pattern := `^g[0-9a-f]+$`
-
-		// Compile the regex
-		regex, err := regexp.Compile(pattern)
-		connect.AssertEqual(t, err, nil)
-
-		result, err := NetworkCreate(networkCreate, clientSession)
-		connect.AssertEqual(t, err, nil)
-
-		connect.AssertEqual(t, regex.MatchString(result.Network.NetworkName), true)
-
-	})
-}
 
 func TestNetworkUpgradeGuestMode(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
@@ -364,7 +333,7 @@ func TestNetworkCreateTermsFail(t *testing.T) {
 		ctx := context.Background()
 
 		networkCreate := NetworkCreateArgs{
-			GuestMode: true,
+			Terms: false,
 		}
 
 		byJwt := jwt.ByJwt{}
@@ -432,39 +401,39 @@ func TestNetworkNameValidation(t *testing.T) {
 
 		// too short
 		networkName := ""
-		_, err := validateNetworkName(networkName)
-		connect.AssertNotEqual(t, err, nil)
+		_, err := ValidateNetworkName(networkName)
+		assert.NotEqual(t, err, nil)
 
 		// too long
 		networkName = "a123456789012345678901234567890123456789012345678901"
-		_, err = validateNetworkName(networkName)
-		connect.AssertNotEqual(t, err, nil)
+		_, err = ValidateNetworkName(networkName)
+		assert.NotEqual(t, err, nil)
 
 		/**
 		 * testing special characters
 		 */
 		networkName = "abcde$"
-		_, err = validateNetworkName(networkName)
-		connect.AssertNotEqual(t, err, nil)
+		_, err = ValidateNetworkName(networkName)
+		assert.NotEqual(t, err, nil)
 
 		networkName = "abcdeé"
-		_, err = validateNetworkName(networkName)
-		connect.AssertNotEqual(t, err, nil)
+		_, err = ValidateNetworkName(networkName)
+		assert.NotEqual(t, err, nil)
 
 		networkName = "東京タワー"
-		_, err = validateNetworkName(networkName)
-		connect.AssertNotEqual(t, err, nil)
+		_, err = ValidateNetworkName(networkName)
+		assert.NotEqual(t, err, nil)
 
 		// test spaces
 		networkName = "abc def"
 		expected := "abc-def"
-		validated, err := validateNetworkName(networkName)
-		connect.AssertEqual(t, validated, expected)
+		validated, err := ValidateNetworkName(networkName)
+		assert.Equal(t, validated, expected)
 
 		// valid name should pass
 		networkName = "abcdef"
-		_, err = validateNetworkName(networkName)
-		connect.AssertEqual(t, err, nil)
+		_, err = ValidateNetworkName(networkName)
+		assert.Equal(t, err, nil)
 
 	})
 }

@@ -43,16 +43,16 @@ func TestNetworkUser(t *testing.T) {
 		guestUserId := server.NewId()
 		guestNetworkName := "guest_hello_world"
 
-		Testing_CreateGuestNetwork(ctx, guestNetworkId, guestNetworkName, guestUserId)
+		Testing_CreateNetwork(ctx, guestNetworkId, guestNetworkName, guestUserId)
 
 		networkUser = GetNetworkUser(ctx, guestUserId)
 
-		connect.AssertNotEqual(t, networkUser, nil)
-		connect.AssertEqual(t, networkUser.UserId, guestUserId)
-		connect.AssertEqual(t, networkUser.UserAuth, nil)
-		connect.AssertEqual(t, networkUser.Verified, false)
-		connect.AssertEqual(t, networkUser.AuthType, AuthTypeGuest)
-		connect.AssertEqual(t, networkUser.NetworkName, guestNetworkName)
+		assert.NotEqual(t, networkUser, nil)
+		assert.Equal(t, networkUser.UserId, guestUserId)
+		assert.Equal(t, networkUser.UserAuth, nil)
+		assert.Equal(t, networkUser.Verified, false)
+		assert.Equal(t, networkUser.AuthType, AuthTypeSeedphrase)
+		assert.Equal(t, networkUser.NetworkName, guestNetworkName)
 
 	})
 }

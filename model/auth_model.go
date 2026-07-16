@@ -39,6 +39,7 @@ const (
 	AuthTypeBringYour AuthType = "bringyour"
 	AuthTypeGuest     AuthType = "guest"
 	AuthTypeSolana    AuthType = "solana"
+	AuthTypeSeedphrase AuthType = "seedphrase"
 )
 
 type WalletAuthArgs struct {
@@ -57,6 +58,7 @@ type AuthLoginArgs struct {
 	AuthJwtType *string         `json:"auth_jwt_type,omitempty"`
 	AuthJwt     *string         `json:"auth_jwt,omitempty"`
 	WalletAuth  *WalletAuthArgs `json:"wallet_auth,omitempty"`
+	Seedphrase  *string         `json:"seedphrase,omitempty"`
 }
 
 type AuthLoginResult struct {
@@ -155,10 +157,27 @@ func AuthLogin(
 			login.WalletAuth,
 			session.Ctx,
 		)
-
+	} else if login.Seedphrase != nil && *login.Seedphrase != "" {
+		result, err := LoginWithSeedphrase(session.Ctx, *login.Seedphrase)
+		if err != nil {
+			return &AuthLoginResult{
+				Error: &AuthLoginResultError{
+					Message: err.Error(),
+				},
+			}, nil
+		}
+		return &AuthLoginResult{
+			Network: &AuthLoginResultNetwork{
+				ByJwt: result.ByJwt,
+			},
+		}, nil
 	}
 
-	return nil, errors.New("invalid login")
+	return &AuthLoginResult{
+		Error: &AuthLoginResultError{
+			Message: "Invalid login credentials.",
+		},
+	}, nil
 }
 
 /**
