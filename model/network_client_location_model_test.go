@@ -8,9 +8,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
-	"github.com/go-playground/assert/v2"
+	"github.com/urnetwork/connect"
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/jwt"
@@ -36,7 +36,7 @@ func TestCanonicalLocations(t *testing.T) {
 		}
 		CreateLocation(ctx, us1)
 
-		assert.Equal(t, us1.LocationId, us1.CountryLocationId)
+		connect.AssertEqual(t, us1.LocationId, us1.CountryLocationId)
 
 		us2 := &Location{
 			LocationType: LocationTypeCountry,
@@ -45,8 +45,8 @@ func TestCanonicalLocations(t *testing.T) {
 		}
 		CreateLocation(ctx, us2)
 
-		assert.Equal(t, us2.LocationId, us1.LocationId)
-		assert.Equal(t, us2.LocationId, us2.CountryLocationId)
+		connect.AssertEqual(t, us2.LocationId, us1.LocationId)
+		connect.AssertEqual(t, us2.LocationId, us2.CountryLocationId)
 
 		a := &Location{
 			LocationType: LocationTypeRegion,
@@ -56,8 +56,8 @@ func TestCanonicalLocations(t *testing.T) {
 		}
 		CreateLocation(ctx, a)
 
-		assert.Equal(t, a.LocationId, a.RegionLocationId)
-		assert.Equal(t, a.CountryLocationId, us1.LocationId)
+		connect.AssertEqual(t, a.LocationId, a.RegionLocationId)
+		connect.AssertEqual(t, a.CountryLocationId, us1.LocationId)
 
 		b := &Location{
 			LocationType: LocationTypeRegion,
@@ -67,9 +67,9 @@ func TestCanonicalLocations(t *testing.T) {
 		}
 		CreateLocation(ctx, b)
 
-		assert.Equal(t, a.LocationId, b.LocationId)
-		assert.Equal(t, a.RegionLocationId, b.RegionLocationId)
-		assert.Equal(t, a.CountryLocationId, b.CountryLocationId)
+		connect.AssertEqual(t, a.LocationId, b.LocationId)
+		connect.AssertEqual(t, a.RegionLocationId, b.RegionLocationId)
+		connect.AssertEqual(t, a.CountryLocationId, b.CountryLocationId)
 
 		c := &Location{
 			LocationType: LocationTypeCity,
@@ -80,8 +80,8 @@ func TestCanonicalLocations(t *testing.T) {
 		}
 		CreateLocation(ctx, c)
 
-		assert.Equal(t, c.RegionLocationId, a.LocationId)
-		assert.Equal(t, c.CountryLocationId, a.CountryLocationId)
+		connect.AssertEqual(t, c.RegionLocationId, a.LocationId)
+		connect.AssertEqual(t, c.CountryLocationId, a.CountryLocationId)
 
 		d := &Location{
 			LocationType: LocationTypeCity,
@@ -92,9 +92,9 @@ func TestCanonicalLocations(t *testing.T) {
 		}
 		CreateLocation(ctx, d)
 
-		assert.Equal(t, d.LocationId, c.LocationId)
-		assert.Equal(t, d.RegionLocationId, c.RegionLocationId)
-		assert.Equal(t, d.CountryLocationId, c.CountryLocationId)
+		connect.AssertEqual(t, d.LocationId, c.LocationId)
+		connect.AssertEqual(t, d.RegionLocationId, c.RegionLocationId)
+		connect.AssertEqual(t, d.CountryLocationId, c.CountryLocationId)
 	})
 }
 
@@ -125,7 +125,7 @@ func TestCanonicalLocationsParallel(t *testing.T) {
 			locationIds[locationId] = true
 		}
 
-		assert.Equal(t, 1, len(locationIds))
+		connect.AssertEqual(t, 1, len(locationIds))
 	})
 }
 
@@ -163,7 +163,7 @@ func TestBestAvailableProviders(t *testing.T) {
 			"0.0.0.0:0",
 			handlerId,
 		)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		secretKeys := map[ProvideMode][]byte{
 			ProvideModePublic: make([]byte, 32),
@@ -220,7 +220,7 @@ func TestBestAvailableProviders(t *testing.T) {
 		}
 
 		clientAddressHash, _, err := clientSessionA.ClientAddressHashPort()
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		stats := &ClientReliabilityStats{
 			ConnectionEstablishedCount: 1,
 			ProvideEnabledCount:        1,
@@ -241,8 +241,8 @@ func TestBestAvailableProviders(t *testing.T) {
 		UpdateClientScores(ctx, 5*time.Second, 1)
 
 		res, err := FindProviders2(findProviders2Args, clientSessionA)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, len(res.Providers), 1)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), 1)
 	})
 }
 
@@ -318,7 +318,7 @@ func TestFindProviders2WithExclude(t *testing.T) {
 				fmt.Sprintf("0.0.0.%d:0", i),
 				handlerId,
 			)
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			secretKeys := map[ProvideMode][]byte{
 				ProvideModePublic: make([]byte, 32),
@@ -329,7 +329,7 @@ func TestFindProviders2WithExclude(t *testing.T) {
 			SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
 
 			clientAddressHash, _, err := clientSession.ClientAddressHashPort()
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 			stats := &ClientReliabilityStats{
 				ConnectionEstablishedCount: 1,
 				ProvideEnabledCount:        1,
@@ -351,7 +351,7 @@ func TestFindProviders2WithExclude(t *testing.T) {
 		UpdateClientReliabilityScores(ctx, server.NowUtc().Add(time.Hour), true)
 		UpdateClientScores(ctx, 5*time.Second, 1)
 
-		clientIds := maps.Keys(clientSessions)
+		clientIds := slices.Collect(maps.Keys(clientSessions))
 		clientIdA := clientIds[0]
 		clientSessionA := clientSessions[clientIdA]
 
@@ -365,8 +365,8 @@ func TestFindProviders2WithExclude(t *testing.T) {
 			ForceMinimum: true,
 		}
 		res, err := FindProviders2(findProviders2Args, clientSessionA)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, len(res.Providers), n)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), n)
 
 		bestAvailable := true
 		findProviders2Args = &FindProviders2Args{
@@ -379,8 +379,8 @@ func TestFindProviders2WithExclude(t *testing.T) {
 			ForceMinimum: true,
 		}
 		res, err = FindProviders2(findProviders2Args, clientSessionA)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, len(res.Providers), n)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), n)
 
 		findProviders2Args = &FindProviders2Args{
 			Specs: []*ProviderSpec{
@@ -393,8 +393,8 @@ func TestFindProviders2WithExclude(t *testing.T) {
 			ForceMinimum:     true,
 		}
 		res, err = FindProviders2(findProviders2Args, clientSessionA)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, len(res.Providers), n-1)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), n-1)
 
 		findProviders2Args = &FindProviders2Args{
 			Specs: []*ProviderSpec{
@@ -445,30 +445,30 @@ func TestFindProviders2WithExclude(t *testing.T) {
 			// prevent oversampling
 			findProviders2Args.ForceCount = true
 			res, err = FindProviders2(findProviders2Args, clientSessionA)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, len(res.Providers), len(priorityClientIds))
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, len(res.Providers), len(priorityClientIds))
 			for _, provider := range res.Providers {
 				netProviderIncludedCounts[provider.ClientId] += 1
 			}
 		}
 		// descending by included count
-		orderedClientIds := maps.Keys(netProviderIncludedCounts)
+		orderedClientIds := slices.Collect(maps.Keys(netProviderIncludedCounts))
 		slices.SortStableFunc(orderedClientIds, func(a server.Id, b server.Id) int {
 			return netProviderIncludedCounts[b] - netProviderIncludedCounts[a]
 		})
 		for _, clientId := range orderedClientIds[:len(priorityClientIds)] {
 			ok := excludeClientIds[clientId]
-			assert.Equal(t, ok, false)
+			connect.AssertEqual(t, ok, false)
 			ok = otherClientIds[clientId]
-			assert.Equal(t, ok, false)
+			connect.AssertEqual(t, ok, false)
 			ok = priorityClientIds[clientId]
-			assert.Equal(t, ok, true)
+			connect.AssertEqual(t, ok, true)
 		}
 		for _, clientId := range orderedClientIds[len(priorityClientIds):] {
 			ok := excludeClientIds[clientId]
-			assert.Equal(t, ok, false)
+			connect.AssertEqual(t, ok, false)
 			ok = otherClientIds[clientId]
-			assert.Equal(t, ok, true)
+			connect.AssertEqual(t, ok, true)
 		}
 
 	})
@@ -482,7 +482,252 @@ func TestRankMode(t *testing.T) {
 		r, _ := utf8.DecodeRuneInString(rankMode)
 		firstLetters[r] += 1
 	}
-	assert.Equal(t, len(rankModes), len(firstLetters))
+	connect.AssertEqual(t, len(rankModes), len(firstLetters))
+}
+
+// write -> read round trips through the redis provider caches:
+// `UpdateClientLocations` -> `loadClientLocations`/`loadInitialClientLocations` and
+// `UpdateClientScores` -> `loadClientScores`/`loadLocationStables`/`FindProviders2`.
+// the cache keys hash tag on the per-target ids so the families spread across
+// cluster slots. the test redis is a single node, so slot spreading is invisible
+// here; this proves functional equivalence of the write and read paths.
+func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		userId := server.NewId()
+		guestMode := false
+		isPro := false
+
+		clientSession := session.Testing_CreateClientSession(
+			ctx,
+			jwt.NewByJwt(networkId, userId, "a", guestMode, isPro),
+		)
+
+		clientId := server.NewId()
+
+		Testing_CreateDevice(
+			ctx,
+			networkId,
+			server.NewId(),
+			clientId,
+			"",
+			"",
+		)
+
+		handlerId := CreateNetworkClientHandler(ctx)
+		connectionId, _, _, _, err := ConnectNetworkClient(
+			ctx,
+			clientId,
+			"0.0.0.0:0",
+			handlerId,
+		)
+		connect.AssertEqual(t, err, nil)
+
+		secretKeys := map[ProvideMode][]byte{
+			ProvideModePublic: make([]byte, 32),
+		}
+		SetProvide(ctx, clientId, secretKeys)
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		createLocationGroup := &LocationGroup{
+			Name:     StrongPrivacyLaws,
+			Promoted: true,
+			MemberLocationIds: []server.Id{
+				city.CityLocationId,
+				city.RegionLocationId,
+				city.CountryLocationId,
+			},
+		}
+		CreateLocationGroup(ctx, createLocationGroup)
+
+		SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
+
+		clientAddressHash, _, err := clientSession.ClientAddressHashPort()
+		connect.AssertEqual(t, err, nil)
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+			ReceiveByteCount:           1024,
+			SendMessageCount:           1,
+			SendByteCount:              1024,
+		}
+		AddClientReliabilityStats(
+			ctx,
+			networkId,
+			clientId,
+			clientAddressHash,
+			server.NowUtc(),
+			stats,
+		)
+		UpdateClientReliabilityScores(ctx, server.NowUtc(), true)
+
+		// client location cache round trip
+
+		err = UpdateClientLocations(ctx, 5*time.Minute)
+		connect.AssertEqual(t, err, nil)
+
+		clientLocations, err := loadClientLocations(ctx, map[server.Id]bool{
+			city.LocationId: true,
+		})
+		connect.AssertEqual(t, err, nil)
+		// the load expands the city to its region and country
+		connect.AssertEqual(t, len(clientLocations), 3)
+
+		cityClientLocation, ok := clientLocations[city.LocationId]
+		connect.AssertEqual(t, ok, true)
+		connect.AssertEqual(t, cityClientLocation.LocationId, city.LocationId)
+		connect.AssertEqual(t, cityClientLocation.LocationType, LocationTypeCity)
+		connect.AssertEqual(t, cityClientLocation.Name, "Palo Alto")
+		connect.AssertEqual(t, cityClientLocation.ClientCount, 1)
+		connect.AssertEqual(t, cityClientLocation.CityLocationId, city.CityLocationId)
+		connect.AssertEqual(t, cityClientLocation.RegionLocationId, city.RegionLocationId)
+		connect.AssertEqual(t, cityClientLocation.CountryLocationId, city.CountryLocationId)
+		connect.AssertEqual(t, cityClientLocation.CountryCode, "us")
+		connect.AssertEqual(t, cityClientLocation.StrongPrivacy, true)
+		connect.AssertEqual(t, len(cityClientLocation.TopCityLocationIdCounts), 0)
+		connect.AssertEqual(t, len(cityClientLocation.TopRegionLocationIdCounts), 0)
+
+		regionClientLocation, ok := clientLocations[city.RegionLocationId]
+		connect.AssertEqual(t, ok, true)
+		connect.AssertEqual(t, regionClientLocation.LocationType, LocationTypeRegion)
+		connect.AssertEqual(t, regionClientLocation.Name, "California")
+		connect.AssertEqual(t, regionClientLocation.ClientCount, 1)
+		connect.AssertEqual(
+			t,
+			regionClientLocation.TopCityLocationIdCounts,
+			map[server.Id]int{city.LocationId: 1},
+		)
+
+		countryClientLocation, ok := clientLocations[city.CountryLocationId]
+		connect.AssertEqual(t, ok, true)
+		connect.AssertEqual(t, countryClientLocation.LocationType, LocationTypeCountry)
+		connect.AssertEqual(t, countryClientLocation.ClientCount, 1)
+		connect.AssertEqual(
+			t,
+			countryClientLocation.TopCityLocationIdCounts,
+			map[server.Id]int{city.LocationId: 1},
+		)
+		connect.AssertEqual(
+			t,
+			countryClientLocation.TopRegionLocationIdCounts,
+			map[server.Id]int{city.RegionLocationId: 1},
+		)
+
+		initialClientLocations, err := loadInitialClientLocations(ctx)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(initialClientLocations.Locations), 1)
+		connect.AssertEqual(t, initialClientLocations.Locations[0].LocationId, city.CountryLocationId)
+		connect.AssertEqual(t, len(initialClientLocations.LocationGroups), 1)
+		connect.AssertEqual(t, initialClientLocations.LocationGroups[0].LocationGroupId, createLocationGroup.LocationGroupId)
+		connect.AssertEqual(t, initialClientLocations.LocationGroups[0].Name, StrongPrivacyLaws)
+		connect.AssertEqual(t, initialClientLocations.LocationGroups[0].Promoted, true)
+
+		// client score cache round trip
+
+		err = UpdateClientScores(ctx, 5*time.Minute, 2)
+		connect.AssertEqual(t, err, nil)
+
+		locationIds := map[server.Id]bool{
+			city.LocationId: true,
+		}
+		locationGroupIds := map[server.Id]bool{
+			createLocationGroup.LocationGroupId: true,
+		}
+		usLocationId := countryCodeLocationIds()["us"]
+		connect.AssertEqual(t, usLocationId, city.CountryLocationId)
+
+		// the scores are written per caller location. the content must read back
+		// identically for the no-match caller location and the us caller location.
+		for _, rankMode := range []RankMode{RankModeQuality, RankModeSpeed} {
+			clientScoresNoMatch, err := loadClientScores(
+				true,
+				rankMode,
+				ctx,
+				locationIds,
+				locationGroupIds,
+				server.Id{},
+				100,
+			)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, len(clientScoresNoMatch), 1)
+
+			clientScore, ok := clientScoresNoMatch[clientId]
+			connect.AssertEqual(t, ok, true)
+			connect.AssertEqual(t, clientScore.ClientId, clientId)
+			connect.AssertEqual(t, clientScore.NetworkId, networkId)
+			connect.AssertEqual(t, 0 < clientScore.ReliabilityWeight, true)
+			_, ok = clientScore.Scores[rankMode]
+			connect.AssertEqual(t, ok, true)
+			_, ok = clientScore.Tiers[rankMode]
+			connect.AssertEqual(t, ok, true)
+
+			clientScoresUs, err := loadClientScores(
+				true,
+				rankMode,
+				ctx,
+				locationIds,
+				locationGroupIds,
+				usLocationId,
+				100,
+			)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, clientScoresNoMatch, clientScoresUs)
+
+			// the client has no latency or speed tests, which deterministically
+			// fails the strict minimums. the force minimum false variant is
+			// written but exports zero clients.
+			clientScoresStrict, err := loadClientScores(
+				false,
+				rankMode,
+				ctx,
+				locationIds,
+				locationGroupIds,
+				usLocationId,
+				100,
+			)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, len(clientScoresStrict), 0)
+		}
+
+		// the location stables read the force minimum false filter keys.
+		// the filter is present with a zero count, so no entries are stable.
+		locationStables, err := loadLocationStables(
+			ctx,
+			[]server.Id{city.LocationId, city.RegionLocationId, city.CountryLocationId},
+			RankModeQuality,
+			usLocationId,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(locationStables), 0)
+
+		// end to end through the public api
+		res, err := FindProviders2(
+			&FindProviders2Args{
+				Specs: []*ProviderSpec{
+					{
+						LocationId: &city.LocationId,
+					},
+				},
+				Count:        10,
+				ForceMinimum: true,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), 1)
+		connect.AssertEqual(t, res.Providers[0].ClientId, clientId)
+	})
 }
 
 // func TestFindLocationGroupByName(t *testing.T) {
@@ -500,20 +745,20 @@ func TestRankMode(t *testing.T) {
 // 		server.Tx(ctx, func(tx server.PgTx) {
 // 			// query existing
 // 			locationGroup := findLocationGroupByNameInTx(ctx, StrongPrivacyLaws, tx)
-// 			assert.Equal(t, locationGroup.Name, StrongPrivacyLaws)
-// 			assert.Equal(t, locationGroup.Promoted, true)
+// 			connect.AssertEqual(t, locationGroup.Name, StrongPrivacyLaws)
+// 			connect.AssertEqual(t, locationGroup.Promoted, true)
 
 // 			// locationGroupId := locationGroup.LocationGroupId
 
 // 			// query with incorrect case should still return
 // 			// locationGroup = findLocationGroupByNameInTx(ctx, "strong privacy Laws And internet freedom", tx)
-// 			// assert.Equal(t, locationGroup.Name, StrongPrivacyLaws)
-// 			// assert.Equal(t, locationGroup.LocationGroupId, locationGroupId)
-// 			// assert.Equal(t, locationGroup.Promoted, true)
+// 			// connect.AssertEqual(t, locationGroup.Name, StrongPrivacyLaws)
+// 			// connect.AssertEqual(t, locationGroup.LocationGroupId, locationGroupId)
+// 			// connect.AssertEqual(t, locationGroup.Promoted, true)
 
 // 			// query should return nil if no match
 // 			locationGroup = findLocationGroupByNameInTx(ctx, "invalid", tx)
-// 			assert.Equal(t, locationGroup, nil)
+// 			connect.AssertEqual(t, locationGroup, nil)
 
 // 		})
 // 	})
@@ -581,13 +826,13 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 				fmt.Sprintf("0.0.0.%d:0", i),
 				handlerId,
 			)
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			SetProvide(ctx, clientId, map[ProvideMode][]byte{
 				ProvideModePublic: make([]byte, 32),
 			})
 			err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			// good latency and speed tests so the quality score gate passes
 			// and the reliability minimums are the deciding filter
@@ -615,7 +860,7 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 			})
 
 			clientAddressHash, _, err := clientSession.ClientAddressHashPort()
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			providers = append(providers, &testProvider{
 				networkId:         networkId,
@@ -701,7 +946,7 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 			for lookbackIndex, clientScores := range lookbackClientScores {
 				for _, p := range providers {
 					score, ok := clientScores[p.clientId]
-					assert.Equal(t, ok, true)
+					connect.AssertEqual(t, ok, true)
 					if d := score.IndependentReliabilityWeight - 1.0; d < -eps || eps < d {
 						t.Errorf(
 							"step %d lookback %d client %s: independent reliability weight %f != 1.0 (unflushed tail counted as unreliability)",
@@ -715,12 +960,12 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 			}
 		}
 		// the loop must actually have scored (no vacuous pass)
-		assert.Equal(t, true, 8 <= scoredSteps)
+		connect.AssertEqual(t, true, 8 <= scoredSteps)
 
 		// end to end through the strict FindProviders2 gate (no ForceMinimum):
 		// every provider must pass the reliability minimums and be returned
 		err := UpdateClientScores(ctx, 5*time.Second, 1)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		res, err := FindProviders2(&FindProviders2Args{
 			Specs: []*ProviderSpec{
@@ -730,8 +975,8 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 			},
 			Count: 2 * n,
 		}, callerSession)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, len(res.Providers), n)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), n)
 	})
 }
 
@@ -798,13 +1043,13 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 				fmt.Sprintf("0.0.%d.%d:0", i/256, i%256),
 				handlerId,
 			)
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			SetProvide(ctx, clientId, map[ProvideMode][]byte{
 				ProvideModePublic: make([]byte, 32),
 			})
 			err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			server.Tx(ctx, func(tx server.PgTx) {
 				server.RaisePgResult(tx.Exec(
@@ -820,7 +1065,7 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 			})
 
 			clientAddressHash, _, err := clientSession.ClientAddressHashPort()
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			providers = append(providers, &testProvider{
 				networkId:         networkId,
@@ -921,7 +1166,7 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 		for lookbackIndex, clientScores := range lookbackClientScores {
 			for i, p := range providers {
 				score, ok := clientScores[p.clientId]
-				assert.Equal(t, ok, true)
+				connect.AssertEqual(t, ok, true)
 				checkedCount += 1
 				if d := score.IndependentReliabilityWeight - 1.0; d < -eps || eps < d {
 					t.Errorf(
@@ -935,11 +1180,11 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 		}
 		// the weight assertions above must not pass vacuously: every provider
 		// is scored in every lookback
-		assert.Equal(t, checkedCount, len(ClientLookbacks)*n)
+		connect.AssertEqual(t, checkedCount, len(ClientLookbacks)*n)
 
 		// and every provider still passes the strict FindProviders2 gate
 		err := UpdateClientScores(ctx, 5*time.Second, 1)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		res, err := FindProviders2(&FindProviders2Args{
 			Specs: []*ProviderSpec{
@@ -949,7 +1194,7 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 			},
 			Count: 2 * n,
 		}, callerSession)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, len(res.Providers), n)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(res.Providers), n)
 	})
 }

@@ -10,9 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
-	// "golang.org/x/exp/maps"
+	// "maps"
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
@@ -31,8 +29,8 @@ func TestStreamKey(t *testing.T) {
 
 	sk := newStreamKey(sourceId, destinationId, intermediaryIds)
 	sk2 := newStreamKey(destinationId, sourceId, reversedIntermediaryIds)
-	assert.Equal(t, sk, sk2)
-	assert.Equal(t, sk.String(), sk2.String())
+	connect.AssertEqual(t, sk, sk2)
+	connect.AssertEqual(t, sk.String(), sk2.String())
 
 	expectedClientEdges := map[server.Id][2]*server.Id{}
 	expectedClientEdges[sourceId] = [2]*server.Id{
@@ -65,7 +63,7 @@ func TestStreamKey(t *testing.T) {
 		clientEdges[clientId] = edges
 	}
 
-	assert.Equal(t, clientEdges, expectedClientEdges)
+	connect.AssertEqual(t, clientEdges, expectedClientEdges)
 }
 
 func TestStreamHop(t *testing.T) {
@@ -80,7 +78,7 @@ func TestStreamHop(t *testing.T) {
 		DestinationId: connect.Id(destinationId),
 		StreamId:      connect.Id(streamId),
 	}
-	assert.Equal(t, hop.Path(), path)
+	connect.AssertEqual(t, hop.Path(), path)
 }
 
 func TestStream(t *testing.T) {
@@ -88,9 +86,14 @@ func TestStream(t *testing.T) {
 	// ensure that the final state for the client id matches the state accumulated from the events
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 
-		keyCount := 32 * 1024
+		// unit-test scale: the invariant (parallel add/remove converges to the
+		// state accumulated from events) is scale-independent. The earlier
+		// 32k-key/131k-contract sizing was a load test in disguise: millions
+		// of redis commands through the 16-conn local pool under -race took
+		// 20+ minutes and then failed the fixed-window event assertions.
+		keyCount := 1024
 		contractCount := 4 * keyCount
-		delayMax := 10 * time.Second
+		delayMax := 2 * time.Second
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -150,7 +153,7 @@ func TestStream(t *testing.T) {
 				fmt.Printf("-")
 			},
 		)
-		l := NewStreamHopListener(ctx, clientId, c.Event, 5*time.Second)
+		l := NewStreamHopListener(ctx, clientId, c.Event, 200*time.Millisecond, 5)
 		defer l.Close()
 
 		var wg sync.WaitGroup
@@ -201,12 +204,12 @@ func TestStream(t *testing.T) {
 		for contractId, streamId := range contractStreamIds {
 			mStreamId, mStreamKey, ok := GetStream(ctx, contractId)
 			if removeContracts[contractId] {
-				assert.Equal(t, ok, false)
+				connect.AssertEqual(t, ok, false)
 			} else {
-				assert.Equal(t, ok, true)
+				connect.AssertEqual(t, ok, true)
 				streamKey := contractStreamKeys[contractId]
-				assert.Equal(t, mStreamId, streamId)
-				assert.Equal(t, mStreamKey, streamKey)
+				connect.AssertEqual(t, mStreamId, streamId)
+				connect.AssertEqual(t, mStreamKey, streamKey)
 			}
 		}
 
@@ -214,11 +217,11 @@ func TestStream(t *testing.T) {
 		case <-time.After(5 * time.Second):
 		}
 
-		assert.Equal(t, len(c.StreamIds()), len(finalStreamIds))
-		assert.Equal(t, c.StreamIds(), finalStreamIds)
+		connect.AssertEqual(t, len(c.StreamIds()), len(finalStreamIds))
+		connect.AssertEqual(t, c.StreamIds(), finalStreamIds)
 
 		_, streamHops := GetStreamHops(ctx, clientId)
-		assert.Equal(t, c.StreamHops(), streamHops)
+		connect.AssertEqual(t, c.StreamHops(), streamHops)
 
 		// creating a new listener should sync to the head state
 		var addCount atomic.Uint64
@@ -233,14 +236,16 @@ func TestStream(t *testing.T) {
 				removeCount.Add(1)
 			},
 		)
-		l2 := NewStreamHopListener(ctx, clientId, c2.Event, 5*time.Second)
+		l2 := NewStreamHopListener(ctx, clientId, c2.Event, 200*time.Millisecond, 5)
 		defer l2.Close()
 
+		// cover a full listener poll cycle (5s) so the assertion does not
+		// depend on pubsub delivery alone
 		select {
-		case <-time.After(1 * time.Second):
+		case <-time.After(6 * time.Second):
 		}
 
-		assert.Equal(t, c2.StreamIds(), finalStreamIds)
+		connect.AssertEqual(t, c2.StreamIds(), finalStreamIds)
 
 		// remove the remaining contracts
 		for contractId, remove := range removeContracts {
@@ -250,16 +255,67 @@ func TestStream(t *testing.T) {
 		}
 
 		select {
-		case <-time.After(1 * time.Second):
+		case <-time.After(6 * time.Second):
 		}
 
-		assert.Equal(t, int(addCount.Load()), len(keepKeys))
-		assert.Equal(t, int(removeCount.Load()), len(keepKeys))
-		assert.Equal(t, c2.StreamIds(), map[server.Id]bool{})
+		connect.AssertEqual(t, int(addCount.Load()), len(keepKeys))
+		connect.AssertEqual(t, int(removeCount.Load()), len(keepKeys))
+		connect.AssertEqual(t, c2.StreamIds(), map[server.Id]bool{})
 
 		_, streamHops2 := GetStreamHops(ctx, clientId)
-		assert.Equal(t, c2.StreamHops(), streamHops2)
+		connect.AssertEqual(t, c2.StreamHops(), streamHops2)
 
 	})
 
+}
+
+// TestStreamHopFlushRecovery guards the PEERS2 backward-counter resync for the
+// stream listener — the exact case the pre-v2 `<` comparison got wrong (it
+// went permanently stale once the counter reset). When the hops counter is
+// flushed/expires and restarts below the listener's last synced value, the
+// `!=` mismatch must trigger a full read, not silence.
+func TestStreamHopFlushRecovery(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		clientId := server.NewId()
+		destinationId := server.NewId()
+
+		c := NewStreamHopAccumulator(
+			func(hop StreamHop) {},
+			func(hop StreamHop) {},
+		)
+		l := NewStreamHopListener(ctx, clientId, c.Event, 200*time.Millisecond, 5)
+		defer l.Close()
+
+		// a hop involving clientId; the listener syncs it
+		contractId1 := server.NewId()
+		AddToStream(ctx, contractId1, clientId, destinationId, nil)
+		select {
+		case <-time.After(1 * time.Second):
+		}
+		connect.AssertEqual(t, len(c.StreamHops()), 1)
+
+		// flush the client's hop state and its version counter (redis loss /
+		// 24h idle expiry). The counter restarts, so a later event id is
+		// BELOW the listener's last synced value.
+		server.Redis(ctx, func(r server.RedisClient) {
+			connect.AssertEqual(t, r.Del(ctx, clientStreamHopsKey(clientId), clientEventIdKey(clientId)).Err(), nil)
+		})
+
+		// a new hop repopulates the set and bumps the (reset) counter to 1,
+		// below the listener's previous value — the `!=` resync must fire and
+		// deliver the new head state
+		contractId2 := server.NewId()
+		destinationId2 := server.NewId()
+		AddToStream(ctx, contractId2, clientId, destinationId2, nil)
+
+		select {
+		case <-time.After(3 * time.Second):
+		}
+		_, headHops := GetStreamHops(ctx, clientId)
+		connect.AssertEqual(t, c.StreamHops(), headHops)
+		connect.AssertEqual(t, len(c.StreamHops()), 1)
+	})
 }

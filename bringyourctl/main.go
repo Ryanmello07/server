@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"github.com/docopt/docopt-go"
 
@@ -37,6 +37,10 @@ Usage:
     bringyourctl db migrate
     bringyourctl db vacuum [--exclude=<table>...]
     bringyourctl db maintenance (all|<epoch>) [--reindex] [--cleanup] [--analyze]
+    bringyourctl db audit [--fix [--force-drop-indexes]]
+    bringyourctl db backfill-sweep-destination-id [--batch=<n>]
+    bringyourctl db backfill-contract-reap-time [--batch=<n>]
+    bringyourctl db sweep-orphans [--slice=<n>]
     bringyourctl search --realm=<realm> --type=<type> add <value>
     bringyourctl search --realm=<realm> --type=<type> around --distance=<distance> <value>
     bringyourctl search --realm=<realm> --type=<type> remove <value>
@@ -87,6 +91,7 @@ Usage:
     bringyourctl model migrate provide-mode
     bringyourctl model migrate proxy-device-config
     bringyourctl model migrate client-reliability-partition [--dry-run] [--finalize] [--parallel=<n>] [--oneshot]
+    bringyourctl model upgrade-client-reliability-index [--parallel=<n>]
     bringyourctl refresh-transfer-balances
     bringyourctl st status [--epoch=<epoch>]
     bringyourctl st deposit [--alpha_rao=<alpha_rao>]
@@ -130,6 +135,14 @@ Options:
 			dbVacuum(opts)
 		} else if maintenance, _ := opts.Bool("maintenance"); maintenance {
 			dbMaintenance(opts)
+		} else if audit, _ := opts.Bool("audit"); audit {
+			dbAudit(opts)
+		} else if backfill, _ := opts.Bool("backfill-sweep-destination-id"); backfill {
+			dbBackfillSweepDestinationId(opts)
+		} else if backfillReap, _ := opts.Bool("backfill-contract-reap-time"); backfillReap {
+			dbBackfillContractReapTime(opts)
+		} else if sweepOrphans, _ := opts.Bool("sweep-orphans"); sweepOrphans {
+			dbSweepOrphans(opts)
 		}
 	} else if search, _ := opts.Bool("search"); search {
 		if add, _ := opts.Bool("add"); add {
@@ -276,6 +289,8 @@ Options:
 			} else if clientReliabilityPartition, _ := opts.Bool("client-reliability-partition"); clientReliabilityPartition {
 				modelMigrateClientReliabilityPartition(opts)
 			}
+		} else if upgradeClientReliabilityIndex, _ := opts.Bool("upgrade-client-reliability-index"); upgradeClientReliabilityIndex {
+			modelUpgradeClientReliabilityIndex(opts)
 		}
 	} else if refreshTransferBalances_, _ := opts.Bool("refresh-transfer-balances"); refreshTransferBalances_ {
 		refreshTransferBalances(opts)
@@ -308,6 +323,152 @@ func dbMigrate(opts docopt.Opts) {
 	fmt.Printf("Applying DB migrations ...\n")
 	server.DbMigrationVerbose = true
 	server.ApplyDbMigrations(context.Background())
+}
+
+// dbAudit compares the live DB schema against the schema the full local
+// db_migrations head should produce.
+//
+//	db audit                      report the drift, then print the reconciling
+//	                              SQL as a dry run (summary at top, SQL at bottom)
+//	db audit --fix                APPLY the additive changes (CREATE TABLE / ADD
+//	                              COLUMN / CREATE INDEX), then print the drops that
+//	                              were not applied for manual review
+//	db audit --fix --force-drop-indexes
+//	                              also drop/recreate indexes (safe to recreate);
+//	                              table/column drops are still never applied
+func dbAudit(opts docopt.Opts) {
+	fix, _ := opts.Bool("--fix")
+	forceDropIndexes, _ := opts.Bool("--force-drop-indexes")
+	ctx := context.Background()
+
+	// docopt does not enforce the [--fix [--force-drop-indexes]] nesting, so guard
+	// it here before touching the DB
+	if forceDropIndexes && !fix {
+		fmt.Println("--force-drop-indexes requires --fix")
+		return
+	}
+
+	// the expected schema is always the full local db_migrations head
+	result := server.AuditSchema(ctx)
+	fmt.Printf("DB recorded version: %d   local db_migrations head: %d\n", result.DbVersion, result.LocalVersion)
+
+	if !fix {
+		// plain audit is the dry run: summary first, then the SQL --fix would run
+		fmt.Print(result.Diff.Report())
+		if result.Diff.HasDifferences() {
+			fmt.Print("\n")
+			fmt.Print(result.Diff.FixSql())
+		}
+		fmt.Printf("\n%d migration(s) need to be applied.\n", result.LocalVersion-result.DbVersion)
+		return
+	}
+
+	// --fix: apply the additive changes (plus index drops with
+	// --force-drop-indexes), then print whatever was not applied for review
+	statementCount := len(result.Diff.FixStatements())
+	if forceDropIndexes {
+		statementCount += len(result.Diff.IndexDropStatements())
+	}
+
+	if statementCount == 0 {
+		fmt.Println("\nNothing to apply.")
+	} else {
+		note := ""
+		if forceDropIndexes && 0 < result.Diff.IndexDropCount() {
+			note = fmt.Sprintf(" (with %d index drop/recreate)", result.Diff.IndexDropCount())
+		}
+		fmt.Printf(
+			"\nApplying %d statement(s)%s. Indexes build non-concurrently (write lock during the build).\n",
+			statementCount, note,
+		)
+		server.ApplySchemaFix(ctx, result.Diff, forceDropIndexes, func(index, total int, statement string) {
+			fmt.Printf("\n[%d/%d]\n%s\n", index+1, total, statement)
+		})
+		fmt.Printf("\nApplied %d statement(s).\n", statementCount)
+	}
+
+	if notApplied := result.Diff.NotAppliedSql(forceDropIndexes); notApplied != "" {
+		fmt.Print("\n")
+		fmt.Print(notApplied)
+	}
+}
+
+// dbBackfillSweepDestinationId backfills transfer_escrow_sweep.destination_id
+// on existing rows so the provider payout stats see pre-deploy sweeps. The
+// column and its covering index are created by db migration; this only fills
+// historical rows. It is idempotent and safe to re-run.
+func dbBackfillSweepDestinationId(opts docopt.Opts) {
+	ctx := context.Background()
+
+	batch := 50000
+	if n, err := opts.Int("--batch"); err == nil && 0 < n {
+		batch = n
+	}
+
+	fmt.Println("Ensuring transfer_escrow_sweep.destination_id exists ...")
+	model.AddSweepDestinationIdColumn(ctx)
+
+	fmt.Printf("Backfilling destination_id in batches of %d ...\n", batch)
+	backfilled := model.BackfillSweepDestinationIds(ctx, batch)
+	fmt.Printf("Backfilled %d sweep(s).\n", backfilled)
+}
+
+// dbBackfillContractReapTime seeds transfer_contract.reap_time for the indexed
+// retention reaper. reap_time replaced the anti-join full-scan reaper that
+// caused a prod incident. Two passes, in order: first every aged closed contract
+// (older than StragglerContractExpiration) is assigned reap_time = now() via the
+// partial index; then contracts of recently completed payments are stamped with
+// complete_time + the completed-payout window. Older payments' contracts are
+// already covered by the first pass -- a contract is strictly older than its
+// payment's completion -- which is what keeps the second pass's work bounded to
+// ~one straggler-expiration of payouts. The column and its partial indexes are
+// created by db migration; run this once after migrating. Idempotent and safe to
+// re-run; prints progress as it goes.
+func dbBackfillContractReapTime(opts docopt.Opts) {
+	ctx := context.Background()
+
+	batch := 50000
+	if n, err := opts.Int("--batch"); err == nil && 0 < n {
+		batch = n
+	}
+
+	fmt.Printf("Assigning straggler reap_time in batches of %d ...\n", batch)
+	straggler := model.BackfillStragglerContractReapTime(ctx, batch, func(assignedCount int64) {
+		fmt.Printf("  assigned %d straggler contract(s) so far ...\n", assignedCount)
+	})
+	fmt.Printf("Assigned %d straggler contract(s).\n", straggler)
+
+	fmt.Println("Stamping contracts of recently completed payments ...")
+	completed := model.BackfillCompletedContractReapTime(ctx, batch, func(stampedCount int64, processedPaymentCount int, totalPaymentCount int) {
+		if processedPaymentCount%200 == 0 || processedPaymentCount == totalPaymentCount {
+			fmt.Printf("  %d/%d payment(s), %d contract(s) stamped ...\n", processedPaymentCount, totalPaymentCount, stampedCount)
+		}
+	})
+	fmt.Printf("Backfilled %d completed contract(s).\n", completed)
+}
+
+// dbSweepOrphans runs the bounded orphan sweeps on demand. It pages each child
+// table fully by its primary key in bounded slices (see model.sweepOrphanCursor),
+// so it never full-scans a child table the way the old "NOT EXISTS ... LIMIT"
+// sweep did (a prod incident: with orphans rare, the LIMIT could only stop after
+// scanning the whole table). The SweepOrphan* taskworkers stay disabled: a full
+// call still pages the entire table, which is fine on demand but too heavy for a
+// frequent task. This command is the manual cleanup path in the meantime.
+func dbSweepOrphans(opts docopt.Opts) {
+	ctx := context.Background()
+
+	sliceSize := 50000
+	if n, err := opts.Int("--slice"); err == nil && 0 < n {
+		sliceSize = n
+	}
+
+	fmt.Printf("Sweeping orphan network-client data in slices of %d ...\n", sliceSize)
+	networkClient := model.SweepOrphanNetworkClientData(ctx, sliceSize)
+	fmt.Printf("Removed %d orphan network-client row(s).\n", networkClient)
+
+	fmt.Printf("Sweeping orphan contract data in slices of %d ...\n", sliceSize)
+	contract := model.SweepOrphanContractData(ctx, sliceSize)
+	fmt.Printf("Removed %d orphan contract row(s).\n", contract)
 }
 
 func dbMaintenance(opts docopt.Opts) {
@@ -823,7 +984,7 @@ func printPayoutPlan(plan *model.PaymentPlan, dryRun bool) {
 	}
 
 	// largest payout first, so the plan reads consistently across runs
-	payments := maps.Values(plan.NetworkPayments)
+	payments := slices.Collect(maps.Values(plan.NetworkPayments))
 	slices.SortFunc(payments, func(a, b *model.AccountPayment) int {
 		return cmp.Compare(b.Payout, a.Payout)
 	})
@@ -1158,7 +1319,7 @@ func reconcileNetEscrow(opts docopt.Opts) {
 	driftByNetworkId, balanceCount := model.ReconcileNetEscrow(ctx, apply)
 
 	// largest absolute drift first
-	networkIds := maps.Keys(driftByNetworkId)
+	networkIds := slices.Collect(maps.Keys(driftByNetworkId))
 	absDrift := func(networkId server.Id) int64 {
 		d := driftByNetworkId[networkId]
 		if d < 0 {
@@ -1219,7 +1380,7 @@ func taskLs(opts docopt.Opts) {
 	taskIds := task.ListPendingTasks(ctx)
 	tasks := task.GetTasks(ctx, taskIds...)
 
-	orderedTaskIds := maps.Keys(tasks)
+	orderedTaskIds := slices.Collect(maps.Keys(tasks))
 	slices.SortFunc(orderedTaskIds, func(a server.Id, b server.Id) int {
 		taskA := tasks[a]
 		taskB := tasks[b]
@@ -1334,7 +1495,7 @@ func reliabilitySetMultipliers(opts docopt.Opts) {
 		countryCodes[m.CountryCode] = m.CountryLocationId
 	}
 
-	orderedCountryCodes := maps.Keys(countryCodes)
+	orderedCountryCodes := slices.Collect(maps.Keys(countryCodes))
 	slices.Sort(orderedCountryCodes)
 	for _, countryCode := range orderedCountryCodes {
 		countryLocationId := countryCodes[countryCode]
@@ -1510,6 +1671,38 @@ func modelMigrateClientReliabilityPartition(opts docopt.Opts) {
 	}
 	if err := model.MigrateClientReliabilityToPartitions(ctx, parallelism, oneshot, dryRun, logf); err != nil {
 		panic(err)
+	}
+}
+
+// Upgrades the partitioned client_reliability secondary index to the desired
+// shape (INCLUDE payload so the reliability score scans are index-only)
+// without a blocking whole-table build: parent shell via CREATE INDEX ... ON
+// ONLY, per-partition CREATE INDEX CONCURRENTLY + ATTACH PARTITION, then drop
+// of the old-shape index. Prints create/attach/skip per partition.
+func modelUpgradeClientReliabilityIndex(opts docopt.Opts) {
+	ctx := context.Background()
+	logf := func(format string, args ...any) {
+		fmt.Printf(format+"\n", args...)
+	}
+	parallel := 6
+	if n, err := opts.Int("--parallel"); err == nil && 0 < n {
+		parallel = n
+	}
+	logf("safe to interrupt and re-run at any point: completed steps are skipped and the upgrade resumes")
+	logf("building partition indexes %d at a time", parallel)
+	upgraded, err := model.UpgradeClientReliabilitySecondaryIndex(ctx, parallel, logf)
+	if err != nil {
+		panic(err)
+	}
+	if upgraded {
+		logf("upgrade complete")
+	} else {
+		logf("no work needed")
+	}
+	if drift, detail := model.ClientReliabilitySecondaryIndexDrift(ctx); drift {
+		logf("WARNING: drift still detected: %s", detail)
+	} else {
+		logf("final state: %s", detail)
 	}
 }
 
