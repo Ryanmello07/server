@@ -121,11 +121,11 @@ func statsProviders(
 		result, err := conn.Query(
 			clientSession.Ctx,
 			`
-			SELECT network_client.client_id
+			SELECT DISTINCT network_client.client_id
 			FROM network_client
-			INNER JOIN provide_key ON provide_key.client_id = network_client.client_id
+			INNER JOIN provide_key ON
+				provide_key.client_id = network_client.client_id
 			WHERE network_client.network_id = $1 AND network_client.active = true
-			GROUP BY network_client.client_id
 			`,
 			networkId,
 		)
@@ -195,11 +195,10 @@ func statsProviders(
 		result, err = conn.Query(
 			clientSession.Ctx,
 			`
-			SELECT tc.destination_id, COALESCE(SUM(s.payout_net_revenue_nano_cents), 0)
+			SELECT s.destination_id, COALESCE(SUM(s.payout_net_revenue_nano_cents), 0)
 			FROM transfer_escrow_sweep s
-			INNER JOIN transfer_contract tc ON tc.contract_id = s.contract_id
-			WHERE tc.destination_id = ANY($1::uuid[]) AND s.sweep_time >= $2
-			GROUP BY tc.destination_id
+			WHERE s.destination_id = ANY($1::uuid[]) AND s.sweep_time >= $2
+			GROUP BY s.destination_id
 			`,
 			ids,
 			windowStart,
@@ -377,8 +376,7 @@ func StatsProvider(
 			`
 			SELECT to_char(s.sweep_time, 'YYYY-MM-DD') AS day, COALESCE(SUM(s.payout_net_revenue_nano_cents), 0)
 			FROM transfer_escrow_sweep s
-			INNER JOIN transfer_contract tc ON tc.contract_id = s.contract_id
-			WHERE tc.destination_id = $1 AND s.sweep_time >= $2
+			WHERE s.destination_id = $1 AND s.sweep_time >= $2
 			GROUP BY day
 			`,
 			clientId,
@@ -561,11 +559,11 @@ func StatsProvidersOverview(
 		result, err := conn.Query(
 			clientSession.Ctx,
 			`
-			SELECT network_client.client_id
+			SELECT DISTINCT network_client.client_id
 			FROM network_client
-			INNER JOIN provide_key ON provide_key.client_id = network_client.client_id
+			INNER JOIN provide_key ON
+				provide_key.client_id = network_client.client_id
 			WHERE network_client.network_id = $1 AND network_client.active = true
-			GROUP BY network_client.client_id
 			`,
 			networkId,
 		)
@@ -610,8 +608,7 @@ func StatsProvidersOverview(
 			`
 			SELECT to_char(s.sweep_time, 'YYYY-MM-DD') AS day, COALESCE(SUM(s.payout_net_revenue_nano_cents), 0)
 			FROM transfer_escrow_sweep s
-			INNER JOIN transfer_contract tc ON tc.contract_id = s.contract_id
-			WHERE tc.destination_id = ANY($1::uuid[]) AND s.sweep_time >= $2
+			WHERE s.destination_id = ANY($1::uuid[]) AND s.sweep_time >= $2
 			GROUP BY day
 			`,
 			ids,

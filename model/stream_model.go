@@ -4,15 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
+	"slices"
 	// "encoding/json"
-	"bytes"
-	"encoding/gob"
 	"fmt"
 	"iter"
+	mathrand "math/rand"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
@@ -174,12 +174,17 @@ func clientStreamHopsKey(clientId server.Id) string {
 	return fmt.Sprintf("{%s}s2_c_hops", clientId)
 }
 
+// the event id counter must outlive any live listener's memory of the last
+// event id (hops carry an 8h ttl; a counter reset while listeners hold a
+// higher id would make new events look stale). Refreshed on every touch, it
+// only expires after 24h of total silence for the client — at which point the
+// hops key is long gone and listeners resync from an empty snapshot.
+// Without a ttl these counters accumulate forever (one per client that ever
+// appeared on a stream hop) and volatile-ttl eviction cannot touch them.
+const clientEventIdTtl = 24 * time.Hour
+
 func clientEventIdKey(clientId server.Id) string {
 	return fmt.Sprintf("{%s}s2_c_eid", clientId)
-}
-
-func clientStreamHopEvents(clientId server.Id) string {
-	return fmt.Sprintf("{%s}s2_c_events", clientId)
 }
 
 func contractStreamKey(contractId server.Id) string {
@@ -262,34 +267,17 @@ func AddToStream(
 
 			if initialSize == 0 {
 				for clientId, edges := range streamKey.Edges() {
-					eventId, err := r.Incr(ctx, clientEventIdKey(clientId)).Result()
-					if err != nil {
-						panic(err)
-					}
-
+					// bump the per-client hops version (PEERS2.md
+					// dirty-counter + poll; no pubsub delivery)
 					streamHopsKey := clientStreamHopsKey(clientId)
-					pipe := r.TxPipeline()
-
-					event := &StreamHopEvent{
-						StreamHopEventType: StreamHopEventTypeAdded,
-						EventId:            eventId,
-					}
-
 					streamHop := NewStreamHop(edges[0], edges[1], streamId)
+
+					pipe := r.TxPipeline()
+					pipe.Incr(ctx, clientEventIdKey(clientId))
 					pipe.SAdd(ctx, streamHopsKey, streamHop.Bytes())
-					event.StreamHops = append(event.StreamHops, streamHop)
-
-					buf := bytes.NewBuffer(nil)
-					encoder := gob.NewEncoder(buf)
-					err = encoder.Encode(event)
-					if err != nil {
-						panic(err)
-					}
-					eventBytes := buf.Bytes()
-					pipe.SPublish(ctx, clientStreamHopEvents(clientId), eventBytes)
-
 					pipe.Expire(ctx, streamHopsKey, ttl)
-					_, err = pipe.Exec(ctx)
+					pipe.Expire(ctx, clientEventIdKey(clientId), clientEventIdTtl)
+					_, err := pipe.Exec(ctx)
 					if err != nil {
 						panic(err)
 					}
@@ -298,6 +286,7 @@ func AddToStream(
 				for clientId, _ := range streamKey.Edges() {
 					streamHopsKey := clientStreamHopsKey(clientId)
 					r.Expire(ctx, streamHopsKey, ttl)
+					r.Expire(ctx, clientEventIdKey(clientId), clientEventIdTtl)
 				}
 			}
 		}
@@ -380,33 +369,16 @@ func RemoveFromStream(ctx context.Context, contractId server.Id) (streamId serve
 
 			if finalSize == 0 {
 				for clientId, edges := range streamKey.Edges() {
-					eventId, err := r.Incr(ctx, clientEventIdKey(clientId)).Result()
-					if err != nil {
-						panic(err)
-					}
-
+					// bump the per-client hops version (PEERS2.md
+					// dirty-counter + poll; no pubsub delivery)
 					streamHopsKey := clientStreamHopsKey(clientId)
-					pipe := r.TxPipeline()
-
-					event := &StreamHopEvent{
-						StreamHopEventType: StreamHopEventTypeRemoved,
-						EventId:            eventId,
-					}
-
 					streamHop := NewStreamHop(edges[0], edges[1], streamId)
+
+					pipe := r.TxPipeline()
+					pipe.Incr(ctx, clientEventIdKey(clientId))
 					pipe.SRem(ctx, streamHopsKey, streamHop.Bytes())
-					event.StreamHops = append(event.StreamHops, streamHop)
-
-					buf := bytes.NewBuffer(nil)
-					encoder := gob.NewEncoder(buf)
-					err = encoder.Encode(event)
-					if err != nil {
-						panic(err)
-					}
-					eventBytes := buf.Bytes()
-					pipe.SPublish(ctx, clientStreamHopEvents(clientId), eventBytes)
-
-					_, err = pipe.Exec(ctx)
+					pipe.Expire(ctx, clientEventIdKey(clientId), clientEventIdTtl)
+					_, err := pipe.Exec(ctx)
 					if err != nil {
 						panic(err)
 					}
@@ -422,8 +394,8 @@ func RemoveFromStream(ctx context.Context, contractId server.Id) (streamId serve
 func GetStream(ctx context.Context, contractId server.Id) (streamId server.Id, key streamKey, ok bool) {
 	server.Redis(ctx, func(r server.RedisClient) {
 		pipe := r.TxPipeline()
-		streamIdCmd := r.Get(ctx, contractStreamId(contractId))
-		streamKeyCmd := r.Get(ctx, contractStreamKey(contractId))
+		streamIdCmd := pipe.Get(ctx, contractStreamId(contractId))
+		streamKeyCmd := pipe.Get(ctx, contractStreamKey(contractId))
 		_, err := pipe.Exec(ctx)
 		if err == server.RedisNil {
 			return
@@ -525,22 +497,29 @@ type StreamHopEvent struct {
 }
 
 type StreamHopListener struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	clientId    server.Id
-	callback    func(*StreamHopEvent)
-	pollTimeout time.Duration
+	ctx           context.Context
+	cancel        context.CancelFunc
+	clientId      server.Id
+	callback      func(*StreamHopEvent)
+	pollInterval  time.Duration
+	fullReadEvery int
 }
 
-func NewStreamHopListener(ctx context.Context, clientId server.Id, callback func(*StreamHopEvent), pollTimeout time.Duration) *StreamHopListener {
+// NewStreamHopListener polls the client's hops version counter every
+// `pollInterval` (jittered ±20%) and emits a Reset event with the full hop
+// set whenever the counter moved (PEERS2.md). Every `fullReadEvery`-th tick
+// full-reads unconditionally as insurance against a missed bump. No
+// subscriptions, no standing connections.
+func NewStreamHopListener(ctx context.Context, clientId server.Id, callback func(*StreamHopEvent), pollInterval time.Duration, fullReadEvery int) *StreamHopListener {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	shl := &StreamHopListener{
-		ctx:         cancelCtx,
-		cancel:      cancel,
-		clientId:    clientId,
-		callback:    callback,
-		pollTimeout: pollTimeout,
+		ctx:           cancelCtx,
+		cancel:        cancel,
+		clientId:      clientId,
+		callback:      callback,
+		pollInterval:  pollInterval,
+		fullReadEvery: fullReadEvery,
 	}
 	go server.HandleError(shl.run)
 	return shl
@@ -549,59 +528,60 @@ func NewStreamHopListener(ctx context.Context, clientId server.Id, callback func
 func (self *StreamHopListener) run() {
 	defer self.cancel()
 
-	messages, unsub := server.Subscribe(self.ctx, clientStreamHopEvents(self.clientId))
-	defer unsub()
-
-	// the last processed event id
-	// event ids start at 1
+	// the last synced version. `!=` (never `<`): the counter moves backward
+	// when it ttl-expires (clientEventIdTtl) or the db is flushed — any
+	// mismatch resyncs from a full read. (The v1 `<` comparison could go
+	// permanently stale across a counter reset.)
 	var eventId int64
+	synced := false
 
-	reset := func() {
-		if resetEventId, resetStreamHops := GetStreamHops(self.ctx, self.clientId); eventId < resetEventId {
+	// full-read and deliver the current snapshot. `force` delivers even when
+	// the version matches the last synced value — used by the insurance tick,
+	// which must self-heal drift the version comparison cannot see (a missed
+	// bump, or a counter that ttl-expires and restarts at a value already
+	// synced).
+	reset := func(force bool) {
+		resetEventId, resetStreamHops := GetStreamHops(self.ctx, self.clientId)
+		if !synced || force || resetEventId != eventId {
+			synced = true
 			eventId = resetEventId
 
 			resetEvent := &StreamHopEvent{
 				StreamHopEventType: StreamHopEventTypeReset,
 				EventId:            resetEventId,
-				StreamHops:         maps.Keys(resetStreamHops),
+				StreamHops:         slices.Collect(maps.Keys(resetStreamHops)),
 			}
 			self.callback(resetEvent)
 		}
 	}
 
-	for {
+	consecutiveErrors := 0
+	for tick := 0; ; tick += 1 {
+		// ±20% jitter spreads fleet polls; error backoff (up to 4x) keeps a
+		// sick slot from being hammered
+		interval := self.pollInterval + time.Duration((mathrand.Float64()*0.4-0.2)*float64(self.pollInterval))
+		interval <<= consecutiveErrors
+
 		select {
 		case <-self.ctx.Done():
 			return
-		case m := <-messages:
-			switch v := m.(type) {
-			case server.RedisSubscription:
-				switch v.Kind {
-				case "subscribe", "ssubscribe":
-					reset()
-				}
-			case server.RedisMessage:
-				buf := bytes.NewBuffer([]byte(v.Payload))
-				decoder := gob.NewDecoder(buf)
-				var event StreamHopEvent
-				err := decoder.Decode(&event)
-				if err == nil {
-					if eventId < event.EventId {
-						if eventId+1 == event.EventId {
-							eventId = event.EventId
-							self.callback(&event)
-						} else {
-							// a gap in delivery, reset
-							reset()
-						}
-					}
-				}
+		case <-time.After(interval):
+		}
+
+		// contain redis panics to the tick: a failed poll must never kill the
+		// listener (2026-07-15: panicked listeners died permanently and their
+		// clients silently stopped receiving updates)
+		if r := server.HandleError(func() {
+			insurance := 0 < self.fullReadEvery && tick%self.fullReadEvery == 0
+			if !synced || insurance {
+				reset(true)
+			} else if GetStreamEventId(self.ctx, self.clientId) != eventId {
+				reset(false)
 			}
-		case <-time.After(self.pollTimeout):
-			// no event, poll in case events are not being delivered
-			if eventId < GetStreamEventId(self.ctx, self.clientId) {
-				reset()
-			}
+		}); r != nil {
+			consecutiveErrors = min(consecutiveErrors+1, 2)
+		} else {
+			consecutiveErrors = 0
 		}
 	}
 }

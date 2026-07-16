@@ -9,7 +9,7 @@ import (
 
 	// "encoding/json"
 
-	// "golang.org/x/exp/maps"
+	// "maps"
 
 	"github.com/urnetwork/glog"
 
@@ -657,6 +657,26 @@ func CompletePayment(
                     paid_net_revenue_nano_cents = account_balance.paid_net_revenue_nano_cents + EXCLUDED.paid_net_revenue_nano_cents
             `,
 			paymentId,
+		))
+
+		// Mark this payment's contracts due for retention. reap_time drives the
+		// indexed reaper (RemoveCompletedContracts): a completed contract is hard
+		// deleted once now() passes reap_time. The bounded update touches only this
+		// payment's sweeps' contracts; LEAST keeps the earliest reap time when a
+		// contract is paid by more than one payment.
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
+                UPDATE transfer_contract
+                SET reap_time = LEAST(COALESCE(transfer_contract.reap_time, 'infinity'::timestamp), $2)
+                WHERE transfer_contract.contract_id IN (
+                    SELECT transfer_escrow_sweep.contract_id
+                    FROM transfer_escrow_sweep
+                    WHERE transfer_escrow_sweep.payment_id = $1
+                )
+            `,
+			paymentId,
+			server.NowUtc().Add(CompletedContractExpiration),
 		))
 	})
 	return

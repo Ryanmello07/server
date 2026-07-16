@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"gopkg.in/yaml.v3"
 
@@ -193,6 +193,11 @@ type ProxyDeviceState struct {
 	DnsResolverSettings *connect.DnsResolverSettings `json:"dns_resolver_settings"`
 }
 
+// the config mirror carries a ttl (pg proxy_device_config is the row of
+// record and GetProxyDeviceConfig falls back to it); without one these keys
+// are unevictable under volatile-ttl and accumulate per removed/idle proxy
+const proxyDeviceConfigMirrorTtl = 72 * time.Hour
+
 func proxyDeviceConfigKey(proxyId server.Id) string {
 	return fmt.Sprintf("{pd_%s}c", proxyId)
 }
@@ -238,7 +243,7 @@ func MigrateProxyDeviceConfig(ctx context.Context, blockSize int) {
 			})
 		})
 
-		proxyIds := maps.Keys(proxyDeviceConfigJsons)
+		proxyIds := slices.Collect(maps.Keys(proxyDeviceConfigJsons))
 
 		if len(proxyIds) == 0 {
 			break
@@ -256,8 +261,7 @@ func MigrateProxyDeviceConfig(ctx context.Context, blockSize int) {
 
 				server.Redis(ctx, func(r server.RedisClient) {
 
-					// no ttl
-					err := r.Set(ctx, proxyDeviceConfigKey(proxyId), proxyDeviceConfigJsons[proxyId], server.NoTtl).Err()
+					err := r.Set(ctx, proxyDeviceConfigKey(proxyId), proxyDeviceConfigJsons[proxyId], proxyDeviceConfigMirrorTtl).Err()
 					server.Raise(err)
 
 				})
@@ -380,8 +384,7 @@ func CreateProxyDeviceConfig(ctx context.Context, proxyDeviceConfig *ProxyDevice
 	}
 
 	server.Redis(ctx, func(r server.RedisClient) {
-		// no ttl
-		r.Set(ctx, proxyDeviceConfigKey(proxyDeviceConfig.ProxyId), proxyDeviceConfigJson, server.NoTtl)
+		server.Raise(r.Set(ctx, proxyDeviceConfigKey(proxyDeviceConfig.ProxyId), proxyDeviceConfigJson, proxyDeviceConfigMirrorTtl).Err())
 	})
 
 	return nil
@@ -422,7 +425,9 @@ func RemoveProxyDeviceConfig(ctx context.Context, proxyId server.Id) {
 	})
 
 	server.Redis(ctx, func(r server.RedisClient) {
-		r.Del(ctx, proxyDeviceConfigKey(proxyId))
+		// a silently failed Del would leave a stale mirror serving a removed
+		// config for up to the mirror ttl
+		server.Raise(r.Del(ctx, proxyDeviceConfigKey(proxyId)).Err())
 	})
 }
 
@@ -433,7 +438,9 @@ func GetProxyDeviceConfig(ctx context.Context, proxyId server.Id) *ProxyDeviceCo
 		proxyDeviceConfigJson, _ = r.Get(ctx, proxyDeviceConfigKey(proxyId)).Result()
 	})
 
-	// TODO this can be removed when older proxy_device_config before the redis set have been cleared out
+	// the redis mirror carries proxyDeviceConfigMirrorTtl, so this pg fallback
+	// is load-bearing for idle proxies whose mirror expired (not just legacy
+	// rows from before the redis set)
 	if proxyDeviceConfigJson == "" {
 		server.Db(ctx, func(conn server.PgConn) {
 			result, err := conn.Query(
@@ -622,7 +629,7 @@ func CreateProxyClient(
 	signedProxyId := SignProxyId(proxyId)
 
 	server.Tx(ctx, func(tx server.PgTx) {
-		hosts := maps.Keys(proxyConfig.Hosts)
+		hosts := slices.Collect(maps.Keys(proxyConfig.Hosts))
 		if len(hosts) == 0 {
 			returnErr = fmt.Errorf("No proxy hosts available")
 			return
@@ -631,7 +638,7 @@ func CreateProxyClient(
 
 		blockServicePorts := proxyConfig.Hosts[proxyHost]
 
-		blocks := maps.Keys(blockServicePorts)
+		blocks := slices.Collect(maps.Keys(blockServicePorts))
 		block := blocks[mathrand.Intn(len(blocks))]
 
 		servicePorts := blockServicePorts[block]
