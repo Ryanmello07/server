@@ -145,7 +145,11 @@ func ScheduleRemoveCompletedContracts(clientSession *session.ClientSession, tx s
 		&RemoveCompletedContractsArgs{},
 		clientSession,
 		task.RunOnce("remove_completed_contracts"),
-		task.RunAt(server.NowUtc().Add(1*time.Minute)),
+		// every 30 minutes: RemoveCompletedContracts drains each eligible set in
+		// bounded batches per run (see removeContractBatches), so retention keeps
+		// up without a high cadence -- the batched anti-join reapers no longer
+		// re-scan the whole old-closed contract set every minute.
+		task.RunAt(server.NowUtc().Add(30*time.Minute)),
 		task.MaxTime(30*time.Minute),
 	)
 }
@@ -191,7 +195,12 @@ func ScheduleSweepOrphanContractData(clientSession *session.ClientSession, tx se
 		&SweepOrphanContractDataArgs{},
 		clientSession,
 		task.RunOnce("sweep_orphan_contract_data"),
-		task.RunAt(server.NowUtc().Add(24*time.Hour)),
+		// weekly, anchored off-peak (~10:00 UTC): the bounded cursor sweep pages
+		// entire large child tables per pass (measured ~2% of db time for the
+		// provide_key slices alone) while finding ~zero orphans in steady state
+		// -- a weekly safety net is plenty, and `bringyourctl db sweep-orphans`
+		// covers on-demand cleanup
+		task.RunAt(nextWeeklyOffPeak(server.NowUtc())),
 		task.MaxTime(4*time.Hour),
 	)
 }
@@ -200,8 +209,15 @@ func SweepOrphanContractData(
 	sweepOrphanContractData *SweepOrphanContractDataArgs,
 	clientSession *session.ClientSession,
 ) (*SweepOrphanContractDataResult, error) {
-	limit := 50000
-	removedCount := model.SweepOrphanContractData(clientSession.Ctx, limit)
+	// Re-enabled 2026-07-14 on the bounded cursor implementation (daily safety
+	// net for orphans left by crashes mid-delete or older releases; the reap_time
+	// reaper cascades dependents with the contract delete, so steady state finds
+	// ~nothing). The model fn pages each child table by primary key in sliceSize
+	// batches, one maintenance tx per slice -- unlike the previous
+	// NOT EXISTS ... LIMIT form, which full-scanned each driver table when
+	// orphans were rare (prod incident 2026-07-14).
+	sliceSize := 50000
+	removedCount := model.SweepOrphanContractData(clientSession.Ctx, sliceSize)
 	return &SweepOrphanContractDataResult{
 		RemovedCount: removedCount,
 	}, nil

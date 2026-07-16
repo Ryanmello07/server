@@ -239,6 +239,9 @@ func verifyClientEgressKey(clientId server.Id) string {
 
 const verifyEligibleKey = "verify_eligible"
 
+// refreshed on every eligibility grant; see updateVerifyEligibleMembership
+const verifyEligibleKeyTtl = 30 * 24 * time.Hour
+
 func verifyEligibilityTokenKey(clientId server.Id) string {
 	return fmt.Sprintf("{velig_%s}", clientId)
 }
@@ -458,6 +461,12 @@ func updateVerifyEligibleMembership(
 	server.Redis(ctx, func(r server.RedisClient) {
 		if eligible {
 			r.SAdd(ctx, verifyEligibleKey, clientId.String())
+			// hygiene bound only: the whole set drops after 30d without a
+			// single eligibility grant (i.e., the system is effectively off)
+			// and rebuilds organically from announce-path re-checks. Member
+			// staleness is handled by the sampled-stale removal at sampling
+			// time; without a ttl this key is unevictable under volatile-ttl.
+			r.Expire(ctx, verifyEligibleKey, verifyEligibleKeyTtl)
 		} else {
 			r.SRem(ctx, verifyEligibleKey, clientId.String())
 		}
@@ -1637,4 +1646,39 @@ func GetVerifyProviderStats(
 		})
 	})
 	return
+}
+
+// VerifyStatsRetention is how long rolled-up verify_provider_stats rows are
+// kept. RemoveOldVerifyProviderStats deletes anything older. Mirrors
+// SearchStatsRetention -- verify_provider_stats grows per period x provider and
+// is read only for recent windows (GetStEpochClientReliability, the /stats
+// APIs), so old rows are pure storage.
+const VerifyStatsRetention = 30 * 24 * time.Hour
+
+// RemoveOldVerifyProviderStats deletes rolled-up rows older than
+// VerifyStatsRetention, in bounded batches so it never holds a long lock.
+// Driven by the RemoveOldVerifyProviderStats task. Mirrors
+// RemoveOldSearchProviderStats.
+func RemoveOldVerifyProviderStats(ctx context.Context, maxTime time.Time, limit int) {
+	minTime := maxTime.Add(-VerifyStatsRetention)
+	server.MaintenanceTx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
+			DELETE FROM verify_provider_stats
+			USING (
+			    SELECT period_start, client_id
+			    FROM verify_provider_stats
+			    WHERE period_start < $1
+			    ORDER BY period_start
+			    LIMIT $2
+			) t
+			WHERE
+			    verify_provider_stats.period_start = t.period_start AND
+			    verify_provider_stats.client_id = t.client_id
+			`,
+			minTime.UTC(),
+			limit,
+		))
+	})
 }

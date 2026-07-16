@@ -78,8 +78,26 @@ func DbVersion(ctx context.Context) int {
 	return endVersionNumber
 }
 
+// MigrationCount is the number of migrations defined locally. The version a DB
+// reaches after applying all of them is this count (versions are 1-indexed by
+// end_version_number, which equals the migration's slice index + 1).
+func MigrationCount() int {
+	return len(migrations)
+}
+
 func ApplyDbMigrations(ctx context.Context) {
-	for i := DbVersion(ctx); i < len(migrations); i += 1 {
+	ApplyDbMigrationsUpTo(ctx, len(migrations))
+}
+
+// ApplyDbMigrationsUpTo applies migrations until the DB reaches version upTo
+// (i.e. it applies the migrations at slice indices [DbVersion, upTo)). Passing
+// len(migrations) is equivalent to ApplyDbMigrations. Used by the schema audit
+// to reconstruct the schema a given recorded version is supposed to produce.
+func ApplyDbMigrationsUpTo(ctx context.Context, upTo int) {
+	if upTo > len(migrations) {
+		upTo = len(migrations)
+	}
+	for i := DbVersion(ctx); i < upTo; i += 1 {
 		MaintenanceTx(ctx, func(tx PgTx) {
 			RaisePgResult(tx.Exec(
 				ctx,
@@ -3513,7 +3531,6 @@ var migrations = []any{
             autovacuum_analyze_scale_factor = 0.02
         )
     `),
-
 	// Index for bulk client deactivation via `client_id = ANY($1) AND network_id = $2`.
 	// Both the synchronous batch path (RemoveNetworkClientsBatch, ≤10k ids) and the
 	// background task path (RemoveNetworkClientsTask, 200k ids per invocation) use
@@ -3525,5 +3542,805 @@ var migrations = []any{
 	newSqlMigration(`
         CREATE INDEX IF NOT EXISTS network_client_network_id_client_id
         ON network_client (network_id, client_id)
+    `),
+
+	// the net-escrow reconcile task (model/subscription_model.go
+	// `openEscrowReservedByBalance`, rescheduled every 5 minutes) sums open
+	// escrow per balance by joining the full transfer_escrow and
+	// transfer_contract tables filtered on `outcome IS NULL`. That predicate is
+	// deliberate: a disputed-but-unsettled contract has the generated `open`
+	// column false yet still holds its reservation, so `open` -- and every index
+	// led by it -- cannot be used. With nothing indexing `outcome`, the join
+	// falls back to a seq scan of the two largest tables on every run.
+	//
+	// This partial index carries only the live set (open + disputed-unsettled,
+	// i.e. exactly `outcome IS NULL`) -- small and roughly steady-state
+	// regardless of table growth -- and keys on contract_id so the scan
+	// enumerates it index-only and nested-loops into transfer_escrow's
+	// (contract_id, balance_id) PK.
+	//
+	// transfer_contract is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_contract_outcome_null
+        ON transfer_contract (contract_id) WHERE outcome IS NULL
+    `),
+
+	// restores the index dropped by the consolidation above (`DROP INDEX IF
+	// EXISTS transfer_contract_open_source_id_companion_contract_id`). The
+	// companion-pairing lookup in model/subscription_model.go
+	// `CreateTransferEscrow` -- run on EVERY contract creation -- finds the
+	// earliest source->dest contract with a null companion, matching either an
+	// open contract OR a recently-closed one (`open = false AND close_time >=
+	// $3`) and taking the earliest by create_time (LIMIT 1). Without this index
+	// the closed branch degrades to scanning the pair's full closed-contract
+	// history (or, via transfer_contract_create_time, an unbounded ordered scan
+	// when the pair has no match) on that hot path. The composite makes both
+	// branches a tight range: (open, source_id, destination_id,
+	// companion_contract_id) equality plus the close_time range, with
+	// create_time/contract_id trailing for the ORDER BY ... LIMIT 1 and an
+	// index-only result.
+	//
+	// transfer_contract is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_contract_open_source_id_companion_contract_id
+        ON transfer_contract (open, source_id, destination_id, companion_contract_id, close_time, create_time, contract_id)
+    `),
+
+	// restores the covering index dropped by the consolidation
+	// (`DROP INDEX IF EXISTS network_client_network_id_active_client_id`, which
+	// swapped it for `network_client_active_network_id_create_time (active,
+	// network_id, create_time)` -- that serves the filter but does not cover
+	// client_id). The StatsProviders active-provider enumeration
+	// (model/provider_model.go: `SELECT client_id FROM network_client JOIN
+	// provide_key ... WHERE network_id = $1 AND active = true GROUP BY
+	// client_id`) then heap-fetches client_id per active client before the
+	// semi-join; for large provider networks that dominates. With (network_id,
+	// active, client_id) the network_client side is index-only and feeds
+	// client_id straight into the provide_key PK (client_id, provide_mode)
+	// semi-join.
+	//
+	// network_client is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_client_network_id_active_client_id
+        ON network_client (network_id, active, client_id)
+    `),
+
+	// covering index for the provider-payout stats scan (model/provider_model.go
+	// StatsProviders: `SUM(payout_net_revenue_nano_cents) FROM
+	// transfer_escrow_sweep ... WHERE sweep_time >= $2`, joined to
+	// transfer_contract for destination_id). The plain (sweep_time) index below
+	// made that a range scan plus a heap fetch per row; this carries contract_id
+	// and the summed payout in the index, so the sweep side is index-only and
+	// only the transfer_contract PK join touches a heap. It leads with
+	// sweep_time, so it strictly supersedes transfer_escrow_sweep_sweep_time
+	// (dropped next) -- every (sweep_time) lookup is a prefix of this one.
+	//
+	// Created before the drop so the sweep_time scan never loses coverage.
+	// transfer_escrow_sweep is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_escrow_sweep_sweep_time_covering
+        ON transfer_escrow_sweep (sweep_time, contract_id, payout_net_revenue_nano_cents)
+    `),
+	newSqlMigration(`
+        DROP INDEX IF EXISTS transfer_escrow_sweep_sweep_time
+    `),
+
+	// candidate scan for the idle top-level client reap
+	// (model/network_client_model.go `RemoveDisconnectedNetworkClients`, run
+	// every 5 minutes). Each batch marks active top-level clients unseen for
+	// TopLevelClientIdleExpiration inactive: `active = true AND source_client_id
+	// IS NULL AND auth_time < $1`, LIMIT, inside the UPDATE ... SET active =
+	// false transaction. No existing index serves that predicate globally -- the
+	// network_client_network_id_top_level partial has the right WHERE but is
+	// keyed on network_id, and the reap does not filter by network -- so the
+	// subquery scanned the entire active top-level population and heap-fetched
+	// auth_time per row, holding ROW EXCLUSIVE on network_client for the scan's
+	// duration (colliding with DDL on the table and pinning the xmin horizon so
+	// autovacuum could not keep up). This partial is keyed on auth_time over
+	// exactly the reap's (active, top-level) set, so a batch is a bounded ordered
+	// range scan (oldest auth_time first) that stops at LIMIT. It is tiny and
+	// self-maintaining: a row leaves it the moment the reap flips active = false.
+	// Pair with `ORDER BY auth_time` in the reap subquery so the plan is the
+	// ordered range scan.
+	//
+	// network_client is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_client_idle_top_level_auth_time
+        ON network_client (auth_time) WHERE (active = true AND source_client_id IS NULL)
+    `),
+
+	// hard-reap of inactive clients (model/network_client_model.go
+	// `RemoveDisconnectedNetworkClients`, every 5 minutes): DELETE ... WHERE
+	// COALESCE(deactivate_time, create_time) < $1 AND active = false. No index
+	// served it -- `active = false` seeks only via (active, network_id,
+	// create_time) whose reap key is create_time, not the COALESCE expression --
+	// so it scanned the entire active = false band (now fed by the mark step
+	// above), evaluating COALESCE per row, unbatched, holding locks on the hot
+	// table. This functional partial index over exactly the inactive set makes
+	// the (now batched) delete an ordered range scan, oldest deactivation first.
+	//
+	// network_client is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_client_inactive_reap_time
+        ON network_client (COALESCE(deactivate_time, create_time)) WHERE (active = false)
+    `),
+
+	// targeted cascades delete the proxy change-log by proxy_id
+	// (model/network_client_proxy_model.go RemoveProxyDeviceConfig,
+	// model/network_client_model.go removeProxyClientData): `DELETE FROM
+	// proxy_client_change WHERE proxy_id = $1 / = ANY($1)`. The table had only
+	// its PK (proxy_host, block, change_id), so proxy_id was unindexed and every
+	// proxy-config removal / client reap seq-scanned the whole change log. (The
+	// reads use the PK prefix and are unaffected.)
+	//
+	// proxy_client_change is large: pre-create this manually with CREATE INDEX
+	// CONCURRENTLY out of band (see FIXME above); the IF NOT EXISTS gate makes
+	// this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS proxy_client_change_proxy_id
+        ON proxy_client_change (proxy_id)
+    `),
+
+	// st_event is the on-chain subnet event log (PK (block_number, log_index)),
+	// growing unboundedly with the chain. model/st_model.go SumStDepositedRao
+	// (`WHERE kind = 'Deposited'`, per deposit-idempotency check) and
+	// GetHeadBoundCkeysInEpoch (`WHERE kind IN (...) AND block_number <= $1
+	// ORDER BY block_number, log_index`, every epoch close) both scanned the
+	// whole log because `kind` was unindexed. Leading with kind bounds both to
+	// the matching events, with block_number/log_index giving the range bound
+	// and the ordering. Pre-create CONCURRENTLY out of band if the log is large.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS st_event_kind_block
+        ON st_event (kind, block_number, log_index)
+    `),
+
+	// GetStEpochClientReliability (model/st_model.go) selects the epoch's rollup
+	// rows by interval overlap: `WHERE $1 < period_end AND period_start < $2`.
+	// The only indexed side was `period_start < $2` (PK leads with period_start),
+	// an unbounded-below range that at epoch close scans almost the whole table;
+	// the selective bound `period_end > $1` led no index. This indexes period_end
+	// so the recent-tail bound drives the scan. NOTE: verify_provider_stats has
+	// no retention task and grows per period x provider -- a reap (mirroring
+	// RemoveOldSearchProviderStats) is still recommended.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS verify_provider_stats_period_end
+        ON verify_provider_stats (period_end)
+    `),
+
+	// CancelHungAccountPayments (model/account_payment_model.go, daily): `UPDATE
+	// account_payment SET canceled = true ... WHERE NOT completed AND NOT
+	// canceled AND create_time < $1`. No index served it; it scanned the whole
+	// non-completed band, which grows monotonically (canceled rows stay
+	// completed = false and account_payment is never deleted). This partial
+	// indexes exactly the truly-pending set, ordered by create_time so the scan
+	// is a tight range that stops early.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS account_payment_pending_create_time
+        ON account_payment (create_time) WHERE (NOT completed AND NOT canceled)
+    `),
+
+	// UpdateClientReliabilityScores (model/network_client_reliability_model.go)
+	// prunes superseded rows: `DELETE FROM client_connection_reliability_score
+	// WHERE lookback_index = $1 AND max_block_number != $2`, once per lookback
+	// each pass. The PK leads with client_id, so lookback_index was unindexed and
+	// the delete seq-scanned the whole score table. This lets it seek
+	// lookback_index = $1 and skip the current max_block_number. (The
+	// network_connection_reliability_score / _window_score siblings delete on
+	// `max_block_number != $1` with no equality anchor -- an index cannot serve a
+	// bare !=, and they are small, so they are left as-is.)
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS client_connection_reliability_score_lookback_max_block
+        ON client_connection_reliability_score (lookback_index, max_block_number)
+    `),
+
+	// the child-client reap (model/network_client_model.go
+	// RemoveDisconnectedNetworkClients) deletes clients with a parent unseen
+	// since minClientTime: `auth_time < $1 AND source_client_id IS NOT NULL AND
+	// no live connection`. The inactive-reap partial added above is the OPPOSITE
+	// predicate (source_client_id IS NULL), so this branch had no index and
+	// seq-scanned the whole table every 5 minutes. This partial covers exactly
+	// the child set; pair with the batched DELETE in the reap.
+	//
+	// network_client is large: pre-create CONCURRENTLY out of band; IF NOT
+	// EXISTS makes this a no-op once pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_client_child_reap_auth_time
+        ON network_client (auth_time) WHERE (source_client_id IS NOT NULL)
+    `),
+
+	// GetOverlappingTransferBalance (model/subscription_model.go, Google Play
+	// renewal) looks up a paid balance by purchase_token overlapping an expiry.
+	// The exact-fit index was dropped as "unused" (migration line 1882) but the
+	// path is live; without it every renewal seq-scans transfer_balance (one of
+	// the largest tables). Restored as a partial -- only paid balances carry a
+	// token.
+	//
+	// transfer_balance is large: pre-create CONCURRENTLY out of band.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_balance_purchase_token
+        ON transfer_balance (purchase_token, end_time, start_time, balance_id) WHERE purchase_token IS NOT NULL
+    `),
+
+	// GetAccountWalletByCircleId (model/account_wallet_model.go, Circle webhook)
+	// filters account_wallet by circle_wallet_id, which was added without an
+	// index -> seq scan per call. Partial since most wallets have no circle id.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS account_wallet_circle_wallet_id
+        ON account_wallet (circle_wallet_id) WHERE circle_wallet_id IS NOT NULL
+    `),
+
+	// GetAllSeekerHolders (model/account_wallet_model.go, payout planning + the
+	// daily free-grant path) filters `has_seeker_token = true`, unindexed ->
+	// seq scan. Seeker holders are a small subset, so this partial is tiny.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS account_wallet_seeker_network
+        ON account_wallet (network_id) WHERE has_seeker_token
+    `),
+
+	// referral cap-checks (model/network_referral_model.go CreateNetworkReferral,
+	// model/network_referral_code_model.go ValidateReferralCode) filter
+	// `referral_network_id = $1`. That column lost all coverage when the
+	// composite PK was reduced to (network_id) (migration line 1749), so these
+	// hot referral paths seq-scan network_referral.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_referral_referral_network_id
+        ON network_referral (referral_network_id)
+    `),
+
+	// GetCircleUCByCircleUCUserId (model/circle_wallet_model.go, Circle webhook)
+	// filters circle_uc by circle_uc_user_id; PK is (network_id), so it is
+	// unindexed -> seq scan.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS circle_uc_circle_uc_user_id
+        ON circle_uc (circle_uc_user_id)
+    `),
+
+	// the by-address auth-attempt lookback (model/auth_model_attempt.go) filters
+	// `client_address_hash = $1 AND attempt_time >= X ORDER BY attempt_time
+	// DESC`. The existing (client_address_hash, client_address_port,
+	// attempt_time) index has the unconstrained port column between the hash and
+	// the time, so it can seek the hash but cannot bound attempt_time or serve
+	// the order -- it reads all history for the hash and sorts. This drops the
+	// port so the range/order is index-served.
+	//
+	// user_auth_attempt is large: pre-create CONCURRENTLY out of band.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS user_auth_attempt_client_address_hash_attempt_time
+        ON user_auth_attempt (client_address_hash, attempt_time)
+    `),
+
+	// reaper seq-scans: each of these deletes an old tail by a time column that
+	// is not the leading (or any) index column, so the maintenance task scans
+	// the whole growing table each run. A plain index on the time column makes
+	// each an ordered range delete.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS wallet_auth_challenge_attempt_attempt_time
+        ON wallet_auth_challenge_attempt (attempt_time)
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS user_auth_verify_verify_time
+        ON user_auth_verify (verify_time)
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS provide_key_change_change_time
+        ON provide_key_change (change_time)
+    `),
+	// the expired-intent cleanup filters `expires_at < $1 AND tx_signature IS
+	// NULL`; the existing partial leads with payment_reference, so it scans every
+	// unpaid intent. This partial leads with expires_at over the same unpaid set.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS solana_payment_intent_expires_at
+        ON solana_payment_intent (expires_at) WHERE tx_signature IS NULL
+    `),
+
+	// audit stats (ComputeStats90) aggregations filter `event_type IN (...)`, but
+	// event_type was in none of the _stats_ indexes, so each windowed scan heap-
+	// fetched every row just to test event_type -- defeating an index-only scan
+	// even though the other selected columns are already in-key. INCLUDE
+	// event_type so the aggregations are index-only. This also makes the
+	// audit_device_event stats index distinct from its identical PK (it was a
+	// pure duplicate before). Each is dropped and recreated with the same name.
+	//
+	// deferred value: the /stats routes are gated, and index-only scans also
+	// need the visibility map that only VACUUM sets on these never-vacuumed
+	// tables -- so this pays off once stats re-enable and the audit tables are
+	// vacuumed. These tables (esp. audit_contract_event) are large: DROP then
+	// CREATE CONCURRENTLY out of band; the IF EXISTS/IF NOT EXISTS gates make the
+	// migrations no-ops once done.
+	newSqlMigration(`DROP INDEX IF EXISTS audit_provider_event_stats_device_id`),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS audit_provider_event_stats_device_id
+        ON audit_provider_event (event_time, device_id, event_id) INCLUDE (event_type)
+    `),
+	newSqlMigration(`DROP INDEX IF EXISTS audit_extender_event_stats_extender_id`),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS audit_extender_event_stats_extender_id
+        ON audit_extender_event (event_time, extender_id, event_id) INCLUDE (event_type)
+    `),
+	newSqlMigration(`DROP INDEX IF EXISTS audit_network_event_stats_network_id`),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS audit_network_event_stats_network_id
+        ON audit_network_event (event_time, network_id, event_id) INCLUDE (event_type)
+    `),
+	newSqlMigration(`DROP INDEX IF EXISTS audit_device_event_stats_device_id`),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS audit_device_event_stats_device_id
+        ON audit_device_event (event_time, device_id, event_id) INCLUDE (event_type)
+    `),
+	newSqlMigration(`DROP INDEX IF EXISTS audit_contract_event_stats`),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS audit_contract_event_stats
+        ON audit_contract_event (event_time, transfer_byte_count, transfer_packets) INCLUDE (event_type)
+    `),
+	newSqlMigration(`DROP INDEX IF EXISTS audit_contract_event_stats_extender_id`),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS audit_contract_event_stats_extender_id
+        ON audit_contract_event (event_time, extender_id, transfer_byte_count, transfer_packets) INCLUDE (event_type)
+    `),
+
+	// RemoveExpiredWalletNonces (model/auth_wallet_nonce_model.go) reaps by
+	// expire_time; auth_wallet_nonce had only its PK (nonce), so the reaper
+	// seq-scanned. The table is live-written by the no-auth AuthWalletNonceCreate
+	// route and had no reaper task wired at all, so it grew unboundedly -- now
+	// batched + scheduled, driven by this index.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS auth_wallet_nonce_expire_time
+        ON auth_wallet_nonce (expire_time)
+    `),
+
+	// RemoveOldNetworkReliabilityWindow reaps network_connection_reliability_window
+	// by bucket_number, which is the SECOND PK column (PK is (network_id,
+	// bucket_number)) with no other index -> full PK scan. This indexes
+	// bucket_number so the reap is an ordered range scan (paired with ORDER BY
+	// bucket_number in the query).
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_connection_reliability_window_bucket_number
+        ON network_connection_reliability_window (bucket_number)
+    `),
+
+	// AddProTransferBalanceToAllNetworks (model/subscription_model.go) finds the
+	// active supporters: `subscription_type = 'supporter' AND start_time <= now
+	// AND now < end_time`, across all networks. The composite
+	// subscription_renewal index leads with network_id, so it can't seek this
+	// network-less filter -> full scan. This partial indexes the supporter subset
+	// by end_time (the selective in-window bound), start_time trailing for the
+	// filter.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS subscription_renewal_supporter_window
+        ON subscription_renewal (end_time, start_time) WHERE subscription_type = 'supporter'
+    `),
+
+	// RefreshVerifyProxyEgress (model/verify_model.go) reads `SELECT client_id,
+	// client_ipv4 FROM proxy_client WHERE client_ipv4 IS NOT NULL` each refresh;
+	// client_ipv4 leads no index -> full scan. This partial (covering both
+	// selected columns) makes it an index-only scan of just the assigned-ipv4
+	// rows.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS proxy_client_client_ipv4
+        ON proxy_client (client_id, client_ipv4) WHERE client_ipv4 IS NOT NULL
+    `),
+
+	// Back out the per-table autovacuum reloptions set earlier (v420 pending_task,
+	// v447-v454 the contract-chain and client-lifecycle tables) and return every
+	// table to the database-default autovacuum behavior. RESET reverts each named
+	// storage parameter to its cluster default; it is a no-op for a parameter that
+	// is not currently set, so these are safe regardless of which of the SET
+	// migrations a given database actually applied.
+	newSqlMigration(`
+        ALTER TABLE pending_task RESET (
+            autovacuum_vacuum_scale_factor,
+            autovacuum_vacuum_cost_delay,
+            autovacuum_analyze_scale_factor
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE contract_close RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_vacuum_threshold,
+            autovacuum_vacuum_insert_scale_factor,
+            autovacuum_vacuum_insert_threshold,
+            autovacuum_analyze_scale_factor,
+            autovacuum_analyze_threshold
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_contract RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_vacuum_threshold,
+            autovacuum_vacuum_insert_scale_factor,
+            autovacuum_vacuum_insert_threshold,
+            autovacuum_analyze_scale_factor,
+            autovacuum_analyze_threshold
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_vacuum_threshold,
+            autovacuum_vacuum_insert_scale_factor,
+            autovacuum_vacuum_insert_threshold,
+            autovacuum_analyze_scale_factor,
+            autovacuum_analyze_threshold
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow_sweep RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_vacuum_threshold,
+            autovacuum_vacuum_insert_scale_factor,
+            autovacuum_vacuum_insert_threshold,
+            autovacuum_analyze_scale_factor,
+            autovacuum_analyze_threshold
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE network_client_location_reliability RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_vacuum_threshold,
+            autovacuum_vacuum_insert_scale_factor,
+            autovacuum_vacuum_insert_threshold,
+            autovacuum_analyze_scale_factor,
+            autovacuum_analyze_threshold
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE network_client RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_analyze_scale_factor
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE provide_key RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_analyze_scale_factor
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE device RESET (
+            autovacuum_vacuum_cost_delay,
+            autovacuum_vacuum_scale_factor,
+            autovacuum_analyze_scale_factor
+        )
+    `),
+
+	// Denormalize transfer_contract.destination_id onto transfer_escrow_sweep so
+	// the provider-payout stats (model/provider_model.go StatsProviders et al.)
+	// filter and group by destination_id AND sweep_time on ONE table, instead of
+	// range-scanning every sweep in the window and PK-joining transfer_contract
+	// just to recover destination_id. settleEscrowInTx stamps it on new sweeps;
+	// existing rows are backfilled by `bringyourctl backfill sweep-destination-id`.
+	// Nullable (no default), so the ADD COLUMN is a fast metadata-only change;
+	// old/orphan sweeps stay NULL and are excluded by the stats filter until
+	// backfilled or reaped.
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow_sweep ADD COLUMN destination_id uuid NULL
+    `),
+	// Covering index for the per-destination payout window scan: leads with
+	// (destination_id, sweep_time) for the filter and carries the summed payout,
+	// so the scan is index-only. transfer_escrow_sweep is large: pre-create this
+	// manually with CREATE INDEX CONCURRENTLY out of band; the IF NOT EXISTS gate
+	// makes this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_escrow_sweep_destination_id_sweep_time
+        ON transfer_escrow_sweep (destination_id, sweep_time) INCLUDE (payout_net_revenue_nano_cents)
+    `),
+
+	// Indexed reap-eligibility for the transfer_contract retention reaper. reap_time
+	// is the instant a contract becomes due for hard deletion: it is set to
+	// complete_time + CompletedContractExpiration when the contract's payment
+	// completes (CompletePayment), and to now() when an aged closed-but-never-
+	// completed straggler is marked by the retention task. The reaper then deletes
+	// by an index range-scan over reap_time instead of the old un-indexable
+	// anti-join full scan over the whole old-closed table that caused a prod
+	// incident. Nullable (no default), so the ADD COLUMN is a fast metadata-only
+	// change; existing rows are seeded by `bringyourctl db backfill-contract-reap-time`.
+	newSqlMigration(`
+        ALTER TABLE transfer_contract ADD COLUMN reap_time timestamp NULL
+    `),
+	// Partial index driving the reaper's delete pass (reap_time IS NOT NULL AND
+	// reap_time < now): only due/pending contracts are indexed, so the scan is a
+	// bounded range. transfer_contract is a large table: pre-create this manually
+	// with CREATE INDEX CONCURRENTLY out of band; the IF NOT EXISTS gate makes this
+	// migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_contract_reap_time
+        ON transfer_contract (reap_time) WHERE reap_time IS NOT NULL
+    `),
+	// Partial index driving the reaper's assign pass (closed contracts not yet
+	// reaped, ordered by create_time), so the straggler scan is a bounded range
+	// instead of an anti-join. Same pre-create-CONCURRENTLY note as above.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_contract_reap_pending_create_time
+        ON transfer_contract (create_time) WHERE reap_time IS NULL AND close_time IS NOT NULL
+    `),
+	// Per-request wallet lookups (MarkWalletSeekerHolder: UPDATE account_wallet
+	// WHERE wallet_address = $1 AND network_id = $2) had no usable index —
+	// account_wallet's other indexes lead with wallet_id or active — so every
+	// call seq-scanned account_wallet. This composite matches both equality
+	// predicates for an index seek. account_wallet can be large: pre-create
+	// manually with CREATE INDEX CONCURRENTLY out of band; the IF NOT EXISTS gate
+	// makes this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS account_wallet_wallet_address_network_id
+        ON account_wallet (wallet_address, network_id)
+    `),
+
+	// Rolling incremental reliability-score maintenance
+	// (UpdateClientReliabilityRunningInTx, model/network_client_reliability_model.go).
+	// Instead of re-scanning the whole lookback window of the
+	// ~hundreds-of-millions-row client_reliability table on every run, the score
+	// computations keep a running per-(client, lookback) sum of the
+	// location-INDEPENDENT reliability contributions and advance it by only the
+	// blocks that entered/left the window since the last run, anchored by a
+	// periodic full recompute. A drained block's client_reliability rows are
+	// immutable (block finality + idempotent absolute-count drain) and
+	// valid_client_count is block-local, so a block's per-client contribution is
+	// deterministic; add-on-entry and subtract-on-exit therefore cancel exactly
+	// (modulo float associativity, reset by the recompute). #1
+	// (client_connection_reliability_score) and #3
+	// (network_connection_reliability_window_score) are written from this table
+	// joined to network_client_location_reliability at write time, so location
+	// stays query-time (no semantic change vs the old full-window query).
+	//
+	// running per-client, location-independent sums; one row per (client, lookback)
+	newSqlMigration(`
+        CREATE TABLE client_reliability_running (
+            client_id uuid NOT NULL,
+            lookback_index int NOT NULL,
+            network_id uuid NOT NULL,
+            independent_sum double precision NOT NULL,
+            reliability_sum double precision NOT NULL,
+
+            PRIMARY KEY (client_id, lookback_index)
+        )
+    `),
+
+	// per-lookback applied window bounds + recompute marker: the prior [min, max)
+	// the rolling maintenance diffs against, and the block the last full recompute
+	// anchored the sums at.
+	newSqlMigration(`
+        CREATE TABLE client_reliability_running_window (
+            lookback_index int NOT NULL,
+            min_block_number bigint NOT NULL,
+            max_block_number bigint NOT NULL,
+            last_recompute_block bigint NOT NULL,
+
+            PRIMARY KEY (lookback_index)
+        )
+    `),
+
+	// The payout planner (planPayments) re-picks sweeps whose payment was
+	// canceled (CancelHungAccountPayments sets canceled=true but does not null the
+	// sweep's payment_id). The payout query's canceled UNION arm drives from the
+	// small canceled set joined to sweeps by payment_id; this partial index over
+	// just the canceled rows makes finding those payment_ids an index-only scan
+	// instead of a seq scan of account_payment. account_payment is large: pre-
+	// create manually with CREATE INDEX CONCURRENTLY out of band; the IF NOT
+	// EXISTS gate makes this migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS account_payment_canceled_payment_id
+        ON account_payment (payment_id) WHERE canceled
+    `),
+
+	// Consecutive-error count for task reschedules, driving exponential backoff
+	// (task.go). Without it every task error retried within RescheduleTimeout
+	// (~2s) forever: 8k payment tasks stuck on an external 429 rate limit
+	// produced ~65 error-reschedule updates/sec, churning pending_task to ~94%
+	// dead tuples and degrading the poll query (observed at 39% of all db exec
+	// time). The count resets naturally when the task completes (row moves to
+	// finished_task and is deleted). pending_task is small, so the ADD COLUMN
+	// with default is instant.
+	newSqlMigration(`
+        ALTER TABLE pending_task ADD COLUMN reschedule_error_count int NOT NULL DEFAULT 0
+    `),
+
+	// Deliberate, targeted re-add of eager autovacuum for pending_task only,
+	// after the 2026-07-13 blanket backout of per-table autovacuum tuning
+	// (v494-502). pending_task is a small (~13k live rows) queue table churned by
+	// every task claim/reschedule; at default autovacuum it was measured at ~94%
+	// dead tuples, which degraded the poll query (ORDER BY available_block ...
+	// FOR UPDATE SKIP LOCKED) to 646ms mean = 39% of all db exec time. The
+	// reschedule backoff reduces the churn, but the queue head still needs eager
+	// vacuuming to keep the poll index clean. Same settings the table had before
+	// the backout.
+	newSqlMigration(`
+        ALTER TABLE pending_task SET (
+            autovacuum_vacuum_scale_factor = 0.01,
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_analyze_scale_factor = 0.02
+        )
+    `),
+
+	// Deliberate, targeted re-add of the per-table autovacuum tuning for the
+	// high-churn large tables, after the 2026-07-13 blanket backout (v494-502).
+	// Evidence from prod 2026-07-14: transfer_contract sat at 67M dead tuples
+	// (the paced reap drain's wake) with autovacuum idle, because the default
+	// scale factor (0.2) does not trigger until 122M dead on a 612M-row table --
+	// dead-tuple debt accumulates for days while every query on the table
+	// degrades. The fixed 5M-dead thresholds below (the same settings the
+	// tables had before the backout) trigger vacuum at a bounded absolute debt
+	// regardless of table size. Settings are identical to the historical
+	// migrations that were RESET.
+	newSqlMigration(`
+        ALTER TABLE contract_close SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0,
+            autovacuum_vacuum_threshold = 5000000,
+            autovacuum_vacuum_insert_scale_factor = 0,
+            autovacuum_vacuum_insert_threshold = 10000000,
+            autovacuum_analyze_scale_factor = 0,
+            autovacuum_analyze_threshold = 1000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_contract SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0,
+            autovacuum_vacuum_threshold = 5000000,
+            autovacuum_vacuum_insert_scale_factor = 0,
+            autovacuum_vacuum_insert_threshold = 10000000,
+            autovacuum_analyze_scale_factor = 0,
+            autovacuum_analyze_threshold = 1000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0,
+            autovacuum_vacuum_threshold = 5000000,
+            autovacuum_vacuum_insert_scale_factor = 0,
+            autovacuum_vacuum_insert_threshold = 10000000,
+            autovacuum_analyze_scale_factor = 0,
+            autovacuum_analyze_threshold = 1000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow_sweep SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0,
+            autovacuum_vacuum_threshold = 5000000,
+            autovacuum_vacuum_insert_scale_factor = 0,
+            autovacuum_vacuum_insert_threshold = 10000000,
+            autovacuum_analyze_scale_factor = 0,
+            autovacuum_analyze_threshold = 1000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE network_client_location_reliability SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0,
+            autovacuum_vacuum_threshold = 5000000,
+            autovacuum_vacuum_insert_scale_factor = 0,
+            autovacuum_vacuum_insert_threshold = 10000000,
+            autovacuum_analyze_scale_factor = 0,
+            autovacuum_analyze_threshold = 1000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE network_client SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0.01,
+            autovacuum_analyze_scale_factor = 0.02
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE provide_key SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0.01,
+            autovacuum_analyze_scale_factor = 0.02
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE device SET (
+            autovacuum_vacuum_cost_delay = 0,
+            autovacuum_vacuum_scale_factor = 0.01,
+            autovacuum_analyze_scale_factor = 0.02
+        )
+    `),
+
+	// Pace the giant-table vacuums. The fixed 5M thresholds above (restored
+	// 2026-07-14) combined with cost_delay = 0 re-created the debt-clearing
+	// behavior, but during the reap-drain era the cascade giants re-qualify
+	// every couple of hours, and three concurrent full-speed vacuums of
+	// multi-hundred-GB tables evict the buffer cache under live traffic
+	// (observed: 130+ backends in BufferMapping LWLock waits). Two changes:
+	// (1) the pure cascade victims (contract_close, transfer_escrow,
+	// transfer_escrow_sweep) tolerate far more dead space than the
+	// query-critical transfer_contract, so their trigger rises to 25M dead
+	// (<1% of table) / 50M inserts; (2) all four giants get the standard
+	// autovacuum cost_delay = 2ms pacing (~80MB/s) instead of unthrottled.
+	// Small hot tables (pending_task, network_client, ...) keep delay 0.
+	newSqlMigration(`
+        ALTER TABLE contract_close SET (
+            autovacuum_vacuum_cost_delay = 2,
+            autovacuum_vacuum_threshold = 25000000,
+            autovacuum_vacuum_insert_threshold = 50000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow SET (
+            autovacuum_vacuum_cost_delay = 2,
+            autovacuum_vacuum_threshold = 25000000,
+            autovacuum_vacuum_insert_threshold = 50000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_escrow_sweep SET (
+            autovacuum_vacuum_cost_delay = 2,
+            autovacuum_vacuum_threshold = 25000000,
+            autovacuum_vacuum_insert_threshold = 50000000
+        )
+    `),
+	newSqlMigration(`
+        ALTER TABLE transfer_contract SET (
+            autovacuum_vacuum_cost_delay = 2
+        )
+    `),
+
+	// Dedicated pair-lookup index for the contract-creation hot path (the
+	// "existing open contract for this (source, destination) pair" check, ~68
+	// calls/sec): equality on the pair + ORDER BY create_time LIMIT 1 walks this
+	// index natively and stops at the first live entry. The previous plan went
+	// through the wider open_source_id index without create_time (sort over all
+	// matches), which degraded ~5x under heavy close churn as dead entries
+	// accumulated between vacuum index-cleanup cycles (observed 115ms -> 597ms =
+	// 76% of all db time). The partial predicate keeps the index tiny (only
+	// open, non-companion contracts). transfer_contract is large: PRE-CREATE
+	// MANUALLY with CREATE INDEX CONCURRENTLY out of band — a plain build here
+	// takes a SHARE lock that blocks all contract writes for the scan; the
+	// IF NOT EXISTS gate makes this migration a no-op once pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_contract_pair_open_create_time
+        ON transfer_contract (source_id, destination_id, create_time)
+        WHERE open AND companion_contract_id IS NULL
+    `),
+
+	// Drop the never-read handler_id index from the hottest insert path.
+	// Verified on prod 2026-07-15: 349 MB, idx_scan = 0 (lifetime), while
+	// network_client_connection sustains hundreds of inserts/sec that each
+	// maintain it. Its intended consumer (the handler-crash cleanup in
+	// network_client_model.go, which deletes by handler_id via a temp-table
+	// join) planned a seq scan of this <= few-million-row table anyway, so the
+	// drop changes no read plan. Pre-drop manually with
+	// DROP INDEX CONCURRENTLY out of band (a plain drop takes a brief ACCESS
+	// EXCLUSIVE on the table and must queue behind in-flight queries); the
+	// IF EXISTS gate makes this migration a no-op once pre-dropped.
+	newSqlMigration(`
+        DROP INDEX IF EXISTS network_client_connection_handler_id
+    `),
+
+	// The open-contract lookups for a client (`WHERE open AND (source_id = $1
+	// OR destination_id = $1)`, the per-client contract-sync path at ~6 calls/s)
+	// have no open-leading destination index on prod: the destination arm
+	// bitmap-scans `transfer_contract_destination_id_close_time` with only
+	// destination_id in the index condition, reading the client's ENTIRE
+	// contract history (whales: millions of entries) and filtering `open` at
+	// the heap -- measured 72ms mean for ~1.5 rows returned. This partial index
+	// contains only open contracts, so the arm becomes a direct seek.
+	// transfer_contract is large: pre-create manually with CREATE INDEX
+	// CONCURRENTLY out of band; the IF NOT EXISTS gate makes this migration a
+	// no-op once pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS transfer_contract_open_destination_partial
+        ON transfer_contract (destination_id) WHERE open
     `),
 }

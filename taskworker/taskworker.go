@@ -51,7 +51,9 @@ func InitTasks(ctx context.Context) {
 		work.ScheduleWarmNetworkGetProviderLocations(clientSession, tx)
 		work.ScheduleRemoveExpiredAuthAttempts(clientSession, tx)
 		work.ScheduleRemoveExpiredWalletAuthChallenges(clientSession, tx)
+		work.ScheduleRemoveExpiredWalletNonces(clientSession, tx)
 		work.ScheduleRemoveOldAuditNetworkEvents(clientSession, tx)
+		work.ScheduleRemoveOldAuditEvents(clientSession, tx)
 		work.ScheduleRemoveOldClientReliabilityStats(clientSession, tx)
 		work.ScheduleRollupClientReliabilityStats(clientSession, tx)
 		work.ScheduleUpdateClientReliabilityScores(clientSession, tx)
@@ -66,6 +68,7 @@ func InitTasks(ctx context.Context) {
 		work.ScheduleCleanupExpiredPaymentIntents(clientSession, tx)
 		work.ScheduleSweepVerifyTrails(clientSession, tx)
 		work.ScheduleRollupVerifyProviderStats(clientSession, tx)
+		work.ScheduleRemoveOldVerifyProviderStats(clientSession, tx)
 		work.ScheduleRollupSearchProviderStats(clientSession, tx)
 		work.ScheduleRemoveOldSearchProviderStats(clientSession, tx)
 		work.ScheduleRefreshVerifyProxyEgress(clientSession, tx)
@@ -219,8 +222,17 @@ func InitTaskWorker(ctx context.Context) *task.TaskWorker {
 			"github.com/urnetwork/server/taskworker/work.RemoveExpiredWalletAuthChallenges",
 		),
 		task.NewTaskTargetWithPost(
+			work.RemoveExpiredWalletNonces,
+			work.RemoveExpiredWalletNoncesPost,
+			"github.com/urnetwork/server/taskworker/work.RemoveExpiredWalletNonces",
+		),
+		task.NewTaskTargetWithPost(
 			work.RemoveOldAuditNetworkEvents,
 			work.RemoveOldAuditNetworkEventsPost,
+		),
+		task.NewTaskTargetWithPost(
+			work.RemoveOldAuditEvents,
+			work.RemoveOldAuditEventsPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.RemoveOldClientReliabilityStats,
@@ -293,6 +305,10 @@ func InitTaskWorker(ctx context.Context) *task.TaskWorker {
 		task.NewTaskTargetWithPost(
 			work.RemoveOldSearchProviderStats,
 			work.RemoveOldSearchProviderStatsPost,
+		),
+		task.NewTaskTargetWithPost(
+			work.RemoveOldVerifyProviderStats,
+			work.RemoveOldVerifyProviderStatsPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.RefreshVerifyProxyEgress,

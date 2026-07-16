@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"math"
+	"slices"
 	// "io"
 	"math/rand"
 	"net"
@@ -22,7 +23,7 @@ import (
 
 	// "runtime/debug"
 
-	"golang.org/x/exp/maps"
+	"maps"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urnetwork/glog"
@@ -176,6 +177,21 @@ type ExchangeSettings struct {
 
 	ExchangeResidentTtl time.Duration
 
+	// 2026-07-15: network peers disabled during the pubsub outage; the v2
+	// dirty-counter + poll architecture (PEERS2.md) replaces pubsub delivery
+	// entirely — re-enable rides the PEERS2 canary rollout. Gates
+	// registration (announce), heartbeat refresh, teardown publish, and the
+	// listener.
+	EnableNetworkPeers bool
+
+	// dirty-counter poll cadence for the per-resident listeners (PEERS2.md):
+	// each tick is one GET on the entity's slot (jittered ±20%), with a full
+	// read only on version mismatch or every ListenerFullReadEvery-th tick
+	// (insurance against a missed bump)
+	NetworkPeersPollInterval time.Duration
+	StreamHopsPollInterval   time.Duration
+	ListenerFullReadEvery    int
+
 	ExchangeResidentWaitTimeout time.Duration
 	ExchangeResidentPollTimeout time.Duration
 
@@ -241,6 +257,10 @@ func DefaultExchangeSettingsWithBufferSize(bufferSize int) *ExchangeSettings {
 		ExchangeWriteHeaderTimeout:         exchangeResidentWaitTimeout,
 		ExchangeReconnectAfterErrorTimeout: 1 * time.Second,
 		ExchangeResidentTtl:                300 * time.Second,
+		EnableNetworkPeers:                 false,
+		NetworkPeersPollInterval:           5 * time.Second,
+		StreamHopsPollInterval:             5 * time.Second,
+		ListenerFullReadEvery:              10,
 
 		ExchangeResidentWaitTimeout: exchangeResidentWaitTimeout,
 		ExchangeResidentPollTimeout: 15 * time.Second,
@@ -400,7 +420,7 @@ func (self *Exchange) NominateLocalResident(
 		ResidentHost:          self.host,
 		ResidentService:       self.service,
 		ResidentBlock:         self.block,
-		ResidentInternalPorts: maps.Keys(self.hostToServicePorts),
+		ResidentInternalPorts: slices.Collect(maps.Keys(self.hostToServicePorts)),
 	}
 	nominated := model.NominateResident(
 		self.ctx,
@@ -419,25 +439,11 @@ func (self *Exchange) NominateLocalResident(
 		instanceId,
 		residentId,
 	)
-	if resident.peerNetworkId != nil {
-		if resident.peerCategory == model.NetworkPeerCategoryProxy {
-			// proxy clients are counted but not visible peers
-			model.AddNetworkProxyPeer(
-				self.ctx,
-				*resident.peerNetworkId,
-				clientId,
-				self.settings.ExchangeResidentTtl,
-			)
-		} else {
-			model.AddNetworkPeer(
-				self.ctx,
-				*resident.peerNetworkId,
-				resident.peerProfile,
-				residentId,
-				self.settings.ExchangeResidentTtl,
-			)
-		}
-	}
+	// note: initial peer registration happens in ConnectionAnnounce.run once
+	// the connection survives the announce window (2026-07-15: registration
+	// on the nomination hot path melted pubsub under connection churn and
+	// hung nominations against memory-full redis nodes). The heartbeat below
+	// maintains and re-adds the registration for the resident's lifetime.
 	go server.HandleError(func() {
 		defer func() {
 			cleanupCtx := context.Background()
@@ -446,7 +452,10 @@ func (self *Exchange) NominateLocalResident(
 				clientId,
 				resident.residentId,
 			)
-			if resident.peerNetworkId != nil {
+			// RemoveNetworkPeer no-ops (no publish) when this resident never
+			// registered, so churny residents that died before announcing
+			// emit nothing here
+			if self.settings.EnableNetworkPeers && resident.peerNetworkId != nil {
 				if resident.peerCategory == model.NetworkPeerCategoryProxy {
 					model.RemoveNetworkProxyPeer(
 						cleanupCtx,
@@ -530,10 +539,12 @@ func (self *Exchange) NominateLocalResident(
 			// `ForwardIdleTimeout`), and without a refresh the registration
 			// expires after `ExchangeResidentTtl` and other residents prune
 			// it to a disconnect marker, bounding disconnect detection.
-			if resident.peerNetworkId != nil && 0 < resident.TransportCount() {
+			if self.settings.EnableNetworkPeers && resident.peerNetworkId != nil && 0 < resident.TransportCount() {
 				server.HandleError(func() {
 					if resident.peerCategory == model.NetworkPeerCategoryProxy {
-						// AddNetworkProxyPeer doubles as the heartbeat
+						// AddNetworkProxyPeer doubles as the heartbeat, and is
+						// also the initial proxy registration (proxy clients
+						// do not pass through ConnectionAnnounce)
 						model.AddNetworkProxyPeer(self.ctx, *resident.peerNetworkId, clientId, self.settings.ExchangeResidentTtl)
 						return
 					}
@@ -1006,7 +1017,7 @@ func (self *Exchange) Drain() {
 			// active connections with potential residents
 			for clientId, handleCancels := range self.connections {
 				resident := self.residents[clientId]
-				return resident, maps.Values(handleCancels), n - 1, true
+				return resident, slices.Collect(maps.Values(handleCancels)), n - 1, true
 			}
 			// residents without active connections
 			for _, resident := range self.residents {
@@ -2101,20 +2112,22 @@ func (self *Resident) Run() {
 				self.client.Send(frame, connect.DestinationId(connect.Id(self.clientId)), nil)
 			},
 		).Event,
-		self.exchange.settings.StreamPollTimeout,
+		self.exchange.settings.StreamHopsPollInterval,
+		self.exchange.settings.ListenerFullReadEvery,
 	)
 	defer streamHopListener.Close()
 
 	// only top-level client-category peers get network peer updates.
-	// The listener sends the complete list on subscribe (reset) and diffs
-	// after. Proxy clients are counted but not subscribed — a hosted device
-	// does not consume the peer list.
-	if self.peerNetworkId != nil && self.peerCategory == model.NetworkPeerCategoryClient {
+	// The listener polls the per-network version counter and sends the
+	// complete list on any change (PEERS2.md). Proxy clients are counted but
+	// get no listener — a hosted device does not consume the peer list.
+	if self.exchange.settings.EnableNetworkPeers && self.peerNetworkId != nil && self.peerCategory == model.NetworkPeerCategoryClient {
 		networkPeerListener := model.NewNetworkPeerListener(
 			self.ctx,
 			*self.peerNetworkId,
 			self.handleNetworkPeerEvent,
-			self.exchange.settings.StreamPollTimeout,
+			self.exchange.settings.NetworkPeersPollInterval,
+			self.exchange.settings.ListenerFullReadEvery,
 		)
 		defer networkPeerListener.Close()
 	}
@@ -2599,7 +2612,7 @@ func (self *Resident) Close() {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		forwards = maps.Values(self.forwards)
+		forwards = slices.Collect(maps.Values(self.forwards))
 		clear(self.forwards)
 	}()
 	for _, forward := range forwards {
