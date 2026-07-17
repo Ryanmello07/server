@@ -1,2 +1,6 @@
-min_connections: 2
+authority: "redis:6379"
+password: "79bfbb4f0882e1437824710a22cc2637"
+db: 0
+cluster: false
+min_connections: 1
 max_connections: 10
