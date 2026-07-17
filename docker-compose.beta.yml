@@ -4,7 +4,9 @@ services:
     restart: unless-stopped
     env_file:
       - ./beta-vault/beta-secrets.env
-    # No host port binding; only needed inside the Docker network.
+    # ⚠️ DATA PERSISTENCE: uses a named volume (postgres_data) that survives
+    # 'docker compose up --force-recreate'. It is DESTROYED by 'docker compose down -v'
+    # or 'docker compose rm -v postgres'. Use ./beta-db-backup.sh before volatile ops.
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -31,6 +33,7 @@ services:
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
+    restart: no
     environment:
       WARP_ENV: local
       WARP_BLOCK: local
@@ -131,4 +134,7 @@ services:
       - ./beta-vault:/srv/warp:ro
 
 volumes:
+  # ⚠️ Named volume that persists Postgres data across container restarts.
+  # Deleting this volume destroys ALL user data. Back up before teardown:
+  #   ./beta-db-backup.sh
   postgres_data:
