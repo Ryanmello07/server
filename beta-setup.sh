@@ -80,7 +80,8 @@ tls_key_paths:
 EOF
 
     cat > "$VAULT/password.yml" <<EOF
-pepper: "${PASSWORD_PEPPER}"
+password:
+  pepper: "${PASSWORD_PEPPER}"
 EOF
 
     cat > "$VAULT/client.yml" <<EOF
