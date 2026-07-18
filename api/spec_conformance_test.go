@@ -78,8 +78,6 @@ func registry() []specEndpoint {
 		{"POST", "/auth/network-delete", nil, rt(controller.NetworkRemoveResult{})},
 		{"POST", "/auth/code-create", rt(model.AuthCodeCreateArgs{}), rt(model.AuthCodeCreateResult{})},
 		{"POST", "/auth/code-login", rt(model.AuthCodeLoginArgs{}), rt(model.AuthCodeLoginResult{})},
-		{"POST", "/auth/upgrade-guest", rt(model.UpgradeGuestArgs{}), rt(model.UpgradeGuestResult{})},
-		{"POST", "/auth/upgrade-guest-existing", rt(model.UpgradeGuestExistingArgs{}), rt(model.UpgradeGuestExistingResult{})},
 
 		{"POST", "/network/auth-client", rt(model.AuthNetworkClientArgs{}), rt(model.AuthNetworkClientResult{})},
 		{"POST", "/network/remove-client", rt(model.RemoveNetworkClientArgs{}), rt(model.RemoveNetworkClientResult{})},
