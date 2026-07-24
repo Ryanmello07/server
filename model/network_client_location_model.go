@@ -1470,7 +1470,20 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 
 	        FROM network_client_location_reliability
 
-	        INNER JOIN client_connection_reliability_score ON
+	        -- fix(beta): this was an INNER JOIN upstream, which requires a
+	        -- client to already have a row in client_connection_reliability_score
+	        -- (populated by a separate multi-stage rollup: raw events -> redis
+	        -- drain -> client_reliability_running -> reliability scores) before
+	        -- it counts toward any provider location at all. At small/cold-start
+	        -- scale (this self-contained beta env) that rollup chain can go
+	        -- indefinitely without producing a single row even though real,
+	        -- currently-connected/valid clients exist -- the INNER JOIN then
+	        -- discards every one of them, and /network/provider-locations comes
+	        -- back completely empty despite real providers being connected.
+	        -- LEFT JOIN counts a location from connected+valid alone, which is
+	        -- real, already-verified data (see SetConnectionLocation), without
+	        -- waiting on the reliability-scoring pipeline to catch up.
+	        LEFT JOIN client_connection_reliability_score ON
 	        	client_connection_reliability_score.client_id = network_client_location_reliability.client_id AND
 				client_connection_reliability_score.lookback_index = 0
 

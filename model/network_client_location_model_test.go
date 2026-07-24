@@ -1198,3 +1198,97 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 		connect.AssertEqual(t, len(res.Providers), n)
 	})
 }
+
+// fix(beta): UpdateClientLocations must count a client toward its location
+// from network_client_location_reliability (connected + valid) alone, even
+// when client_connection_reliability_score has no row for it at all -- that
+// table is populated by a separate multi-stage rollup (raw events -> redis
+// drain -> client_reliability_running -> reliability scores) that, at
+// small/cold-start scale, can go indefinitely without producing a single
+// row even though real, currently-connected/valid clients exist. Upstream
+// used an INNER JOIN here, which silently produced an empty provider
+// locations list in that scenario despite real data existing; this asserts
+// the beta-only LEFT JOIN keeps counting it.
+func TestUpdateClientLocationsCountsClientsWithoutReliabilityScores(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+
+		handlerId := CreateNetworkClientHandler(ctx)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connect.AssertEqual(t, err, nil)
+
+		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
+		connect.AssertEqual(t, err, nil)
+
+		// populates network_client_location_reliability straight from the
+		// live connection tables -- independent of, and deliberately without
+		// ever touching, the reliability-scoring pipeline below
+		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
+
+		// confirm the bug scenario is actually set up: a real connected+valid
+		// row exists, but no reliability score row does
+		var connectedAndValid bool
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`SELECT connected AND valid FROM network_client_location_reliability WHERE client_id = $1`,
+				clientId,
+			)
+			server.WithPgResult(result, err, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&connectedAndValid))
+				}
+			})
+		})
+		connect.AssertEqual(t, connectedAndValid, true)
+
+		var scoreCount int
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`SELECT COUNT(*) FROM client_connection_reliability_score WHERE client_id = $1`,
+				clientId,
+			)
+			server.WithPgResult(result, err, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&scoreCount))
+				}
+			})
+		})
+		connect.AssertEqual(t, scoreCount, 0)
+
+		err = UpdateClientLocations(ctx, time.Hour)
+		connect.AssertEqual(t, err, nil)
+
+		initialClientLocations, err := loadInitialClientLocations(ctx)
+		connect.AssertEqual(t, err, nil)
+		if initialClientLocations == nil {
+			t.Fatal("expected a populated client locations cache, got nil")
+		}
+
+		// the top-level locations list is country-level entries only (city
+		// and region roll up into a country entry's TopCityLocationIdCounts
+		// / TopRegionLocationIdCounts, see UpdateClientLocations), so the
+		// country this client's city belongs to is what must show up here.
+		found := false
+		for _, clientLocation := range initialClientLocations.Locations {
+			if clientLocation.LocationId == city.CountryLocationId {
+				found = true
+			}
+		}
+		connect.AssertEqual(t, found, true)
+	})
+}
