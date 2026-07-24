@@ -2418,13 +2418,21 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	            network_client_location_reliability.max_bytes_per_second,
 	            network_client_location_reliability.has_latency_test,
 	            network_client_location_reliability.has_speed_test,
-	            client_connection_reliability_score.lookback_index,
-	            client_connection_reliability_score.reliability_weight,
-	            client_connection_reliability_score.independent_reliability_weight
+	            -- fix(beta): see the LEFT JOIN comment below
+	            COALESCE(client_connection_reliability_score.lookback_index, 0),
+	            COALESCE(client_connection_reliability_score.reliability_weight, 1),
+	            COALESCE(client_connection_reliability_score.independent_reliability_weight, 1)
 
 	        FROM network_client_location_reliability
 
-	        INNER JOIN client_connection_reliability_score ON
+	        -- fix(beta): same class of issue as UpdateClientLocations above --
+	        -- an INNER JOIN here requires a reliability score to already exist
+	        -- before a client counts toward its location's stability filter at
+	        -- all, which the reliability-scoring pipeline may never produce at
+	        -- this env's small/cold-start scale. LEFT JOIN plus the COALESCE
+	        -- defaults above treats an unscored client as neutral (full
+	        -- weight, lookback 0) rather than excluding it outright.
+	        LEFT JOIN client_connection_reliability_score ON
 	        	client_connection_reliability_score.client_id = network_client_location_reliability.client_id
 	        WHERE
 	        	network_client_location_reliability.connected = true AND
@@ -2473,13 +2481,17 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		            network_client_location_reliability.max_bytes_per_second,
 		            network_client_location_reliability.has_latency_test,
 		            network_client_location_reliability.has_speed_test,
-		            client_connection_reliability_score.lookback_index,
-	                client_connection_reliability_score.reliability_weight,
-	                client_connection_reliability_score.independent_reliability_weight
+		            COALESCE(client_connection_reliability_score.lookback_index, 0),  -- fix(beta): see LEFT JOIN comment below
+	                COALESCE(client_connection_reliability_score.reliability_weight, 1),
+	                COALESCE(client_connection_reliability_score.independent_reliability_weight, 1)
 
 	            FROM network_client_location_reliability
 
-	            INNER JOIN client_connection_reliability_score ON
+	            -- fix(beta): same class of issue as UpdateClientLocations/the query
+            -- above this one -- treats an unscored client as neutral rather
+            -- than excluding it, since the reliability-scoring pipeline may
+            -- never populate at this env's small/cold-start scale
+            LEFT JOIN client_connection_reliability_score ON
 	        		client_connection_reliability_score.client_id = network_client_location_reliability.client_id
 
 	            LEFT JOIN location_group_member location_group_member_city ON

@@ -1292,3 +1292,79 @@ func TestUpdateClientLocationsCountsClientsWithoutReliabilityScores(t *testing.T
 		connect.AssertEqual(t, found, true)
 	})
 }
+
+// fix(beta): GetProviderLocations has a second filter beyond
+// UpdateClientLocations -- it only shows a location if loadLocationStables
+// has an entry for it, which is populated by UpdateClientScores. That
+// function had the identical INNER JOIN-against-client_connection_reliability_score
+// pattern (twice), so fixing UpdateClientLocations alone was not sufficient:
+// the locations list stayed empty because this second stage still silently
+// dropped every location with no scored clients. This asserts the
+// beta-only LEFT JOIN + COALESCE defaults keep an unscored client counted
+// here too.
+func TestUpdateClientScoresCountsClientsWithoutReliabilityScores(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+
+		handlerId := CreateNetworkClientHandler(ctx)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connect.AssertEqual(t, err, nil)
+
+		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
+		connect.AssertEqual(t, err, nil)
+
+		// good latency and speed tests so the quality score gate passes and
+		// the reliability-score join is what's actually being tested here
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`INSERT INTO network_client_latency (connection_id, latency_ms, sample_count) VALUES ($1, $2, $3)`,
+				connectionId, 30, 1,
+			))
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`INSERT INTO network_client_speed (connection_id, bytes_per_second, sample_count) VALUES ($1, $2, $3)`,
+				connectionId, 100*1024*1024, 1,
+			))
+		})
+
+		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
+
+		// confirm the bug scenario: no reliability score row for this client
+		var scoreCount int
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`SELECT COUNT(*) FROM client_connection_reliability_score WHERE client_id = $1`,
+				clientId,
+			)
+			server.WithPgResult(result, err, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&scoreCount))
+				}
+			})
+		})
+		connect.AssertEqual(t, scoreCount, 0)
+
+		err = UpdateClientScores(ctx, time.Hour, 1)
+		connect.AssertEqual(t, err, nil)
+
+		locationStables, err := loadLocationStables(ctx, []server.Id{city.CountryLocationId}, RankModeQuality, server.Id{})
+		connect.AssertEqual(t, err, nil)
+		_, ok := locationStables[city.CountryLocationId]
+		connect.AssertEqual(t, ok, true)
+	})
+}
