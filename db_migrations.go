@@ -4492,4 +4492,13 @@ var migrations = []any{
         CREATE INDEX IF NOT EXISTS provider_egress_location_observed_at
             ON provider_egress_location (observed_at)
     `),
+	// asn was created as int4, which tops out at 2147483647. 32-bit ASNs run to
+	// 4294967295, so anything above the int4 ceiling -- the private 4200000000+
+	// range in particular -- fails to insert and sends the ingest into a retry
+	// loop. Widen in place rather than editing the create above, which has
+	// already been applied here.
+	newSqlMigration(`
+        ALTER TABLE provider_egress_location
+            ALTER COLUMN asn TYPE bigint
+    `),
 }
