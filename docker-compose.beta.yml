@@ -133,8 +133,26 @@ services:
     volumes:
       - ./beta-vault:/srv/warp:ro
 
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # persists issued Let's Encrypt certs across restarts so a redeploy
+      # doesn't re-request them (ACME rate limits are per-domain per-week)
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - connect
+
 volumes:
   # ⚠️ Named volume that persists Postgres data across container restarts.
   # Deleting this volume destroys ALL user data. Back up before teardown:
   #   ./beta-db-backup.sh
   postgres_data:
+  caddy_data:
+  caddy_config:

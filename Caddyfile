@@ -1,0 +1,7 @@
+api.beta-test.net {
+	reverse_proxy api:8080
+}
+
+connect.beta-test.net {
+	reverse_proxy connect:80
+}

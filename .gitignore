@@ -8,3 +8,6 @@ beta-vault/vault/*.yml
 !beta-vault/vault/*.yml.example
 plans/
 .superpowers/
+
+# local beta database dumps (contain user data; never commit)
+beta-backups/
