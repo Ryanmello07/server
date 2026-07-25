@@ -11,3 +11,6 @@ plans/
 
 # local beta database dumps (contain user data; never commit)
 beta-backups/
+
+# DKIM signing keys for the beta mail server (private key must never be committed)
+beta-vault/dkim/
