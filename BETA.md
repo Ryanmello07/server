@@ -53,7 +53,7 @@ The server contains:
 
 `./beta-setup.sh` generates all sensitive material locally on first run:
 
-- `beta-vault/beta-secrets.env` — Postgres password, Redis password, JWT symmetric secret, password pepper, client IP hash pepper, and proxy signing secret.
+- `beta-vault/beta-secrets.env` — Postgres password, Redis password, JWT symmetric secret, password pepper, client IP hash pepper, proxy signing secret, and provider-egress ingest secret.
 - `beta-vault/vault/tls/*.pem` — JWT RSA and EC signing keys.
 - `beta-vault/vault/*.yml` — runtime vault files consumed by the Go services.
 
@@ -65,12 +65,15 @@ To fully rotate secrets:
 ./beta-down.sh
 rm -f beta-vault/beta-secrets.env
 rm -f beta-vault/vault/pg.yml beta-vault/vault/redis.yml beta-vault/vault/jwt.yml \
-      beta-vault/vault/password.yml beta-vault/vault/client.yml beta-vault/vault/proxy.yml
+      beta-vault/vault/password.yml beta-vault/vault/client.yml beta-vault/vault/proxy.yml \
+      beta-vault/vault/provider_egress.yml
 rm -rf beta-vault/vault/tls beta-vault/config/mmdb beta-vault/config/arindb
 ./beta-setup.sh
 ```
 
 > **Warning**: Running `./beta-down.sh` without `-v` keeps the named Docker volume, so Postgres data survives. Running `./beta-down.sh -v` deletes the volume and resets the database. Rotating secrets does not require deleting the volume, but if you also delete the data volume you will lose all user accounts and network data.
+
+> **Note**: the provider-egress-location ingest endpoint (used by an operator-run prober that learns a provider's real egress location and submits it so the server can prefer it over the built-in mmdb lookup) is disabled until `beta-vault/vault/provider_egress.yml` exists with a non-empty `ingest_secret` — `./beta-setup.sh` generates this automatically. The secret is memoized in the API process on first request, so the `api` service must be restarted after creating or rotating it: `docker compose -f docker-compose.beta.yml restart api`.
 
 ## Quick start
 
@@ -377,6 +380,7 @@ beta-vault/vault/jwt.yml
 beta-vault/vault/password.yml
 beta-vault/vault/client.yml
 beta-vault/vault/proxy.yml
+beta-vault/vault/provider_egress.yml
 beta-vault/vault/tls/jwt-rsa.pem
 beta-vault/vault/tls/jwt-rsa.pub.pem
 beta-vault/vault/tls/ec/jwt-ec.pem
