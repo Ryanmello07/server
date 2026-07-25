@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"net/netip"
 	// "strings"
 	"time"
 
@@ -56,6 +57,56 @@ func SetConnectionLocation(
 	connectionId server.Id,
 	clientIp string,
 ) error {
+	// a provider probed through its own egress is located from that probe, not
+	// from a lookup on its control-connection ip: the egress is where user
+	// traffic actually exits, and an operator-run prober learns it by routing
+	// geolocation lookups through the provider itself and cross-checking them
+	// across several sources, then submits the result here. When a fresh
+	// probed entry exists we prefer it over the built-in mmdb lookup on the
+	// control ip. GetFreshProviderEgressLocationForConnection is
+	// a single query joining network_client_connection to
+	// provider_egress_location: this runs for every connection (provider or
+	// not) on the connect-announce path and inside a retry loop, so it must
+	// not cost the two round trips (client lookup, then egress lookup) the
+	// naive version would.
+	if egress := model.GetFreshProviderEgressLocationForConnection(
+		ctx,
+		connectionId,
+		model.ProviderEgressLocationMaxAge,
+	); egress != nil {
+		scores := &model.ConnectionLocationScores{}
+		if egress.Hosting {
+			scores.NetTypeHosting = 1
+		}
+		if egress.Proxy {
+			scores.NetTypePrivacy = 1
+		}
+		if egress.Mobile {
+			scores.NetTypeVirtual = 1
+		}
+		// keep the ARIN org-vs-country foreign check on the probed path too,
+		// so a probed provider is ranked on equal terms with an equivalent
+		// unprobed one (net_type_foreign feeds the ranking columns). Compute
+		// it exactly as the mmdb path does in GetLocationForIp: the ARIN org
+		// country of the control ip against the mmdb country of that SAME
+		// control ip -- not the probed country, which is a different
+		// question (whether probing changed the answer) and must not be
+		// silently folded into this ranking penalty. Any lookup failure
+		// just leaves NetTypeForeign at 0; it must never fail or panic this
+		// path.
+		if addr, err := netip.ParseAddr(clientIp); err == nil {
+			if ipInfo, err := server.GetIpInfo(addr); err == nil {
+				scores.NetTypeForeign = arinForeignScore(addr, ipInfo.CountryCode)
+			}
+		}
+		err := model.SetConnectionLocation(ctx, connectionId, egress.LocationId, scores)
+		if err == nil {
+			return nil
+		}
+		// fall through to the mmdb path on a storage error
+		glog.Infof("[ncc][%s]could not set probed egress location. err = %s\n", connectionId, err)
+	}
+
 	location, connectionLocationScores, err := GetLocationForIp(ctx, clientIp)
 	if err != nil {
 		// server.Logger().Printf("Get ip for location error: %s", err)
