@@ -15,7 +15,13 @@ COPY ./userwireguard /workspace/userwireguard
 COPY ./sn /workspace/sn
 
 WORKDIR /workspace/server
-RUN go mod tidy && CGO_ENABLED=0 go build -o /out/ ./...
+# Build only the binaries the beta stack runs, not ./... . Upstream's
+# connect/sim-latency load-test tool targets the sdk/connect on upstream main,
+# while beta pins connect to the beta/custom-server fork, so it does not
+# compile here -- and building it is not something beta needs in order to
+# deploy.
+RUN go mod tidy && CGO_ENABLED=0 go build -o /out/ \
+    ./bringyourctl ./cli/api ./cli/connect ./cli/taskworker
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
