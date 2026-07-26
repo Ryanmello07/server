@@ -97,9 +97,10 @@ services:
     # on -- see that service for why it cannot be on `default`.
     networks:
       - default
-      - prober
-    ports:
-      - "8080:8080"
+    # No published port. Caddy terminates tls for api.beta-test.net and is the
+    # only ingress; publishing 8080 would let a client reach the api over plain
+    # http and bypass the forwarded-address headers connect and the api rely on
+    # to see the real client address.
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,10 +131,14 @@ services:
     # see the api service above for why `default` has to be repeated here
     networks:
       - default
-      - prober
-    ports:
-      - "5080:80"
-      - "15080:15080"
+    # No published ports. Caddy terminates tls for connect.beta-test.net and is
+    # the only ingress. This is load-bearing beyond transport security: connect
+    # only trusts a forwarded client address when it receives BOTH
+    # X-Forwarded-For and X-Forwarded-Source-Port (connect/transport.go:220),
+    # and otherwise falls back to the raw peer address. A client arriving on a
+    # published port presents the docker gateway address, which is private, has
+    # no mmdb entry, and yields "Unknown location type" -- so no location row is
+    # written and the provider never appears in the provider list.
     depends_on:
       postgres:
         condition: service_healthy

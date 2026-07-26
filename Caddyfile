@@ -1,7 +1,30 @@
+# connect derives every client's location from the address it sees on the
+# websocket. It only trusts a forwarded address when BOTH X-Forwarded-For and
+# X-Forwarded-Source-Port are present (connect/transport.go:220-227) -- that
+# pair is what the warp load balancer sends. Caddy sets X-Forwarded-For on its
+# own, but not the port, so connect fell through to r.RemoteAddr and saw
+# Caddy's container address (172.18.x.x) for every client. A private address
+# has no mmdb entry, so GuessLocationType returned "Unknown location type",
+# no network_client_location row was written, and no provider ever reached
+# network_client_location_reliability -- which silently emptied the provider
+# location list.
+#
+# Sending the source port restores the pair, and with it the real client
+# address. api needs it too: the same address feeds rate limiting and the
+# ARIN foreign-provider score, both of which would otherwise see one shared
+# proxy address for the entire deployment.
+(client_address) {
+	header_up X-Forwarded-Source-Port {http.request.remote.port}
+}
+
 api.beta-test.net {
-	reverse_proxy api:8080
+	reverse_proxy api:8080 {
+		import client_address
+	}
 }
 
 connect.beta-test.net {
-	reverse_proxy connect:80
+	reverse_proxy connect:80 {
+		import client_address
+	}
 }
