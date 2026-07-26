@@ -357,8 +357,8 @@ A provider is not probed the moment it appears, and being probed once is not
 permanent.
 
 1. **Probation** — a newly seen provider must demonstrate sustained reliability
-   across its first day before it is offered to anyone. Not eligible for
-   selection.
+   across the **12-hour** reliability window before it is offered to anyone. Not
+   eligible for selection.
 2. **Pending verification** — probation satisfied; a combined geo + bandwidth
    probe is scheduled at a **random** time within the window, never a fixed
    offset from graduation.
@@ -373,17 +373,25 @@ for a known probe window, and load spreads naturally across the fleet.
 
 **Two constraints this places on the rest of the design.**
 
-*Available windows.* `ClientLookbacks` is `[5m, 60m, 12h]` — there is no 24-hour
-window (a 6-day entry exists but is commented out). A literal one-day probation
-therefore needs either a new lookback entry, which adds rollup rows per client
-per window, or acceptance of the existing 12h window as the gate. This must be
-decided before the lifecycle is implemented.
+*Probation window: 12 hours (decided).* `ClientLookbacks` is `[5m, 60m, 12h]`;
+there is no 24-hour window, and the only longer entry (6 days) is commented out.
+Probation therefore uses the existing **12h** lookback rather than introducing a
+new one, which would add rollup rows for every client on every window purely to
+express a rounder number. The 12h index is already computed, already fed into
+`PassesMinimums` through `minIndependentReliabilityWeights`, and already the
+longest signal the reliability pipeline maintains — so the gate is the strongest
+evidence available, at no additional storage or write cost.
+
+The practical consequence is that a provider becomes eligible roughly half a day
+after first being seen instead of a full day. Given identity churn resets
+probation entirely (below), a shorter window is also the more forgiving choice
+for honest providers that restart.
 
 *Identity stability is now load-bearing.* Probation accrues per `client_id`, and
 **every provider restart mints a new one** — verified by restarting a real
 provider four times and observing four distinct client ids, under both the
-`auth-provide` and `provide` subcommands. A provider that restarts daily never
-accumulates a full day of history and can never graduate; with a
+`auth-provide` and `provide` subcommands. A provider that restarts more often
+than every 12 hours never accumulates a full window and can never graduate; with a
 `Restart=always` service unit this is the expected case, not an edge case. The
 same churn discards any verified location and measured bandwidth, since both are
 keyed by `client_id`.
