@@ -1858,6 +1858,13 @@ func loadInitialClientLocations(ctx context.Context) (initialClientLocations *In
 func loadLocationStables(
 	ctx context.Context,
 	locationIds []server.Id,
+	// forceMinimum selects which pre-computed key family to read. The writer
+	// (UpdateClientScores) populates both, so this only chooses between them.
+	// User-facing listing passes false and keeps today's behaviour; an operator
+	// census passes true, because a location where every provider fails the
+	// minimums gate is otherwise invisible and its providers can never be
+	// probed or graduate probation.
+	forceMinimum bool,
 	rankMode RankMode,
 	clientLocationId server.Id,
 ) (
@@ -1874,7 +1881,7 @@ func loadLocationStables(
 		for _, locationId := range locationIds {
 			locationFilterCmds[locationId] = pipe.Get(
 				ctx,
-				clientScoreLocationFilterKey(false, rankMode, locationId, clientLocationId),
+				clientScoreLocationFilterKey(forceMinimum, rankMode, locationId, clientLocationId),
 			)
 		}
 		// note ignore the error for GET since it will include missing key
@@ -1990,6 +1997,8 @@ func FindProviderLocations(
 		locationStables, _ := loadLocationStables(
 			session.Ctx,
 			slices.Collect(maps.Keys(clientLocations)),
+			// user-facing search: only surface locations that meet the bar
+			false,
 			rankMode,
 			clientLocationId,
 		)
@@ -2075,6 +2084,8 @@ func GetProviderLocations(
 	locationStables, _ := loadLocationStables(
 		session.Ctx,
 		locationIds,
+		// user-facing listing: only surface locations that meet the bar
+		false,
 		rankMode,
 		clientLocationId,
 	)
