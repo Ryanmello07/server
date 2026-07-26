@@ -31,7 +31,7 @@ code-level discipline alone (see *The jail*).
 | Question | Decision |
 | --- | --- |
 | Consequence of no fresh probe | **Advisory.** Provider stays listed, falls back to its mmdb location, and is flagged unverified. |
-| Where the prober runs | **Taskworker, in a network-namespace jail** (a separate child process). |
+| Where the prober runs | **A separate unprivileged process, confined by the deployment** (Docker network on beta, systemd `IPAddressAllow` upstream), self-verifying its confinement at startup. |
 | Tamper resistance | **Rotating identity + corroboration + multi-hop probing.** |
 | Which providers | **Public providers only** (`provide_mode = 3`). |
 
@@ -99,16 +99,39 @@ Extended, not replaced.
 
 ## The jail
 
-The prober process runs in a network namespace whose only route is the platform
-websocket endpoint. Not firewall rules inside a shared namespace — a distinct
-netns, so no route to a geolocation API exists at all.
+The prober runs confined so that no route to a geolocation API exists at all,
+rather than relying on application code to decline to use one.
 
-The Go-level fail-closed behaviour stays as defence in depth, but correctness of
-the hard constraint stops depending on it. A future refactor that introduces a
-default `http.Client` then fails loudly instead of silently leaking.
+**The prober itself requires no privileges and assumes nothing about how it is
+confined.** This matters because the deployments differ fundamentally: beta runs
+under Docker Compose, and the mainstream deployment does not use Docker at all.
+A design that depended on Docker networking, or on the process creating its own
+namespace (which would need `CAP_NET_ADMIN` on a component that today runs
+completely unprivileged), would fit one environment and break the other.
 
-The namespace is asserted by an integration test (see *Testing*), so the
-constraint is verified as infrastructure rather than trusted as code.
+Confinement is therefore supplied by the deployment, in whatever way is native
+to it:
+
+| Deployment | Mechanism |
+| --- | --- |
+| beta (Docker Compose) | a service attached only to a network that reaches the platform |
+| mainstream (no Docker) | systemd `IPAddressDeny=any` + `IPAddressAllow=<platform>`, kernel-enforced via eBPF |
+
+Neither requires the prober to hold a capability, and neither is code we have to
+keep correct.
+
+**The prober verifies its own confinement at startup.** Before doing any work it
+attempts a *direct* connection — not through a tunnel — to a known geolocation
+API address. If that connection succeeds, the confinement is not in place, and
+the prober exits non-zero without probing anything.
+
+This is the part that makes the arrangement trustworthy across environments. The
+operator's configuration is no longer an assumption the design rests on; it is a
+runtime precondition the prober refuses to run without, and it holds identically
+under Docker, systemd, or a future deployment that resembles neither.
+
+The Go-level fail-closed behaviour stays as defence in depth, so a refactor that
+introduced a default `http.Client` would fail loudly rather than leak silently.
 
 ## Identity rotation
 
@@ -294,9 +317,11 @@ project's probe population would also give an honest count.
 - **`probeverdict`**: table-driven over every rule, including RTT-impossible
   cases with real distances, and an explicit case asserting mmdb divergence does
   **not** produce `Suspect`.
-- **The jail**: an integration test asserting the namespace has *no route* to a
-  geolocation IP — the constraint verified as infrastructure, not trusted as
-  code. Complemented by a tcpdump check in staging.
+- **Confinement**: a test asserting the startup self-check fails closed — that
+  the prober exits non-zero when a direct connection to a geolocation address
+  succeeds, and proceeds when it is refused. This is the constraint verified as
+  a runtime precondition rather than trusted as configuration. Complemented by a
+  tcpdump check in staging.
 - **Multi-hop**: assert the target observes the intermediary's `source_id`, not
   the prober's.
 - **Pool guard**: assert that below `min_intermediary_pool` the probe runs direct
@@ -480,8 +505,8 @@ measured bandwidth survive a provider restart. The second is a user-visible bug
 today. The third gates everything else — without it P1's results and the
 lifecycle's probation both evaporate on restart.
 
-**P1 — Automated probing in a jail.** The `egressprober` binary, the network
-namespace, and the taskworker job. Direct probing only, single fixed identity,
+**P1 — Automated probing, confined.** The `egressprober` worker, its startup
+self-check, the deployment confinement for both environments, and the taskworker job. Direct probing only, single fixed identity,
 no verdict logic — results land exactly as they do today. Delivers the
 automation and, critically, makes the hard constraint structural.
 
