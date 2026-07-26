@@ -318,10 +318,12 @@ is throughput to our own platform, not the throughput a user gets when their
 traffic exits to the internet. Egress bandwidth is measured the same way the
 location is: through the provider's tunnel.
 
-**Shared tunnel.** The geo probe and the speed test run in one tunnel session —
-open once, geolocate (~100 KB measured), then measure throughput. Contract setup
-dominates the cost, so sharing the session roughly halves the per-provider price
-against two separate passes.
+**Opportunistically shared tunnel.** When a provider is due for both, the geo
+probe and the speed test run in one tunnel session — open once, geolocate
+(~100 KB measured), then measure throughput. Contract setup dominates the cost,
+so sharing the session roughly halves the per-provider price. The sharing is
+conditional, not automatic: see *Queueing and load*, where bandwidth is
+budget-gated and must never hold up a location refresh.
 
 **Two targets, recorded separately.** Each round measures against an
 operator-hosted endpoint *and* a public CDN object, stored as distinct columns.
@@ -336,6 +338,61 @@ whichever comes first**, and throughput is computed over the steady-state window
 after discarding the first 500 ms. Cost is hard-capped at 50 MB per provider per
 round: a fast link hits the byte cap, a slow one hits the time cap.
 
+### Bandwidth results are advisory
+
+Measured bandwidth is **recorded and never gates the market**. It does not feed
+`PassesMinimums`, it does not exclude a provider, and it does not change who is
+selected. The market keeps behaving exactly as it does today; the probe only
+adds a column.
+
+This is deliberate. Everything below about queueing means bandwidth coverage
+will be partial and uneven for a long time — providers deep in the queue may go
+days without a measurement. If an absent or stale number could gate selection,
+our own capacity limits would silently remove real supply from the market. An
+advisory number cannot cause that outage no matter how far behind the queue
+falls.
+
+### Queueing and load
+
+Every probe byte crosses the operator's own platform: the path is
+prober -> platform -> provider -> internet, so a 50 MB test costs the operator
+50 MB of `connect` throughput plus the transport encryption CPU, not just the
+provider's bandwidth. Bandwidth probing is therefore capacity-limited by the
+operator, and must never be scheduled as "probe everything that is due".
+
+**Reuse the fixed hourly bucket reservation already in this repo.**
+`model/bulk_client_removal_rate_limit.go` solves precisely this problem for bulk
+deletes and is running on beta: a deployment-wide per-hour budget
+(`BulkClientRemovalBucketDuration = time.Hour`), reservations against a specific
+`bucket_start`, a `MaxBulkClientRemovalLookaheadBuckets = 24` lookahead that
+makes the daily cap fall out of the hourly one, and a jittered `RunAt` within
+the bucket so deferred work does not stampede the hour boundary.
+
+Bandwidth probing takes the same shape, budgeted in **bytes** rather than row
+counts: each probe reserves its worst-case 50 MB against an hourly byte budget,
+and when the current hour is full it is queued into the next hour with lookahead
+rather than rejected. The operator's exposure per hour is then a configured
+constant, independent of how many providers are due.
+
+Alongside the budget, a **global concurrency cap** (default 2) limits
+simultaneous bandwidth tests. This is deliberately separate from, and much
+tighter than, the geo probe's concurrency of 4: a geo probe moves ~100 KB while
+a bandwidth test moves up to 50 MB, so one shared limit would either throttle
+geolocation pointlessly or let bandwidth saturate the platform.
+
+**Queue ordering prioritises providers with more valid connections.** Budget is
+scarce, so it goes first to providers actually carrying traffic, ordered by
+validated connection count and reliability weight, with age as the tie-break so
+nothing starves indefinitely.
+
+**This changes the shared-tunnel decision above.** Sharing one tunnel for geo and
+bandwidth is only correct when both are due *and* bandwidth budget is available.
+Binding them unconditionally would drag location freshness down to the bandwidth
+queue's much slower cadence. The rule is therefore: always run the geo probe on
+its own schedule, and attach a bandwidth test to that same tunnel opportunistically
+when the provider is due for one and has a reservation. Otherwise the tunnel
+carries geolocation alone. Bandwidth never delays a location update.
+
 **Marketplace gating is a separate decision.** Today a provider on
 `transportVersion < 2` gets `V0TestConfig()` (`connect/transport.go:380`), so no
 speed or latency test ever runs. Scoring then adds 40 for the missing latency
@@ -346,10 +403,20 @@ untested provider is mathematically guaranteed to fail the minimums gate** and
 can never be returned by `find-providers2`. That is the root cause of the
 observed "39 listed, 1 returned".
 
-Feeding egress bandwidth into the minimums would therefore admit those providers
-to the market for the first time. That is likely desirable, but it changes who
-receives user traffic and earns, so it is called out as its own decision rather
-than riding in on a geolocation change.
+**This project does not fix that**, and that must not be misread. Because
+measured bandwidth is advisory, it does not satisfy the minimums, so providers on
+`transportVersion < 2` stay excluded from `find-providers2` exactly as they are
+today. Recording an egress bandwidth number for a provider the market will never
+return is still useful — it is the evidence needed to decide the gating question
+later — but nobody should expect this work to put those 36 providers into
+service.
+
+Admitting them requires a separate, deliberate decision: either let a measured
+egress bandwidth satisfy the minimums, or stop penalising a provider for tests
+that its transport version makes it structurally incapable of running. The
+second is arguably the real bug — the current rule punishes providers for a
+protocol version rather than for anything they did — but either way it changes
+who receives user traffic and earns, so it is out of scope here.
 
 ## Provider lifecycle
 
@@ -431,7 +498,11 @@ behaviour, honestly recorded as `assurance = 'direct'`.
 ## Out of scope
 
 - Turning on the hard gate.
+- Letting measured bandwidth satisfy `PassesMinimums`, and the related question
+  of whether a provider should be penalised for tests its transport version
+  cannot run. Both change who earns.
 - Cross-operator sharing or attestation of probe results.
 - Probing non-public providers, which would require a protocol change giving
   every provider a counterparty it cannot refuse.
-- Automatic action on `suspect` verdicts.
+- Automatic action on `suspect` verdicts, including
+  `bandwidth_divergence`.
