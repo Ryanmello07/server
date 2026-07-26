@@ -97,6 +97,7 @@ services:
     # on -- see that service for why it cannot be on `default`.
     networks:
       - default
+      - prober
     # No published port. Caddy terminates tls for api.beta-test.net and is the
     # only ingress; publishing 8080 would let a client reach the api over plain
     # http and bypass the forwarded-address headers connect and the api rely on
@@ -131,6 +132,7 @@ services:
     # see the api service above for why `default` has to be repeated here
     networks:
       - default
+      - prober
     # No published ports. Caddy terminates tls for connect.beta-test.net and is
     # the only ingress. This is load-bearing beyond transport security: connect
     # only trusts a forwarded client address when it receives BOTH

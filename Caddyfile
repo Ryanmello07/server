@@ -14,6 +14,14 @@
 # ARIN foreign-provider score, both of which would otherwise see one shared
 # proxy address for the entire deployment.
 (client_address) {
+	# connect trusts X-UR-Forwarded-For ahead of everything else
+	# (connect/transport.go:220) and the api derives the session client address
+	# from the same value. A proxy passes client headers through verbatim, so
+	# with Caddy as the sole ingress any client could send this header and pin
+	# itself to an address of its choosing -- forging its provider location and
+	# evading the per-address rate limits. Strip it on the way in; only the
+	# warp load balancer is entitled to set it, and it is not in this path.
+	header_up -X-UR-Forwarded-For
 	header_up X-Forwarded-Source-Port {http.request.remote.port}
 }
 
