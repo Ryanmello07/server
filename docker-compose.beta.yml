@@ -91,6 +91,13 @@ services:
       BRINGYOUR_REDIS_HOSTNAME: redis
       WARP_HOME: /srv/warp
     command: ["api", "--port=8080"]
+    # `default` must stay listed: naming any network at all stops compose from
+    # attaching the default one implicitly, and postgres, redis and caddy are
+    # all on it. `prober` is the internal-only network the egress-prober lives
+    # on -- see that service for why it cannot be on `default`.
+    networks:
+      - default
+      - prober
     ports:
       - "8080:8080"
     depends_on:
@@ -120,6 +127,10 @@ services:
       WARP_HOME: /srv/warp
       WARP_PORTS: "80:5080,15080:15080"
     command: ["connect", "--port=80"]
+    # see the api service above for why `default` has to be repeated here
+    networks:
+      - default
+      - prober
     ports:
       - "5080:80"
       - "15080:15080"
@@ -132,6 +143,99 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./beta-vault:/srv/warp:ro
+
+  # Operator-run prober. For each provider it opens a tunnel THROUGH that
+  # provider and asks public geolocation APIs what address they see, so the
+  # server learns the provider's real egress location.
+  #
+  # It must never be able to reach those APIs directly. A direct lookup would
+  # record THIS host's location for the provider and hand the operator's own
+  # address to third-party APIs. That is what the `prober` network below is
+  # for: it is `internal: true`, so the container has no default route, no NAT
+  # and no path off the docker bridge. It reaches `api` and `connect` and
+  # nothing else.
+  #
+  # The confinement IS the network attachment. Do not add this service to
+  # `default`, do not publish ports from it, and never pass
+  # --skip-confinement-check: a check disabled in a config file is not a check.
+  # The prober verifies its own confinement at startup and exits non-zero if it
+  # can reach a geolocation address, so a wrong network stops the prober
+  # instead of silently leaking.
+  #
+  # Not started by default (profile `prober`), because it needs a network
+  # client jwt that only an operator can mint. Start it explicitly:
+  #   docker compose -f docker-compose.beta.yml up -d --no-deps egress-prober
+  egress-prober:
+    profiles:
+      - prober
+    build:
+      # The prober lives in its own repo. Clone it next to this one (the same
+      # urnetwork parent directory Dockerfile.beta builds from), or point
+      # PROBER_CONTEXT at the checkout:
+      #   git clone https://github.com/Ryanmello07/urnetwork-operator-proxy.git
+      context: ${PROBER_CONTEXT:-../urnetwork-operator-proxy}
+      # Its go.mod replaces github.com/urnetwork/connect and .../glog with
+      # ../connect and ../glog, so those two checkouts have to be in the build
+      # as well. Named contexts keep each one small -- a single context over
+      # the whole urnetwork parent directory is ~1.6G to transfer.
+      additional_contexts:
+        connect: ${CONNECT_CONTEXT:-../connect}
+        glog: ${GLOG_CONTEXT:-../glog}
+      dockerfile_inline: |
+        FROM golang:1.26.5-alpine AS build
+        # layout mirrors the local urnetwork monorepo so the ../ replaces resolve
+        WORKDIR /src/urnetwork-operator-proxy
+        COPY . .
+        COPY --from=connect / /src/connect
+        COPY --from=glog / /src/glog
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/egress-prober ./cmd/egress-prober
+        FROM alpine:3
+        RUN apk add --no-cache ca-certificates
+        COPY --from=build /out/egress-prober /usr/local/bin/egress-prober
+        # the prober needs no privileges: the provider tunnel is a userspace
+        # gvisor netstack, not a kernel tun device
+        USER 65534:65534
+        ENTRYPOINT ["egress-prober"]
+    restart: unless-stopped
+    networks:
+      - prober
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # UR_PROBER_BY_JWT and UR_OPERATOR_SECRET. Kept out of the command line so
+    # they never appear in `docker inspect` args or in ps inside the container.
+    # required:false so the whole compose project still loads before an
+    # operator has created the file.
+    env_file:
+      - path: ./beta-vault/prober.env
+        required: false
+    command:
+      - --api-url=http://api:8080
+      - --platform-url=ws://connect:80/
+      - --interval=1h
+      - --concurrency=2
+      - --probe-timeout=60s
+      - --confinement-timeout=3s
+      # DNS vs -confinement-address, for this environment: an `internal: true`
+      # docker network cannot resolve external names at all -- docker's
+      # embedded resolver answers SERVFAIL because it has no route to forward
+      # the query. The startup self-check would then resolve none of the
+      # geolocation hosts, obtain no evidence either way, and REFUSE TO START
+      # (ErrNoEvidence): being unable to verify is not evidence of confinement.
+      # So we hand it the addresses to dial instead of asking it to resolve
+      # them, which keeps the check real inside a jail where dns is blocked.
+      #
+      # These are a second copy of the endpoint list and can go stale. Keep
+      # them in step with the hosts the prober prints on every start
+      # ("geolocation hosts: ..."); re-resolve with
+      #   for h in ip.pn free.freeipapi.com ipinfo.io; do getent ahostsv4 $h; done
+      # A stale address weakens the check (it tests an IP nobody serves any
+      # more) but can never produce a false "not confined".
+      - --confinement-address=134.119.216.174:443  # ip.pn
+      - --confinement-address=104.21.94.136:443    # free.freeipapi.com (cloudflare)
+      - --confinement-address=172.67.168.79:443    # free.freeipapi.com (cloudflare)
+      - --confinement-address=34.117.59.81:443     # ipinfo.io
 
   caddy:
     image: caddy:2-alpine
@@ -148,6 +252,15 @@ services:
     depends_on:
       - api
       - connect
+
+networks:
+  # The egress-prober's confinement. `internal: true` gives containers on this
+  # network no gateway and no NAT, so nothing attached to it can reach the
+  # internet -- only the other containers that are also on it (api, connect).
+  # Removing `internal: true`, or adding another network to the prober, undoes
+  # the confinement; the prober's startup self-check is what catches that.
+  prober:
+    internal: true
 
 volumes:
   # ⚠️ Named volume that persists Postgres data across container restarts.

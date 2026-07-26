@@ -3,6 +3,8 @@ beta-vault/config/**/*.mmdb
 beta-vault/vault/tls/**/*.pem
 beta-vault/vault/tls/**/*.pub.pem
 beta-vault/beta-secrets.env
+# egress-prober client jwt and operator secret; the .example template is tracked
+beta-vault/prober.env
 beta-vault/vault/*.yml
 # Keep .example templates tracked
 !beta-vault/vault/*.yml.example
