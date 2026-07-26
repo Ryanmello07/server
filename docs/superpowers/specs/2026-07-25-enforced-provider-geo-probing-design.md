@@ -64,9 +64,11 @@ Four units with clean boundaries:
 ### `egressprober` (new binary, operator-proxy repo)
 
 Wraps the existing `providertunnel`, `geolocate` and `ingest` libraries in a
-long-lived worker that reads probe jobs and reports results. It is a separate
-process specifically so it can be network-jailed; Go cannot confine a subset of
-goroutines to a namespace.
+worker that reads probe jobs and reports results. It is a separate process so
+that the deployment can confine it as a whole — a process is the smallest unit
+either Docker or systemd can apply an egress restriction to, and Go cannot
+confine a subset of goroutines. Keeping it out of the taskworker also means the
+component holding geolocation code is not the one holding database credentials.
 
 ### `provider_egress_probe_work.go` (new taskworker job, server repo)
 
