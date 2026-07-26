@@ -1509,3 +1509,243 @@ func TestUpdateClientLocationsCountsOnlyPublicProviders(t *testing.T) {
 		connect.AssertEqual(t, found, true)
 	})
 }
+
+// `UpdateClientScores` carries the same "can this provider serve a stranger"
+// filter as `UpdateClientLocations`, and it matters on a different path:
+// the per-location source query fills the per-location client scores, which
+// become the `clientScoreLocation*` redis keys, which `loadLocationStables`
+// reads and `GetProviderLocations` gates on. A location whose only providers
+// are network-only must therefore not be stable at all.
+//
+// Two connected+valid providers with identical latency/speed data in two
+// different countries, differing ONLY in whether they hold a Public provide
+// key. Removing the `EXISTS (... provide_mode = ...)` clause from the
+// per-location source query makes the network-only provider's country stable
+// and puts its client score in the cache, and this test goes red.
+func TestUpdateClientScoresCountsOnlyPublicProviders(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		publicCity := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, publicCity)
+
+		networkOnlyCity := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Toronto",
+			Region:       "Ontario",
+			Country:      "Canada",
+			CountryCode:  "ca",
+		}
+		CreateLocation(ctx, networkOnlyCity)
+
+		publicClientId, networkOnlyClientId := connectPublicAndNetworkOnlyProviders(
+			ctx,
+			t,
+			publicCity,
+			networkOnlyCity,
+		)
+
+		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
+
+		err := UpdateClientScores(ctx, time.Hour, 1)
+		connect.AssertEqual(t, err, nil)
+
+		locationStables, err := loadLocationStables(
+			ctx,
+			[]server.Id{publicCity.CountryLocationId, networkOnlyCity.CountryLocationId},
+			RankModeQuality,
+			server.Id{},
+		)
+		connect.AssertEqual(t, err, nil)
+
+		// the Public provider's country has a provider a stranger can use
+		_, ok := locationStables[publicCity.CountryLocationId]
+		connect.AssertEqual(t, ok, true)
+		// the network-only provider's country has none. a missing entry is how
+		// loadLocationStables says "no providers", so it must be absent
+		_, ok = locationStables[networkOnlyCity.CountryLocationId]
+		connect.AssertEqual(t, ok, false)
+
+		// and the same at the client-score level FindProviders2 consumes
+		clientScores, err := loadClientScores(
+			true,
+			RankModeQuality,
+			ctx,
+			map[server.Id]bool{
+				publicCity.LocationId:      true,
+				networkOnlyCity.LocationId: true,
+			},
+			map[server.Id]bool{},
+			server.Id{},
+			100,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(clientScores), 1)
+		_, ok = clientScores[publicClientId]
+		connect.AssertEqual(t, ok, true)
+		_, ok = clientScores[networkOnlyClientId]
+		connect.AssertEqual(t, ok, false)
+	})
+}
+
+// the location *group* source query in `UpdateClientScores` needs the same
+// filter as the per-location one. It fills `locationGroupClientScores` ->
+// the `clientScoreLocationGroup*` redis keys -> `loadClientScores` ->
+// `FindProviders2` whenever the spec carries a `LocationGroupId`. Unfiltered,
+// a user who selects a promoted group (e.g. "Strong Privacy Laws") is handed
+// providers that cannot accept their contract, and `CreateContract` rejects
+// them with `NoPermission`.
+//
+// Same two providers, differing only in the Public provide key, each in its
+// own location group. Removing the `EXISTS` clause from the group query puts
+// the network-only provider in its group's cache and this test goes red.
+func TestUpdateClientScoresGroupCountsOnlyPublicProviders(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		publicCity := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, publicCity)
+
+		networkOnlyCity := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Toronto",
+			Region:       "Ontario",
+			Country:      "Canada",
+			CountryCode:  "ca",
+		}
+		CreateLocation(ctx, networkOnlyCity)
+
+		publicGroup := &LocationGroup{
+			Name:     "Test Group Public",
+			Promoted: true,
+			MemberLocationIds: []server.Id{
+				publicCity.CityLocationId,
+				publicCity.RegionLocationId,
+				publicCity.CountryLocationId,
+			},
+		}
+		CreateLocationGroup(ctx, publicGroup)
+
+		networkOnlyGroup := &LocationGroup{
+			Name:     "Test Group Network Only",
+			Promoted: true,
+			MemberLocationIds: []server.Id{
+				networkOnlyCity.CityLocationId,
+				networkOnlyCity.RegionLocationId,
+				networkOnlyCity.CountryLocationId,
+			},
+		}
+		CreateLocationGroup(ctx, networkOnlyGroup)
+
+		publicClientId, networkOnlyClientId := connectPublicAndNetworkOnlyProviders(
+			ctx,
+			t,
+			publicCity,
+			networkOnlyCity,
+		)
+
+		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
+
+		err := UpdateClientScores(ctx, time.Hour, 1)
+		connect.AssertEqual(t, err, nil)
+
+		// read the group cache only -- no location ids -- so this asserts on
+		// the group query alone
+		clientScores, err := loadClientScores(
+			true,
+			RankModeQuality,
+			ctx,
+			map[server.Id]bool{},
+			map[server.Id]bool{
+				publicGroup.LocationGroupId:      true,
+				networkOnlyGroup.LocationGroupId: true,
+			},
+			server.Id{},
+			100,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(clientScores), 1)
+		_, ok := clientScores[publicClientId]
+		connect.AssertEqual(t, ok, true)
+		_, ok = clientScores[networkOnlyClientId]
+		connect.AssertEqual(t, ok, false)
+
+		// the network-only group on its own exports nothing
+		networkOnlyGroupClientScores, err := loadClientScores(
+			true,
+			RankModeQuality,
+			ctx,
+			map[server.Id]bool{},
+			map[server.Id]bool{networkOnlyGroup.LocationGroupId: true},
+			server.Id{},
+			100,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, len(networkOnlyGroupClientScores), 0)
+	})
+}
+
+// connects one provider per location that is identical in every respect the
+// scoring pipeline looks at -- connected, valid, same latency and speed
+// samples so both clear the strict minimums -- except that the first holds a
+// Public provide key and the second holds only a Network one. Anything that
+// separates the two downstream is the provide-mode filter and nothing else.
+func connectPublicAndNetworkOnlyProviders(
+	ctx context.Context,
+	t testing.TB,
+	publicLocation *Location,
+	networkOnlyLocation *Location,
+) (publicClientId server.Id, networkOnlyClientId server.Id) {
+	handlerId := CreateNetworkClientHandler(ctx)
+
+	connectProvider := func(location *Location, modes map[ProvideMode][]byte) server.Id {
+		networkId := server.NewId()
+		clientId := server.NewId()
+		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connect.AssertEqual(t, err, nil)
+		err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
+		connect.AssertEqual(t, err, nil)
+		SetProvide(ctx, clientId, modes)
+
+		// good latency and speed samples so the client passes the strict
+		// minimums; loadLocationStables reads the force-minimum-false filter
+		// key, which is empty for a client that fails them
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`INSERT INTO network_client_latency (connection_id, latency_ms, sample_count) VALUES ($1, $2, $3)`,
+				connectionId, 30, 1,
+			))
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`INSERT INTO network_client_speed (connection_id, bytes_per_second, sample_count) VALUES ($1, $2, $3)`,
+				connectionId, 100*1024*1024, 1,
+			))
+		})
+		return clientId
+	}
+
+	// serves strangers
+	publicClientId = connectProvider(publicLocation, map[ProvideMode][]byte{
+		ProvideModePublic:  []byte("public-secret"),
+		ProvideModeNetwork: []byte("network-secret"),
+	})
+	// own network only -- cannot accept a contract from a user outside it
+	networkOnlyClientId = connectProvider(networkOnlyLocation, map[ProvideMode][]byte{
+		ProvideModeNetwork: []byte("network-secret"),
+	})
+	return
+}
