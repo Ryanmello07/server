@@ -1233,6 +1233,14 @@ func TestUpdateClientLocationsCountsClientsWithoutReliabilityScores(t *testing.T
 		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
 		connect.AssertEqual(t, err, nil)
 
+		// only clients holding a Public provide key are counted (see
+		// TestUpdateClientLocationsCountsOnlyPublicProviders); the
+		// reliability-score join is what is under test here, so satisfy that
+		// precondition explicitly
+		SetProvide(ctx, clientId, map[ProvideMode][]byte{
+			ProvideModePublic: []byte("public-secret"),
+		})
+
 		// populates network_client_location_reliability straight from the
 		// live connection tables -- independent of, and deliberately without
 		// ever touching, the reliability-scoring pipeline below
@@ -1325,6 +1333,14 @@ func TestUpdateClientScoresCountsClientsWithoutReliabilityScores(t *testing.T) {
 
 		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
 		connect.AssertEqual(t, err, nil)
+
+		// only clients holding a Public provide key are counted (see
+		// TestUpdateClientLocationsCountsOnlyPublicProviders); the
+		// reliability-score join is what is under test here, so satisfy that
+		// precondition explicitly
+		SetProvide(ctx, clientId, map[ProvideMode][]byte{
+			ProvideModePublic: []byte("public-secret"),
+		})
 
 		// good latency and speed tests so the quality score gate passes and
 		// the reliability-score join is what's actually being tested here
@@ -1423,5 +1439,73 @@ func TestSetConnectionLocationToleratesCountryOnlyLocation(t *testing.T) {
 		connect.AssertEqual(t, *city, country.CountryLocationId)
 		connect.AssertEqual(t, *region, country.CountryLocationId)
 		connect.AssertEqual(t, *cty, country.CountryLocationId)
+	})
+}
+
+func TestUpdateClientLocationsCountsOnlyPublicProviders(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		handlerId := CreateNetworkClientHandler(ctx)
+
+		// connect a client and give it the provide modes supplied
+		connectOne := func(modes map[ProvideMode][]byte) server.Id {
+			networkId := server.NewId()
+			clientId := server.NewId()
+			Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+			connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+			connect.AssertEqual(t, err, nil)
+			err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
+			connect.AssertEqual(t, err, nil)
+			if modes != nil {
+				SetProvide(ctx, clientId, modes)
+			}
+			return clientId
+		}
+
+		// serves strangers -- must be counted
+		connectOne(map[ProvideMode][]byte{
+			ProvideModePublic:  []byte("public-secret"),
+			ProvideModeNetwork: []byte("network-secret"),
+		})
+		// own network only -- must NOT be counted, it cannot accept a
+		// contract from a user outside its network
+		connectOne(map[ProvideMode][]byte{
+			ProvideModeNetwork: []byte("network-secret"),
+		})
+		// no provide key at all -- must NOT be counted
+		connectOne(nil)
+
+		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
+
+		err := UpdateClientLocations(ctx, time.Hour)
+		connect.AssertEqual(t, err, nil)
+
+		initialClientLocations, err := loadInitialClientLocations(ctx)
+		connect.AssertEqual(t, err, nil)
+		if initialClientLocations == nil {
+			t.Fatal("expected a populated client locations cache, got nil")
+		}
+
+		found := false
+		for _, clientLocation := range initialClientLocations.Locations {
+			if clientLocation.LocationId == city.CountryLocationId {
+				found = true
+				// exactly one of the three connected clients holds a Public
+				// key; counting the other two advertises supply no user can
+				// reach (39 advertised vs 2 reachable, observed on beta)
+				connect.AssertEqual(t, clientLocation.ClientCount, 1)
+			}
+		}
+		connect.AssertEqual(t, found, true)
 	})
 }
