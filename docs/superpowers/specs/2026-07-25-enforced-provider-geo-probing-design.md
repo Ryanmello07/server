@@ -333,37 +333,91 @@ project's probe population would also give an honest count.
 - **Live check**: the committed manual single-provider probe
   (`cmd/egress-prober/manual_probe_test.go`, env-guarded).
 
-## Egress bandwidth measurement
+## Bandwidth measurement
 
-The location probe answers *where* a provider exits. The other half of what the
-market needs is *how fast*, and the existing measurement answers the wrong
-question.
+The location probe answers *where* a provider exits. The market also needs *how
+fast*, and the existing measurement answers the wrong question — but the
+obvious replacement is far too expensive to run as a census, so the primary
+signal is passive.
 
-`connect/transport_announce.go` speed-tests the **server-to-provider transport**
-and averages samples into `network_client_speed`, keyed by `connection_id`. That
-is throughput to our own platform, not the throughput a user gets when their
-traffic exits to the internet. Egress bandwidth is measured the same way the
-location is: through the provider's tunnel.
+### Why the existing measurement is not usable
+
+`connect/transport_announce.go` sends `SpeedTotalByteCount = 512 KiB` with
+`MaxSpeedCount = 2` ("warm up then test") over the provider's already-open
+connection, averaging into `network_client_speed` keyed by `connection_id`.
+
+Five problems, two of them severe:
+
+1. **Wrong path.** It measures provider-to-platform throughput, not
+   provider-to-internet. A provider with a fat pipe to us and a throttled egress
+   measures fast and serves slow.
+2. **Too small to measure anything on a fast link.** 512 KiB is 4.2 Mbit; at
+   1 Gbit it completes in ~4 ms, entirely inside TCP slow start. Above roughly
+   50 Mbit the result reflects congestion-window ramp and RTT, not capacity. It
+   is precise-looking noise.
+3. **Trivially gameable.** The platform's address is fixed and known, so
+   prioritising that single flow is a one-line change on the provider.
+4. **Keyed by `connection_id`**, so it is discarded on every reconnect.
+5. **Disabled below `transportVersion 2`** (`V0TestConfig()`), and its absence
+   adds 80 to the penalty score against a threshold of 40 — so it does not merely
+   fail to measure those providers, it removes them from the market.
+
+### Primary signal: passive accounting of real user traffic
+
+Providers are already paid for the bytes they carry, and
+`transfer_escrow.payout_byte_count` already records bytes actually delivered per
+contract. Deriving throughput from that costs **zero additional bytes** and is
+unfakeable in the way that matters: a provider cannot inflate it without
+genuinely serving real users fast, which is the outcome we want anyway.
+
+This is strictly better than any active probe for a provider that carries
+traffic. It measures the real path, at real load, continuously, with no
+observer effect and nothing for a provider to detect or special-case.
+
+Aggregate **per provider only**. Throughput per provider over a window is all
+the market needs; per-user traffic patterns are neither required nor to be
+derived. This is a new use of data already collected for billing, not new
+collection.
+
+### Secondary signal: active egress probe, sampled
+
+Active probing remains, narrowed to what passive accounting cannot answer:
+
+- a provider that has carried no traffic yet, so has no passive history;
+- periodic spot-checks to calibrate passive figures and catch a provider whose
+  measured throughput and delivered throughput disagree.
+
+It is a **sample, not a census** — a small percentage of eligible providers per
+round, on rotation.
+
+**Sizing.** Each target streams until **5 s elapsed or 5 MB transferred**,
+whichever first, with throughput computed after discarding the first 500 ms.
+Ranking needs tiers, not precision: 5 MB separates tiers, and the larger cap
+bought accuracy nobody consumes. Routine runs use the operator endpoint only;
+the second (CDN) target is added only when corroborating a result already
+suspected, where divergence beyond 3x yields
+`suspect("bandwidth_divergence")`.
 
 **Opportunistically shared tunnel.** When a provider is due for both, the geo
-probe and the speed test run in one tunnel session — open once, geolocate
-(~100 KB measured), then measure throughput. Contract setup dominates the cost,
-so sharing the session roughly halves the per-provider price. The sharing is
-conditional, not automatic: see *Queueing and load*, where bandwidth is
-budget-gated and must never hold up a location refresh.
+probe and the speed test share one tunnel session — open once, geolocate
+(~100 KB measured), then measure throughput. Contract setup dominates cost. The
+sharing is conditional: bandwidth is budget-gated and must never delay a
+location refresh.
 
-**Two targets, recorded separately.** Each round measures against an
-operator-hosted endpoint *and* a public CDN object, stored as distinct columns.
-They are never averaged: the whole value of two targets is that a provider
-prioritising one and not the other becomes visible. Divergence beyond 3x yields
-`suspect("bandwidth_divergence")`, advisory like every other verdict.
+### Why this shape, in numbers
 
-**Adaptive and bounded.** A fixed payload fails at both ends — 10 MB is 0.8 s on
-100 Mbit but 0.08 s on 1 Gbit, where the result is TCP slow-start noise rather
-than throughput. Each target streams until **5 s elapsed or 25 MB transferred,
-whichever comes first**, and throughput is computed over the steady-state window
-after discarding the first 500 ms. Cost is hard-capped at 50 MB per provider per
-round: a fast link hits the byte cap, a slow one hits the time cap.
+At 100k providers a full census at 50 MB each is ~5 TB per round — and because
+probes are real paid contracts, that is money leaving the operator's account and
+arriving in providers'. A census is not worth it for a ranking input.
+
+| Approach | Bytes per round at 100k providers |
+| --- | --- |
+| Existing platform test (1 MiB each) | ~100 GiB, measuring the wrong path |
+| Full active census at 50 MB | ~5 TB |
+| Passive + 5% sampled at 5 MB | ~25 GB |
+
+The passive-plus-sampling shape costs **less than the existing test** while
+measuring the path users actually get.
 
 ### Bandwidth results are advisory
 
@@ -382,9 +436,10 @@ falls.
 ### Queueing and load
 
 Every probe byte crosses the operator's own platform: the path is
-prober -> platform -> provider -> internet, so a 50 MB test costs the operator
-50 MB of `connect` throughput plus the transport encryption CPU, not just the
-provider's bandwidth. Bandwidth probing is therefore capacity-limited by the
+prober -> platform -> provider -> internet, so a 5 MB test costs the operator
+5 MB of `connect` throughput plus the transport encryption CPU, not just the
+provider's bandwidth. It is also a real paid contract, so the byte budget below
+is a **spending** limit as much as a load limit. Bandwidth probing is therefore capacity-limited by the
 operator, and must never be scheduled as "probe everything that is due".
 
 **Reuse the fixed hourly bucket reservation already in this repo.**
@@ -396,7 +451,7 @@ makes the daily cap fall out of the hourly one, and a jittered `RunAt` within
 the bucket so deferred work does not stampede the hour boundary.
 
 Bandwidth probing takes the same shape, budgeted in **bytes** rather than row
-counts: each probe reserves its worst-case 50 MB against an hourly byte budget,
+counts: each probe reserves its worst-case 5 MB against an hourly byte budget,
 and when the current hour is full it is queued into the next hour with lookahead
 rather than rejected. The operator's exposure per hour is then a configured
 constant, independent of how many providers are due.
@@ -404,7 +459,7 @@ constant, independent of how many providers are due.
 Alongside the budget, a **global concurrency cap** (default 2) limits
 simultaneous bandwidth tests. This is deliberately separate from, and much
 tighter than, the geo probe's concurrency of 4: a geo probe moves ~100 KB while
-a bandwidth test moves up to 50 MB, so one shared limit would either throttle
+a bandwidth test moves up to 5 MB, so one shared limit would either throttle
 geolocation pointlessly or let bandwidth saturate the platform.
 
 **Queue ordering prioritises providers with more valid connections.** Budget is
