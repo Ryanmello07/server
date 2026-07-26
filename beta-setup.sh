@@ -157,11 +157,12 @@ docker compose -f docker-compose.beta.yml up -d api connect taskworker
 
 echo
 echo "Beta network running:"
-echo "  API:     http://$PUBLIC_IP:8080"
-echo "  Connect: ws://$PUBLIC_IP:5080/"
+echo "  API:     https://api.beta-test.net"
+echo "  Connect: wss://connect.beta-test.net/"
 echo
 echo "All generated secrets live in $SECRETS_FILE and beta-vault/vault/*.yml"
 echo "These files are NOT tracked by git."
 echo "Postgres data is preserved across ./beta-setup.sh runs in the named volume."
 echo "To intentionally wipe the database, run ./beta-down.sh -v."
-echo "To use from another machine, open TCP ports 8080, 5080, and 15080."
+echo "Caddy is the only ingress; open TCP 80 and 443. The api and connect"
+echo "service ports are deliberately unpublished -- see BETA.md, Firewall."

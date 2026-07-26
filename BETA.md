@@ -48,7 +48,7 @@ The server contains:
 - Linux host with Docker Engine 24+ and Docker Compose v2.
 - `curl`, `openssl`, and Go 1.26+ installed on the host (Go is only used by setup scripts that generate the MMDB).
 - Public IP address if you want to use the server from another machine.
-- TCP ports 8080, 5080, and 15080 available on the host.
+- TCP ports 80 and 443 available on the host (Caddy terminates tls and is the only ingress).
 
 ## Security notes
 
@@ -97,12 +97,12 @@ When finished you will see output similar to:
 
 ```
 Beta network running:
-  API:     http://74.50.11.113:8080
-  Connect: ws://74.50.11.113:5080/
+  API:     https://api.beta-test.net
+  Connect: wss://connect.beta-test.net/
 
 All generated secrets live in ./beta-vault/beta-secrets.env and beta-vault/vault/*.yml
 These files are NOT tracked by git.
-To use from another machine, open TCP ports 8080, 5080, and 15080.
+Reachable from anywhere over https; no other ports need opening.
 ```
 
 Replace `74.50.11.113` with your host's public IP.
@@ -111,7 +111,7 @@ Replace `74.50.11.113` with your host's public IP.
 
 ```bash
 # Health check
-curl -s http://74.50.11.113:8080/status | jq .
+curl -s https://api.beta-test.net/status | jq .
 
 # WebSocket upgrade handshake
 curl -fsS -i -N \
@@ -119,10 +119,13 @@ curl -fsS -i -N \
   -H 'Connection: Upgrade' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
   -H 'Sec-WebSocket-Version: 13' \
-  http://74.50.11.113:5080/
+  --http1.1 \
+  https://connect.beta-test.net/
 ```
 
-You should receive `HTTP/1.1 101 Switching Protocols`.
+You should receive `HTTP/1.1 101 Switching Protocols`. Use `--http1.1`: over
+HTTP/2 a `Connection: Upgrade` header is illegal, so curl reports 400 and it
+looks like an outage when the service is fine.
 
 ## Common operations
 
@@ -179,24 +182,29 @@ docker compose -f docker-compose.beta.yml logs -f api
 
 The beta server binds ports on all interfaces (`0.0.0.0`). To reach it from another machine, the host firewall must allow inbound traffic on:
 
-- `8080/tcp` — HTTP REST API and Solana wallet challenge
-- `5080/tcp` — Client WebSocket connect tunnel
-- `15080/tcp` — Internal connect exchange, used when multiple connect instances or providers run against the same server
+- `80/tcp` — Caddy; redirects to https and answers the ACME http-01 challenge
+- `443/tcp` — Caddy; terminates tls for `api.beta-test.net` and `connect.beta-test.net`
+
+The api and connect service ports are deliberately **not** published. Caddy is
+the only ingress, and that is load-bearing beyond transport security: connect
+trusts a forwarded client address only when it receives both `X-Forwarded-For`
+and `X-Forwarded-Source-Port` (`connect/transport.go:220`). A client arriving
+on a published port presents the docker gateway address instead — a private
+address with no mmdb entry — so no location row is written and the provider
+never appears in the provider list.
 
 Example with `ufw`:
 
 ```bash
-sudo ufw allow 8080/tcp
-sudo ufw allow 5080/tcp
-sudo ufw allow 15080/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
 ```
 
 Example with `iptables`:
 
 ```bash
-sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
-sudo iptables -A INPUT -p tcp --dport 5080 -j ACCEPT
-sudo iptables -A INPUT -p tcp --dport 15080 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 ```
 
 Remember that the beta server uses plain HTTP and WebSocket, not TLS. Do not send real production secrets through it.
@@ -218,7 +226,7 @@ This beta server uses the server-issued wallet challenge from `urnetwork/server#
 ### Get a challenge
 
 ```bash
-curl -s -X POST http://74.50.11.113:8080/auth/wallet-challenge \
+curl -s -X POST https://api.beta-test.net/auth/wallet-challenge \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
@@ -266,13 +274,13 @@ Repository: `https://github.com/Ryanmello07/urnetwork-webmanager-beta`, branch `
 git clone -b beta/main https://github.com/Ryanmello07/urnetwork-webmanager-beta.git
 cd urnetwork-webmanager-beta
 npm install
-VITE_API_BASE=http://74.50.11.113:8080 npm run dev
+VITE_API_BASE=https://api.beta-test.net npm run dev
 ```
 
 If you deploy the dashboard to a static host such as Bolt or Netlify, use its `_redirects` file to proxy `/api/*` to the beta server. This avoids mixed-content and CORS issues when the dashboard is served over HTTPS.
 
 ```
-/api/* http://74.50.11.113:8080/:splat 200
+/api/* https://api.beta-test.net/:splat 200
 /* /index.html 200
 ```
 
@@ -283,8 +291,8 @@ Repository: `https://github.com/Ryanmello07/connect`, branch `beta/custom-server
 The fork defaults to the beta server:
 
 ```go
-apiUrl := "http://74.50.11.113:8080"
-connectUrl := "ws://74.50.11.113:5080/"
+apiUrl := "https://api.beta-test.net"
+connectUrl := "wss://connect.beta-test.net/"
 ```
 
 ### Run a provider with a dashboard JWT
@@ -513,18 +521,23 @@ To share the beta environment with a teammate, share the repository and have the
 ## Architecture
 
 ```text
-+--------+         +-----------------------------+
-| Client | <-----> | API server :8080            |
-+--------+         |  - HTTP REST API            |
-                   |  - Solana wallet challenge  |
-                   |  - /connect auth endpoint   |
++--------+  https  +-----------------------------+
+| Client | <-----> | Caddy :80 :443              |
++--------+         |  - the ONLY ingress         |
+                   |  - lets encrypt certs       |
+                   |  - sets the forwarded       |
+                   |    address headers connect  |
+                   |    needs to see real client |
+                   |    ips                      |
                    +-----------------------------+
-                              |
-                   +----------v------------------+
-                   | Connect server :5080        |
-                   |  - WebSocket upgrade on /   |
-                   |  - Internal exchange :15080 |
-                   +-----------------------------+
+                         |                 |
+          api.beta-test  |                 | connect.beta-test
+                   +-----v-------+  +------v----------------------+
+                   | API :8080   |  | Connect :80                 |
+                   | (unpublished)|  |  - WebSocket upgrade on /   |
+                   +-------------+  |  - Internal exchange :15080 |
+                                    |  (both unpublished)         |
+                                    +-----------------------------+
                               |
                    +----------v----------+
                    | Postgres :5432      |
@@ -566,16 +579,30 @@ A: It is reasonably secure for beta testing because all secrets are generated lo
 
 ### Port already in use
 
-If `8080` or `5080` is busy, edit `docker-compose.beta.yml` and change the host-side port mappings:
+Only Caddy publishes ports (`80` and `443`). If either is busy, stop whatever
+holds it — they cannot be remapped, because Let's Encrypt's http-01 challenge
+and public https both require the standard ports.
 
-```yaml
-api:
-  ports:
-    - "18080:8080"   # change 18080 to any free port
+The api and connect service ports are intentionally unpublished; do not add
+`ports:` entries for them. See *Firewall* above for why that is load-bearing.
 
-connect:
-  ports:
-    - "15080:80"     # change 15080 to any free port
+### The provider list is empty
+
+Check whether connect can see real client addresses:
+
+```bash
+docker compose -f docker-compose.beta.yml logs --since 5m connect | grep -c 'could not find client location'
+```
+
+Anything above zero means connect is recording a private proxy address for
+clients, so no location row is written. Confirm the Caddyfile still sends
+`X-Forwarded-Source-Port`, and note that the Caddyfile is a **single-file bind
+mount**: editing it on the host replaces the inode, the container keeps reading
+the old one, and `caddy reload` reports success while reloading stale content.
+Apply changes with:
+
+```bash
+docker compose -f docker-compose.beta.yml up -d --force-recreate caddy
 ```
 
 If you change the internal exchange port mapping, update `connect/resident.go`:
@@ -588,10 +615,10 @@ and update `WARP_PORTS` in `docker-compose.beta.yml` accordingly.
 
 ### `failed to fetch` from the browser dashboard
 
-If the dashboard is served over HTTPS and tries to call `http://74.50.11.113:8080`, browsers block mixed content. Use the dashboard's `/api/*` rewrite or run the dashboard locally over HTTP:
+If the dashboard is served over HTTPS and tries to call `https://api.beta-test.net`, browsers block mixed content. Use the dashboard's `/api/*` rewrite or run the dashboard locally over HTTP:
 
 ```bash
-VITE_API_BASE=http://74.50.11.113:8080 npm run dev
+VITE_API_BASE=https://api.beta-test.net npm run dev
 ```
 
 For a static HTTPS host, route `/api/*` to the beta server with a 200 rewrite, not a 302 redirect.
@@ -652,7 +679,7 @@ Then start it with `--by-jwt=<TOKEN>` from the patched `Ryanmello07/connect` for
 Before using the SOCKS5 proxy, connect at least one provider. Use the provider CLI or ask someone to run one against the beta server. Then verify:
 
 ```bash
-curl -s http://74.50.11.113:8080/network/provider-locations | jq '.locations | length'
+curl -s https://api.beta-test.net/network/provider-locations | jq '.locations | length'
 ```
 
 If the count is 0, no provider is registered yet.
