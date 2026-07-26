@@ -306,16 +306,104 @@ project's probe population would also give an honest count.
 - **Live check**: the committed manual single-provider probe
   (`cmd/egress-prober/manual_probe_test.go`, env-guarded).
 
+## Egress bandwidth measurement
+
+The location probe answers *where* a provider exits. The other half of what the
+market needs is *how fast*, and the existing measurement answers the wrong
+question.
+
+`connect/transport_announce.go` speed-tests the **server-to-provider transport**
+and averages samples into `network_client_speed`, keyed by `connection_id`. That
+is throughput to our own platform, not the throughput a user gets when their
+traffic exits to the internet. Egress bandwidth is measured the same way the
+location is: through the provider's tunnel.
+
+**Shared tunnel.** The geo probe and the speed test run in one tunnel session —
+open once, geolocate (~100 KB measured), then measure throughput. Contract setup
+dominates the cost, so sharing the session roughly halves the per-provider price
+against two separate passes.
+
+**Two targets, recorded separately.** Each round measures against an
+operator-hosted endpoint *and* a public CDN object, stored as distinct columns.
+They are never averaged: the whole value of two targets is that a provider
+prioritising one and not the other becomes visible. Divergence beyond 3x yields
+`suspect("bandwidth_divergence")`, advisory like every other verdict.
+
+**Adaptive and bounded.** A fixed payload fails at both ends — 10 MB is 0.8 s on
+100 Mbit but 0.08 s on 1 Gbit, where the result is TCP slow-start noise rather
+than throughput. Each target streams until **5 s elapsed or 25 MB transferred,
+whichever comes first**, and throughput is computed over the steady-state window
+after discarding the first 500 ms. Cost is hard-capped at 50 MB per provider per
+round: a fast link hits the byte cap, a slow one hits the time cap.
+
+**Marketplace gating is a separate decision.** Today a provider on
+`transportVersion < 2` gets `V0TestConfig()` (`connect/transport.go:380`), so no
+speed or latency test ever runs. Scoring then adds 40 for the missing latency
+test and 40 for the missing speed test; the total is capped at
+`MaxClientScore = 50`, while `PassesMinimums` fails whenever
+`maxScore (2 * scorePerTier = 40) <= score`. Since 50 >= 40 always, **an
+untested provider is mathematically guaranteed to fail the minimums gate** and
+can never be returned by `find-providers2`. That is the root cause of the
+observed "39 listed, 1 returned".
+
+Feeding egress bandwidth into the minimums would therefore admit those providers
+to the market for the first time. That is likely desirable, but it changes who
+receives user traffic and earns, so it is called out as its own decision rather
+than riding in on a geolocation change.
+
+## Provider lifecycle
+
+A provider is not probed the moment it appears, and being probed once is not
+permanent.
+
+1. **Probation** — a newly seen provider must demonstrate sustained reliability
+   across its first day before it is offered to anyone. Not eligible for
+   selection.
+2. **Pending verification** — probation satisfied; a combined geo + bandwidth
+   probe is scheduled at a **random** time within the window, never a fixed
+   offset from graduation.
+3. **Verified** — all checks passed. The provider becomes eligible for
+   selection through the API.
+4. **Suspect / failed** — a check failed. Not eligible; re-probed later under
+   the per-provider backoff.
+
+Re-verification recurs at random times, so `verified` decays rather than being
+granted once. Randomness serves two purposes at once: a provider cannot prepare
+for a known probe window, and load spreads naturally across the fleet.
+
+**Two constraints this places on the rest of the design.**
+
+*Available windows.* `ClientLookbacks` is `[5m, 60m, 12h]` — there is no 24-hour
+window (a 6-day entry exists but is commented out). A literal one-day probation
+therefore needs either a new lookback entry, which adds rollup rows per client
+per window, or acceptance of the existing 12h window as the gate. This must be
+decided before the lifecycle is implemented.
+
+*Identity stability is now load-bearing.* Probation accrues per `client_id`, and
+**every provider restart mints a new one** — verified by restarting a real
+provider four times and observing four distinct client ids, under both the
+`auth-provide` and `provide` subcommands. A provider that restarts daily never
+accumulates a full day of history and can never graduate; with a
+`Restart=always` service unit this is the expected case, not an edge case. The
+same churn discards any verified location and measured bandwidth, since both are
+keyed by `client_id`.
+
+Stable identity keying is consequently a **hard prerequisite** for both this
+lifecycle and the probe results themselves, not an optimisation. It belongs in
+P0.
+
 ## Decomposition
 
 This is too large for a single implementation plan. It splits into four, each
 producing working, testable software on its own:
 
-**P0 — Prerequisites** (small, independent, ship first). Pass
-`force_minimum: true` from the prober's enumeration, and make the provider count
-provide-mode aware so the location list stops advertising clients that cannot
-accept a contract. Neither depends on anything else here, and the second is a
-user-visible bug today.
+**P0 — Prerequisites** (small, independent, ship first). Three items:
+`force_minimum: true` in the prober's enumeration; a provide-mode aware provider
+count so the location list stops advertising clients that cannot accept a
+contract; and **stable identity keying**, so probation, verified locations and
+measured bandwidth survive a provider restart. The second is a user-visible bug
+today. The third gates everything else — without it P1's results and the
+lifecycle's probation both evaporate on restart.
 
 **P1 — Automated probing in a jail.** The `egressprober` binary, the network
 namespace, and the taskworker job. Direct probing only, single fixed identity,
