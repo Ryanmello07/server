@@ -1480,10 +1480,18 @@ func initialClientLocationsKey() string {
 // order.
 //
 // A client's city/region/country location ids are not guaranteed to differ: a
-// country-only geo resolution stores the country id in all three columns (see
-// SetConnectionLocation), and a region-only one stores it in two. Anything that
-// fans a client out across the three columns has to treat them as a set, or the
-// client is counted once per column instead of once per location it is in.
+// country-only geo resolution stores the country id in all three columns and a
+// region-only one stores it in two, because SetConnectionLocation falls back to
+// the coarsest granularity available rather than writing a NULL into the NOT
+// NULL city/region columns. Anything that fans a client out across the three
+// columns has to treat them as a set, or the client is counted once per column
+// instead of once per location it is in.
+//
+// Scope: that coarsest-granularity fallback is a beta change. upstream/main has
+// no country-only fallback -- it passes the NULL through and the insert raises
+// -- so on main today no row with city = region = country exists and this
+// dedupe changes nothing there. It becomes load-bearing upstream when the
+// fallback lands with PR #407, which carries its own copy of this helper.
 func distinctIds(ids ...*server.Id) []server.Id {
 	distinct := make([]server.Id, 0, len(ids))
 	for _, id := range ids {
@@ -1591,6 +1599,10 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 				// times in its own country. Distinct ids -- a real
 				// city-granular client -- still roll up into their region and
 				// country exactly as before.
+				//
+				// This is a live fix on beta, where that fallback exists, and a
+				// forward guard against upstream/main, where it does not yet --
+				// see distinctIds.
 				for _, locationId := range distinctIds(
 					&cityLocationId,
 					&regionLocationId,
