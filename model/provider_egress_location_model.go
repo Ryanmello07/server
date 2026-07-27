@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/urnetwork/server"
 )
@@ -365,6 +366,252 @@ func GetLocation(ctx context.Context, locationId server.Id) *Location {
 	return loc
 }
 
+// normalizeLocationName folds a location name to a comparison key: lowercased,
+// with every rune that is not a letter or a digit dropped. So
+// "Frankfurt am Main", "Frankfurt Am Main" and "FRANKFURT AM MAIN" all fold to
+// "frankfurtammain" and match the one row that already exists.
+//
+// This is deliberately a comparison key only -- it is never stored, and never
+// used to build a location_name. It exists so a trivial spelling variant from a
+// geolocation source resolves to the existing row instead of being treated as a
+// different place.
+//
+// Punctuation is dropped rather than mapped to a space because the disagreement
+// is over whether the separator exists at all ("Washington, D.C." vs
+// "Washington DC"). Note this deliberately does not fold "Frankfurt/Main" onto
+// "Frankfurt am Main": dropping the separator gives "frankfurtmain" !=
+// "frankfurtammain", so that one falls back to country granularity rather than
+// matching the wrong row. Falling back is the safe outcome; guessing is not.
+// Stdlib only, by design -- a transliteration/fuzzy-match dependency is a large
+// amount of new behaviour to take on for an ingest path whose failure mode is
+// already "use the country".
+func normalizeLocationName(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range strings.ToLower(name) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// matchLocationNameInTx returns the location_id of the row in `candidates`
+// whose location_name matches `name`, preferring an exact match and falling
+// back to a normalized one (see normalizeLocationName), or nil for no match.
+// Candidates must already be ordered deterministically by the caller so that
+// two rows folding to the same key always resolve the same way.
+func matchLocationName(name string, candidateIds []server.Id, candidateNames []string) *server.Id {
+	for i, candidateName := range candidateNames {
+		if candidateName == name {
+			return &candidateIds[i]
+		}
+	}
+	normalized := normalizeLocationName(name)
+	if normalized == "" {
+		// nothing comparable survives folding (e.g. a name of only
+		// punctuation); an empty key would match any other such row
+		return nil
+	}
+	for i, candidateName := range candidateNames {
+		if normalizeLocationName(candidateName) == normalized {
+			return &candidateIds[i]
+		}
+	}
+	return nil
+}
+
+// MatchExistingLocation resolves (countryCode, region, city) against location
+// rows that ALREADY EXIST and returns the city-granular row, or nil if any
+// level of the hierarchy does not resolve. It never inserts anything.
+//
+// This is the resolver the provider egress ingest path uses instead of
+// CreateLocation. CreateLocation deduplicates a city on its exact
+// location_name, so an unrecognised spelling does not fail -- it silently
+// creates a new, permanent row in the shared `location` table and indexes it
+// for search. A geolocation probe has no business defining the world's cities:
+// the three free sources the prober reaches consensus over demonstrably
+// disagree on spelling (we observed "Frankfurt am Main (Innenstadt I)" against
+// "Frankfurt am Main" for one host), and the consensus stores the winning
+// source's original display string. Each variant would become its own row,
+// those rows outlive a code revert, and there is no cleanup path.
+//
+// Matching is case-insensitive and ignores punctuation and whitespace
+// differences, so the ordinary variants resolve to the row that is already
+// there. When nothing resolves the caller falls back to country granularity --
+// see SubmitProviderEgressLocation. Falling back loses precision for one
+// submission; creating a row corrupts shared data permanently.
+//
+// Each level tries an exact, fully-indexed match first (the common case: the
+// winning source usually spells it the way the mmdb import did) and only scans
+// the level's candidates when that misses.
+func MatchExistingLocation(
+	ctx context.Context,
+	countryCode string,
+	region string,
+	city string,
+) *Location {
+	countryCode = strings.ToLower(strings.TrimSpace(countryCode))
+	region = strings.TrimSpace(region)
+	city = strings.TrimSpace(city)
+	if countryCode == "" || region == "" || city == "" {
+		return nil
+	}
+
+	var match *Location
+	server.Db(ctx, func(conn server.PgConn) {
+		// country: keyed on country_code alone, exactly as CreateLocation
+		// dedupes it, so there is no name to match here
+		var countryLocationId server.Id
+		var countryName string
+		found := false
+		result, err := conn.Query(
+			ctx,
+			`
+			SELECT location_id, location_name
+			FROM location
+			WHERE location_type = $1 AND country_code = $2
+			ORDER BY location_id
+			LIMIT 1
+			`,
+			LocationTypeCountry,
+			countryCode,
+		)
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				server.Raise(result.Scan(&countryLocationId, &countryName))
+				found = true
+			}
+		})
+		if !found {
+			return
+		}
+
+		// region, within that country
+		regionLocationId := matchChildLocation(
+			ctx,
+			conn,
+			LocationTypeRegion,
+			countryCode,
+			region,
+			`
+			SELECT location_id, location_name
+			FROM location
+			WHERE
+				location_type = $1 AND
+				country_code = $2 AND
+				location_name = $3 AND
+				country_location_id = $4
+			`,
+			`
+			SELECT location_id, location_name
+			FROM location
+			WHERE
+				location_type = $1 AND
+				country_code = $2 AND
+				country_location_id = $3
+			ORDER BY location_id
+			`,
+			[]any{countryLocationId},
+		)
+		if regionLocationId == nil {
+			return
+		}
+
+		// city, within that region
+		cityLocationId := matchChildLocation(
+			ctx,
+			conn,
+			LocationTypeCity,
+			countryCode,
+			city,
+			`
+			SELECT location_id, location_name
+			FROM location
+			WHERE
+				location_type = $1 AND
+				country_code = $2 AND
+				location_name = $3 AND
+				region_location_id = $4 AND
+				country_location_id = $5
+			`,
+			`
+			SELECT location_id, location_name
+			FROM location
+			WHERE
+				location_type = $1 AND
+				country_code = $2 AND
+				region_location_id = $3 AND
+				country_location_id = $4
+			ORDER BY location_id
+			`,
+			[]any{*regionLocationId, countryLocationId},
+		)
+		if cityLocationId == nil {
+			return
+		}
+
+		match = &Location{
+			LocationType:      LocationTypeCity,
+			City:              city,
+			Region:            region,
+			Country:           countryName,
+			CountryCode:       countryCode,
+			LocationId:        *cityLocationId,
+			CityLocationId:    *cityLocationId,
+			RegionLocationId:  *regionLocationId,
+			CountryLocationId: countryLocationId,
+		}
+	})
+	return match
+}
+
+// matchChildLocation runs the exact-match query first and only falls back to
+// scanning the level's candidates when it misses. `parents` are the parent
+// location ids the two queries scope on: the exact query binds them after
+// (location_type, country_code, name), the candidate query after
+// (location_type, country_code).
+func matchChildLocation(
+	ctx context.Context,
+	conn server.PgConn,
+	locationType LocationType,
+	countryCode string,
+	name string,
+	exactSql string,
+	candidatesSql string,
+	parents []any,
+) *server.Id {
+	exactArgs := append([]any{locationType, countryCode, name}, parents...)
+	var exactId *server.Id
+	result, err := conn.Query(ctx, exactSql, exactArgs...)
+	server.WithPgResult(result, err, func() {
+		if result.Next() {
+			var locationId server.Id
+			var locationName string
+			server.Raise(result.Scan(&locationId, &locationName))
+			exactId = &locationId
+		}
+	})
+	if exactId != nil {
+		return exactId
+	}
+
+	candidateArgs := append([]any{locationType, countryCode}, parents...)
+	candidateIds := []server.Id{}
+	candidateNames := []string{}
+	result, err = conn.Query(ctx, candidatesSql, candidateArgs...)
+	server.WithPgResult(result, err, func() {
+		for result.Next() {
+			var locationId server.Id
+			var locationName string
+			server.Raise(result.Scan(&locationId, &locationName))
+			candidateIds = append(candidateIds, locationId)
+			candidateNames = append(candidateNames, locationName)
+		}
+	})
+	return matchLocationName(name, candidateIds, candidateNames)
+}
+
 // GetProviderEgressLocationDue returns the client ids of providers whose
 // egress location is due for a probe: no fresh success (newest probe older than
 // minObservedAt, or never probed) *and* no recent attempt (last attempt older
@@ -407,6 +654,39 @@ func GetLocation(ctx context.Context, locationId server.Id) *Location {
 // observed_at and attempt_at are naive `timestamp` columns holding utc, and
 // comparing them against sql now() would cast through the session timezone and
 // silently skip a window.
+//
+// # Two passes, not one
+//
+// Expressed as a single statement this is a scan of
+// network_client_location_reliability with two LEFT JOINs, sorted on
+// observed_at from an outer-joined table. That sort cannot use an index: the
+// column being ordered on does not exist for most of the rows being ordered.
+// At beta's 40 providers that is free. At 100k it is a full scan plus an
+// unindexable sort, on every poll.
+//
+// The ordering makes the split possible. `NULLS FIRST` means every never-probed
+// provider sorts ahead of every probed one, so the result is always the
+// concatenation of two independently ordered groups:
+//
+//  1. never probed -- no provider_egress_location row at all. This is the
+//     dominant group (it is why the ordering is NULLS FIRST), and within it
+//     every observed_at is equally absent, so the order is client_id alone. As
+//     an anti-join with no outer-joined column in the ORDER BY it is an ordered
+//     index scan over (valid, connected, client_id) with a LIMIT: no sort, and
+//     it stops as soon as the batch is full.
+//  2. stale but probed -- has a row, older than minObservedAt. Only reached
+//     when pass 1 came up short of the limit. Driven from
+//     provider_egress_location itself, where observed_at is a real, indexable
+//     column: an ordered range scan over (observed_at, client_id).
+//
+// Both passes carry the same eligibility predicates, so the concatenation is
+// row-for-row what the single statement returned, in the same order, under the
+// same limit. `attempt_at IS NULL OR attempt_at < $n` becomes the equivalent
+// `NOT EXISTS (... AND $n <= attempt_at)` -- equivalent because client_id is the
+// primary key of provider_egress_probe_attempt, so there is at most one row to
+// quantify over. The same holds for `observed_at IS NULL` on
+// provider_egress_location, whose client_id is likewise a primary key and whose
+// observed_at is NOT NULL: the only way that test is true is that no row exists.
 func GetProviderEgressLocationDue(
 	ctx context.Context,
 	minObservedAt time.Time,
@@ -415,18 +695,19 @@ func GetProviderEgressLocationDue(
 ) []server.Id {
 	clientIds := []server.Id{}
 	server.Db(ctx, func(conn server.PgConn) {
+		// pass 1: never probed. Ordered by client_id alone -- every row in this
+		// group has no observed_at, so the ORDER BY's leading key is constant
+		// across it and the tie-break is the whole ordering.
+		//
+		// `limit` is passed through as given rather than clamped, so a
+		// nonsensical limit fails exactly as the single-statement version did
+		// (LIMIT 0 returns nothing; a negative limit is an error).
 		result, err := conn.Query(
 			ctx,
 			`
 			SELECT
 				network_client_location_reliability.client_id
 			FROM network_client_location_reliability
-
-			LEFT JOIN provider_egress_location ON
-				provider_egress_location.client_id = network_client_location_reliability.client_id
-
-			LEFT JOIN provider_egress_probe_attempt ON
-				provider_egress_probe_attempt.client_id = network_client_location_reliability.client_id
 
 			WHERE
 				network_client_location_reliability.connected = true AND
@@ -437,28 +718,22 @@ func GetProviderEgressLocationDue(
 						provide_key.client_id = network_client_location_reliability.client_id AND
 						provide_key.provide_mode = $1
 				) AND
-				(
-					provider_egress_location.observed_at IS NULL OR
-					provider_egress_location.observed_at < $2
+				NOT EXISTS (
+					SELECT 1 FROM provider_egress_location
+					WHERE
+						provider_egress_location.client_id = network_client_location_reliability.client_id
 				) AND
-				(
-					provider_egress_probe_attempt.attempt_at IS NULL OR
-					provider_egress_probe_attempt.attempt_at < $3
+				NOT EXISTS (
+					SELECT 1 FROM provider_egress_probe_attempt
+					WHERE
+						provider_egress_probe_attempt.client_id = network_client_location_reliability.client_id AND
+						$2 <= provider_egress_probe_attempt.attempt_at
 				)
 
-			-- never-probed sorts ahead of merely stale: a missing observed_at
-			-- is infinitely old. client_id breaks the tie so batch composition
-			-- is deterministic instead of plan-dependent -- otherwise the whole
-			-- never-probed population ties on NULL and which slice of it the
-			-- prober gets back under a limit is whatever order the executor
-			-- happened to produce.
-			ORDER BY
-				provider_egress_location.observed_at ASC NULLS FIRST,
-				network_client_location_reliability.client_id ASC
-			LIMIT $4
+			ORDER BY network_client_location_reliability.client_id ASC
+			LIMIT $3
 			`,
 			ProvideModePublic,
-			minObservedAt.UTC(),
 			minAttemptAt.UTC(),
 			limit,
 		)
@@ -466,6 +741,77 @@ func GetProviderEgressLocationDue(
 			for result.Next() {
 				var clientId server.Id
 				server.Raise(result.Scan(&clientId))
+				clientIds = append(clientIds, clientId)
+			}
+		})
+
+		remaining := limit - len(clientIds)
+		if remaining <= 0 {
+			// the batch is full from never-probed providers alone, which is the
+			// steady state until the population has been swept once. The
+			// single-statement version would have returned exactly these rows
+			// too: they all sort ahead of anything with an observed_at.
+			return
+		}
+
+		// pass 2: stale but probed. Driven from provider_egress_location, so
+		// observed_at is a real column of the driving table and the ORDER BY is
+		// an ordered index scan rather than a sort.
+		result, err = conn.Query(
+			ctx,
+			`
+			SELECT
+				provider_egress_location.client_id
+			FROM provider_egress_location
+
+			INNER JOIN network_client_location_reliability ON
+				network_client_location_reliability.client_id = provider_egress_location.client_id
+
+			WHERE
+				provider_egress_location.observed_at < $2 AND
+				network_client_location_reliability.connected = true AND
+				network_client_location_reliability.valid = true AND
+				EXISTS (
+					SELECT 1 FROM provide_key
+					WHERE
+						provide_key.client_id = provider_egress_location.client_id AND
+						provide_key.provide_mode = $1
+				) AND
+				NOT EXISTS (
+					SELECT 1 FROM provider_egress_probe_attempt
+					WHERE
+						provider_egress_probe_attempt.client_id = provider_egress_location.client_id AND
+						$3 <= provider_egress_probe_attempt.attempt_at
+				)
+
+			-- oldest probe first, client_id breaking the tie, so batch
+			-- composition is deterministic instead of plan-dependent
+			ORDER BY
+				provider_egress_location.observed_at ASC,
+				provider_egress_location.client_id ASC
+			LIMIT $4
+			`,
+			ProvideModePublic,
+			minObservedAt.UTC(),
+			minAttemptAt.UTC(),
+			remaining,
+		)
+		server.WithPgResult(result, err, func() {
+			// the two passes are separate statements and so separate snapshots.
+			// A provider that gains its first provider_egress_location row
+			// between them would be never-probed to pass 1 and stale to pass 2;
+			// the single-statement version could not do that, so screen it out
+			// rather than hand the prober the same client twice.
+			seen := map[server.Id]bool{}
+			for _, clientId := range clientIds {
+				seen[clientId] = true
+			}
+			for result.Next() {
+				var clientId server.Id
+				server.Raise(result.Scan(&clientId))
+				if seen[clientId] {
+					continue
+				}
 				clientIds = append(clientIds, clientId)
 			}
 		})
