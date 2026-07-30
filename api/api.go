@@ -55,6 +55,13 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/network/remove-client", handlers.RemoveNetworkClient),
 		router.NewRoute("POST", "/network/remove-clients", handlers.RemoveNetworkClients),
 		router.NewRoute("POST", "/network/provider-egress-location", handlers.ProviderEgressLocationSubmit),
+		// operator-to-server, gated by the same operator secret as the egress
+		// location ingest above: the active bandwidth probe's download target,
+		// its result submission, and the byte-budget reservation the prober
+		// takes before spending any probe bytes
+		router.NewRoute("GET", "/network/provider-bandwidth-test", handlers.ProviderBandwidthTest),
+		router.NewRoute("POST", "/network/provider-bandwidth-result", handlers.ProviderBandwidthResult),
+		router.NewRoute("POST", "/network/provider-bandwidth-reserve", handlers.ProviderBandwidthReserve),
 		router.NewRoute("GET", "/network/clients", handlers.NetworkClients),
 		router.NewRoute("GET", "/network/peers", handlers.NetworkPeers),
 		router.NewRoute("GET", "/network/provider-locations", handlers.NetworkGetProviderLocations),
