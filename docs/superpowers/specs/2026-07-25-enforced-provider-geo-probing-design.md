@@ -419,6 +419,29 @@ arriving in providers'. A census is not worth it for a ranking input.
 The passive-plus-sampling shape costs **less than the existing test** while
 measuring the path users actually get.
 
+**One code path, one sampling rate, both deployments.** Beta is not a
+lower-stakes environment where the sampling rate can be relaxed and mainstream
+kept conservative. The whole point of testing on beta is testing what actually
+ships, so there is exactly one implementation and one tuned sampling-rate
+constant — not a mode flag, not an environment check. If beta needs a
+different number to reach useful coverage at its current provider count, that
+is a value for the *same* constant, chosen so it behaves sensibly at both
+scales, not a second code path. A flag that only one environment ever
+exercises is how the `transportVersion < 2` gap went unnoticed for as long as
+it did.
+
+**A zero-cost balance code does not make active probing free on mainstream.**
+`--cost=0` produces a `transfer_balance` row with `paid = false`
+(`net_revenue_nano_cents = 0`), but the payout planner sums paid and unpaid
+traffic identically before computing provider payouts
+(`account_payment_model_plan.go`, "paid and free traffic are weighted
+equally" — the point/token system does not distinguish by revenue). So probe
+bytes settled under a free balance code still create a real payout obligation
+to the provider on any deployment where payouts are actually planned and
+sent; only on beta, where `account_payment` has never been populated, is the
+byte budget genuinely free today. The byte budget above is therefore sized as
+a spend limit unconditionally, not only where payouts happen to be live.
+
 ### Bandwidth results are advisory
 
 Measured bandwidth is **recorded and never gates the market**. It does not feed
