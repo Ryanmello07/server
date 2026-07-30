@@ -4586,4 +4586,88 @@ var migrations = []any{
         CREATE INDEX IF NOT EXISTS provider_egress_location_observed_at_client_id
             ON provider_egress_location (observed_at, client_id)
     `),
+
+	// The recorded judgement for a probed egress location: `verdict` is
+	// verified/unverified/suspect, `verdict_reason` the short failure class that
+	// produced it (see probeverdict), and `assurance` how the probe reached the
+	// provider (`direct` until multi-hop lands in P3).
+	//
+	// All three are additive with safe defaults, so every existing row reads as
+	// an unjudged direct probe and every existing reader of
+	// provider_egress_location is unaffected. Nothing writes a non-default
+	// verdict until the ingest path computes one.
+	//
+	// Appended, never inserted: migrations here apply by slice index
+	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
+	// already-applied entry corrupts live databases. IF NOT EXISTS on every
+	// statement makes a re-run -- or a duplicated merge resolution -- a no-op.
+	newSqlMigration(`
+        ALTER TABLE provider_egress_location
+            ADD COLUMN IF NOT EXISTS verdict varchar(16) NOT NULL DEFAULT 'unverified',
+            ADD COLUMN IF NOT EXISTS verdict_reason varchar(64) NOT NULL DEFAULT '',
+            ADD COLUMN IF NOT EXISTS assurance varchar(16) NOT NULL DEFAULT 'direct'
+    `),
+
+	// One measured throughput figure per provider, from either source (passive
+	// aggregation of settled bytes, or an active sampled download) -- consumers
+	// read one number and the `source` column says which produced it.
+	//
+	// client_id is the primary key, so a new measurement overwrites the old one
+	// (mirrors provider_egress_location's own shape). This is a ranking input,
+	// not a history: keeping every sample would grow without bound for a value
+	// only ever read as "the current figure".
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS provider_bandwidth (
+            client_id          uuid NOT NULL PRIMARY KEY,
+            bytes_per_second   double precision NOT NULL,
+            source             varchar(16) NOT NULL,
+            sample_byte_count  bigint NOT NULL,
+            window_start       timestamp NOT NULL,
+            window_end         timestamp NOT NULL,
+            update_time        timestamp NOT NULL
+        )
+    `),
+
+	// serves staleness sweeps and "who needs a fresh measurement" scans, which
+	// range on window_end. Lookups of a single provider's figure go through the
+	// primary key and need no index of their own.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS provider_bandwidth_window_end
+            ON provider_bandwidth (window_end)
+    `),
+
+	// The deployment-wide byte budget for active bandwidth probing, in the
+	// same shape as bulk_client_removal_quota: one row per admitted
+	// reservation, counting against a fixed hourly bucket. See
+	// ReserveProviderBandwidthSlot for why active probe bytes need a spend
+	// limit at all -- they are real, paid contract traffic on any deployment
+	// where payouts are planned, regardless of the balance code used.
+	//
+	// byte_count is bigint, not int: a bucket's budget is measured in hundreds
+	// of megabytes, where the bulk-delete table's client_count counts rows and
+	// fits an int comfortably. client_id is stored for observability only,
+	// exactly as network_id is there -- the limit itself is global, not scoped
+	// per provider.
+	//
+	// Appended, never inserted: migrations here apply by slice index
+	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
+	// already-applied entry corrupts live databases. IF NOT EXISTS on every
+	// statement makes a re-run -- or a duplicated merge resolution -- a no-op.
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS provider_bandwidth_quota (
+            provider_bandwidth_quota_id uuid NOT NULL PRIMARY KEY,
+            client_id                   uuid NOT NULL,
+            byte_count                  bigint NOT NULL,
+            bucket_start                timestamp NOT NULL,
+            create_time                 timestamp NOT NULL
+        )
+    `),
+
+	// every read of this table is a range over the lookahead window
+	// (`$1 <= bucket_start AND bucket_start < $2`), and the reaper deletes by
+	// the same column, so bucket_start is the only index it needs.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS provider_bandwidth_quota_bucket_start
+            ON provider_bandwidth_quota (bucket_start)
+    `),
 }
