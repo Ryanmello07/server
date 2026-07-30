@@ -50,7 +50,7 @@ appear in a higher-paying country, or to hide the real one.
 | Chain its own egress through another country | **Not an attack.** The API honestly reports where traffic exits, and user traffic exits there too. That is the correct answer. |
 | Detect the probe and route *it* through a clean exit while sending user traffic elsewhere | **The real attack.** Addressed by identity rotation and multi-hop; bounded by RTT corroboration. |
 | Block the geolocation hosts so no probe succeeds | Probe fails, provider stays `unverified`. Under advisory enforcement this costs the provider nothing — a known gap, closed when the gate is enabled. |
-| Claim a country it cannot physically be in | **RTT floor.** Catches the cheap version of this lie; see the honest limits below. |
+| Claim a country it cannot physically be in | **Not defended.** An RTT-distance floor was designed and then dropped — see *Corroboration* below. |
 
 The probe-detection attack cannot be fully eliminated: a provider can in
 principle fingerprint traffic shape. The goal is to make detection expensive
@@ -181,67 +181,62 @@ result that looks as trustworthy as a hopped one.
 type Input struct {
     Consensus     ConsensusSummary // country code, confident flag
     MmdbCountry   string           // from the control-connection ip
-    ObservedRTT   time.Duration    // measured to the provider
     PreviousCode  string           // last recorded country, "" if none
     PreviousAt    time.Time
 }
 
 type Verdict struct {
     State  State  // Verified | Unverified | Suspect
-    Reason string // machine-readable, e.g. "rtt_impossible"
+    Reason string // machine-readable, e.g. "unstable"
 }
 ```
 
 Rules, in order:
 
 1. **No country consensus** → `Unverified("no_consensus")`.
-2. **RTT floor violated** → `Suspect("rtt_impossible")`. See below.
-3. **Country changed since the previous probe within 24h** →
+2. **Country changed since the previous probe within 24h** →
    `Suspect("unstable")`.
-4. Otherwise → `Verified`.
+3. Otherwise → `Verified`.
 
 **Probed country differing from the mmdb country is explicitly NOT suspicious.**
 That divergence is the entire purpose of this project — the egress legitimately
 differs from where the control connection originates. It is recorded as
 `divergent_from_mmdb` for observability and never penalised.
 
-### The RTT floor
+### The RTT floor was designed, then dropped
 
-A check grounded in physics rather than in the provider's cooperation — but with
-a real limit, stated plainly below rather than glossed over.
+An earlier version of this design corroborated the claimed country against
+`network_client_connection.expected_latency_ms` and a great-circle-distance
+floor: light-speed-in-vacuum sets a minimum RTT for any claimed distance, so an
+implausibly fast answer from a claimed-distant country would be flagged
+`suspect("rtt_impossible")`.
 
-`ObservedRTT` is the operator's own measurement of the provider's **control
-connection** (`network_client_connection.expected_latency_ms`, already
-populated — 48 ms and 89 ms for the two providers observed in testing). It is
-measured server-side and independently of the probe path, so the multi-hop route
-does not distort it.
+**Dropped for two reasons, and the decision is deliberate rather than an
+oversight:**
 
-For claimed country C, take the great-circle distance `d` (km) from the
-operator's probe origin to the nearest point of C. The absolute floor is:
+1. **It needs a fixed reference point that does not exist.** The floor requires
+   knowing where the RTT was actually measured *from* — the operator's own
+   platform — and `network_client_connection.connection_block` exists
+   specifically to distinguish more than one deployment instance/region. A
+   single hardcoded origin coordinate is wrong for any provider whose RTT was
+   measured against a different instance than the one the constant assumes,
+   and the error is not safely one-sided: a misplaced origin can flag an
+   honest, correctly-placed provider as `suspect` rather than only ever
+   loosening the check. Making it correct means resolving the measuring
+   instance per submission and maintaining a coordinate for each — real
+   complexity for a check that was already documented as one-sided and
+   defeatable by degrading one's own latency (see below).
+2. **The corroboration it bought was modest.** Even implemented correctly, it
+   only ever caught a provider being implausibly *fast* for a distant claim; a
+   provider willing to add artificial delay defeats it entirely. Weighed
+   against a reference-point problem that only shows up at multi-region scale,
+   it was not worth carrying.
 
-```
-rtt_floor_ms = 2 * d / 300_000 km/s * 1000
-```
-
-Speed of light **in vacuum**, deliberately — not the ~200,000 km/s of fibre.
-Using the vacuum figure makes the bound strictly unachievable rather than merely
-unlikely, so an honest provider on an unusually good path can never be flagged.
-False negatives are acceptable here; false positives are not, because the
-penalty is a `Suspect` verdict on a real operator's provider.
-
-Worked example: Atlanta → Spain is ~7,000 km, so the floor is ~47 ms. A provider
-answering in 8 ms while claiming Spain is impossible and gets flagged. The
-measured value for the real Spanish provider in testing was well above the floor.
-
-**What this does not catch.** The floor is one-sided. It detects a provider that
-claims a distant country while answering too quickly to be there — but a
-provider can *inflate* its latency by adding artificial delay, and thereby fake
-being further away than it is. The check is therefore cost-imposing rather than
-absolute: faking distance requires degrading your own measured latency, which
-lowers the provider's quality score and, with it, its selection rate and
-earnings. That is a real deterrent, not a proof. It should be described that way
-in any operator-facing documentation, so the verdict is not read as a stronger
-guarantee than it is.
+`suspect("rtt_impossible")` therefore does not exist. The verdict model keeps
+only the two corroboration rules that need no external reference point:
+absence of consensus, and instability over time. Reintroducing an RTT-style
+check later would need the per-instance reference point resolved first, not a
+retry of the single-constant version.
 
 `suspect` verdicts alert and are recorded. **They trigger no automatic action**
 under advisory enforcement.

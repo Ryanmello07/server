@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn raw geo-probe results into recorded judgements (verdict, RTT corroboration, failure taxonomy), and add a bandwidth signal that measures real throughput — passively from settled traffic first, actively only where passive history doesn't exist yet — all under a byte-spend budget that applies identically on beta and mainstream.
+**Goal:** Turn raw geo-probe results into recorded judgements (verdict and failure taxonomy), and add a bandwidth signal that measures real throughput — passively from settled traffic first, actively only where passive history doesn't exist yet — all under a byte-spend budget that applies identically on beta and mainstream.
 
-**Architecture:** Bandwidth has two independent sources feeding one stored figure per provider: a passive aggregate computed from already-settled `transfer_escrow` bytes (zero additional cost, cannot be gamed selectively), and a sampled active probe that shares the geo-probe's tunnel when a provider has no passive history yet. Both write through the same table, tagged by source, so consumers never have to know which produced a given row. A pure `probeverdict` package turns a submission plus corroborating signals (RTT, mmdb divergence) into `verified` / `unverified` / `suspect`, decoupled entirely from the transport that produced the submission. Active probing is rationed by an hourly byte-budget reservation that mirrors the existing bulk-delete quota exactly, because probe bytes are real paid contracts on any deployment where payouts are planned.
+**Architecture:** Bandwidth has two independent sources feeding one stored figure per provider: a passive aggregate computed from already-settled `transfer_escrow` bytes (zero additional cost, cannot be gamed selectively), and a sampled active probe that shares the geo-probe's tunnel when a provider has no passive history yet. Both write through the same table, tagged by source, so consumers never have to know which produced a given row. A pure `probeverdict` package turns a submission into `verified` / `unverified` / `suspect` from consensus and stability alone -- an RTT-distance corroboration was designed and deliberately dropped (see Task 3) -- decoupled entirely from the transport that produced the submission. Active probing is rationed by an hourly byte-budget reservation that mirrors the existing bulk-delete quota exactly, because probe bytes are real paid contracts on any deployment where payouts are planned.
 
 **Tech Stack:** Go 1.26.5, PostgreSQL 16, Redis (bucket reservations), the `connect` client library.
 
@@ -16,7 +16,7 @@
 - **One code path, one sampling-rate constant, both deployments.** Never branch on environment. If beta needs a different value for the sampling-rate constant to reach useful coverage at its provider count, that is a *value* chosen so it behaves sensibly at both scales — not a flag, not a second path. A knob only one environment ever exercises is how the `transportVersion < 2` gap went unnoticed.
 - **A zero-cost balance code does not make active probing free.** `transfer_balance.paid` can be false, but the payout planner sums paid and unpaid traffic identically before computing payouts (`account_payment_model_plan.go`). The byte budget in Task 4 is a spend limit unconditionally, not only where payouts happen to be live.
 - **Bandwidth results are advisory.** Nothing in this plan may alter `PassesMinimums`, scoring weights, or which providers `find-providers2` returns. A measured or missing bandwidth number must never gate selection — queue coverage will be partial for a long time, and an advisory number is what keeps that from becoming an outage.
-- **The probed country diverging from the mmdb country is not suspicious.** That divergence is the entire point of the project. Only a physically-impossible RTT is suspicious.
+- **The probed country diverging from the mmdb country is not suspicious.** That divergence is the entire point of the project. There is no RTT-based corroboration in this plan (designed and dropped, see Task 3) -- the only two verdict rules are absence of consensus and instability over time.
 - **Migrations apply by slice index** (`for i := DbVersion(ctx); i < upTo; i++`) — always append, never edit or reorder an applied migration.
 - **Two branches per server-side change:** a feature branch off `beta/self-contained-env` PR'd to `Ryanmello07/server`, plus a cherry-picked branch PR'd to `urnetwork/server` `main`. Check `git remote -v` before pushing in any checkout — remotes are inverted between `/tmp/sandbox/server` and `/root/urnetwork/server`.
 - Server tests need the local stack (`local/run-local.sh --keep-up`). A whole-package `go test ./model` is blocked by a pre-existing missing `subsidy.yml`; say so explicitly rather than claiming it passed.
@@ -30,11 +30,11 @@
 | --- | --- | --- |
 | `model/provider_bandwidth_model.go` (server) | **New.** Passive aggregation + storage for both bandwidth sources | Create |
 | `model/provider_bandwidth_model_test.go` | Tests | Create |
-| `probeverdict/probeverdict.go` (server) | **New.** Pure verdict logic: RTT floor, staleness, divergence | Create |
+| `probeverdict/probeverdict.go` (server) | **New.** Pure verdict logic: consensus absence, staleness | Create |
 | `probeverdict/probeverdict_test.go` | Table-driven tests | Create |
 | `db_migrations.go` | Verdict columns + bandwidth table | Modify — appended migrations only |
 | `model/provider_bandwidth_rate_limit.go` (server) | **New.** Hourly byte-budget reservation, mirrors bulk-delete | Create |
-| `controller/provider_egress_location_controller.go` | Ingest args extended with RTT; verdict computed on submit | Modify |
+| `controller/provider_egress_location_controller.go` | Verdict computed on submit | Modify |
 | `api/handlers/provider_bandwidth_handlers.go` (server) | **New.** Operator-secret-gated download endpoint for the active probe | Create |
 | `api/api.go` | Route registration | Modify |
 | `bandwidth/bandwidth.go` (operator-proxy) | **New.** Adaptive-size throughput measurement over a `*http.Client` | Create |
@@ -191,7 +191,7 @@ gh pr create --repo urnetwork/server --base main \
 
 **Interfaces:**
 - Consumes: `ProviderBandwidth` from Task 1.
-- Produces: a `provider_bandwidth` table, and four new columns on `provider_egress_location`: `verdict varchar(16) NOT NULL DEFAULT 'unverified'`, `verdict_reason varchar(64) NOT NULL DEFAULT ''`, `assurance varchar(16) NOT NULL DEFAULT 'direct'`, `rtt_millis int NOT NULL DEFAULT 0`. (`intermediary_client_id` is P3's concern — do not add it here, it has no writer until multi-hop exists and an unused nullable column with no test is dead weight.)
+- Produces: a `provider_bandwidth` table, and three new columns on `provider_egress_location`: `verdict varchar(16) NOT NULL DEFAULT 'unverified'`, `verdict_reason varchar(64) NOT NULL DEFAULT ''`, `assurance varchar(16) NOT NULL DEFAULT 'direct'`. (No `rtt_millis` or `intermediary_client_id`: the RTT check was designed and dropped — see Task 3 — and multi-hop's intermediary tracking is P3's concern. An unused column with no writer and no test is dead weight; add it when something actually writes it, not before.)
 
 - [ ] **Step 1: Create the branch**
 
@@ -228,7 +228,7 @@ func TestProviderBandwidthTableExists(t *testing.T) {
 func TestProviderEgressLocationHasVerdictColumns(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
-		for _, col := range []string{"verdict", "verdict_reason", "assurance", "rtt_millis"} {
+		for _, col := range []string{"verdict", "verdict_reason", "assurance"} {
 			var exists bool
 			server.Db(ctx, func(conn server.PgConn) {
 				result, err := conn.Query(ctx,
@@ -263,8 +263,7 @@ Find the tail of the `migrations` slice in `db_migrations.go` (it currently ends
         ALTER TABLE provider_egress_location
             ADD COLUMN IF NOT EXISTS verdict varchar(16) NOT NULL DEFAULT 'unverified',
             ADD COLUMN IF NOT EXISTS verdict_reason varchar(64) NOT NULL DEFAULT '',
-            ADD COLUMN IF NOT EXISTS assurance varchar(16) NOT NULL DEFAULT 'direct',
-            ADD COLUMN IF NOT EXISTS rtt_millis int NOT NULL DEFAULT 0
+            ADD COLUMN IF NOT EXISTS assurance varchar(16) NOT NULL DEFAULT 'direct'
     `),
 	newSqlMigration(`
         CREATE TABLE IF NOT EXISTS provider_bandwidth (
@@ -330,16 +329,17 @@ go build ./... && go vet ./...
 
 **Repo:** `/root/urnetwork/server`. New standalone package, so branch from `beta/self-contained-env` directly rather than stacking — it has no dependency on Tasks 1-2's schema, only on their *types* being stable, and stacking unnecessarily would make this task's PR show unrelated schema diffs. Two branches: `feat/provider-egress-verdict` and `-upstream`.
 
-**Context:** the spec's threat model requires: (1) no country consensus → `unverified`; (2) an RTT that makes the claimed country physically impossible → `suspect`; (3) country flip-flopping within 24h → `suspect`; (4) probed country differing from mmdb is explicitly **not** suspicious — that divergence is the entire point. The RTT check is one-sided and cost-imposing, not a proof: a provider can inflate its own latency to fake being further away, at the cost of its own quality score. Document this limit in the package comment, not just here.
+**Context:** the spec's threat model requires: (1) no country consensus → `unverified`; (2) country flip-flopping within 24h → `suspect`; (3) probed country differing from mmdb is explicitly **not** suspicious — that divergence is the entire point.
+
+**An RTT-distance floor was designed for this package and deliberately dropped before implementation — do not add it back.** See the spec's "The RTT floor was designed, then dropped" section for the full reasoning. In short: the check needs a fixed reference point (where the RTT was measured *from*), and `network_client_connection.connection_block` exists specifically because there can be more than one such point. A wrong reference point does not fail safe — it can flag an honest, correctly-placed provider as `suspect`, not merely loosen the check. Weighed against a check that was already one-sided and defeatable by a provider willing to degrade its own latency, it was not worth carrying the reference-point problem. `Input` therefore has no RTT or coordinate fields at all, and `Verdict.Reason` never takes the value `"rtt_impossible"`.
 
 **Files:**
 - Create: `probeverdict/probeverdict.go`, `probeverdict/probeverdict_test.go`
 
 **Interfaces:**
-- Produces: `type Input struct { CountryConfident bool; CountryCode string; ObservedRTT time.Duration; ProbeOriginLat, ProbeOriginLon float64; ClaimedLat, ClaimedLon float64; PreviousCountryCode string; PreviousObservedAt time.Time; Now time.Time }`
+- Produces: `type Input struct { CountryConfident bool; CountryCode string; PreviousCountryCode string; PreviousObservedAt time.Time; Now time.Time }`
 - Produces: `type Verdict struct { State string; Reason string }` — `State` is `"verified"`, `"unverified"`, or `"suspect"`.
 - Produces: `func Evaluate(in Input) Verdict`
-- Produces: `func GreatCircleKm(lat1, lon1, lat2, lon2 float64) float64` — exported because the RTT floor calculation is independently useful and testable on its own.
 
 - [ ] **Step 1: Create the branch**
 
@@ -368,43 +368,11 @@ func TestEvaluateNoConsensusIsUnverified(t *testing.T) {
 	}
 }
 
-func TestEvaluateImpossibleRttIsSuspect(t *testing.T) {
-	// Atlanta (33.75, -84.39) to Madrid (40.42, -3.70): ~7500km, vacuum
-	// light-speed floor ~50ms round trip. 8ms observed is impossible.
-	v := Evaluate(Input{
-		CountryConfident: true,
-		CountryCode:      "es",
-		ObservedRTT:      8 * time.Millisecond,
-		ProbeOriginLat:   33.75, ProbeOriginLon: -84.39,
-		ClaimedLat: 40.42, ClaimedLon: -3.70,
-	})
-	if v.State != "suspect" || v.Reason != "rtt_impossible" {
-		t.Errorf("got %+v, want suspect/rtt_impossible", v)
-	}
-}
-
-func TestEvaluatePlausibleRttIsVerified(t *testing.T) {
-	// same distance, 90ms observed -- comfortably above the vacuum floor
-	v := Evaluate(Input{
-		CountryConfident: true,
-		CountryCode:      "es",
-		ObservedRTT:      90 * time.Millisecond,
-		ProbeOriginLat:   33.75, ProbeOriginLon: -84.39,
-		ClaimedLat: 40.42, ClaimedLon: -3.70,
-	})
-	if v.State != "verified" {
-		t.Errorf("got %+v, want verified", v)
-	}
-}
-
 func TestEvaluateCountryFlipFlopIsSuspect(t *testing.T) {
 	now := time.Now()
 	v := Evaluate(Input{
 		CountryConfident:    true,
 		CountryCode:         "de",
-		ObservedRTT:         90 * time.Millisecond,
-		ProbeOriginLat:      33.75, ProbeOriginLon: -84.39,
-		ClaimedLat: 52.52, ClaimedLon: 13.40, // berlin
 		PreviousCountryCode: "es",
 		PreviousObservedAt:  now.Add(-2 * time.Hour),
 		Now:                 now,
@@ -414,29 +382,34 @@ func TestEvaluateCountryFlipFlopIsSuspect(t *testing.T) {
 	}
 }
 
-func TestEvaluateMmdbDivergenceAloneIsNotSuspect(t *testing.T) {
-	// this test asserts the single most important safety property in the
-	// package: a country that differs from what mmdb would have said is
-	// NOT an input to Evaluate at all, and correctly verified when RTT and
-	// consensus are otherwise clean. There is deliberately no mmdb-country
-	// field on Input -- see the package doc comment.
+func TestEvaluateCountryChangeOutsideWindowIsVerified(t *testing.T) {
+	// a country change is only "unstable" within the 24h window -- after it,
+	// a changed country is a legitimate correction, not a flip-flop
+	now := time.Now()
 	v := Evaluate(Input{
-		CountryConfident: true,
-		CountryCode:      "es",
-		ObservedRTT:      90 * time.Millisecond,
-		ProbeOriginLat:   33.75, ProbeOriginLon: -84.39,
-		ClaimedLat: 40.42, ClaimedLon: -3.70,
+		CountryConfident:    true,
+		CountryCode:         "de",
+		PreviousCountryCode: "es",
+		PreviousObservedAt:  now.Add(-25 * time.Hour),
+		Now:                 now,
 	})
 	if v.State != "verified" {
-		t.Errorf("a clean probe with no prior history must verify regardless of what mmdb would have said, got %+v", v)
+		t.Errorf("got %+v, want verified (change is outside the 24h window)", v)
 	}
 }
 
-func TestGreatCircleKmKnownDistance(t *testing.T) {
-	// Atlanta to Madrid is ~7500km
-	km := GreatCircleKm(33.75, -84.39, 40.42, -3.70)
-	if km < 7000 || 8000 < km {
-		t.Errorf("GreatCircleKm = %.0f, want ~7500", km)
+func TestEvaluateMmdbDivergenceAloneIsNotSuspect(t *testing.T) {
+	// this test asserts the single most important safety property in the
+	// package: a country that differs from what mmdb would have said is NOT
+	// an input to Evaluate at all -- there is no field for it on Input, so a
+	// clean first-time probe always verifies regardless of what mmdb would
+	// have said about the same connection.
+	v := Evaluate(Input{
+		CountryConfident: true,
+		CountryCode:      "es",
+	})
+	if v.State != "verified" {
+		t.Errorf("a clean probe with no prior history must verify regardless of what mmdb would have said, got %+v", v)
 	}
 }
 ```
@@ -454,25 +427,24 @@ Expected: build failure, `undefined: Evaluate`.
 // it is fully table-testable independent of how a submission arrived.
 //
 // Deliberately absent from Input: the mmdb-derived country for the same
-// connection. A probed country differing from what the free mmdb would have
-// said is the entire point of this project -- the egress genuinely differs
-// from where the control connection originates -- and must never be treated
-// as suspicious. Keeping that field off Input makes the omission structural
-// rather than a rule a caller could get wrong.
+// connection, and any RTT or coordinate fields. A probed country differing
+// from what the free mmdb would have said is the entire point of this
+// project and must never be treated as suspicious -- keeping that field off
+// Input makes the omission structural. An RTT-distance corroboration was
+// designed and dropped before implementation (see the spec's "The RTT floor
+// was designed, then dropped"): it needs a fixed reference point that this
+// system does not have a single answer for once more than one deployment
+// instance exists, and a wrong reference point does not fail safe -- it can
+// flag an honest provider as suspect. Do not reintroduce ObservedRTT or
+// coordinate fields here without first resolving that reference-point
+// problem in the spec.
 package probeverdict
 
-import (
-	"math"
-	"time"
-)
+import "time"
 
 type Input struct {
 	CountryConfident bool
 	CountryCode      string
-	ObservedRTT      time.Duration
-
-	ProbeOriginLat, ProbeOriginLon float64
-	ClaimedLat, ClaimedLon         float64
 
 	PreviousCountryCode string
 	PreviousObservedAt  time.Time
@@ -488,29 +460,9 @@ type Verdict struct {
 // flip-flop rather than a legitimate correction.
 const unstableWindow = 24 * time.Hour
 
-// vacuumLightSpeedKmPerSec is used deliberately instead of fibre's ~200,000
-// km/s: the vacuum figure makes the floor strictly unachievable rather than
-// merely unlikely, so an honest provider on an unusually good path is never
-// flagged. False negatives are acceptable here; false positives are not,
-// because the cost is a suspect verdict on a real operator's provider.
-//
-// This check is one-sided and cost-imposing, not a proof: a provider can
-// inflate its own measured latency to fake being further away than it is,
-// at the cost of degrading its own quality score. It catches the cheap
-// version of the lie, not a determined one.
-const vacuumLightSpeedKmPerSec = 299792.458
-
 func Evaluate(in Input) Verdict {
 	if !in.CountryConfident {
 		return Verdict{State: "unverified", Reason: "no_consensus"}
-	}
-
-	if 0 < in.ObservedRTT {
-		distanceKm := GreatCircleKm(in.ProbeOriginLat, in.ProbeOriginLon, in.ClaimedLat, in.ClaimedLon)
-		floorSeconds := 2 * distanceKm / vacuumLightSpeedKmPerSec
-		if in.ObservedRTT.Seconds() < floorSeconds {
-			return Verdict{State: "suspect", Reason: "rtt_impossible"}
-		}
 	}
 
 	if in.PreviousCountryCode != "" && in.PreviousCountryCode != in.CountryCode {
@@ -525,28 +477,12 @@ func Evaluate(in Input) Verdict {
 
 	return Verdict{State: "verified"}
 }
-
-// GreatCircleKm returns the great-circle distance between two lat/lon points
-// in kilometres, via the haversine formula.
-func GreatCircleKm(lat1, lon1, lat2, lon2 float64) float64 {
-	const earthRadiusKm = 6371.0
-	toRad := func(deg float64) float64 { return deg * math.Pi / 180 }
-
-	phi1, phi2 := toRad(lat1), toRad(lat2)
-	dPhi := toRad(lat2 - lat1)
-	dLambda := toRad(lon2 - lon1)
-
-	a := math.Sin(dPhi/2)*math.Sin(dPhi/2) +
-		math.Cos(phi1)*math.Cos(phi2)*math.Sin(dLambda/2)*math.Sin(dLambda/2)
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-	return earthRadiusKm * c
-}
 ```
 
 - [ ] **Step 5: Run the tests**
 
 Run: `go test ./probeverdict/ -v`
-Expected: all six PASS.
+Expected: all five PASS.
 
 - [ ] **Step 6: Ship both branches** (same shape as prior tasks; this package has no server-side dependency so the upstream cherry-pick should apply with zero conflicts — note that explicitly in the PR body).
 
@@ -965,12 +901,13 @@ go build ./... && go vet ./... && gofmt -l . && go test ./... -race -count=1
 
 **Context:** Task 3 built and tested `probeverdict.Evaluate` in isolation; nothing calls it yet. This task is what actually turns a submission into a recorded judgement — without it, the `verdict` column added in Task 2 sits at its default (`'unverified'`) forever, and Task 3's package is dead code.
 
+**No RTT plumbing here.** `probeverdict.Input` has no RTT or coordinate fields (see Task 3), and Task 2 does not add an `rtt_millis` column, so there is nothing RTT-shaped anywhere in this task.
+
 **Files:**
 - Modify: `controller/provider_egress_location_controller.go`
 
 **Interfaces:**
-- Consumes: `probeverdict.Evaluate` (Task 3), the `verdict`/`verdict_reason`/`rtt_millis` columns (Task 2), `model.GetProviderEgressLocation` and `model.GetLocation` (existing).
-- Extends: `SubmitProviderEgressLocationArgs` gains `RttMillis int \`json:"rtt_millis,omitempty"\`` — the RTT the prober observed to this provider during the probe. `0` (omitted) means no RTT was available; the wiring must treat that as "skip the RTT check", not as a 0ms RTT, which would trip the impossibility floor on every submission.
+- Consumes: `probeverdict.Evaluate` (Task 3), `model.GetProviderEgressLocation` (existing).
 
 - [ ] **Step 1: Create the branch**
 
@@ -994,11 +931,9 @@ func TestSubmitProviderEgressLocationRecordsVerifiedVerdict(t *testing.T) {
 		clientId := server.NewId()
 		Testing_CreateDevice(ctx, server.NewId(), server.NewId(), clientId, "", "")
 
-		// atlanta to madrid, ~90ms -- comfortably plausible
 		_, err := SubmitProviderEgressLocation(ctx, &SubmitProviderEgressLocationArgs{
 			ClientId: clientId, CountryCode: "es", Country: "Spain",
 			CountryConfident: true, ObservedAt: server.NowUtc(),
-			RttMillis: 90,
 		})
 		connect.AssertEqual(t, err, nil)
 
@@ -1010,17 +945,23 @@ func TestSubmitProviderEgressLocationRecordsVerifiedVerdict(t *testing.T) {
 	})
 }
 
-func TestSubmitProviderEgressLocationRecordsSuspectOnImpossibleRtt(t *testing.T) {
+func TestSubmitProviderEgressLocationRecordsSuspectOnCountryFlipFlop(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
 		clientId := server.NewId()
 		Testing_CreateDevice(ctx, server.NewId(), server.NewId(), clientId, "", "")
 
-		// atlanta to madrid claimed, 8ms observed -- physically impossible
+		// first probe: spain
 		_, err := SubmitProviderEgressLocation(ctx, &SubmitProviderEgressLocationArgs{
 			ClientId: clientId, CountryCode: "es", Country: "Spain",
+			CountryConfident: true, ObservedAt: server.NowUtc().Add(-time.Hour),
+		})
+		connect.AssertEqual(t, err, nil)
+
+		// second probe an hour later: germany -- a flip-flop inside the 24h window
+		_, err = SubmitProviderEgressLocation(ctx, &SubmitProviderEgressLocationArgs{
+			ClientId: clientId, CountryCode: "de", Country: "Germany",
 			CountryConfident: true, ObservedAt: server.NowUtc(),
-			RttMillis: 8,
 		})
 		connect.AssertEqual(t, err, nil)
 
@@ -1029,51 +970,20 @@ func TestSubmitProviderEgressLocationRecordsSuspectOnImpossibleRtt(t *testing.T)
 			t.Fatal("expected a stored egress location")
 		}
 		connect.AssertEqual(t, stored.Verdict, "suspect")
-		connect.AssertEqual(t, stored.VerdictReason, "rtt_impossible")
-	})
-}
-
-func TestSubmitProviderEgressLocationOmittedRttSkipsTheFloorCheck(t *testing.T) {
-	server.DefaultTestEnv().Run(t, func(t testing.TB) {
-		ctx := context.Background()
-		clientId := server.NewId()
-		Testing_CreateDevice(ctx, server.NewId(), server.NewId(), clientId, "", "")
-
-		// RttMillis omitted entirely (zero value) -- must NOT be read as an
-		// impossible 0ms RTT and flagged suspect
-		_, err := SubmitProviderEgressLocation(ctx, &SubmitProviderEgressLocationArgs{
-			ClientId: clientId, CountryCode: "es", Country: "Spain",
-			CountryConfident: true, ObservedAt: server.NowUtc(),
-		})
-		connect.AssertEqual(t, err, nil)
-
-		stored := model.GetProviderEgressLocation(ctx, clientId)
-		connect.AssertEqual(t, stored.Verdict, "verified")
+		connect.AssertEqual(t, stored.VerdictReason, "unstable")
 	})
 }
 ```
 
-Real coordinates for the RTT floor test must resolve from wherever Step 3 sources them (below) — if that is a fixed operator-origin constant, use its actual value in the test rather than a placeholder, so the test exercises the real code path.
-
 - [ ] **Step 3: Run and confirm failure**
 
-Expected: compile failure, `undefined: RttMillis` field, or the verdict assertions failing against the always-`'unverified'` default — confirm which, and report it.
+Expected: the verdict assertions fail against the column's default (`'unverified'`), since nothing computes or stores a verdict yet.
 
 - [ ] **Step 4: Implement**
 
 In `SubmitProviderEgressLocation`, after the existing validation and before the row is written:
 
 ```go
-	// operatorOriginLat/Lon approximate the platform's own location -- the
-	// fixed point every RTT in this system is measured from, since the
-	// prober tunnels through the platform to reach a provider. Imprecision
-	// here only loosens the RTT floor (a conservative direction): it can
-	// make a genuinely impossible claim look marginally plausible, never the
-	// reverse, because GreatCircleKm only grows if the origin is misplaced
-	// toward the claimed location.
-	const operatorOriginLat = 33.7490 // Atlanta -- replace with the real operator origin before shipping
-	const operatorOriginLon = -84.3880
-
 	previous := model.GetProviderEgressLocation(ctx, args.ClientId)
 	var previousCountryCode string
 	var previousObservedAt time.Time
@@ -1082,33 +992,16 @@ In `SubmitProviderEgressLocation`, after the existing validation and before the 
 		previousObservedAt = previous.ObservedAt
 	}
 
-	var claimedLat, claimedLon float64
-	if loc := model.GetCountryLocationByCode(ctx, countryCode); loc != nil {
-		claimedLat, claimedLon = loc.Latitude, loc.Longitude
-	}
-
-	var observedRTT time.Duration
-	if 0 < args.RttMillis {
-		observedRTT = time.Duration(args.RttMillis) * time.Millisecond
-	}
-
 	verdict := probeverdict.Evaluate(probeverdict.Input{
 		CountryConfident:    args.CountryConfident,
 		CountryCode:         countryCode,
-		ObservedRTT:         observedRTT,
-		ProbeOriginLat:      operatorOriginLat,
-		ProbeOriginLon:      operatorOriginLon,
-		ClaimedLat:          claimedLat,
-		ClaimedLon:          claimedLon,
 		PreviousCountryCode: previousCountryCode,
 		PreviousObservedAt:  previousObservedAt,
 		Now:                 server.NowUtc(),
 	})
 ```
 
-then pass `verdict.State` and `verdict.Reason` through to whatever writes the row (extend `model.SetProviderEgressLocation`'s args struct with `Verdict`/`VerdictReason` fields, defaulting to `"unverified"`/`""` for any other caller — check whether `model.GetCountryLocationByCode` already exists under that or a similar name before adding it; if the lookup takes a different shape, adapt the call rather than inventing a new model function).
-
-**Do not ship the hardcoded Atlanta constant.** It is a placeholder for wherever this plan is actually executed from — replace it with the real operator origin (or, if the deployment's egress point can move, source it from a config resource the same way `provider_egress.yml`'s secret is read) before merging. Flag this explicitly in the PR description so it cannot be missed in review.
+then pass `verdict.State` and `verdict.Reason` through to whatever writes the row (extend `model.SetProviderEgressLocation`'s args struct with `Verdict`/`VerdictReason` fields, defaulting to `"unverified"`/`""` for any other caller).
 
 - [ ] **Step 5: Run tests and regressions**
 
@@ -1117,7 +1010,7 @@ then pass `verdict.State` and `verdict.Reason` through to whatever writes the ro
 go build ./... && go vet ./...
 ```
 
-- [ ] **Step 6: Ship both branches**, and call out the placeholder origin constant prominently in both PR descriptions.
+- [ ] **Step 6: Ship both branches.**
 
 ---
 
@@ -1127,11 +1020,11 @@ go build ./... && go vet ./...
 | --- | --- |
 | 1 | Passive bandwidth derived correctly from settled bytes; nil (not zero) when no history; companion contracts excluded |
 | 2 | New table and columns present; existing `provider_egress_location` readers unaffected by the additive columns |
-| 3 | All six `probeverdict` tests pass, including the mmdb-non-suspicious property and the RTT floor with a real distance |
+| 3 | All five `probeverdict` tests pass, including the mmdb-non-suspicious property |
 | 4 | Budget fills then spills to the next bucket; errors only when every lookahead bucket is full; existing bulk-delete tests unaffected |
 | 5 | Auth rejects/accepts correctly; streamed byte count matches the request and is clamped; the result endpoint stores an active measurement and rejects non-positive values |
 | 6 | `Measure` respects both the byte and time caps; sampling only fires when `NeedsBandwidth` was true and budget was reserved |
-| 7 | A plausible RTT verifies, an impossible one is flagged suspect with the right reason, and an omitted RTT does not falsely trip the floor |
+| 7 | A clean submission verifies; a country flip-flop within 24h is flagged suspect with the right reason |
 | All | Both PRs open per server-side task; nothing merged to a base; the placeholder operator-origin constant is replaced before merge |
 
 ## Out of Scope
