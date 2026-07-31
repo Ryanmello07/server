@@ -46,31 +46,49 @@ const MaxProviderBandwidthLookaheadBuckets = 24
 // rate, which stays one value everywhere so both deployments exercise the same
 // path.
 //
-// The default is deliberately the conservative one, so an environment with no
-// config file cannot accidentally spend more than a small deployment can
-// afford.
+// The default below is deliberately the conservative one, so an environment
+// with no config file cannot accidentally spend more than a small deployment
+// can afford. It is NOT beta's value: beta sets 80 in
+// beta-vault/config/provider_bandwidth.yml, derived below. The compiled
+// default of 40 covers 20 providers per hour (two reservations each), which is
+// the point -- an unconfigured deployment gets a floor, not a fleet sweep.
 //
 // HOW TO DERIVE IT, using the measurements taken on beta 2026-07-31:
 //
 //	Each provider costs TWO reservations, not one -- the operator target and
 //	the cdn target are measured separately and never averaged.
 //
-//	A 40-provider sweep at 5 MiB per target moves:
-//	  operator: 200 MiB out (the api serves it) + 200 MiB back in (the
+//	A 40-provider sweep at MaxProviderBandwidthBytesPerProbe (16 MiB) per
+//	target moves:
+//	  operator: 640 MiB out (the api serves it) + 640 MiB back in (the
 //	            provider relays it through connect) -- it crosses the uplink
 //	            TWICE
-//	  cdn:      200 MiB in only (cloudflare serves it, we only relay)
-//	  total:    600 MiB per sweep
+//	  cdn:      640 MiB in only (cloudflare serves it, we only relay)
+//	  total:    1.9 GiB per sweep, of which 1.25 GiB is reserved budget
 //
-//	Measured beta headroom under exactly that load:
+//	Measured beta headroom under the SINGLE-STREAM load that preceded this
+//	(one third the bytes, one eighth the simultaneous transfers):
 //	  uplink    240-324 MB/s down, 28-120 MB/s up -> the sweep used 0.17%
 //	  cpu       connect 5.4% idle -> 50% peak of ONE core, on a 4-core box
 //	  memory    available flat at ~2.3 GB; connect RSS +25 MiB across the pass
 //
-//	So on beta NO hardware resource binds; the budget is what binds. The right
-//	value is therefore set by coverage, not by capacity: 2 reservations x 40
-//	providers = 80 to sweep the fleet in one hour, and 100 leaves room to grow
-//	to 50 providers before anyone is skipped.
+//	So on beta NO hardware resource binds; the budget is what binds, and the
+//	right value is set by coverage rather than by capacity: 2 reservations x
+//	40 providers = 80 is exactly one full sweep of the current fleet in one
+//	hour.
+//
+//	80, not the 100 this carried when a reservation was 5 MiB. That 100 bought
+//	headroom to grow to 50 providers; a reservation now costs 3.2x more, so
+//	the same headroom would cost 1.56 GiB/hour and 37.5 GiB/day worst case.
+//	Coverage of the fleet that exists is kept and the speculative headroom is
+//	spent instead. A 41st provider being deferred to the next hour is the
+//	budget working as designed, not a fault -- raise this value when the fleet
+//	actually grows.
+//
+//	Bytes are not the only dimension. Simultaneous transfers served by the api
+//	are (the prober's stream count) x (its -concurrency), which a byte budget
+//	does not bound at all: 8 x 2 = 16 at beta's deployed -concurrency=2. That
+//	is bounded on the prober side, where both numbers live.
 //
 // Revisit against real data; this is tuned, not structural.
 const defaultActiveBandwidthProbesPerBucket = 40

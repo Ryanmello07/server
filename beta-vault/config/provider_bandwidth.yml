@@ -9,11 +9,33 @@
 #   cpu      connect 5.4% idle -> 50% peak of ONE core (4 cores available)
 #   memory   available flat at ~2.3 GB, connect RSS +25 MiB over the pass
 #
+# Those figures were taken under the SINGLE-STREAM probe that preceded this.
+# A probe is now 8 parallel streams of 2 MiB, because one TCP flow cannot
+# exceed (connect's 1 MiB window / RTT) and the single-stream probe was
+# measuring that ceiling instead of the provider -- eleven of twelve providers
+# came back with ~1 MiB in flight, and a box measured at 79 MB/s on its own
+# host reported 4.8 MB/s through the tunnel. So one reservation is now 16 MiB,
+# not 5 MiB.
+#
 # No hardware resource binds; the budget does. So the value is set by coverage:
 # each provider costs TWO reservations (operator + cdn, measured separately and
-# never averaged), so 40 providers needs 80, and 100 leaves room to grow to 50
-# providers before anyone gets skipped.
+# never averaged), so a full 40-provider sweep in one hour needs
 #
-# 100 x 5 MiB = 500 MiB/hour, worst case 12 GiB/day if every lookahead bucket
-# fills. Against a 100 MB/s uplink that is 0.14 MB/s averaged over the hour.
-probes_per_bucket: 100
+#   40 providers x 2 targets = 80 reservations
+#
+# 80 x 16 MiB = 1280 MiB = 1.25 GiB/hour, worst case 30 GiB/day if every one of
+# the 24 lookahead buckets fills. Against the measured 28-120 MB/s uplink that
+# is 0.36 MiB/s averaged over the hour.
+#
+# 80, not the 100 this was: 100 bought headroom to grow to 50 providers back
+# when a reservation was 5 MiB, and at 16 MiB that same headroom would cost
+# 1.56 GiB/hour and 37.5 GiB/day. Coverage of the fleet that exists is kept and
+# the speculative headroom is spent instead. A 41st provider being deferred to
+# the next hour is this budget working as designed -- raise this when the fleet
+# actually grows.
+#
+# Bytes are not the only dimension, and the other one is not bounded here: the
+# api serves (streams x the prober's -concurrency) transfers at once, which is
+# 8 x 2 = 16 with beta's deployed -concurrency=2. That is bounded on the prober
+# side, where both numbers live.
+probes_per_bucket: 80
