@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/urnetwork/glog"
 	"github.com/urnetwork/server"
+	"sync"
 )
 
 // A deployment-wide budget on the bytes active bandwidth probing is allowed
@@ -36,36 +38,82 @@ import (
 const ProviderBandwidthBucketDuration = time.Hour
 const MaxProviderBandwidthLookaheadBuckets = 24
 
-// MaxActiveBandwidthProbesPerBucket is derived from the population this
-// probes, not picked arbitrarily. Active sampling only ever runs against
-// providers with no passive history -- on beta today that is the entire fleet
-// (nothing has settled a contract yet), and on a mature deployment it is the
-// trickle of newly-joined providers before their first settled contract. 40
-// per hour comfortably covers a beta-sized fleet in a single pass, and stays a
-// small, bounded spend on a mature deployment where the no-passive-history
-// population is naturally small. It is one value chosen to behave sensibly at
-// both scales, not a per-environment knob.
+// activeBandwidthProbesPerBucket is the per-hour reservation budget. It is
+// CAPACITY, and capacity is a property of the deployment rather than of this
+// code, so it is configurable: beta runs on a 4-core box with a 40-provider
+// fleet, mainnet has ~100k providers and must measure its own limits and set
+// its own number. That is different from a behavioural knob like the sampling
+// rate, which stays one value everywhere so both deployments exercise the same
+// path.
 //
-// This is a tuned value, not a structural one: revisit it against real
-// production data once active probing has run for a week.
-const MaxActiveBandwidthProbesPerBucket = 40
+// The default is deliberately the conservative one, so an environment with no
+// config file cannot accidentally spend more than a small deployment can
+// afford.
+//
+// HOW TO DERIVE IT, using the measurements taken on beta 2026-07-31:
+//
+//	Each provider costs TWO reservations, not one -- the operator target and
+//	the cdn target are measured separately and never averaged.
+//
+//	A 40-provider sweep at 5 MiB per target moves:
+//	  operator: 200 MiB out (the api serves it) + 200 MiB back in (the
+//	            provider relays it through connect) -- it crosses the uplink
+//	            TWICE
+//	  cdn:      200 MiB in only (cloudflare serves it, we only relay)
+//	  total:    600 MiB per sweep
+//
+//	Measured beta headroom under exactly that load:
+//	  uplink    240-324 MB/s down, 28-120 MB/s up -> the sweep used 0.17%
+//	  cpu       connect 5.4% idle -> 50% peak of ONE core, on a 4-core box
+//	  memory    available flat at ~2.3 GB; connect RSS +25 MiB across the pass
+//
+//	So on beta NO hardware resource binds; the budget is what binds. The right
+//	value is therefore set by coverage, not by capacity: 2 reservations x 40
+//	providers = 80 to sweep the fleet in one hour, and 100 leaves room to grow
+//	to 50 providers before anyone is skipped.
+//
+// Revisit against real data; this is tuned, not structural.
+const defaultActiveBandwidthProbesPerBucket = 40
 
-// One active probe downloads 5 MB (the spec's per-probe figure), so the
-// hourly budget is 40 probes x 5 MB = 200 MB/hour, and the daily cap is
-// 24 x 200 MB = 4.8 GB worst case -- the ceiling only reached if every bucket
-// in the lookahead window fills.
-//
+var activeBandwidthProbesPerBucket = sync.OnceValue(func() int {
+	// OPTIONAL, exactly like pro.yml: an environment without the file must not
+	// fail to boot, it must fall back to the conservative default.
+	resource, err := server.Config.SimpleResource("provider_bandwidth.yml")
+	if err != nil {
+		glog.Infof("[bwq]provider_bandwidth.yml not present; using the default budget of %d probes/hour\n", defaultActiveBandwidthProbesPerBucket)
+		return defaultActiveBandwidthProbesPerBucket
+	}
+	var y struct {
+		ProbesPerBucket int `yaml:"probes_per_bucket"`
+	}
+	resource.UnmarshalYaml(&y)
+	if y.ProbesPerBucket <= 0 {
+		glog.Errorf("[bwq]provider_bandwidth.yml has probes_per_bucket=%d, which is not usable; using the default %d\n", y.ProbesPerBucket, defaultActiveBandwidthProbesPerBucket)
+		return defaultActiveBandwidthProbesPerBucket
+	}
+	glog.Infof("[bwq]active bandwidth budget: %d probes/hour from provider_bandwidth.yml\n", y.ProbesPerBucket)
+	return y.ProbesPerBucket
+})
+
+// MaxProviderBandwidthBytesPerBucket and PerDay are functions rather than
+// consts because the budget is now configurable.
+func MaxProviderBandwidthBytesPerBucket() int64 {
+	return int64(activeBandwidthProbesPerBucket()) * MaxProviderBandwidthBytesPerProbe
+}
+
+func MaxProviderBandwidthBytesPerDay() int64 {
+	return MaxProviderBandwidthLookaheadBuckets * MaxProviderBandwidthBytesPerBucket()
+}
+
 // Explicitly int64: a byte budget is not a row count, and callers pass an
 // int64 byteCount.
 const MaxProviderBandwidthBytesPerProbe int64 = 5 * 1024 * 1024
-const MaxProviderBandwidthBytesPerBucket int64 = MaxActiveBandwidthProbesPerBucket * MaxProviderBandwidthBytesPerProbe
-const MaxProviderBandwidthBytesPerDay int64 = MaxProviderBandwidthLookaheadBuckets * MaxProviderBandwidthBytesPerBucket
 
 func maxProviderBandwidthError() error {
 	return fmt.Errorf(
 		"The active bandwidth probe budget (%d bytes per hour, %d bytes per day) has been reached for this deployment. Please try again later.",
-		MaxProviderBandwidthBytesPerBucket,
-		MaxProviderBandwidthBytesPerDay,
+		MaxProviderBandwidthBytesPerBucket(),
+		MaxProviderBandwidthBytesPerDay(),
 	)
 }
 
@@ -136,7 +184,7 @@ func ReserveProviderBandwidthSlot(
 
 		for i := 0; i < MaxProviderBandwidthLookaheadBuckets; i++ {
 			candidate := windowStart.Add(time.Duration(i) * ProviderBandwidthBucketDuration)
-			if usedByBucket[candidate]+byteCount <= MaxProviderBandwidthBytesPerBucket {
+			if usedByBucket[candidate]+byteCount <= MaxProviderBandwidthBytesPerBucket() {
 				id := server.NewId()
 				server.RaisePgResult(tx.Exec(
 					ctx,

@@ -1,0 +1,19 @@
+# Active bandwidth probe budget for THIS deployment.
+#
+# Capacity is a property of the deployment, so each one sets its own. Mainnet
+# must measure its own limits -- at ~100k providers a full sweep is a
+# completely different regime and needs sampling, not a larger bucket.
+#
+# Beta, measured 2026-07-31 on the 4-core host under a full 40-provider pass:
+#   uplink   240-324 MB/s down, 28-120 MB/s up   -> the sweep used 0.17%
+#   cpu      connect 5.4% idle -> 50% peak of ONE core (4 cores available)
+#   memory   available flat at ~2.3 GB, connect RSS +25 MiB over the pass
+#
+# No hardware resource binds; the budget does. So the value is set by coverage:
+# each provider costs TWO reservations (operator + cdn, measured separately and
+# never averaged), so 40 providers needs 80, and 100 leaves room to grow to 50
+# providers before anyone gets skipped.
+#
+# 100 x 5 MiB = 500 MiB/hour, worst case 12 GiB/day if every lookahead bucket
+# fills. Against a 100 MB/s uplink that is 0.14 MB/s averaged over the hour.
+probes_per_bucket: 100
