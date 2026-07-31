@@ -105,9 +105,25 @@ func MaxProviderBandwidthBytesPerDay() int64 {
 	return MaxProviderBandwidthLookaheadBuckets * MaxProviderBandwidthBytesPerBucket()
 }
 
+// MaxProviderBandwidthBytesPerProbe is what ONE reservation admits, and it
+// must equal what one measurement actually transfers -- a budget that
+// under-counts is worse than no budget, because it reports a spend ceiling the
+// deployment is quietly exceeding.
+//
+// A measurement is 8 parallel streams of 2 MiB = 16 MiB, per target. It is
+// parallel because it has to be: a single TCP flow cannot exceed (send window
+// / RTT), connect's MaxWindowSize is scaledPow2WindowSize(mib(1), ...), and
+// the single-stream probe therefore measured 1 MiB / RTT for every provider on
+// the fleet rather than the provider. Eleven of twelve beta providers came
+// back with a bandwidth-delay product of ~1 MiB -- exactly one window -- and a
+// provider independently measured at 79 MB/s on its own host reported
+// 4.8 MB/s through the tunnel. N flows get N windows; the prober's
+// bandwidth.MaxSampleBytes is the other half of this figure and the two must
+// be changed together.
+//
 // Explicitly int64: a byte budget is not a row count, and callers pass an
 // int64 byteCount.
-const MaxProviderBandwidthBytesPerProbe int64 = 5 * 1024 * 1024
+const MaxProviderBandwidthBytesPerProbe int64 = 16 * 1024 * 1024
 
 func maxProviderBandwidthError() error {
 	return fmt.Errorf(
