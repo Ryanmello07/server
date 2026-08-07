@@ -16,3 +16,7 @@ beta-backups/
 
 # DKIM signing keys for the beta mail server (private key must never be committed)
 beta-vault/dkim/
+
+# go test binaries and profiles -- build artifacts, never committed
+*.test
+model/profile/
