@@ -16,8 +16,27 @@
 - Fail closed: no health record, or `Total <= 0`, or no observed location → the provider does **not** count.
 - Do not add any field to a gob-serialised struct (`ClientScore`, `ClientLocation`, `ClientFilter`). Stale cache entries decode new fields as the zero value; see the `NetworkOnly` comment at `model/network_client_location_model.go:2413`.
 - Bulk-load per pass. A per-provider query inside the counting loop is a ~2400x amplification on the live box.
-- Go builds run in a container; there is no host toolchain:
-  `docker run --rm -v /root/urnetwork:/src -w /src/server golang:1.26 go build ./model/...`
+- Work in the isolated worktree `/tmp/gated-count/server`, never in
+  `/root/urnetwork/server` (that is the live beta checkout).
+- Go builds run in a container; there is no host toolchain. Use this exact
+  command, then restore the lockfiles:
+
+  ```bash
+  docker run --rm -v /tmp/gated-count:/src -w /src/server golang:1.26 \
+    bash -c 'go build -mod=mod ./model/... > /tmp/b.log 2>&1; echo "EXIT=$?"; \
+             grep -viE "^go: downloading" /tmp/b.log | head'
+  cd /tmp/gated-count/server && git checkout -- go.mod go.sum
+  ```
+
+  `-mod=mod` is required: `connect` and `sdk` were updated ahead of this repo's
+  `go.mod`, so a plain `go build` stops with "updates to go.mod needed". The
+  deployed images are unaffected because `Dockerfile.beta` runs `go mod tidy`
+  before building. `-mod=mod` rewrites `go.mod`/`go.sum` as a side effect —
+  restore them before committing so the diff stays limited to the task.
+- Always capture a build's exit code from the build itself, e.g.
+  `go build ... > log 2>&1; echo "EXIT=$?"`. Piping into `head` or `grep`
+  reports the filter's status and will show a passing build that in fact
+  failed.
 - Nothing in this plan deploys. Deployment is a separate, explicit step after review.
 
 ---
