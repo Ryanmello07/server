@@ -248,6 +248,16 @@ func TestProvidersList(t *testing.T) {
 				server.NowUtc(),
 				stats,
 			)
+
+			// UpdateClientScores only offers a provider a probe has MEASURED
+			// healthy, so a fixture provider needs a health record or it is
+			// correctly excluded from the list this tool reads.
+			model.SetProviderEgressHealth(ctx, &model.ProviderEgressHealth{
+				ClientId:   clientId,
+				MeasuredAt: server.NowUtc(),
+				OKCount:    131,
+				Total:      131,
+			})
 		}
 
 		model.UpdateClientReliabilityScores(ctx, server.NowUtc(), true)
