@@ -1,5 +1,10 @@
 services:
   postgres:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     image: postgres:16
     restart: unless-stopped
     env_file:
@@ -16,13 +21,32 @@ services:
       retries: 5
 
   redis:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     image: redis:7
     restart: unless-stopped
     env_file:
       - ./beta-vault/beta-secrets.env
+    # memory budget: redis ran uncapped with policy `noeviction` and grew to
+    # 4.0G (peak 4.6G) on a 7.9G box, which is what the kernel OOM-killer kept
+    # killing -- every kill dropped the precomputed score sets and stranded
+    # UpdateClientScores mid-run. 4gb is a ceiling just above the legitimate
+    # working set. 3gb, not 4gb: `connect` holds per-provider connection state
+    # and has grown to 2.4G as the pool went from 40 to ~2400 providers, so
+    # redis+connect at 4+2.4 would leave under 1.5G for everything else.
+    #
+    # volatile-lru, NOT allkeys-lru: 97.6% of keys (797k of 817k) carry a TTL,
+    # so there is always an eviction candidate, and the ~20k persistent keys are
+    # never touched. allkeys-lru could evict those.
     command: >
-      sh -c "redis-server --requirepass $$REDIS_PASSWORD"
+      sh -c "redis-server --requirepass $$REDIS_PASSWORD
+      --maxmemory 3gb --maxmemory-policy volatile-lru"
     # No host port binding; only needed inside the Docker network.
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
       interval: 5s
@@ -30,6 +54,11 @@ services:
       retries: 5
 
   migrate:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
@@ -53,6 +82,11 @@ services:
       - ./beta-vault:/srv/warp:ro
 
   taskworker:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
@@ -76,6 +110,11 @@ services:
       - ./beta-vault:/srv/warp:ro
 
   api:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
@@ -113,6 +152,11 @@ services:
       - ./beta-vault:/srv/warp:ro
 
   connect:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build:
       context: ../
       dockerfile: server/Dockerfile.beta
@@ -173,6 +217,11 @@ services:
   # client jwt that only an operator can mint. Start it explicitly:
   #   docker compose -f docker-compose.beta.yml up -d --no-deps egress-prober
   egress-prober:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     profiles:
       - prober
     build:
@@ -219,6 +268,11 @@ services:
         required: false
     command:
       - --api-url=http://api:8080
+      # The far-side address: the bandwidth target is fetched through the
+      # provider tunnel, so it egresses to the public internet and comes back
+      # to the api by its public name. --api-url above is the control plane
+      # (prober -> api, internal) and is NOT interchangeable with this.
+      - --public-api-url=https://api.beta-test.net
       - --platform-url=ws://connect:80/
       - --interval=1h
       - --concurrency=2
@@ -239,12 +293,51 @@ services:
       #   for h in ip.pn free.freeipapi.com ipinfo.io; do getent ahostsv4 $h; done
       # A stale address weakens the check (it tests an IP nobody serves any
       # more) but can never produce a false "not confined".
-      - --confinement-address=134.119.216.174:443  # ip.pn
+      # Full-table diagnostic run: every destination, no sampling. This is
+      # deliberately NOT how a scheduled pass should run -- it costs ~4.5x and
+      # forfeits the anti-gaming property that random sampling provides -- but
+      # it is what answers "show me the complete health of every provider".
+      - --egress-health-all
+      - --confinement-address=188.40.247.138:443  # api.i.pn (ip.pn json endpoint moved hosts 2026-08-02)
       - --confinement-address=104.21.94.136:443    # free.freeipapi.com (cloudflare)
       - --confinement-address=172.67.168.79:443    # free.freeipapi.com (cloudflare)
       - --confinement-address=34.117.59.81:443     # ipinfo.io
+      # egress-health destinations (egresshealth.DestinationHosts). These belong
+      # here for a sharper reason than the geolocation hosts: a direct
+      # geolocation lookup merely records the OPERATOR's location for a
+      # provider, but a direct egress-health check would PASS -- this host can
+      # obviously reach Cloudflare and Amazon -- and so would certify a
+      # blackholing provider as healthy. That is the exact inversion of the
+      # signal the check exists to produce.
+      #
+      # One representative address per host is enough, and after the table grew
+      # to ~140 destinations that is now the ONLY workable approach: enumerating
+      # every destination here is not hand-maintainable, and it would not buy
+      # anything. The prober's network is `internal: true` -- no gateway, no NAT
+      # -- so connectivity is all-or-nothing. If these addresses are unreachable
+      # the route does not exist, and no destination is reachable either. The
+      # check is proving the ABSENCE OF A ROUTE, not enumerating a destination
+      # list; treating it as the latter is what would make it unmaintainable.
+      #
+      # Spread across distinct networks (cloudflare, google, amazon, wikimedia,
+      # fastly) so a partial-connectivity misconfiguration -- a second network
+      # attached to the prober that reaches some ASNs -- still trips it.
+      - --confinement-address=104.17.24.14:443     # cdnjs.cloudflare.com
+      - --confinement-address=104.16.248.249:443   # cloudflare-dns.com
+      - --confinement-address=151.101.193.155:443  # code.jquery.com
+      - --confinement-address=94.140.14.14:443     # dns.adguard-dns.com
+      - --confinement-address=8.8.8.8:443          # dns.google
+      - --confinement-address=3.170.73.93:443      # sdk.amazonaws.com
+      - --confinement-address=3.171.166.195:443    # www.amazon.com
+      - --confinement-address=151.101.129.140:443  # www.reddit.com
+      - --confinement-address=208.80.154.224:443   # www.wikipedia.org
 
   caddy:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     image: caddy:2-alpine
     restart: unless-stopped
     ports:
@@ -276,3 +369,4 @@ volumes:
   postgres_data:
   caddy_data:
   caddy_config:
+  redis_data:
