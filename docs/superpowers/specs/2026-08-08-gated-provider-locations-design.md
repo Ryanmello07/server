@@ -94,7 +94,18 @@ On today's data the US count would fall to the 137 verified providers.
 
 This shares the same shape as the health predicate, so it belongs in the same
 shared helper: one function answering "does this provider count toward this
-location", used by both jobs.
+location".
+
+The two jobs share the **health** predicate, and only that. `UpdateClientScores`
+builds a pool that is not country-scoped, so an observed-country check is not a
+question it can even ask; `UpdateClientLocations` counts supply *per location*,
+so it applies the observed-country check **on top of** health. The relationship
+between them is one-way containment, not equality: every provider the count
+admits for location L also passes the health predicate `UpdateClientScores`
+uses, but not the converse — a healthy provider with no observed location, or
+observed egressing from somewhere else, remains selectable and contributes 0 to
+L's count. That divergence is the intended design, not a defect to be repaired
+away.
 
 ## Behaviour
 
@@ -122,9 +133,14 @@ Unit, in `model/`:
 3. A provider with **no** health record is excluded (fail-closed).
 4. The 90% boundary: `117/131` fails, `118/131` passes — asserted against the
    integer comparison, not a float.
-5. The count produced by `UpdateClientLocations` equals the number of providers
-   `UpdateClientScores` admits for the same fixture. This is the regression
-   test for the shared predicate; it fails if the two ever diverge.
+5. The shared **health** predicate is asserted directly, in memory, for both
+   jobs — that is the whole of what they share. Do **not** assert that the two
+   jobs produce the same number for the same fixture: they are not supposed to.
+   `UpdateClientLocations` applies an additional observed-country check that
+   `UpdateClientScores` cannot, so a healthy-but-unlocated (or
+   located-elsewhere) provider is admitted by the score job and counted 0 by the
+   location job. Items 7 and 8 pin exactly that gap; an equality assertion here
+   would contradict them and would be "fixed" by reintroducing the bug.
 
 Regression, protecting the non-goals:
 
