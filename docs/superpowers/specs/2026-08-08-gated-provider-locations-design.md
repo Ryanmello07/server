@@ -52,8 +52,11 @@ health when incrementing `locationClientCounts`.
 
 The predicate itself is extracted from `UpdateClientScores` into a shared
 helper so both jobs call the identical function. This is the point of the
-design: the count and the membership become incapable of disagreeing, because
-there is only one definition of "healthy" to disagree about.
+design: the count and the membership become incapable of disagreeing about
+*health*, because there is only one definition of "healthy" to disagree
+about. The count layers an additional observed-country check on top (see
+"Location verification" below), so the two jobs still deliberately diverge
+for a healthy-but-unlocated provider.
 
 Rejected alternatives:
 
