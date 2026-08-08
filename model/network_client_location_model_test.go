@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"maps"
+
+	"github.com/go-playground/assert/v2"
 
 	"github.com/urnetwork/connect"
 
@@ -571,6 +574,16 @@ func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
 			stats,
 		)
 		UpdateClientReliabilityScores(ctx, server.NowUtc(), true)
+
+		// UpdateClientLocations counts only a provider a probe measured
+		// healthy AND observed egressing from the country it claims (see
+		// providerCountFilter); this fixture claims "us", so it must be
+		// observed in "us" too, or the round trip under test never happens.
+		testing_setProviderEgressHealthy(ctx, clientId)
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: clientId, LocationId: city.LocationId,
+			CountryCode: "us", Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
 
 		// client location cache round trip
 
@@ -1287,6 +1300,17 @@ func TestUpdateClientLocationsCountsClientsWithoutReliabilityScores(t *testing.T
 		})
 		connect.AssertEqual(t, scoreCount, 0)
 
+		// UpdateClientLocations counts only a provider a probe measured
+		// healthy AND observed egressing from the country it claims (see
+		// providerCountFilter); this fixture claims "us", so it must be
+		// observed in "us" too, or the LEFT JOIN behavior under test is never
+		// reached.
+		testing_setProviderEgressHealthy(ctx, clientId)
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: clientId, LocationId: city.LocationId,
+			CountryCode: "us", Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
+
 		err = UpdateClientLocations(ctx, time.Hour)
 		connect.AssertEqual(t, err, nil)
 
@@ -1486,7 +1510,7 @@ func TestUpdateClientLocationsCountsOnlyPublicProviders(t *testing.T) {
 		}
 
 		// serves strangers -- must be counted
-		connectOne(map[ProvideMode][]byte{
+		publicClientId := connectOne(map[ProvideMode][]byte{
 			ProvideModePublic:  []byte("public-secret"),
 			ProvideModeNetwork: []byte("network-secret"),
 		})
@@ -1497,6 +1521,17 @@ func TestUpdateClientLocationsCountsOnlyPublicProviders(t *testing.T) {
 		})
 		// no provide key at all -- must NOT be counted
 		connectOne(nil)
+
+		// UpdateClientLocations counts only a provider a probe measured
+		// healthy AND observed egressing from the country it claims (see
+		// providerCountFilter). Only the Public-key client needs this -- the
+		// other two are excluded upstream by the provide-mode filter under
+		// test, before the count gate is ever reached.
+		testing_setProviderEgressHealthy(ctx, publicClientId)
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: publicClientId, LocationId: city.LocationId,
+			CountryCode: "us", Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
 
 		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
 
@@ -1976,6 +2011,17 @@ func createCountryOnlyAndCityProviders(ctx context.Context, t testing.TB) (
 		// measured healthy, so the egress-health gate is not what excludes a
 		// provider here -- the location roll-up under test is
 		testing_setProviderEgressHealthy(ctx, clientId)
+
+		// UpdateClientLocations also requires a probe-observed egress country
+		// matching the CLAIMED one (see providerCountFilter). The two
+		// providers this helper builds claim different countries -- observe
+		// each in its own (location.CountryCode), not a shared one, or the
+		// country-only provider (claims "ca") would wrongly fail closed
+		// against an "us" observation.
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: clientId, LocationId: location.LocationId,
+			CountryCode: location.CountryCode, Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
 
 		return clientId
 	}
@@ -2946,5 +2992,390 @@ func TestUpdateClientScoresRestoresAProviderWhoseHealthRecovers(t *testing.T) {
 		if _, ok := testing_selectableClientScores(ctx, t, city, false)[clientId]; !ok {
 			t.Fatal("a provider that measured healthy again did not come back on the next pass")
 		}
+	})
+}
+
+func TestProviderCountFilter(t *testing.T) {
+	healthy := server.NewId()
+	degraded := server.NewId()
+	unmeasured := server.NewId()
+	zeroTotal := server.NewId()
+	wrongCountry := server.NewId()
+	unobserved := server.NewId()
+
+	f := providerCountFilter{
+		healthCounts: map[server.Id]ProviderEgressHealthCounts{
+			// 118/131 is the first passing value: 10*118 >= 9*131 (1180 >= 1179)
+			healthy: {OKCount: 118, Total: 131},
+			// 117/131 is the last failing value: 1170 < 1179
+			degraded:     {OKCount: 117, Total: 131},
+			zeroTotal:    {OKCount: 0, Total: 0},
+			wrongCountry: {OKCount: 131, Total: 131},
+			unobserved:   {OKCount: 131, Total: 131},
+		},
+		countryCodes: map[server.Id]string{
+			healthy:      "us",
+			degraded:     "us",
+			zeroTotal:    "us",
+			wrongCountry: "gb",
+			// unobserved deliberately absent
+		},
+	}
+
+	// the 90% boundary, asserted on the integer comparison
+	assert.Equal(t, f.passesHealth(healthy), true)
+	assert.Equal(t, f.passesHealth(degraded), false)
+
+	// fail closed: never probed, and probed-with-no-destinations
+	assert.Equal(t, f.passesHealth(unmeasured), false)
+	assert.Equal(t, f.passesHealth(zeroTotal), false)
+
+	// counts only where health passes AND the observed country matches
+	assert.Equal(t, f.countsTowardCountry(healthy, "us"), true)
+	assert.Equal(t, f.countsTowardCountry(degraded, "us"), false)
+
+	// healthy but egressing from somewhere else: not counted in the claim
+	assert.Equal(t, f.countsTowardCountry(wrongCountry, "us"), false)
+	// ...and it does count where it actually is
+	assert.Equal(t, f.countsTowardCountry(wrongCountry, "gb"), true)
+
+	// healthy but never located: fail closed
+	assert.Equal(t, f.countsTowardCountry(unobserved, "us"), false)
+
+	// comparison is case insensitive on the caller's side
+	assert.Equal(t, f.countsTowardCountry(healthy, "US"), true)
+}
+
+// TestProviderCountFilterShouldSkipCountGate covers the fleet-wide floor in
+// UpdateClientLocations: health and observed-country come from two
+// INDEPENDENT pipelines (an external push endpoint and a separate internal
+// job, respectively) that can stall separately, so either map being empty --
+// not just health -- must skip the count gate for the pass. This is pure
+// in-memory logic, no database required.
+func TestProviderCountFilterShouldSkipCountGate(t *testing.T) {
+	someProvider := server.NewId()
+
+	// both maps empty -- neither pipeline has produced anything: skip
+	assert.Equal(
+		t,
+		providerCountFilter{
+			healthCounts: map[server.Id]ProviderEgressHealthCounts{},
+			countryCodes: map[server.Id]string{},
+		}.shouldSkipCountGate(),
+		true,
+	)
+
+	// health empty, countryCodes populated -- the health pipeline alone
+	// stalled: skip
+	assert.Equal(
+		t,
+		providerCountFilter{
+			healthCounts: map[server.Id]ProviderEgressHealthCounts{},
+			countryCodes: map[server.Id]string{someProvider: "us"},
+		}.shouldSkipCountGate(),
+		true,
+	)
+
+	// countryCodes empty, health populated -- the location pipeline alone
+	// stalled: skip. This is the case the previous, health-only guard missed.
+	assert.Equal(
+		t,
+		providerCountFilter{
+			healthCounts: map[server.Id]ProviderEgressHealthCounts{someProvider: {OKCount: 131, Total: 131}},
+			countryCodes: map[server.Id]string{},
+		}.shouldSkipCountGate(),
+		true,
+	)
+
+	// neither empty -- both pipelines are producing data: do not skip, apply
+	// the gate normally
+	assert.Equal(
+		t,
+		providerCountFilter{
+			healthCounts: map[server.Id]ProviderEgressHealthCounts{someProvider: {OKCount: 131, Total: 131}},
+			countryCodes: map[server.Id]string{someProvider: "us"},
+		}.shouldSkipCountGate(),
+		false,
+	)
+}
+
+// TestProviderCountFilterShouldRecountUngated covers the OUTPUT-side half of
+// the fleet-wide floor. shouldSkipCountGate looks at the two input maps before
+// the pass; shouldRecountUngated looks at what the pass produced. Non-empty
+// inputs can still yield an empty count -- a fleet-wide claimed/observed
+// mismatch, or every claimed country resolving to NULL -- and an empty count
+// wipes every location out of redis. Pure in-memory logic, no database.
+func TestProviderCountFilterShouldRecountUngated(t *testing.T) {
+	// the failure this exists to catch: rows existed, the gate ate all of
+	// them, nothing counted anywhere. Do not publish that; recount ungated.
+	assert.Equal(t, shouldRecountUngated(true, 152, 0), true)
+
+	// the gate counted something: publish it, however small
+	assert.Equal(t, shouldRecountUngated(true, 152, 1), false)
+
+	// no connected + valid + Public rows at all. Supply really is gone and
+	// emptying the published list is the correct answer, not a fallback.
+	assert.Equal(t, shouldRecountUngated(true, 0, 0), false)
+
+	// the gate was already skipped for this pass (shouldSkipCountGate fired).
+	// An empty count is then the ungated answer already -- recounting would
+	// produce the identical result and loop the reasoning.
+	assert.Equal(t, shouldRecountUngated(false, 152, 0), false)
+	assert.Equal(t, shouldRecountUngated(false, 0, 0), false)
+}
+
+// Testing_CreateProviderAtLocation inserts exactly the rows a provider needs
+// to clear the pre-existing UpdateClientLocations gate: a network_client row,
+// a Public provide_key, and a network_client_location_reliability row that is
+// connected, valid, and pinned to countryId at all three granularities (city =
+// region = country), mirroring the country-only fallback in
+// SetConnectionLocation (a geo lookup with no city/region resolves to the
+// country id at every column -- see the fix(beta) comment there).
+//
+// It also creates the `location` row for countryId itself: the gated query
+// under test resolves the provider's CLAIMED country by joining
+// network_client_location_reliability.country_location_id back to `location`,
+// and loadClientLocations only surfaces a location that has a `location` row.
+// Both go through raw SQL rather than CreateLocation/SetConnectionLocation
+// because the caller picks countryId up front (so a later lookup can key on
+// it), and CreateLocation always mints its own id.
+//
+// health and observed egress location are deliberately NOT set here -- every
+// caller states its own via SetProviderEgressHealth/SetProviderEgressLocation,
+// exactly as the pre-gate minimums (connected/valid/Public key) are set here
+// while health is layered on top by each test.
+func Testing_CreateProviderAtLocation(
+	ctx context.Context,
+	networkId server.Id,
+	clientId server.Id,
+	countryId server.Id,
+	countryCode string,
+) {
+	countryCode = strings.ToLower(countryCode)
+
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
+				INSERT INTO location (
+					location_id,
+					location_type,
+					location_name,
+					country_location_id,
+					country_code,
+					location_full_name
+				)
+				VALUES ($1, $2, $3, $1, $3, $3)
+				ON CONFLICT (location_id) DO NOTHING
+			`,
+			countryId,
+			LocationTypeCountry,
+			countryCode,
+		))
+
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
+				INSERT INTO network_client (
+					client_id,
+					network_id
+				)
+				VALUES ($1, $2)
+				ON CONFLICT (client_id) DO NOTHING
+			`,
+			clientId,
+			networkId,
+		))
+
+		// client_address_hash_count = 1 AND location_count = 1 AND
+		// country_location_id IS NOT NULL is exactly the GENERATED `valid`
+		// expression on this table (see the CREATE TABLE in db_migrations.go);
+		// `valid` itself cannot be assigned directly.
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
+				INSERT INTO network_client_location_reliability (
+					client_id,
+					network_id,
+					update_block_number,
+					city_location_id,
+					region_location_id,
+					country_location_id,
+					client_address_hash_count,
+					location_count,
+					connected
+				)
+				VALUES ($1, $2, 0, $3, $3, $3, 1, 1, true)
+				ON CONFLICT (client_id) DO UPDATE SET
+					network_id = $2,
+					city_location_id = $3,
+					region_location_id = $3,
+					country_location_id = $3,
+					client_address_hash_count = 1,
+					location_count = 1,
+					connected = true
+			`,
+			clientId,
+			networkId,
+			countryId,
+		))
+	})
+
+	SetProvide(ctx, clientId, map[ProvideMode][]byte{
+		ProvideModePublic: []byte("testing-public-provide-secret"),
+	})
+}
+
+// TestUpdateClientLocationsCountIsGated is the core assertion for this task:
+// UpdateClientLocations must count a provider toward provider_count only where
+// a probe measured it healthy AND observed it egressing from the country it
+// claims. Before this change, connected + valid + a Public provide key was
+// enough on its own -- an unreachable or misrepresenting provider still
+// inflated the count.
+//
+// It covers all three exclusion paths against a real database, because each
+// one leans on SQL the in-memory providerCountFilter test cannot exercise: the
+// health check, the claimed-vs-observed MISMATCH, and a NULL claimed country
+// arriving from the LEFT JOIN onto `location`.
+func TestUpdateClientLocationsCountIsGated(t *testing.T) {
+	(&server.TestEnv{ApplyDbMigrations: true}).Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		countryId := server.NewId()
+
+		healthy := server.NewId()
+		unhealthy := server.NewId()
+		unprobed := server.NewId()
+		// healthy, but a probe watched it egress from GB while it claims US.
+		// This is the MISMATCH path: it exercises the LEFT JOIN onto
+		// `location`, the char(2) country_code round trip, and the
+		// strings.ToLower comparison inside countsTowardCountry -- none of
+		// which the in-memory filter test can reach.
+		wrongCountry := server.NewId()
+		// healthy AND observed exactly where it claims to be, but its
+		// country_location_id points at a `location` row that does not exist,
+		// so the LEFT JOIN yields a NULL claimed country. This is the
+		// NULL-claimed-country path: unverifiable against anything, so it must
+		// fail closed like an unobserved provider.
+		orphanClaim := server.NewId()
+		orphanCountryId := server.NewId()
+
+		// four providers in the claimed country, all connected with a Public
+		// provide key; only `healthy` is measured healthy and observed in US
+		for _, clientId := range []server.Id{healthy, unhealthy, unprobed, wrongCountry} {
+			Testing_CreateProviderAtLocation(ctx, networkId, clientId, countryId, "US")
+		}
+		// created at its own country id, whose `location` row is then removed
+		// out from under it. This schema declares no foreign keys, so the
+		// reliability row survives pointing at nothing -- which is exactly the
+		// state the LEFT JOIN has to handle.
+		//
+		// Uses "ZZ" rather than "US" because `location` also carries
+		// UNIQUE(location_full_name) (see db_migrations.go), and
+		// Testing_CreateProviderAtLocation's location insert is only
+		// ON CONFLICT (location_id) DO NOTHING -- a second "us" row at a
+		// different location id collides with that unique index instead of
+		// being ignored. The observed country code below is never actually
+		// compared for this provider (the NULL claimed country short-circuits
+		// first), but keeping it "ZZ" too keeps the fixture internally
+		// consistent with what it claims to be.
+		Testing_CreateProviderAtLocation(ctx, networkId, orphanClaim, orphanCountryId, "ZZ")
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`DELETE FROM location WHERE location_id = $1`,
+				orphanCountryId,
+			))
+		})
+
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: healthy, OKCount: 131, Total: 131, MeasuredAt: server.NowUtc(),
+		})
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: unhealthy, OKCount: 0, Total: 131, MeasuredAt: server.NowUtc(),
+		})
+		// both new providers pass health, so health is not what excludes them:
+		// the claimed-vs-observed country check is.
+		for _, clientId := range []server.Id{wrongCountry, orphanClaim} {
+			SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+				ClientId: clientId, OKCount: 131, Total: 131, MeasuredAt: server.NowUtc(),
+			})
+		}
+		// ObservedAt must be now: GetAllProviderEgressCountryCodes returns only
+		// rows observed within ProviderEgressLocationMaxAge, so a zero-value
+		// ObservedAt would make these fixtures invisible and the assertions
+		// below would pass for the wrong reason.
+		for _, clientId := range []server.Id{healthy, unhealthy} {
+			SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+				ClientId: clientId, CountryCode: "US",
+				Verdict: "verified", ObservedAt: server.NowUtc(),
+			})
+		}
+		// matches the "ZZ" it claims (see Testing_CreateProviderAtLocation
+		// call above) so the fixture stays internally consistent, even though
+		// the NULL claimed country short-circuits the comparison before this
+		// observed code is ever read.
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: orphanClaim, CountryCode: "ZZ",
+			Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: wrongCountry, CountryCode: "GB",
+			Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
+
+		UpdateClientLocations(ctx, 1*time.Hour)
+
+		clientLocations, err := loadClientLocations(ctx, map[server.Id]bool{countryId: true})
+		assert.Equal(t, err, nil)
+
+		// only the measured-healthy, observed-in-US provider is counted.
+		// Before this change all three of the original providers counted; the
+		// GB-egressing and NULL-claimed-country providers must not add to it
+		// either, so the total is still exactly 1.
+		assert.Equal(t, clientLocations[countryId].ClientCount, 1)
+	})
+}
+
+// TestFindProviders2ClientIdBypassesHealthGate pins a deliberate exception to
+// the health/location gate: a spec.ClientId entry is appended straight to the
+// result (see the `if spec.ClientId != nil` branch in FindProviders2) without
+// ever touching loadClientScores or PassesMinimums. An explicit client id is
+// a caller's deliberate choice -- e.g. reconnecting to a known provider -- so
+// the public-list gate that excludes measured-unhealthy providers elsewhere
+// must not apply here. Nothing tested this before; if the bypass were ever
+// folded into the gated path, this test would start failing because the
+// provider marked comprehensively unhealthy below would be dropped from the
+// result instead of being returned.
+func TestFindProviders2ClientIdBypassesHealthGate(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		countryId := server.NewId()
+		unhealthy := server.NewId()
+
+		Testing_CreateProviderAtLocation(ctx, networkId, unhealthy, countryId, "US")
+		// measured comprehensively dead, so the gate excludes it everywhere else
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: unhealthy, OKCount: 0, Total: 131, MeasuredAt: server.NowUtc(),
+		})
+
+		clientSession := session.Testing_CreateClientSession(
+			ctx,
+			jwt.NewByJwt(networkId, server.NewId(), "test", false, false),
+		)
+
+		result, err := FindProviders2(&FindProviders2Args{
+			Specs: []*ProviderSpec{{ClientId: &unhealthy}},
+			Count: 1,
+		}, clientSession)
+		assert.Equal(t, err, nil)
+
+		// an explicit client id is a deliberate choice by the caller, so the
+		// public-list health gate must not apply to it
+		assert.Equal(t, len(result.Providers), 1)
+		assert.Equal(t, result.Providers[0].ClientId, unhealthy)
 	})
 }
