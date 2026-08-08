@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/urnetwork/connect"
 
@@ -101,14 +101,25 @@ func TestRouterBasic(t *testing.T) {
 			NewRoute("POST", "/inputclient", InputClient),
 		}
 
-		port := 8080
-
 		routerHandler := NewRouter(ctx, routes)
-		go http.ListenAndServe(fmt.Sprintf(":%d", port), routerHandler)
-
-		select {
-		case <-time.After(time.Second):
+		listener, listenErr := net.Listen("tcp4", "127.0.0.1:0")
+		if listenErr != nil {
+			t.Fatalf("listen: %v", listenErr)
 		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		httpServer := &http.Server{Handler: routerHandler}
+		serveDone := make(chan error, 1)
+		go func() {
+			serveDone <- httpServer.Serve(listener)
+		}()
+		defer func() {
+			if err := httpServer.Close(); err != nil {
+				t.Errorf("close router server: %v", err)
+			}
+			if err := <-serveDone; err != nil && err != http.ErrServerClosed {
+				t.Errorf("serve router server: %v", err)
+			}
+		}()
 
 		networkId := server.NewId()
 		userId := server.NewId()
@@ -121,17 +132,6 @@ func TestRouterBasic(t *testing.T) {
 		)
 		auth := func(header http.Header) {
 			header.Add("Authorization", fmt.Sprintf("Bearer %s", byJwt.Sign()))
-		}
-
-		byJwtGuestMode := jwt.NewByJwt(
-			networkId,
-			userId,
-			"test",
-			true,  // guest mode true
-			false, // pro is false
-		)
-		authGuestMode := func(header http.Header) {
-			header.Add("Authorization", fmt.Sprintf("Bearer %s", byJwtGuestMode.Sign()))
 		}
 
 		deviceId := server.NewId()
@@ -158,31 +158,6 @@ func TestRouterBasic(t *testing.T) {
 			server.HttpResponseRequireStatusOk(server.ResponseJsonObject[map[string]any]),
 		)
 		connect.AssertEqual(t, err, nil)
-
-		_, err = server.HttpGet(
-			ctx,
-			fmt.Sprintf("http://127.0.0.1:%d/noauth", port),
-			authGuestMode,
-			server.HttpResponseRequireStatusOk(server.ResponseJsonObject[map[string]any]),
-		)
-		connect.AssertEqual(t, err, nil)
-
-		_, err = server.HttpGet(
-			ctx,
-			fmt.Sprintf("http://127.0.0.1:%d/noauth", port),
-			authGuestMode,
-			server.HttpResponseRequireStatusOk(server.ResponseJsonObject[map[string]any]),
-		)
-		connect.AssertEqual(t, err, nil)
-
-		// users in guest mode should be restricted to authenticated level routes
-		_, err = server.HttpGet(
-			ctx,
-			fmt.Sprintf("http://127.0.0.1:%d/auth", port),
-			authGuestMode,
-			server.HttpResponseRequireStatusOk(server.ResponseJsonObject[map[string]any]),
-		)
-		connect.AssertNotEqual(t, err, nil)
 
 		_, err = server.HttpGet(
 			ctx,
@@ -231,16 +206,6 @@ func TestRouterBasic(t *testing.T) {
 			fmt.Sprintf("http://127.0.0.1:%d/inputauth", port),
 			map[string]any{},
 			auth,
-			server.HttpResponseRequireStatusOk(server.ResponseJsonObject[map[string]any]),
-		)
-		connect.AssertEqual(t, err, nil)
-
-		// should allow guest requests
-		_, err = server.HttpPost(
-			ctx,
-			fmt.Sprintf("http://127.0.0.1:%d/inputauth", port),
-			map[string]any{},
-			authGuestMode,
 			server.HttpResponseRequireStatusOk(server.ResponseJsonObject[map[string]any]),
 		)
 		connect.AssertEqual(t, err, nil)

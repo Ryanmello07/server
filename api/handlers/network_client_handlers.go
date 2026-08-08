@@ -29,7 +29,7 @@ func RemoveNetworkClient(w http.ResponseWriter, r *http.Request) {
 }
 
 func RemoveNetworkClients(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100 MB cap
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100 MB cap (allows ~2M UUIDs worst case)
 	router.WrapWithInputRequireAuth(model.RemoveNetworkClients, w, r)
 }
 
