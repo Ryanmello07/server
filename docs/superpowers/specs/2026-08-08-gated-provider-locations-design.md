@@ -65,6 +65,37 @@ Rejected alternatives:
   source of truth, but it reworks a hot read path that every app polls, for no
   behavioural gain over the shared predicate.
 
+## Location verification
+
+A provider is counted toward a location only if a probe has **observed** it
+egressing from that country. Two sources exist and they are not the same thing:
+
+* `network_client_location` — where the provider *claims* to be, derived from
+  its connection. This is what the count uses today, and it is self-reported.
+* `provider_egress_location` — where a probe actually *saw* its traffic leave.
+
+Measured on beta across the 152 currently-healthy providers:
+
+| | providers |
+| --- | --- |
+| claimed country == observed country | 137 |
+| no probe-observed location yet | 12 |
+| **claimed country != observed country** | **3** (claim `at`, egress from `gb`) |
+
+Three providers are advertised in a country they do not egress from. Small
+today, but the count is the number apps show users when they pick a location,
+so "3 of the providers in Austria are actually in Britain" is a correctness
+bug, and it is exactly what an adversarial provider would exploit at scale.
+
+**Rule:** count a provider toward location L only when it passes health **and**
+its probe-observed country matches its claimed country. A provider with no
+observed location is **not** counted — fail-closed, matching the health rule.
+On today's data the US count would fall to the 137 verified providers.
+
+This shares the same shape as the health predicate, so it belongs in the same
+shared helper: one function answering "does this provider count toward this
+location", used by both jobs.
+
 ## Behaviour
 
 The health predicate is unchanged from the deployed gate: a provider passes
@@ -99,12 +130,15 @@ Regression, protecting the non-goals:
 
 6. A provider failing health is still returned for an explicit
    `spec.ClientId` request.
+7. A provider whose observed country differs from its claimed country is not
+   counted toward the claimed location.
+8. A provider with no observed location is not counted (fail-closed).
 
 Live verification on beta, after deploy:
 
-7. `provider_count` for each returned location equals the count of
-   health-passing providers for that location in Postgres.
-8. A known-unhealthy provider is still reachable by client ID.
+9. `provider_count` for each returned location equals the count of providers
+   that both pass health and have a matching observed country, per Postgres.
+10. A known-unhealthy provider is still reachable by client ID.
 
 ## Out of scope — recorded, not fixed
 
