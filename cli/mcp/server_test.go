@@ -258,6 +258,15 @@ func TestProvidersList(t *testing.T) {
 				OKCount:    131,
 				Total:      131,
 			})
+
+			// UpdateClientLocations additionally requires a probe-observed
+			// egress country matching the CLAIMED one (see
+			// providerCountFilter in model/network_client_location_model.go);
+			// every provider here claims city ("us"), so observe it there too.
+			model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
+				ClientId: clientId, LocationId: city.LocationId,
+				CountryCode: "us", Verdict: "verified", ObservedAt: server.NowUtc(),
+			})
 		}
 
 		model.UpdateClientReliabilityScores(ctx, server.NowUtc(), true)
