@@ -185,3 +185,43 @@ Related: the `forceMinimum=true` ("operator census") key family is written by
 `loadLocationStables` pass `false`. Operators therefore have no way to see
 locations whose providers all fail the minimums, which is precisely the
 visibility needed to diagnose the above.
+
+## Result
+
+Deployed to beta 2026-08-08. Verified live.
+
+| | before | after |
+| --- | --- | --- |
+| advertised providers (fleet) | 1653 | **103** |
+| countries listed | 34 | **7** |
+| United States | 301 | 69 |
+| Germany | 119 | 24 |
+
+Every advertised count matches the database exactly, for all seven countries
+served (us 69, de 24, fr 4, cz 2, ca 2, fi 1, bd 1). That is the check that
+mattered: the number an app shows is now the number of providers a probe has
+measured healthy AND observed egressing from that country.
+
+The `recounting ungated` canary did not fire, so the gate is active rather
+than falling back. No panics in taskworker or api. `/status` 200.
+
+A gated provider (0 of 131 destinations) is absent from the public list and
+still in the probe queue, last probed 2026-08-08 17:20 — the graduation path
+is intact, so it returns automatically if it ever measures healthy.
+
+### Not verified
+
+No DB-backed test in this branch has ever been executed; there is no Postgres
+in the build environment. The live numbers above are the only end-to-end
+evidence. `TestUpdateClientLocationsCountIsGated` and the four other DB tests
+should be run against a real database before this is relied on further.
+
+### Wider than the count
+
+11 countries have verifiably-healthy providers but only 7 are listed. Spain
+(14 verified providers) and Italy (2) are absent. That is the pre-existing
+`loadLocationStables` reliability filter, not this change -- a location is
+listed only when its providers also clear the reliability minimums, and the
+fleet's lookback history reset when it reconnected during the migration
+earlier today. Expected to recover as history accumulates; nothing here
+addresses it.
