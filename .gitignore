@@ -13,6 +13,19 @@ plans/
 
 # local beta database dumps (contain user data; never commit)
 beta-backups/
+# binaries
+client/build
+bringyourctl/bringyourctl
+cli/api/api
+cli/mcp/mcp
+cli/taskworker/taskworker
+gpt/gpt
+cli/connect/connect
+connect/connect.test
+connect/profile
+cli/proxy/proxy
+main
+connect/sim-latency/sim-latency
 
 # DKIM signing keys for the beta mail server (private key must never be committed)
 beta-vault/dkim/

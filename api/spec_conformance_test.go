@@ -78,6 +78,10 @@ func registry() []specEndpoint {
 		{"POST", "/auth/network-delete", nil, rt(controller.NetworkRemoveResult{})},
 		{"POST", "/auth/code-create", rt(model.AuthCodeCreateArgs{}), rt(model.AuthCodeCreateResult{})},
 		{"POST", "/auth/code-login", rt(model.AuthCodeLoginArgs{}), rt(model.AuthCodeLoginResult{})},
+		{"POST", "/auth/add-auth", rt(controller.AddAuthArgs{}), rt(controller.AddAuthResult{})},
+		{"POST", "/auth/remove-auth", rt(controller.RemoveAuthArgs{}), rt(controller.RemoveAuthResult{})},
+		{"POST", "/auth/regenerate-seedphrase", rt(controller.RegenerateSeedphraseArgs{}), rt(controller.RegenerateSeedphraseResult{})},
+		{"POST", "/auth/generate-seedphrase", rt(controller.GenerateSeedphraseArgs{}), rt(controller.GenerateSeedphraseResult{})},
 
 		{"POST", "/network/auth-client", rt(model.AuthNetworkClientArgs{}), rt(model.AuthNetworkClientResult{})},
 		{"POST", "/network/remove-client", rt(model.RemoveNetworkClientArgs{}), rt(model.RemoveNetworkClientResult{})},
@@ -144,6 +148,8 @@ func registry() []specEndpoint {
 		{"POST", "/account/wallets/verify-seeker", rt(controller.VerifySeekerNftHolderArgs{}), rt(controller.VerifySeekerNftHolderResult{})},
 		{"GET", "/account/balance-codes", nil, rt(controller.GetNetworkRedeemedBalanceCodesResult{})},
 		{"GET", "/account/referral-code", nil, rt(controller.NetworkReferralResult{})},
+		{"POST", "/account/change-name", rt(controller.ChangeNetworkNameArgs{}), rt(controller.ChangeNetworkNameResult{})},
+		{"POST", "/account/claim-name", rt(controller.ClaimNetworkNameArgs{}), rt(controller.ClaimNetworkNameResult{})},
 		{"POST", "/referral-code/validate", rt(controller.ValidateReferralCodeArgs{}), rt(controller.ValidateNetworkReferralCodeResult{})},
 		{"GET", "/account/referral-network", nil, rt(controller.GetNetworkReferralResult{})},
 		{"GET", "/account/unlink-referral-network", nil, rt(controller.UnlinkReferralNetworkResult{})},
@@ -166,7 +172,7 @@ func registry() []specEndpoint {
 // present as routes; TestSpecRoutesImplemented covers that.)
 func skips() map[string]string {
 	return map[string]string{
-		"GET /my-ip-info":                      "response is an unexported handler-local struct (handlers.response)",
+		"GET /my-ip-info":                      "spec MyIPInfoResult includes landmarks[], served by whereami rather than this api",
 		"GET /device/share-code/{code}/qr.png": "image/png response, no JSON schema",
 		"GET /device/adopt-code/{code}/qr.png": "image/png response, no JSON schema",
 	}

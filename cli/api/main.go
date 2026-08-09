@@ -19,6 +19,7 @@ import (
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/api"
+	"github.com/urnetwork/server/oauth"
 	"github.com/urnetwork/server/router"
 	"github.com/urnetwork/server/stats"
 )
@@ -110,6 +111,11 @@ Options:
 	}
 
 	routes := api.Routes()
+
+	// removes expired oauth authorization codes and refresh tokens (IDP.md).
+	// Runs in every replica: the delete is a bounded idempotent range over an
+	// indexed expire_time, so a replica that loses the race deletes nothing.
+	oauth.NewReaperWithDefaults(ctx)
 
 	port, _ := opts.Int("--port")
 

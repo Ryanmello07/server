@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/go-playground/assert/v2"
-	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/jwt"
 	"github.com/urnetwork/server/session"
@@ -24,8 +23,8 @@ func TestNetworkCreateTermsFail(t *testing.T) {
 		clientSession := session.Testing_CreateClientSession(ctx, &byJwt)
 
 		result, err := NetworkCreate(networkCreate, clientSession)
-		connect.AssertEqual(t, err, nil)
-		connect.AssertEqual(t, result.Error.Message, AgreeToTerms)
+		assert.Equal(t, err, nil)
+		assert.Equal(t, result.Error.Message, AgreeToTerms)
 	})
 }
 
@@ -52,8 +51,8 @@ func TestNetworkUpdate(t *testing.T) {
 			NetworkName: networkName,
 		}
 		result, err := NetworkUpdate(networkUpdateArgs, sourceSession)
-		connect.AssertEqual(t, err, nil)
-		connect.AssertNotEqual(t, result.Error, nil)
+		assert.Equal(t, err, nil)
+		assert.NotEqual(t, result.Error, nil)
 
 		// fail
 		// network name should be at least 6 characters
@@ -61,8 +60,8 @@ func TestNetworkUpdate(t *testing.T) {
 			NetworkName: "a",
 		}
 		result, err = NetworkUpdate(networkUpdateArgs, sourceSession)
-		connect.AssertEqual(t, err, nil)
-		connect.AssertNotEqual(t, result.Error, nil)
+		assert.Equal(t, err, nil)
+		assert.NotEqual(t, result.Error, nil)
 
 		// success
 		newName := "uvwxyz"
@@ -70,11 +69,11 @@ func TestNetworkUpdate(t *testing.T) {
 			NetworkName: newName,
 		}
 		result, err = NetworkUpdate(networkUpdateArgs, sourceSession)
-		connect.AssertEqual(t, err, nil)
-		connect.AssertEqual(t, result.Error, nil)
+		assert.Equal(t, err, nil)
+		assert.Equal(t, result.Error, nil)
 
 		network := GetNetwork(sourceSession)
-		connect.AssertEqual(t, network.NetworkName, newName)
+		assert.Equal(t, network.NetworkName, newName)
 
 	})
 }
