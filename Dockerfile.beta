@@ -21,7 +21,7 @@ WORKDIR /workspace/server
 # four; building the rest (connect/sim-latency, monitor, scripts) only makes
 # the image larger and lets breakage in a tool beta never runs block a deploy.
 RUN go mod tidy && CGO_ENABLED=0 go build -o /out/ \
-    ./bringyourctl ./cli/api ./cli/connect ./cli/taskworker
+    ./bringyourctl ./cli/api ./cli/connect ./cli/taskworker ./cli/proxy
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*

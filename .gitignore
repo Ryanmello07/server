@@ -2,6 +2,10 @@
 beta-vault/config/**/*.mmdb
 beta-vault/vault/tls/**/*.pem
 beta-vault/vault/tls/**/*.pub.pem
+# caddy writes .crt/.key, not .pem. Without these two lines the proxy's
+# TLS PRIVATE KEY is untracked-but-not-ignored, so a `git add -A` commits it.
+beta-vault/vault/tls/**/*.key
+beta-vault/vault/tls/**/*.crt
 beta-vault/beta-secrets.env
 # egress-prober client jwt and operator secret; the .example template is tracked
 beta-vault/prober.env

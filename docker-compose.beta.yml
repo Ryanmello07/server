@@ -218,6 +218,56 @@ services:
   # Not started by default (profile `prober`), because it needs a network
   # client jwt that only an operator can mint. Start it explicitly:
   #   docker compose -f docker-compose.beta.yml up -d --no-deps egress-prober
+  # The proxy server: socks/http/https/api/wg endpoints that proxy clients are
+  # pointed at by CreateProxyClient. It is NOT behind caddy -- it terminates its
+  # own TLS, reading the cert for proxy.beta-test.net from the vault at
+  # tls/proxy.beta-test.net/ (server/tls.go). Caddy holds a block for that name
+  # purely so ACME issues and renews the certificate.
+  #
+  # The published ports MUST match the port numbers in the vault's proxy.yml
+  # `hosts` block, because those are the numbers baked into the URLs handed to
+  # clients. The container-side ports are fixed constants (proxy/server.go:41-45)
+  # and are not configurable.
+  proxy:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    build:
+      context: ../
+      dockerfile: server/Dockerfile.beta
+    restart: unless-stopped
+    # --port is the STATUS listener only (GET /status). It must not collide with
+    # the five fixed service ports the proxy also binds (8080 socks, 8081 http,
+    # 8082 https, 8083 api, 8084 wg -- proxy/server.go:41-45). The binary's
+    # default of 80 would also collide with caddy if host networking were used.
+    command: ["proxy", "--port=8090"]
+    env_file:
+      - ./beta-vault/beta-secrets.env
+    environment:
+      WARP_ENV: local
+      WARP_BLOCK: local
+      WARP_SERVICE: proxy
+      WARP_VERSION: 0.0.0-beta
+      WARP_HOST: 127.0.0.1
+      BRINGYOUR_POSTGRES_HOSTNAME: postgres
+      BRINGYOUR_REDIS_HOSTNAME: redis
+      WARP_HOME: /srv/warp
+    volumes:
+      - ./beta-vault:/srv/warp:ro
+    ports:
+      - "9080:8080"      # socks
+      - "9081:8081"      # http
+      - "9082:8082"      # https
+      - "9083:8083"      # api
+      - "9084:8084/udp"  # wireguard
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   egress-prober:
     logging:
       driver: json-file

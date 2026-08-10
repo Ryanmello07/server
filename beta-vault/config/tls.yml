@@ -1,0 +1,10 @@
+# Hosts the proxy server will terminate TLS for. A name not listed here is
+# refused (or self-signed, if EnableSelfSign is on) rather than served.
+#
+# The certificate itself is read from the VAULT at
+#   tls/<host>/<host>.crt and tls/<host>/<host>.key
+# (server/tls.go findExplicit). Caddy obtains and renews the Let's Encrypt cert
+# for this name -- see the proxy.beta-test.net block in the Caddyfile -- and the
+# files are copied into the vault from caddy's store.
+allowed_hosts:
+  - "proxy.beta-test.net"

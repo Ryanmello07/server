@@ -36,3 +36,12 @@ connect.beta-test.net {
 		import client_address
 	}
 }
+
+# proxy.beta-test.net exists here only so caddy obtains and renews a Let's
+# Encrypt certificate for it. Caddy does NOT carry proxy traffic: the proxy
+# server terminates its own TLS on its own ports (see the `proxy` service),
+# reading the cert from the vault at tls/proxy.beta-test.net/. This block is
+# what makes the ACME HTTP-01 challenge on :80 succeed.
+proxy.beta-test.net {
+	respond "urnetwork proxy" 200
+}
