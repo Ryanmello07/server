@@ -31,19 +31,21 @@ services:
     env_file:
       - ./beta-vault/beta-secrets.env
     # memory budget: redis ran uncapped with policy `noeviction` and grew to
-    # 4.0G (peak 4.6G) on a 7.9G box, which is what the kernel OOM-killer kept
-    # killing -- every kill dropped the precomputed score sets and stranded
-    # UpdateClientScores mid-run. 4gb is a ceiling just above the legitimate
-    # working set. 3gb, not 4gb: `connect` holds per-provider connection state
-    # and has grown to 2.4G as the pool went from 40 to ~2400 providers, so
-    # redis+connect at 4+2.4 would leave under 1.5G for everything else.
+    # 4.0G (peak 4.6G) on the old 7.9G box, which is what the kernel OOM-killer
+    # kept killing -- every kill dropped the precomputed score sets and stranded
+    # UpdateClientScores mid-run. The cap is a ceiling above the legitimate
+    # working set, not a target.
+    #
+    # 6gb sized for this 15.9G host. It was 3gb on the old 7.9G box, where
+    # `connect` (which holds per-provider connection state and grew to 2.4G)
+    # left no room for more. Measured here at ~2G used with 0 evictions.
     #
     # volatile-lru, NOT allkeys-lru: 97.6% of keys (797k of 817k) carry a TTL,
     # so there is always an eviction candidate, and the ~20k persistent keys are
     # never touched. allkeys-lru could evict those.
     command: >
       sh -c "redis-server --requirepass $$REDIS_PASSWORD
-      --maxmemory 3gb --maxmemory-policy volatile-lru"
+      --maxmemory 6gb --maxmemory-policy volatile-lru"
     # No host port binding; only needed inside the Docker network.
     volumes:
       - redis_data:/data
@@ -275,7 +277,24 @@ services:
       - --public-api-url=https://api.beta-test.net
       - --platform-url=ws://connect:80/
       - --interval=1h
-      - --concurrency=2
+      # 24 simultaneous tunnels. Probes are network bound, not cpu bound: each
+      # tests 131 destinations and a dead provider burns the full
+      # --probe-timeout on every one, so a single probe takes ~3 minutes wall
+      # clock. Throughput is therefore concurrency / probe-duration, and the box
+      # sits idle waiting on timeouts -- measured at concurrency 8 it managed
+      # ~135 probes/hour with load 2.6 across 8 cores and the prober using
+      # 121MB. At 24 it measured ~490/hour on the same box.
+      #
+      # Raising --due-limit alone did nothing: queue depth was never the
+      # constraint. This was 2 for the old 7.9G/4-core box, below the binary's
+      # own default of 4.
+      - --concurrency=24
+      # Ask for the server's maximum batch (maxProviderEgressDueLimit=500)
+      # rather than the 100 default. With a 6h re-probe backoff and ~2400
+      # providers, 100 per pass can never cover the fleet: it capped coverage
+      # at ~100/hour against a need of ~400/hour, which is why most providers
+      # stayed untested and therefore hidden by the health gate.
+      - --due-limit=500
       - --probe-timeout=60s
       - --confinement-timeout=3s
       # DNS vs -confinement-address, for this environment: an `internal: true`
