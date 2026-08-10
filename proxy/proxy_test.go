@@ -26,15 +26,18 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,40 +184,23 @@ type proxyTestPorts struct {
 	wg    int
 }
 
+// reserveProxyTestPorts allocates the proxy servers' listen ports through
+// server.ReserveTestListenPorts: probed on the wildcard address the servers
+// actually bind, from below the OS ephemeral range so the release -> bind
+// window cannot lose a port to the process's own outbound dials (see the
+// allocator doc in server/test_util.go; certification failure c12-1).
 func reserveProxyTestPorts(t testing.TB) (*proxyTestPorts, func()) {
-	var reservations []io.Closer
-	reserveTcp := func() int {
-		listener, err := net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("reserve tcp test port: %v", err)
-		}
-		reservations = append(reservations, listener)
-		return listener.Addr().(*net.TCPAddr).Port
+	ports, release, err := server.ReserveTestListenPorts("tcp", "tcp", "tcp", "tcp", "udp")
+	if err != nil {
+		t.Fatalf("reserve proxy test ports: %v", err)
 	}
-	reserveUdp := func() int {
-		packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("reserve udp test port: %v", err)
-		}
-		reservations = append(reservations, packetConn)
-		return packetConn.LocalAddr().(*net.UDPAddr).Port
-	}
-	ports := &proxyTestPorts{
-		socks: reserveTcp(),
-		http:  reserveTcp(),
-		https: reserveTcp(),
-		api:   reserveTcp(),
-		wg:    reserveUdp(),
-	}
-	var releaseOnce sync.Once
-	release := func() {
-		releaseOnce.Do(func() {
-			for _, reservation := range reservations {
-				reservation.Close()
-			}
-		})
-	}
-	return ports, release
+	return &proxyTestPorts{
+		socks: ports[0],
+		http:  ports[1],
+		https: ports[2],
+		api:   ports[3],
+		wg:    ports[4],
+	}, release
 }
 
 func listenProxyTestTcp(t testing.TB) net.Listener {
@@ -506,6 +492,14 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 	case <-time.After(1 * time.Second):
 	}
 
+	// a server whose listen failed panics and its rescue handler cancels the
+	// shared ctx; report that as the bring-up failure it is instead of letting
+	// a later step surface collateral (c12-1 died as a misleading wg "device
+	// closed" one second after two EADDRINUSE bind panics)
+	if ctx.Err() != nil {
+		t.Fatalf("proxy server bring-up canceled the harness ctx (a listener failed to bind; see Unexpected error above)")
+	}
+
 	// register the wg client with the wg server (in production this is driven by
 	// the proxy client notification / warmup callback)
 	if err := wg.AddProxyClients(proxyClient); err != nil {
@@ -635,6 +629,52 @@ func TestProxy(t *testing.T) {
 			testProxySocks(t, h)
 			testProxyHttps(t, h)
 			testProxyWireguard(t, h)
+		}
+	})
+}
+
+func TestProxyNonPublicTargetTimesOut(t *testing.T) {
+	if testing.Short() {
+		return
+	}
+	env := server.DefaultTestEnv()
+	env.RerunCount = 0
+	env.Run(t, func(t testing.TB) {
+		h := setupProxyTest(t)
+		defer h.close(t)
+
+		var targetReached atomic.Bool
+		targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			targetReached.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer targetServer.Close()
+
+		proxyUrl, err := url.Parse(fmt.Sprintf("http://%s:x@127.0.0.1:%d", h.signedProxyId, h.httpPort))
+		if err != nil {
+			t.Fatalf("parse proxy url: %v", err)
+		}
+		client := &http.Client{
+			Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
+			Timeout:   1 * time.Second,
+		}
+		defer client.CloseIdleConnections()
+
+		startTime := time.Now()
+		response, err := client.Get(targetServer.URL)
+		if response != nil {
+			response.Body.Close()
+			t.Fatalf("non-public target returned status %d", response.StatusCode)
+		}
+		var netError net.Error
+		if !errors.As(err, &netError) || !netError.Timeout() {
+			t.Fatalf("expected connect timeout for non-public target, got %v", err)
+		}
+		if time.Since(startTime) < 750*time.Millisecond {
+			t.Fatalf("non-public target failed before the connect timeout: %v", err)
+		}
+		if targetReached.Load() {
+			t.Fatalf("non-public target was reached through the proxy")
 		}
 	})
 }
