@@ -1,9 +1,10 @@
 name: test
 
-# Every branch, deliberately: this repo carries long-lived deployment
-# branches as well as main, and naming them here would bake one fork's
-# layout into a file that gets cherry-picked between them. Pairing it with
-# the concurrency group below keeps a busy branch to one run at a time.
+# Every branch, deliberately. Work on this project happens on long-lived
+# branches and forks as well as main, and listing them here would bake one
+# repository's layout into a file that is meant to stay identical wherever
+# it is merged. The concurrency group below keeps a busy branch to a single
+# run at a time.
 on:
   push:
   pull_request:
