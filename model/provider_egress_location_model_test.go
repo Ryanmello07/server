@@ -7,8 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
 )
 
@@ -39,11 +38,11 @@ func TestProviderEgressLocationUpsertAndGet(t *testing.T) {
 		if got == nil {
 			t.Fatal("expected a stored egress location")
 		}
-		assert.Equal(t, got.LocationId, country.LocationId)
-		assert.Equal(t, got.CountryCode, "us")
-		assert.Equal(t, got.ASN, 401486)
-		assert.Equal(t, got.Hosting, true)
-		assert.Equal(t, got.Proxy, false)
+		connect.AssertEqual(t, got.LocationId, country.LocationId)
+		connect.AssertEqual(t, got.CountryCode, "us")
+		connect.AssertEqual(t, got.ASN, 401486)
+		connect.AssertEqual(t, got.Hosting, true)
+		connect.AssertEqual(t, got.Proxy, false)
 
 		// upsert replaces, given a strictly newer observed_at: the upsert is
 		// monotonic (see TestProviderEgressLocationUpsertIgnoresOlderReplay below),
@@ -58,9 +57,9 @@ func TestProviderEgressLocationUpsertAndGet(t *testing.T) {
 			ObservedAt:  now.Add(time.Minute),
 		})
 		got = GetProviderEgressLocation(ctx, clientId)
-		assert.Equal(t, got.ASN, 999)
-		assert.Equal(t, got.Hosting, false)
-		assert.Equal(t, got.Proxy, true)
+		connect.AssertEqual(t, got.ASN, 999)
+		connect.AssertEqual(t, got.Hosting, false)
+		connect.AssertEqual(t, got.Proxy, true)
 	})
 }
 
@@ -110,9 +109,9 @@ func TestProviderEgressLocationUpsertIgnoresOlderReplay(t *testing.T) {
 		if got == nil {
 			t.Fatal("expected a stored egress location")
 		}
-		assert.Equal(t, got.CountryCode, "jp")
-		assert.Equal(t, got.ASN, 111)
-		assert.Equal(t, got.LocationId, jpCountry.LocationId)
+		connect.AssertEqual(t, got.CountryCode, "jp")
+		connect.AssertEqual(t, got.ASN, 111)
+		connect.AssertEqual(t, got.LocationId, jpCountry.LocationId)
 	})
 }
 
@@ -144,7 +143,7 @@ func TestProviderEgressLocationCountryCodeLowercased(t *testing.T) {
 		if got == nil {
 			t.Fatal("expected a stored egress location")
 		}
-		assert.Equal(t, got.CountryCode, "us")
+		connect.AssertEqual(t, got.CountryCode, "us")
 	})
 }
 
@@ -500,7 +499,7 @@ func TestProviderEgressProbeAttemptUpsertIgnoresOlderReplay(t *testing.T) {
 		if got == nil {
 			t.Fatal("expected a stored probe attempt")
 		}
-		assert.Equal(t, got.ProbeFailure, "no_consensus")
+		connect.AssertEqual(t, got.ProbeFailure, "no_consensus")
 		// postgres `timestamp` keeps microseconds, Go keeps nanoseconds, so
 		// compare with a tolerance rather than for equality
 		if delta := got.AttemptAt.Sub(newer); delta < -time.Millisecond || time.Millisecond < delta {
@@ -513,7 +512,7 @@ func TestProviderEgressProbeAttemptUpsertIgnoresOlderReplay(t *testing.T) {
 			ClientId: clientId, AttemptAt: newest, ProbeFailure: "",
 		})
 		got = GetProviderEgressProbeAttempt(ctx, clientId)
-		assert.Equal(t, got.ProbeFailure, "")
+		connect.AssertEqual(t, got.ProbeFailure, "")
 
 		// absent
 		if GetProviderEgressProbeAttempt(ctx, server.NewId()) != nil {
@@ -722,9 +721,9 @@ func TestProviderEgressLocationVerdictDefaults(t *testing.T) {
 		if stored == nil {
 			t.Fatal("expected a stored egress location")
 		}
-		assert.Equal(t, stored.Verdict, ProviderEgressVerdictUnverified)
-		assert.Equal(t, stored.VerdictReason, "")
-		assert.Equal(t, stored.Assurance, ProviderEgressAssuranceDirect)
+		connect.AssertEqual(t, stored.Verdict, ProviderEgressVerdictUnverified)
+		connect.AssertEqual(t, stored.VerdictReason, "")
+		connect.AssertEqual(t, stored.Assurance, ProviderEgressAssuranceDirect)
 
 		// an explicit judgement is stored verbatim
 		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
@@ -741,9 +740,9 @@ func TestProviderEgressLocationVerdictDefaults(t *testing.T) {
 		if stored == nil {
 			t.Fatal("expected a stored egress location")
 		}
-		assert.Equal(t, stored.Verdict, "suspect")
-		assert.Equal(t, stored.VerdictReason, "unstable")
-		assert.Equal(t, stored.Assurance, ProviderEgressAssuranceDirect)
+		connect.AssertEqual(t, stored.Verdict, "suspect")
+		connect.AssertEqual(t, stored.VerdictReason, "unstable")
+		connect.AssertEqual(t, stored.Assurance, ProviderEgressAssuranceDirect)
 	})
 }
 
@@ -779,16 +778,16 @@ func TestGetAllProviderEgressCountryCodes(t *testing.T) {
 
 		// observed providers come back lowercased, so callers can compare
 		// against location.country_code without normalising at each site
-		assert.Equal(t, codes[observed], "gb")
+		connect.AssertEqual(t, codes[observed], "gb")
 
 		// a provider with no observed location is ABSENT, not "".
 		// Callers rely on the two-value lookup to fail closed.
 		_, ok := codes[unobserved]
-		assert.Equal(t, ok, false)
+		connect.AssertEqual(t, ok, false)
 
 		// a provider whose only observation has aged out is ABSENT too --
 		// indistinguishable from never probed, which fails closed
 		_, ok = codes[stale]
-		assert.Equal(t, ok, false)
+		connect.AssertEqual(t, ok, false)
 	})
 }

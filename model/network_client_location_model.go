@@ -3142,6 +3142,13 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			for result.Next() {
 				lookbackClientScore, cityLocationId, regionLocationId, countryLocationId := loadClientScore(result)
 
+				// top-level only; the lookback copies stay nil (see `ClientScore`)
+				setLocationIds := func(clientScore *ClientScore) {
+					clientScore.CityLocationId = cityLocationId
+					clientScore.RegionLocationId = regionLocationId
+					clientScore.CountryLocationId = countryLocationId
+				}
+
 				// once per distinct location id: a country-only client stores
 				// its country id in all three columns (see
 				// SetConnectionLocation), and a client belongs in a location's
@@ -3149,14 +3156,6 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 				// repeat is already absorbed, but going through the set makes
 				// the intent explicit and keeps this loop in step with the
 				// counting loop in UpdateClientLocations.
-				//
-				// The location ids are set top-level only; the lookback copies
-				// stay nil (see `ClientScore`).
-				setLocationIds := func(clientScore *ClientScore) {
-					clientScore.CityLocationId = cityLocationId
-					clientScore.RegionLocationId = regionLocationId
-					clientScore.CountryLocationId = countryLocationId
-				}
 				for _, locationId := range distinctIds(
 					cityLocationId,
 					regionLocationId,

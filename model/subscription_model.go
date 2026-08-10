@@ -17,6 +17,7 @@ import (
 
 	// "maps"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/urnetwork/glog"
@@ -781,9 +782,29 @@ func AddTransferBalance(ctx context.Context, transferBalance *TransferBalance) {
 // TODO if none, return err
 func GetOverlappingTransferBalance(ctx context.Context, purchaseToken string, expiryTime time.Time) (balanceId server.Id, returnErr error) {
 	server.Db(ctx, func(conn server.PgConn) {
-		result, err := conn.Query(
-			ctx,
-			`
+		balanceId, returnErr = getOverlappingTransferBalance(conn, ctx, purchaseToken, expiryTime)
+	})
+
+	return
+}
+
+// GetOverlappingTransferBalanceInTx is the in-tx variant, for callers that gate a
+// credit on the check and need the check and the credit in ONE transaction (the
+// Play renewal path re-checks under an advisory lock before crediting).
+func GetOverlappingTransferBalanceInTx(tx server.PgTx, ctx context.Context, purchaseToken string, expiryTime time.Time) (balanceId server.Id, returnErr error) {
+	return getOverlappingTransferBalance(tx, ctx, purchaseToken, expiryTime)
+}
+
+// overlappingBalanceQuerier is the intersection of PgConn and PgTx this query
+// needs, so the Db and InTx variants can share one implementation.
+type overlappingBalanceQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func getOverlappingTransferBalance(conn overlappingBalanceQuerier, ctx context.Context, purchaseToken string, expiryTime time.Time) (balanceId server.Id, returnErr error) {
+	result, err := conn.Query(
+		ctx,
+		`
                 SELECT
                     balance_id
                 FROM transfer_balance
@@ -794,16 +815,15 @@ func GetOverlappingTransferBalance(ctx context.Context, purchaseToken string, ex
                 ORDER BY end_time DESC
                 LIMIT 1
             `,
-			purchaseToken,
-			expiryTime,
-		)
-		server.WithPgResult(result, err, func() {
-			if result.Next() {
-				server.Raise(result.Scan(&balanceId))
-			} else {
-				returnErr = errors.New("Overlapping transfer balance not found.")
-			}
-		})
+		purchaseToken,
+		expiryTime,
+	)
+	server.WithPgResult(result, err, func() {
+		if result.Next() {
+			server.Raise(result.Scan(&balanceId))
+		} else {
+			returnErr = errors.New("Overlapping transfer balance not found.")
+		}
 	})
 
 	return
@@ -1291,6 +1311,19 @@ func CreateCompanionContract(
 	return
 }
 
+// ErrMissingCompanionOrigin: a companion contract request arrived before any
+// open origin contract in the opposite direction exists. At cold start this
+// is an ORDERING RACE, not a terminal condition: both sides bring their
+// sessions up simultaneously and the encryption control carrier requests its
+// companion contract at session setup, frequently beating the peer's origin
+// creation by milliseconds. The controller retries this case briefly (see
+// nextContract) because the client cannot: every contract failure reaches the
+// client collapsed into InsufficientBalance, and the client's blind
+// CreateContractTimeout retry loop turned this race into a 30s sequence
+// starve (observed 12 times per full test-suite run; also the mechanism that
+// manufactured dead-on-arrival multiclient window clients).
+var ErrMissingCompanionOrigin = fmt.Errorf("Missing origin contract for companion.")
+
 func CreateCompanionTransferEscrow(
 	ctx context.Context,
 	sourceNetworkId server.Id,
@@ -1361,7 +1394,71 @@ func CreateCompanionTransferEscrow(
 		})
 
 		if companionContractId == nil {
-			returnErr = fmt.Errorf("Missing origin contract for companion.")
+			// Fall back to a companion contract as the origin anchor. In an
+			// asymmetric relationship every return-direction contract is
+			// itself a companion (the return side has no plain contract path
+			// by definition), and the ONLY companion-on-companion requester
+			// is the forward side's TLS-server EncryptedControl reply
+			// carrier (EncryptionControlUseCompanion): its reply direction
+			// mirrors the peer's companion-carried return direction. With
+			// plain-origin-only matching that carrier can never open — a
+			// deadlock that EncryptionModeRequired surfaces as a hard
+			// establishment failure (Opportunistic silently downgraded the
+			// peer's direction to plaintext instead, which is how it went
+			// unnoticed). The payer is unchanged: the companion's
+			// destination side pays, exactly as for a plain-origin
+			// companion. Plain origins stay preferred; the chain is bounded
+			// in practice at depth two (a reply carrier answering a return
+			// direction).
+			result, err := tx.Query(
+				ctx,
+				`
+                    SELECT contract_id
+                    FROM (
+                        (
+                            SELECT contract_id, create_time
+                            FROM transfer_contract
+                            WHERE
+                                open = true AND
+                                source_id = $1 AND
+                                destination_id = $2 AND
+                                companion_contract_id IS NOT NULL
+                            ORDER BY create_time ASC
+                            LIMIT 1
+                        )
+
+                        UNION ALL
+
+                        (
+                            SELECT contract_id, create_time
+                            FROM transfer_contract
+                            WHERE
+                                open = false AND
+                                $3 <= close_time AND
+                                source_id = $1 AND
+                                destination_id = $2 AND
+                                companion_contract_id IS NOT NULL
+                            ORDER BY create_time ASC
+                            LIMIT 1
+                        )
+
+                        ORDER BY create_time ASC
+                        LIMIT 1
+                    ) AS earliest_companion_origin
+                `,
+				destinationId,
+				sourceId,
+				server.NowUtc().Add(-originContractTimeout),
+			)
+			server.WithPgResult(result, err, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&companionContractId))
+				}
+			})
+		}
+
+		if companionContractId == nil {
+			returnErr = ErrMissingCompanionOrigin
 			return
 		}
 
@@ -3187,7 +3284,7 @@ func AddSubscriptionRenewalInTx(tx server.PgTx, ctx context.Context, renewal *Su
 						transaction_id
 			)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (network_id, subscription_type, end_time, start_time) DO UPDATE
+			ON CONFLICT (network_id, subscription_type, end_time, start_time, market) DO UPDATE
 			SET
 				net_revenue_nano_cents = $5,
 				purchase_token = $6
@@ -3257,6 +3354,56 @@ func HasSubscriptionRenewal(
 		})
 	})
 	return active, market
+}
+
+// GetActiveSubscriptionRenewalMarkets returns every market that is currently
+// billing the network for subscriptionType, one entry per market.
+//
+// A network can hold concurrent renewals in more than one market -- the same
+// person subscribing on an iPhone and again on the web is billed twice, by two
+// unrelated payment systems, each of which must be cancelled where it lives.
+// HasSubscriptionRenewal collapses that set with MIN(market) and can only ever
+// name one of them, which leaves the other silently charging; use this when the
+// caller has to show or act on all of them.
+//
+// Several sequential renewal rows in one market are one subscription to cancel,
+// so the set is deduped by market. Market is nullable (it predates the column)
+// and older rows also wrote the empty string, so both are normalized to "" and
+// share a single "unknown store" entry. Ordered for a stable result, with the
+// unknown entry first.
+func GetActiveSubscriptionRenewalMarkets(
+	ctx context.Context,
+	networkId server.Id,
+	subscriptionType SubscriptionType,
+) []SubscriptionMarket {
+	markets := []SubscriptionMarket{}
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			`
+			SELECT DISTINCT
+				COALESCE(market, '') AS market
+			FROM subscription_renewal
+			WHERE
+				network_id = $1
+				AND subscription_type = $2
+				AND start_time <= $3
+				AND $3 < end_time
+			ORDER BY market
+			`,
+			networkId,
+			subscriptionType,
+			server.NowUtc(),
+		)
+		server.WithPgResult(result, err, func() {
+			for result.Next() {
+				var market SubscriptionMarket
+				server.Raise(result.Scan(&market))
+				markets = append(markets, market)
+			}
+		})
+	})
+	return markets
 }
 
 // IsPro reports whether a network currently holds the Pro entitlement.
@@ -3352,7 +3499,10 @@ func AddProTransferBalanceToAllNetworks(
 					fraction := float64(endTime.Sub(startTime)) / float64(supporterDuration)
 					subsidyNetRevenue = NanoCents(fraction * float64(netRevenueNanoCents))
 				}
-				supporters[networkId] = subsidyNetRevenue
+				// SUM, do not overwrite: a network can hold several active renewals
+				// at once (one row per market), and each contributes its own
+				// pro-rated revenue to the subsidy accounting
+				supporters[networkId] += subsidyNetRevenue
 			}
 		})
 

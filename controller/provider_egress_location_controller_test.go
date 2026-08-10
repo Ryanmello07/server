@@ -7,8 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
 )
@@ -31,7 +30,7 @@ func TestSubmitProviderEgressLocationCountryOnly(t *testing.T) {
 			CountryConfident: true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		if res.LocationId == (server.Id{}) {
 			t.Fatal("expected a resolved location id")
 		}
@@ -40,10 +39,10 @@ func TestSubmitProviderEgressLocationCountryOnly(t *testing.T) {
 		if stored == nil {
 			t.Fatal("expected the submission to be stored")
 		}
-		assert.Equal(t, stored.CountryCode, "us")
-		assert.Equal(t, stored.ASN, 401486)
-		assert.Equal(t, stored.Hosting, true)
-		assert.Equal(t, stored.CityConfident, false)
+		connect.AssertEqual(t, stored.CountryCode, "us")
+		connect.AssertEqual(t, stored.ASN, 401486)
+		connect.AssertEqual(t, stored.Hosting, true)
+		connect.AssertEqual(t, stored.CityConfident, false)
 
 		// the resolved location must be the country-granular row, with no
 		// city/region association
@@ -51,7 +50,7 @@ func TestSubmitProviderEgressLocationCountryOnly(t *testing.T) {
 		if loc == nil {
 			t.Fatal("expected the resolved location row to exist")
 		}
-		assert.Equal(t, loc.LocationType, model.LocationTypeCountry)
+		connect.AssertEqual(t, loc.LocationType, model.LocationTypeCountry)
 		if loc.CityLocationId != (server.Id{}) {
 			t.Fatal("a country-granularity row must not have a city association")
 		}
@@ -129,22 +128,22 @@ func TestSubmitProviderEgressLocationCityConfidentStoresCity(t *testing.T) {
 			CityConfident:    true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		stored := model.GetProviderEgressLocation(ctx, clientId)
 		if stored == nil {
 			t.Fatal("expected the submission to be stored")
 		}
-		assert.Equal(t, stored.CityConfident, true)
+		connect.AssertEqual(t, stored.CityConfident, true)
 
 		// the resolved location must be the city-granular row that already
 		// existed, not a new one
-		assert.Equal(t, stored.LocationId, denver.LocationId)
+		connect.AssertEqual(t, stored.LocationId, denver.LocationId)
 		loc := model.GetLocation(ctx, stored.LocationId)
 		if loc == nil {
 			t.Fatal("expected the resolved location row to exist")
 		}
-		assert.Equal(t, loc.LocationType, model.LocationTypeCity)
+		connect.AssertEqual(t, loc.LocationType, model.LocationTypeCity)
 	})
 }
 
@@ -356,7 +355,7 @@ func TestSubmitProviderEgressLocationAcceptsWithinSkewObservedAt(t *testing.T) {
 			CountryConfident: true,
 			ObservedAt:       server.NowUtc().Add(1 * time.Minute),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		if res.LocationId == (server.Id{}) {
 			t.Fatal("expected a resolved location id")
 		}
@@ -365,6 +364,42 @@ func TestSubmitProviderEgressLocationAcceptsWithinSkewObservedAt(t *testing.T) {
 		if stored == nil {
 			t.Fatal("expected the submission to be stored")
 		}
+	})
+}
+
+// A large 32-bit ASN (e.g. from the private-use range, common on
+// hosting/VPN infrastructure) must round-trip cleanly, not panic. The asn
+// column used to be `int` (Postgres int4, max ~2.147e9); ASNs are 32-bit
+// unsigned (max ~4.295e9), so a value above int4's range panicked deep in
+// pgx's arg encoding.
+func TestSubmitProviderEgressLocationAcceptsLargeAsn(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		model.Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+
+		const largeAsn = 4200000000
+
+		res, err := SubmitProviderEgressLocation(ctx, &SubmitProviderEgressLocationArgs{
+			ClientId:         clientId,
+			CountryCode:      "us",
+			Country:          "United States",
+			ASN:              largeAsn,
+			CountryConfident: true,
+			ObservedAt:       server.NowUtc(),
+		})
+		connect.AssertEqual(t, err, nil)
+		if res.LocationId == (server.Id{}) {
+			t.Fatal("expected a resolved location id")
+		}
+
+		stored := model.GetProviderEgressLocation(ctx, clientId)
+		if stored == nil {
+			t.Fatal("expected the submission to be stored")
+		}
+		connect.AssertEqual(t, stored.ASN, largeAsn)
 	})
 }
 
@@ -429,7 +464,7 @@ func TestSubmitProviderEgressLocationUnknownCityDoesNotCreateALocation(t *testin
 			CityConfident:    true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		// nothing was added to the shared table
 		after := testing_countLocations(ctx)
@@ -449,7 +484,7 @@ func TestSubmitProviderEgressLocationUnknownCityDoesNotCreateALocation(t *testin
 		if loc.LocationType != model.LocationTypeCountry {
 			t.Errorf("stored location_type = %q, want %q: an unmatched city must fall back to country granularity", loc.LocationType, model.LocationTypeCountry)
 		}
-		assert.Equal(t, res.LocationId, stored.LocationId)
+		connect.AssertEqual(t, res.LocationId, stored.LocationId)
 
 		// city_confident tracks the granularity actually stored, so the row
 		// stays internally consistent: location_id is a city row exactly when
@@ -521,7 +556,7 @@ func TestSubmitProviderEgressLocationMatchesCitySpellingVariant(t *testing.T) {
 				CityConfident:    true,
 				ObservedAt:       server.NowUtc(),
 			})
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			stored := model.GetProviderEgressLocation(ctx, clientId)
 			if stored == nil {
@@ -623,7 +658,7 @@ func TestSubmitProviderEgressLocationMatchesAccentedCityVariant(t *testing.T) {
 				CityConfident:    true,
 				ObservedAt:       server.NowUtc(),
 			})
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 
 			stored := model.GetProviderEgressLocation(ctx, clientId)
 			if stored == nil {
@@ -686,7 +721,7 @@ func TestSubmitProviderEgressLocationAmbiguousQualifierFallsBackToCountry(t *tes
 			CityConfident:    true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		stored := model.GetProviderEgressLocation(ctx, clientId)
 		if stored == nil {
@@ -732,7 +767,7 @@ func TestSubmitProviderEgressLocationVerdictVerified(t *testing.T) {
 			CountryConfident: true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		stored := model.GetProviderEgressLocation(ctx, clientId)
 		if stored == nil {
@@ -741,9 +776,9 @@ func TestSubmitProviderEgressLocationVerdictVerified(t *testing.T) {
 		if stored.Verdict != "verified" {
 			t.Errorf("verdict = %q, want %q: a consensus-backed submission with no conflicting history is verified", stored.Verdict, "verified")
 		}
-		assert.Equal(t, stored.VerdictReason, "")
+		connect.AssertEqual(t, stored.VerdictReason, "")
 		// assurance is unrelated to the verdict and stays at its default
-		assert.Equal(t, stored.Assurance, model.ProviderEgressAssuranceDirect)
+		connect.AssertEqual(t, stored.Assurance, model.ProviderEgressAssuranceDirect)
 	})
 }
 
@@ -771,7 +806,7 @@ func TestSubmitProviderEgressLocationVerdictSuspectOnCountryFlipFlop(t *testing.
 			CountryConfident: true,
 			ObservedAt:       server.NowUtc().Add(-2 * time.Hour),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		first := model.GetProviderEgressLocation(ctx, clientId)
 		if first == nil {
@@ -789,13 +824,13 @@ func TestSubmitProviderEgressLocationVerdictSuspectOnCountryFlipFlop(t *testing.
 			CountryConfident: true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		stored := model.GetProviderEgressLocation(ctx, clientId)
 		if stored == nil {
 			t.Fatal("expected the second submission to be stored")
 		}
-		assert.Equal(t, stored.CountryCode, "jp")
+		connect.AssertEqual(t, stored.CountryCode, "jp")
 		if stored.Verdict != "suspect" {
 			t.Errorf("verdict = %q, want %q: a country change inside the instability window is a flip-flop", stored.Verdict, "suspect")
 		}
@@ -847,9 +882,9 @@ func TestSubmitProviderEgressLocationVerdictMmdbDivergenceIsNotSuspect(t *testin
 		clientIp := "24.48.0.1"
 
 		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		// the fixture is only meaningful if mmdb disagrees with the probe below
-		assert.Equal(t, mmdbLocation.CountryCode, "ca")
+		connect.AssertEqual(t, mmdbLocation.CountryCode, "ca")
 		model.CreateLocation(ctx, mmdbLocation)
 
 		networkId := server.NewId()
@@ -858,9 +893,9 @@ func TestSubmitProviderEgressLocationVerdictMmdbDivergenceIsNotSuspect(t *testin
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		_, err = SubmitProviderEgressLocation(ctx, &SubmitProviderEgressLocationArgs{
 			ClientId:         clientId,
@@ -869,13 +904,13 @@ func TestSubmitProviderEgressLocationVerdictMmdbDivergenceIsNotSuspect(t *testin
 			CountryConfident: true,
 			ObservedAt:       server.NowUtc(),
 		})
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		stored := model.GetProviderEgressLocation(ctx, clientId)
 		if stored == nil {
 			t.Fatal("expected the submission to be stored")
 		}
-		assert.Equal(t, stored.CountryCode, "jp")
+		connect.AssertEqual(t, stored.CountryCode, "jp")
 		if stored.Verdict != "verified" {
 			t.Errorf(
 				"verdict = %q, want %q: the probed country (jp) differing from the mmdb country (%s) is the point of probing and must never be suspicious on its own",

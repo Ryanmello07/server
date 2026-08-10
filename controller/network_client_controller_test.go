@@ -5,8 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
 )
@@ -31,7 +30,7 @@ func TestSetConnectionLocationPrefersEgressLocation(t *testing.T) {
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, "8.8.8.8:0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
 			ClientId:    clientId,
@@ -41,7 +40,7 @@ func TestSetConnectionLocationPrefersEgressLocation(t *testing.T) {
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, "8.8.8.8")
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		var countryLocationId server.Id
 		server.Db(ctx, func(conn server.PgConn) {
@@ -56,7 +55,7 @@ func TestSetConnectionLocationPrefersEgressLocation(t *testing.T) {
 				}
 			})
 		})
-		assert.Equal(t, countryLocationId, probed.CountryLocationId)
+		connect.AssertEqual(t, countryLocationId, probed.CountryLocationId)
 	})
 }
 
@@ -71,11 +70,11 @@ func TestSetConnectionLocationFallsBackToMmdb(t *testing.T) {
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, "8.8.8.8:0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		// no SetProviderEgressLocation call -> mmdb path
 		err = SetConnectionLocation(ctx, connectionId, "8.8.8.8")
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		var count int
 		server.Db(ctx, func(conn server.PgConn) {
@@ -90,7 +89,7 @@ func TestSetConnectionLocationFallsBackToMmdb(t *testing.T) {
 				}
 			})
 		})
-		assert.Equal(t, count, 1)
+		connect.AssertEqual(t, count, 1)
 	})
 }
 
@@ -106,7 +105,7 @@ func TestSetConnectionLocationStaleProbedFallsBackToMmdb(t *testing.T) {
 		// the mmdb location this ip actually resolves to; created up front so
 		// its canonical (deduped) location id is known for the assertion.
 		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		model.CreateLocation(ctx, mmdbLocation)
 
 		// a stale probed location, deliberately a different country than
@@ -125,7 +124,7 @@ func TestSetConnectionLocationStaleProbedFallsBackToMmdb(t *testing.T) {
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
 			ClientId:    clientId,
@@ -135,7 +134,7 @@ func TestSetConnectionLocationStaleProbedFallsBackToMmdb(t *testing.T) {
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		var countryLocationId server.Id
 		server.Db(ctx, func(conn server.PgConn) {
@@ -150,7 +149,7 @@ func TestSetConnectionLocationStaleProbedFallsBackToMmdb(t *testing.T) {
 				}
 			})
 		})
-		assert.Equal(t, countryLocationId, mmdbLocation.CountryLocationId)
+		connect.AssertEqual(t, countryLocationId, mmdbLocation.CountryLocationId)
 		if countryLocationId == probed.CountryLocationId {
 			t.Fatal("stale probed location must not be used")
 		}
@@ -169,7 +168,7 @@ func TestSetConnectionLocationProbedWriteErrorFallsBackToMmdb(t *testing.T) {
 		clientIp := "8.8.8.8"
 
 		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		model.CreateLocation(ctx, mmdbLocation)
 
 		networkId := server.NewId()
@@ -178,7 +177,7 @@ func TestSetConnectionLocationProbedWriteErrorFallsBackToMmdb(t *testing.T) {
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		// a fresh probed entry pointing at a location id that was never
 		// created via CreateLocation -- the storage write in
@@ -191,7 +190,7 @@ func TestSetConnectionLocationProbedWriteErrorFallsBackToMmdb(t *testing.T) {
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		var countryLocationId server.Id
 		server.Db(ctx, func(conn server.PgConn) {
@@ -206,7 +205,7 @@ func TestSetConnectionLocationProbedWriteErrorFallsBackToMmdb(t *testing.T) {
 				}
 			})
 		})
-		assert.Equal(t, countryLocationId, mmdbLocation.CountryLocationId)
+		connect.AssertEqual(t, countryLocationId, mmdbLocation.CountryLocationId)
 	})
 }
 
@@ -242,7 +241,7 @@ func TestSetConnectionLocationProbedNetTypeForeignMatchesMmdbParity(t *testing.T
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		// probed country ("jp") deliberately differs from the control ip's
 		// mmdb country ("us" for 8.8.8.8).
@@ -254,7 +253,7 @@ func TestSetConnectionLocationProbedNetTypeForeignMatchesMmdbParity(t *testing.T
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		var netTypeForeign int
 		server.Db(ctx, func(conn server.PgConn) {
@@ -269,7 +268,7 @@ func TestSetConnectionLocationProbedNetTypeForeignMatchesMmdbParity(t *testing.T
 				}
 			})
 		})
-		assert.Equal(t, netTypeForeign, 0)
+		connect.AssertEqual(t, netTypeForeign, 0)
 	})
 }
 
@@ -299,7 +298,7 @@ func TestSetConnectionLocationMapsProbedFlagsToScores(t *testing.T) {
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, "8.8.8.8:0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
 			ClientId:    clientId,
@@ -312,7 +311,7 @@ func TestSetConnectionLocationMapsProbedFlagsToScores(t *testing.T) {
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, "8.8.8.8")
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		var netTypeHosting int
 		var netTypePrivacy int
@@ -329,92 +328,9 @@ func TestSetConnectionLocationMapsProbedFlagsToScores(t *testing.T) {
 				}
 			})
 		})
-		assert.Equal(t, netTypeHosting, 1)
-		assert.Equal(t, netTypePrivacy, 1)
-		assert.Equal(t, netTypeVirtual, 0)
-	})
-}
-
-// A failing probed-egress lookup must not propagate out of
-// SetConnectionLocation, and the connection must still be located via mmdb.
-//
-// model.GetFreshProviderEgressLocationForConnection goes through server.Db,
-// which re-panics any postgres error that is neither transient nor a
-// connection error (see isTransientError / isConnectionError in db.go).
-// undefined_table (42P01) is exactly such an error, and it is not a
-// hypothetical one: provider_egress_location is a new table in this change,
-// so rolling the binary before running `bringyourctl db migrate` makes every
-// single connection announce hit it.
-//
-// That matters far more than a failed lookup, because SetConnectionLocation is
-// called from ConnectNetworkClient *before* connect's disconnect-cleanup defer
-// is registered (connect/transport_announce.go): an escaping panic tears the
-// connection down and orphans its network_client_connection row as
-// connected = true. This project has already lost ~30k rows to that exact
-// deploy-ordering mistake once.
-//
-// The failure is injected for real -- the table is dropped, so the query
-// genuinely raises 42P01 out of the pgx driver -- rather than asserted against
-// a mock, because the thing under test is what server.Db does with a real
-// postgres error, not what the call site does with a fabricated one.
-func TestSetConnectionLocationEgressLookupErrorFallsBackToMmdb(t *testing.T) {
-	server.DefaultTestEnv().Run(t, func(t testing.TB) {
-		ctx := context.Background()
-
-		clientIp := "8.8.8.8"
-
-		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
-		model.CreateLocation(ctx, mmdbLocation)
-
-		networkId := server.NewId()
-		clientId := server.NewId()
-		model.Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
-
-		handlerId := model.CreateNetworkClientHandler(ctx)
-		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
-
-		// a fresh probed entry exists, so the lookup is definitely reached --
-		// then the table it reads is dropped out from under it, which is the
-		// state a deploy-before-migrate leaves the binary in.
-		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
-			ClientId:    clientId,
-			LocationId:  mmdbLocation.LocationId,
-			CountryCode: "jp",
-			ObservedAt:  server.NowUtc(),
-		})
-		server.Tx(ctx, func(tx server.PgTx) {
-			server.RaisePgResult(tx.Exec(ctx, `DROP TABLE provider_egress_location`))
-		})
-
-		// the panic is caught here rather than left to kill the test binary,
-		// so a regression reports as this test failing with the reason
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("the probed egress lookup must not panic out of SetConnectionLocation; it reached the caller as: %v", r)
-				}
-			}()
-			err = SetConnectionLocation(ctx, connectionId, clientIp)
-		}()
-		assert.Equal(t, err, nil)
-
-		// and the mmdb path still produced a location for the connection
-		var countryLocationId server.Id
-		server.Db(ctx, func(conn server.PgConn) {
-			result, qerr := conn.Query(
-				ctx,
-				`SELECT country_location_id FROM network_client_location WHERE connection_id = $1`,
-				connectionId,
-			)
-			server.WithPgResult(result, qerr, func() {
-				if result.Next() {
-					server.Raise(result.Scan(&countryLocationId))
-				}
-			})
-		})
-		assert.Equal(t, countryLocationId, mmdbLocation.CountryLocationId)
+		connect.AssertEqual(t, netTypeHosting, 1)
+		connect.AssertEqual(t, netTypePrivacy, 1)
+		connect.AssertEqual(t, netTypeVirtual, 0)
 	})
 }
 
@@ -468,9 +384,9 @@ func TestSetConnectionLocationProbedCountryDoesNotCoarsenMmdbCity(t *testing.T) 
 		clientIp := "24.48.0.1"
 
 		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 		// the fixture is only meaningful if mmdb really has a city here
-		assert.Equal(t, mmdbLocation.LocationType, model.LocationTypeCity)
+		connect.AssertEqual(t, mmdbLocation.LocationType, model.LocationTypeCity)
 		model.CreateLocation(ctx, mmdbLocation)
 
 		// the probed location: the same country, but only the country --
@@ -481,7 +397,7 @@ func TestSetConnectionLocationProbedCountryDoesNotCoarsenMmdbCity(t *testing.T) 
 			CountryCode:  "ca",
 		}
 		model.CreateLocation(ctx, probed)
-		assert.Equal(t, probed.LocationId, mmdbLocation.CountryLocationId)
+		connect.AssertEqual(t, probed.LocationId, mmdbLocation.CountryLocationId)
 
 		networkId := server.NewId()
 		clientId := server.NewId()
@@ -489,7 +405,7 @@ func TestSetConnectionLocationProbedCountryDoesNotCoarsenMmdbCity(t *testing.T) 
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
 			ClientId:      clientId,
@@ -500,7 +416,7 @@ func TestSetConnectionLocationProbedCountryDoesNotCoarsenMmdbCity(t *testing.T) 
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		cityLocationId, regionLocationId, countryLocationId := testing_connectionLocationIds(ctx, connectionId)
 		if cityLocationId != mmdbLocation.CityLocationId {
@@ -510,8 +426,8 @@ func TestSetConnectionLocationProbedCountryDoesNotCoarsenMmdbCity(t *testing.T) 
 				mmdbLocation.CityLocationId,
 			)
 		}
-		assert.Equal(t, regionLocationId, mmdbLocation.RegionLocationId)
-		assert.Equal(t, countryLocationId, mmdbLocation.CountryLocationId)
+		connect.AssertEqual(t, regionLocationId, mmdbLocation.RegionLocationId)
+		connect.AssertEqual(t, countryLocationId, mmdbLocation.CountryLocationId)
 		// and the collapse this guards against, stated directly
 		if cityLocationId == countryLocationId {
 			t.Errorf("city/region/country all collapsed to %s; the provider is no longer in any city filter", countryLocationId)
@@ -532,9 +448,9 @@ func TestSetConnectionLocationProbedCountryCorrectsMmdbCityInAnotherCountry(t *t
 		clientIp := "24.48.0.1"
 
 		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, mmdbLocation.LocationType, model.LocationTypeCity)
-		assert.Equal(t, mmdbLocation.CountryCode, "ca")
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, mmdbLocation.LocationType, model.LocationTypeCity)
+		connect.AssertEqual(t, mmdbLocation.CountryCode, "ca")
 		model.CreateLocation(ctx, mmdbLocation)
 
 		probed := &model.Location{
@@ -550,7 +466,7 @@ func TestSetConnectionLocationProbedCountryCorrectsMmdbCityInAnotherCountry(t *t
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
 			ClientId:      clientId,
@@ -561,7 +477,7 @@ func TestSetConnectionLocationProbedCountryCorrectsMmdbCityInAnotherCountry(t *t
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		_, _, countryLocationId := testing_connectionLocationIds(ctx, connectionId)
 		if countryLocationId != probed.CountryLocationId {
@@ -588,8 +504,8 @@ func TestSetConnectionLocationProbedCityWinsOverMmdbCity(t *testing.T) {
 		clientIp := "24.48.0.1"
 
 		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, mmdbLocation.LocationType, model.LocationTypeCity)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, mmdbLocation.LocationType, model.LocationTypeCity)
 		model.CreateLocation(ctx, mmdbLocation)
 
 		probed := &model.Location{
@@ -607,7 +523,7 @@ func TestSetConnectionLocationProbedCityWinsOverMmdbCity(t *testing.T) {
 
 		handlerId := model.CreateNetworkClientHandler(ctx)
 		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
 			ClientId:      clientId,
@@ -618,10 +534,93 @@ func TestSetConnectionLocationProbedCityWinsOverMmdbCity(t *testing.T) {
 		})
 
 		err = SetConnectionLocation(ctx, connectionId, clientIp)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		cityLocationId, _, countryLocationId := testing_connectionLocationIds(ctx, connectionId)
-		assert.Equal(t, cityLocationId, probed.CityLocationId)
-		assert.Equal(t, countryLocationId, probed.CountryLocationId)
+		connect.AssertEqual(t, cityLocationId, probed.CityLocationId)
+		connect.AssertEqual(t, countryLocationId, probed.CountryLocationId)
+	})
+}
+
+// A failing probed-egress lookup must not propagate out of
+// SetConnectionLocation, and the connection must still be located via mmdb.
+//
+// model.GetFreshProviderEgressLocationForConnection goes through server.Db,
+// which re-panics any postgres error that is neither transient nor a
+// connection error (see isTransientError / isConnectionError in db.go).
+// undefined_table (42P01) is exactly such an error, and it is not a
+// hypothetical one: provider_egress_location is a new table in this change,
+// so rolling the binary before running `bringyourctl db migrate` makes every
+// single connection announce hit it.
+//
+// That matters far more than a failed lookup, because SetConnectionLocation is
+// called from ConnectNetworkClient *before* connect's disconnect-cleanup defer
+// is registered (connect/transport_announce.go): an escaping panic tears the
+// connection down and orphans its network_client_connection row as
+// connected = true. This project has already lost ~30k rows to that exact
+// deploy-ordering mistake once.
+//
+// The failure is injected for real -- the table is dropped, so the query
+// genuinely raises 42P01 out of the pgx driver -- rather than asserted against
+// a mock, because the thing under test is what server.Db does with a real
+// postgres error, not what the call site does with a fabricated one.
+func TestSetConnectionLocationEgressLookupErrorFallsBackToMmdb(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		clientIp := "8.8.8.8"
+
+		mmdbLocation, _, err := GetLocationForIp(ctx, clientIp)
+		connect.AssertEqual(t, err, nil)
+		model.CreateLocation(ctx, mmdbLocation)
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		model.Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+
+		handlerId := model.CreateNetworkClientHandler(ctx)
+		connectionId, _, _, _, err := model.ConnectNetworkClient(ctx, clientId, clientIp+":0", handlerId)
+		connect.AssertEqual(t, err, nil)
+
+		// a fresh probed entry exists, so the lookup is definitely reached --
+		// then the table it reads is dropped out from under it, which is the
+		// state a deploy-before-migrate leaves the binary in.
+		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
+			ClientId:    clientId,
+			LocationId:  mmdbLocation.LocationId,
+			CountryCode: "jp",
+			ObservedAt:  server.NowUtc(),
+		})
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `DROP TABLE provider_egress_location`))
+		})
+
+		// the panic is caught here rather than left to kill the test binary,
+		// so a regression reports as this test failing with the reason
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("the probed egress lookup must not panic out of SetConnectionLocation; it reached the caller as: %v", r)
+				}
+			}()
+			err = SetConnectionLocation(ctx, connectionId, clientIp)
+		}()
+		connect.AssertEqual(t, err, nil)
+
+		// and the mmdb path still produced a location for the connection
+		var countryLocationId server.Id
+		server.Db(ctx, func(conn server.PgConn) {
+			result, qerr := conn.Query(
+				ctx,
+				`SELECT country_location_id FROM network_client_location WHERE connection_id = $1`,
+				connectionId,
+			)
+			server.WithPgResult(result, qerr, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&countryLocationId))
+				}
+			})
+		})
+		connect.AssertEqual(t, countryLocationId, mmdbLocation.CountryLocationId)
 	})
 }

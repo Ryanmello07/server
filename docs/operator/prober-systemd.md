@@ -6,10 +6,10 @@ It must never be able to reach those APIs any other way. A direct lookup would
 record the *operator's own* location for the provider and hand the operator's
 address to third-party APIs.
 
-The beta stack confines the prober with a docker network (`egress-prober` in
-`docker-compose.beta.yml`, on an `internal: true` network). The mainstream
-deployment uses no Docker, so this page gives the equivalent: a systemd unit
-whose egress is denied by the kernel.
+A Docker deployment can confine it by attaching the prober to an
+`internal: true` network -- no gateway, no NAT -- and to no other network. The
+mainstream deployment uses no Docker at all, so this page gives the equivalent:
+a systemd unit whose egress is denied by the kernel.
 
 `IPAddressDeny=` / `IPAddressAllow=` are enforced by systemd's cgroup/BPF filter.
 No container, no network namespace, no capability grant, and no root — the
@@ -21,14 +21,14 @@ filter applies to the service's cgroup regardless of the user it runs as.
   logs `Failed to add IP address ... ignoring` and **the address rules do
   nothing**. See [Verifying it is actually enforced](#verifying-it-is-actually-enforced).
 - The `egress-prober` binary from
-  `https://github.com/Ryanmello07/urnetwork-operator-proxy` at
+  `https://github.com/urnetwork/operator-proxy` at
   `/usr/local/bin/egress-prober`:
 
   ```bash
-  git clone https://github.com/Ryanmello07/urnetwork-operator-proxy.git
+  git clone https://github.com/urnetwork/operator-proxy.git
   git clone https://github.com/urnetwork/connect.git       # ../connect replace
   git clone https://github.com/urnetwork/glog.git          # ../glog replace
-  cd urnetwork-operator-proxy
+  cd operator-proxy
   CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/egress-prober ./cmd/egress-prober
   ```
 
@@ -185,9 +185,10 @@ There are two ways to resolve this, and this unit takes the first:
    at dial time either, so accepting one would mean dialling nothing. This is a
    second copy of the endpoint list and it can go stale; the prober prints the
    hostnames it expects (`geolocation hosts: ...`) on every start so drift is
-   visible in the journal. The docker-compose beta service takes this route,
-   because an `internal: true` docker network cannot resolve external names at
-   all.
+   visible in the journal. A confined docker deployment has to take this
+   route, because an `internal: true` docker network cannot resolve external
+   names at all -- the embedded resolver answers SERVFAIL, having no route to
+   forward the query.
 
 ## Addresses, not hostnames
 
