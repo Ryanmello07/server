@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh the urnetwork egress-prober client jwt twice daily
+
+[Timer]
+# Twice a day against a 24h token lifetime. Once daily would leave no room to
+# recover: a single missed or failed run means an expired credential and a
+# silent probe outage until someone notices. At 12h a failure still has a full
+# second attempt before anything breaks.
+OnCalendar=*-*-* 05,17:00:00
+# Survive downtime: if the box was off over a scheduled run, refresh on boot
+# rather than waiting for the next window with a possibly-expired token.
+Persistent=true
+RandomizedDelaySec=300
+Unit=urnetwork-prober-jwt-refresh.service
+
+[Install]
+WantedBy=timers.target

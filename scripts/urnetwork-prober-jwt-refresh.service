@@ -1,0 +1,16 @@
+[Unit]
+# The prober's client jwt expires after 24h (jwt.expiryDuration). When it does,
+# probing does not stop -- it silently produces nothing: the operator-secret
+# calls keep working, so the prober looks healthy while every probe fails
+# no_consensus because the tunnel cannot authenticate.
+Description=Re-mint the urnetwork egress-prober client jwt
+Documentation=file:/root/urnetwork/server/docs/operator/prober-systemd.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/urnetwork/server/scripts/refresh-prober-jwt.sh
+# The script verifies the new token returns HTTP 200 before writing prober.env,
+# so a failure here leaves the working credential in place rather than
+# installing a broken one.

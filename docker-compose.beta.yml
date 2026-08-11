@@ -326,7 +326,20 @@ services:
       # (prober -> api, internal) and is NOT interchangeable with this.
       - --public-api-url=https://api.beta-test.net
       - --platform-url=ws://connect:80/
-      - --interval=1h
+      # --interval is a sleep AFTER a pass finishes, not a fixed period, so the
+      # cycle is pass_duration + interval and throughput is
+      # due-limit / (pass_duration + interval). At 1h that measured 500 probes
+      # per ~90 minute cycle -- ~390/hour, with the prober idle for roughly two
+      # thirds of every cycle while the due queue held tens of thousands of
+      # unprobed providers. 1m effectively runs passes back to back (~1000/hour)
+      # without removing the gap entirely: at 0 a pass that returns an empty
+      # queue would spin.
+      #
+      # --due-limit is already at the server's ceiling: the api clamps a batch to
+      # provider_egress_due.yml's max_due_limit, and with that file absent it
+      # falls back to 500. Raising this past 500 does nothing until that config
+      # exists AND api restarts, because the value is memoised with sync.OnceValue.
+      - --interval=1m
       # 24 simultaneous tunnels. Probes are network bound, not cpu bound: each
       # tests 131 destinations and a dead provider burns the full
       # --probe-timeout on every one, so a single probe takes ~3 minutes wall
@@ -345,7 +358,22 @@ services:
       # at ~100/hour against a need of ~400/hour, which is why most providers
       # stayed untested and therefore hidden by the health gate.
       - --due-limit=500
-      - --probe-timeout=60s
+      # Beta runs ONE prober, so shard 0 of 1 -- which sends no shard
+      # parameters at all and is byte-identical to the unsharded request.
+      # Set here explicitly so the deployed value is visible rather than
+      # implied: mainnet runs one prober per edge server and sets
+      # --shard-count to the number of them, each with its own index.
+      - --shard-count=1
+      - --shard-index=0
+      # 2m20s, not 60s: with --egress-health-all the whole health run must
+      # fit inside one probe timeout, and 60s left 4.286s per request --
+      # below the 10s cold-tunnel floor, so every request risked timing out
+      # and being recorded as a PROVIDER failure. The prober refuses to
+      # start rather than charge honest providers for that, and names this
+      # value. Raising the timeout keeps full-table coverage; dropping
+      # --egress-health-all would sample instead and lose the concurrency
+      # exercise that only the full table provides.
+      - --probe-timeout=2m20s
       - --confinement-timeout=3s
       # DNS vs -confinement-address, for this environment: an `internal: true`
       # docker network cannot resolve external names at all -- docker's

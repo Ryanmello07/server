@@ -9,6 +9,9 @@ beta-vault/vault/tls/**/*.crt
 beta-vault/beta-secrets.env
 # egress-prober client jwt and operator secret; the .example template is tracked
 beta-vault/prober.env
+# The prober account's seedphrase is the ONLY way back into that network.
+# It is not recoverable from the database (salted hash only).
+beta-vault/prober-account.txt
 beta-vault/vault/*.yml
 # Keep .example templates tracked
 !beta-vault/vault/*.yml.example
