@@ -3295,11 +3295,30 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	// invalid however tolerant the rule is). 0.95 allows three such blocks an
 	// hour. Repeated reconnects still fail it: they are real user impact, and
 	// `client_reliability_valid` only forgives ONE per block.
+	// TEMPORARY (beta): lowered from 0.95/0.7/0.6 while the fleet recovers from
+	// the 24h-token expiry.
+	//
+	// Every provider was issued a credential that died after a day, so the fleet
+	// spent days disconnecting and reconnecting. The hour threshold forgives
+	// three bad blocks in sixty and, as its own comment says, repeated
+	// reconnects still fail it -- so the churn drove the whole fleet under the
+	// gate and /network/provider-locations went to zero. Confirmed by
+	// elimination: a provider with health 128/131 measured 6.7h ago and a
+	// passing blackhole check was still excluded, and find-providers2 returns 0
+	// gated against 50 ungated.
+	//
+	// The token lifetime is back to 30 days, but reliability is a trailing
+	// measurement: nothing but elapsed uptime can lift these weights again. This
+	// buys the fleet that time instead of advertising nothing meanwhile.
+	//
+	// RAISE THIS BACK to 0.95/0.7/0.6 once the fleet has strung together clean
+	// hours. Left in place it admits providers with genuinely poor reliability,
+	// which is the very thing the gate exists to keep out of the market.
 	if NormalNetworkConditions() {
 		minFilter.minIndependentReliabilityWeights = map[int]float64{
-			1: float64(0.95),
-			2: float64(0.7),
-			3: float64(0.6),
+			1: float64(0.5),
+			2: float64(0.4),
+			3: float64(0.3),
 		}
 	} else {
 		// some abormal conditions, loosen the stats as they reset
