@@ -21,7 +21,17 @@ the connect crash-loop outage (bad overnight build, concurrent map writes in
 ForEachMaster callbacks → fleet-wide Exited(2) churn → lb 502 → zero new
 connections): new 5.10 crash-loop playbook incl. the post-churn contract
 trough, and the §7 ticket-identity discipline (stable target, varying frame)
-learned from 61 zombie log-class tickets.
+learned from 61 zombie log-class tickets. Updated 2026-08-11 after the grafana
+config-panic outage (a `{{ env: }}` value in grafana.yml naming a settings.yml
+env_var that never reaches the container → every new container Exited(2)
+fleet-wide, and the hosts that had already dropped their old container served
+nothing; meanwhile the public dashboard read empty because the shared
+datasource row was pinned to another host's rotating mimir port): new 11.10
+config-env startup panic, 11.11 shared-datasource port drift, playbook rows
+8-9. The same day's cleanup added 11.7c drain starvation — old containers pile
+up one per deploy while the deploy itself reports success, because the
+host-wide drain lock queued every service behind one holder; that is the
+failure 11.7 gets mistaken for, and it is why `warpctl logs` returned empty.
 
 Intended consumer: a monitoring service with read access to pg (primary),
 redis (cluster, all nodes individually), and service logs. Each signal below
@@ -87,8 +97,12 @@ WHERE function_name LIKE '%UpdateClient%'
 ```
 - GOTCHA — long-running vs stuck: a live run shows claim_time refreshing
   every ~10s (the keepalive bumps claim_time+release_time). Frozen claim +
-  future release_time = pre-lease-fix binary or killed worker. claim age >
-  2× the task's historical duration (finished_task history) = investigate.
+  future release_time = pre-lease-fix binary or killed worker. Current workers
+  use a five-minute rolling lease, so a killed worker's claim self-releases
+  within five minutes of its final heartbeat. A direct-postgres session lock
+  still prevents duplicate execution if only the heartbeat is starved and the
+  original worker remains alive. claim age > 2× the task's historical duration
+  (finished_task history) = investigate.
 
 ### 1.3 pg idle-in-transaction count — the redis-latency mirror
 ```sql
@@ -1195,6 +1209,42 @@ was healthy without it.
   use a generous stop timeout. Leftover UNHEALTHY entries: forget via the loki
   http `/ring` page (internal port from WARP_PORTS, host-loopback, no root).
 
+### 11.7c Drain STARVATION — containers pile up while the poll passes (2026-08-11)
+A second, more common way old containers survive, and it looks nothing like
+11.7: the deploy fully succeeds. The poll passes, the DNAT is repointed at the
+new front, `Found overlapping containers (...)` is logged with the full list —
+and then nothing. Containers accumulate one per deploy (observed 5 deep on
+edge-3; `up=5`, `lokis=2`, `mimirs=2`).
+```
+journalctl -u warp-main-<service>-<block> --since -2h | grep -E 'Found overlapping|Draining'
+#   Found overlapping containers (...) a, b, c   <- present, repeatedly
+#   Draining N overlapping container(s)          <- NEVER printed
+lsof /srv/warp/<env>/warpctl-host-drain*.lock    # W = the holder, plain u = queued
+```
+- TELL: `Found overlapping` with no matching `Draining` line and no
+  `docker container stop` in the journal. The drain goroutine is blocked
+  *before* its first log line, which is the host-drain-lock acquire.
+- ROOT: the stagger lock was ONE file per host shared by every service. The wait
+  bound is `DrainTimeout + 5m` = **65m**, and a connect drain legitimately holds
+  it for up to `DrainTimeout` waiting on client connections, so grafana's drain
+  queued behind it and was still queued when the next deploy replaced it. Seven
+  warpctl workers were stacked on one lock file. Fixed 2026-08-11: the lock is
+  scoped per env+service (`warpctl-host-drain-<env>-<service>.lock`), which
+  preserves the original intent — the capacity the stagger protects is per
+  service, so only the groups of one service need to take turns.
+- **`systemctl restart` does NOT clear a pileup — it adds to it.** The unit stop
+  deliberately leaves containers running ("restarting warpctl should not
+  interrupt running services"), so a restart just deploys one more. Measured
+  twice: `up 2→3`, then `3→4`. To clear one by hand, read the DNAT front target
+  (`iptables -t nat -S WARP-MAIN-<SERVICE>-<BLOCK> | grep 'dport 7176'`), keep
+  the container whose `WARP_PORTS` `80:` matches it — that is the one the lb is
+  routed to, so there is no gap — and `docker stop -t 150` the rest.
+- WHY IT MATTERS beyond waste: every container runs its own alloy AND its own
+  loki, alloy pushes to the shared reuseport `local_port`, so log data scatters
+  across N loki instances per host while the ring exposes ONE entry per host
+  (11.7b). Queries reach a single instance and `warpctl logs <env> <service>`
+  returns EMPTY. Metrics survive it; logs do not.
+
 ### 11.8 systemd unit port baking (WARP_PORTS staleness)
 `warpctl service run` reads ports from `--portblocks` BAKED into the unit at
 `create-units` time, NOT live services.yml. Symptom: front panics
@@ -1218,15 +1268,128 @@ redeploy. Editing services.yml alone does nothing until the units are regenerate
    host's data missing → memberlist island (11.7b): check `/ring` member count
    per host + rendered `join_members`; a redeploy re-bridges, the code fix
    (build ≥997082420) prevents it.
+8. every host's NEW container `Exited (2)` with a `missing env var` panic and no
+   old container left on some of them → config-env startup panic (11.10). Read
+   the panic before assuming 11.7: the poll loop looks identical.
+9. panels empty while `/api/health`, the ui, and login are all 200 → shared
+   datasource row port drift (11.11): compare the provisioned datasource url to
+   the port mimir is actually listening on for that host.
+10. the lb intermittently 504s / a fraction of requests hang while the rest are
+    fast, and ONE host also shows memberlist `i/o timeout` to every peer → that
+    host's conntrack table is full (11.12): `sysctl net.netfilter.nf_conntrack_count`
+    vs `_max`. Check this BEFORE anything grafana-specific — the container is a
+    victim, not the cause, and every other symptom here is downstream of it.
+
+### 11.10 grafana.yml `{{ env: }}` → fleet-wide startup panic (2026-08-11)
+A config value may thread `{{ env:KEY }}`, but the KEYs live in settings.yml
+`env_vars`, which **warpctl never puts in the container environment**.
+```
+docker logs $(docker ps -a --filter name=grafana -q | head -1) 2>&1 | head -20
+#   panic: missing env var BRINGYOUR_MINIO_HOSTNAME for grafana.yml value "{{ env:BRINGYOUR_MINIO_HOSTNAME }}"
+#   main.resolveMinioEndpoint -> renderLokiConfig -> main.main
+docker ps -a --filter name=grafana --format '{{.Image}} | {{.Status}}'
+#   ...2026.8.10-1016091940 | Exited (2) 1m ago   <- new build, crash looping
+#   ...2026.7.20-997576310  | Up 10 hours         <- old build, still serving
+docker inspect $c --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -c BRINGYOUR_  # 0 on EVERY service
+```
+- ROOT: `--envvar=` is emitted only for services.yml `env_vars`
+  (`warpctl/config.go` ~2368); no unit carries a `BRINGYOUR_*` one
+  (`grep -rl 'envvar=BRINGYOUR' xops/main/ansible/files/systemd/` = 0). The
+  server binary sees these values only because `server/env.go` init() replays
+  settings `env_vars` through `os.Setenv`; the grafana front has no such step,
+  so `os.Getenv` was always empty. Fixed 2026-08-11: `interpolateEnv` resolves
+  from `hostSettings.EnvVars` first and the process env second — the postgres
+  and redis hostnames in `renderGrafanaConfig` already read settings directly,
+  and only the minio path had drifted onto `os.Getenv`.
+- TELL vs 11.7: on the stuck hosts `docker ps -a` shows **no lingering old
+  container** — a plain crash loop, not the poll deadlock. warpctl still loops
+  `Poll http://<gw>:14488/status` forever, which reads exactly like 11.7.
+- AMPLIFIER: hosts that still had their previous container kept serving; hosts
+  whose old container was already gone served NOTHING → lb 502 there. The fleet
+  splits into healthy / no-data / 502 simultaneously, so a single external
+  probe reports whichever host it happened to land on.
+- TEST GAP that let it ship: `main_test.go` set the very same var with
+  `t.Setenv`, so the suite passed. The regression test now resolves purely from
+  `HostSettings.EnvVars` with nothing in the process environment.
+
+### 11.11 Shared datasource row → per-host port drift ("no data", everything healthy)
+Grafana state is ONE shared env postgres and file provisioning upserts
+datasources by `uid`, so every host writes `uid: warp-mimir` with **its own**
+WARP_PORTS mimir port and the host that starts last pins its port fleet-wide.
+```
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"intervalMs":900000,"maxDataPoints":50,"timeRange":{"from":"now-24h","to":"now"}}' \
+  https://<env>-grafana.<domain>/api/public/dashboards/<accessToken>/panels/<id>/query
+#   {"results":{"A":{"error":"Post \"http://127.0.0.1:14578/prometheus/api/v1/query_range\":
+#    connect: connection refused","errorSource":"downstream","status":502,"frames":[]}}}
+ss -tln | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | awk '$1>=14578 && $1<=14607'  # real mimir port
+docker exec $c grep -A1 warp-mimir /run/warp-grafana/provisioning/datasources/loki.yml     # what THIS host wrote
+```
+- DECISIVE READ: a host whose own provisioning file says 14579 dials 14578 →
+  the shared DB row overrode the local file. That is the whole bug in one line.
+- The public dashboard renders it as empty panels with no error, while
+  `/api/health`, the ui, and login all return 200 and mimir itself is fine
+  (`curl 127.0.0.1:<real port>/prometheus/api/v1/query?query=up` → 200). Do not
+  read "no data" as an ingest or retention problem before checking this.
+- Fixed 2026-08-11: the datasources address the front's stable `local_port`
+  (3100) and the **loopback binding of that port** serves `/prometheus/` and
+  `/loki/` reads. That port is identical on every host and every deploy, so the
+  shared row is correct fleet-wide. The lan binding stays push-only — those
+  read routes are unauthenticated (same trust as the loopback child listeners
+  the datasources dialed before), and the lan binding is reachable from every
+  routed host.
+
+### 11.12 conntrack table full after a reboot → host-wide packet loss (2026-08-12)
+Presents as grafana "down": the lb returns intermittent 504 and ~1 in 6 requests
+hangs past 12s while the other five answer in 0.26s. It is NOT a grafana bug —
+one host is dropping packets for **every** new connection, and grafana is just
+the loudest victim.
+```
+sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max   # count == max
+dmesg -T | grep 'table full'          # nf_conntrack: table full, dropping packet
+grep conntrack /etc/sysctl.conf       # says 1048576 — but the RUNNING value is 262144
+uptime -s                             # the split falls exactly on boot time
+```
+- DECISIVE READ: **`/etc/sysctl.conf` says 1048576 while the running value is
+  262144.** The config is right and un-applied. 262144 = the module's own default
+  (65536 buckets x 4), so that exact number means "nobody ever set this".
+- MECHANISM: `net.netfilter.*` keys only exist once `nf_conntrack` is loaded. At
+  boot nothing loads it until docker configures nat, which is *after*
+  systemd-sysctl has already applied sysctl.conf — so the key silently no-ops
+  (systemd-sysctl still exits `0/SUCCESS`; there is no error to find) and the
+  module later comes up at its default. **Every reboot reverted it until the
+  next ansible run.** The ansible path always worked because the playbooks
+  modprobe first, which is why the fleet looked fine for months.
+- Compare across hosts before blaming the app — the correlation is the proof:
+  the four hosts booted before 2026-08-11 02:35 ran 1048576; the two booted
+  after (fireside 22:41, edge-3 02:14) ran 262144. Only edge-3 carried enough
+  traffic to actually fill it (peer edge-1 idles at 180k).
+- Symptom set is wide and misleading: loki/mimir memberlist gossip fails
+  `dial tcp <peer>:6492/6493: i/o timeout` to every peer, mimir queries return
+  `fetched_series_count=0`, ping drops 50-100%, and even ssh to the box drops
+  commands. `i/o timeout` (not `connection refused`) is the tell — packets are
+  dropped, not rejected. Partial rather than total loss = slots briefly freeing.
+- Do NOT chase the NIC. Check `ethtool`/`ip -s link` once to clear it and move
+  on: on edge-3 the link was 10Gb/s full duplex with 0 carrier and 0 TX errors,
+  and `rx_missed 10816 / 2.2B` packets is noise. ARP was clean too (every peer
+  agreed on the MAC, no duplicate IP), and INPUT policy was ACCEPT with no rules.
+- IMMEDIATE FIX (safe, instant, no restart — just realizes the host's own
+  declared config): `sudo sysctl -w net.netfilter.nf_conntrack_max=1048576`
+- PERMANENT FIX 2026-08-12: the playbooks now write
+  `/etc/modules-load.d/nf-conntrack.conf`, and `systemd-sysctl.service` is
+  ordered `After=systemd-modules-load.service`, so sysctl.conf applies on every
+  boot. Applied to playbook-{edges,dbs,redis-clusters,subtensor}.yml — all four
+  had the identical defect.
 
 ---
 
 ## 12. Taskworker drain (deploy) — TASKDRAIN1
 
 The taskworker plane has no client connections; its "clients" are the chain
-cadences (contract close ×8, handler reap 60s, reliability rollup 1min,
-client scores 30s). Deploys are make-before-break over the shared pg queue,
-so a HEALTHY deploy pauses nothing. These signals catch the unhealthy paths.
+cadences (one contract-close scheduler task with an internal worker pool,
+handler reap 60s, reliability rollup 1min, client scores 30s). Deploys are
+make-before-break over the shared pg queue, so a HEALTHY deploy pauses
+nothing. These signals catch the unhealthy paths.
 
 ### 12.1 Drain outcome (log classes, service=taskworker)
 PROBE: `logs/taskworker-drain-gave-up` (tailer class; only the gave-up line is
@@ -1244,9 +1407,10 @@ The drain logs one start line and exactly one outcome line per SIGTERM:
   seconds elsewhere; their reschedule_error starts with `Drained:` and does
   NOT advance reschedule_error_count).
 - BROKEN: "drain gave up" = a ctx-ignoring task rode to SIGKILL. Its claim
-  (and EVERY claim of that container) is now leased until claim +
-  max(30s, run_max_time_seconds) — find them with 12.3 and decide whether to
-  `bringyourctl task release`. Also broken: no outcome line within
+  (and EVERY claim of that container) remains leased for at most five minutes
+  after its final heartbeat — find them with 12.3 and normally let them
+  self-release. Use `bringyourctl task release` only for verified-dead workers
+  when immediate recovery matters. Also broken: no outcome line within
   DrainFinishTimeout+DrainCancelTimeout+30s of the start line (process hung
   outside task work).
 - Metrics mirror: `urnetwork_taskworker_drain_inflight`, `_drain_seconds`,
@@ -1280,17 +1444,21 @@ WHERE now() < release_time
 ORDER BY release_time DESC;
 ```
 - HEALTHY: rows whose task genuinely runs long (compare finished_task
-  duration history, 2.5) and whose worker is alive.
-- BROKEN: lease_remaining_s ≈ run_max_time_seconds shortly AFTER a
-  taskworker kill/crash = stranded claim; the chain is paused until release.
-  DbMaintenance strands for up to 24h (skips a nightly window),
-  UpdateClientScores/UpdateReliabilities up to 2h (selection freshness, 2.8),
-  a CloseExpiredContracts slice 30min (close backlog, 2.6).
-- ACTION: verify the claiming worker is dead (deploy log / container list),
-  then `bringyourctl task release <task_id>` (immediate re-claim per run_at)
-  and/or `bringyourctl task kick <run_once_key>` (pull run_at to now).
-  Releasing a RUNNING task re-opens the duplicate-execution window — verify
-  first.
+  duration history, 2.5), whose claim_time keeps advancing, and whose worker
+  is alive.
+- BROKEN: claim_time frozen > 2m shortly AFTER a taskworker kill/crash = a
+  temporarily stranded claim. Current binaries cap release_time at five
+  minutes after the last heartbeat regardless of run_max_time_seconds, so the
+  chain self-recovers in at most five minutes instead of 30min–24h. A
+  direct-postgres session advisory lock remains held while a worker is alive,
+  so a starved heartbeat alone cannot create a duplicate; PostgreSQL drops the
+  lock with the dead worker's connection. A lease remaining far beyond five
+  minutes identifies a pre-fix claim/binary and still needs manual handling.
+- ACTION: normally observe automatic expiry. If immediate re-claim is needed,
+  verify the claiming worker is dead (deploy log / container list), then run
+  `bringyourctl task release <task_id>` and/or `bringyourctl task kick
+  <run_once_key>` (pull run_at to now). Releasing a RUNNING task re-opens the
+  duplicate-execution window — verify first.
 
 ### 12.4 Post-deploy convergence
 PROBES: `pg/task-due-lag` (oldest due-and-unclaimed > 180s sustained = the

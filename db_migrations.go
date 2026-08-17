@@ -32,6 +32,21 @@ func newSqlMigration(sql string) *SqlMigration {
 	}
 }
 
+// OnlineSqlMigration runs catalog-changing SQL that postgres forbids inside a
+// transaction (notably CREATE/DROP INDEX CONCURRENTLY). auditSql is the
+// transaction-safe equivalent replayed into the schema audit's throwaway DB.
+// Keeping both forms in the migration stream means online production changes
+// remain part of the expected schema instead of becoming invisible code
+// migrations.
+type OnlineSqlMigration struct {
+	sql      string
+	auditSql string
+}
+
+func newOnlineSqlMigration(sql string, auditSql string) *OnlineSqlMigration {
+	return &OnlineSqlMigration{sql: sql, auditSql: auditSql}
+}
+
 // important these migration functions must be idempotent
 type CodeMigration struct {
 	callback func(context.Context)
@@ -41,6 +56,37 @@ func newCodeMigration(callback func(context.Context)) *CodeMigration {
 	return &CodeMigration{
 		callback: callback,
 	}
+}
+
+func migrationSetIdleInTransactionTimeout(ctx context.Context) {
+	MaintenanceDb(ctx, func(conn PgConn) {
+		var alterSql string
+		result, err := conn.Query(ctx, `
+			SELECT format(
+				'ALTER DATABASE %I SET idle_in_transaction_session_timeout = %L',
+				current_database(),
+				'5min'
+			)
+		`)
+		WithPgResult(result, err, func() {
+			if result.Next() {
+				Raise(result.Scan(&alterSql))
+			}
+		})
+		if alterSql == "" {
+			panic("could not resolve current database for idle transaction timeout")
+		}
+		RaisePgResult(conn.Exec(ctx, alterSql))
+	}, OptReadWrite(), OptNoRetry())
+}
+
+func migrationVacuumPendingTask(ctx context.Context) {
+	// VACUUM cannot run inside the per-migration transaction. The table is a
+	// small queue; this removes versions that became reclaimable after the idle
+	// transaction guard above and refreshes the poll index statistics.
+	MaintenanceDb(ctx, func(conn PgConn) {
+		RaisePgResult(conn.Exec(ctx, `VACUUM (ANALYZE) pending_task`))
+	}, OptReadWrite(), OptNoRetry())
 }
 
 func DbVersion(ctx context.Context) int {
@@ -120,6 +166,13 @@ func ApplyDbMigrationsUpTo(ctx context.Context, upTo int) {
 				}()
 				RaisePgResult(tx.Exec(ctx, v.sql))
 			})
+		case *OnlineSqlMigration:
+			if DbMigrationVerbose {
+				glog.Infof("[migrate][%d/%d]online sql = %s\n", i+1, len(migrations), v.sql)
+			}
+			MaintenanceDb(ctx, func(conn PgConn) {
+				RaisePgResult(conn.Exec(ctx, v.sql))
+			}, OptReadWrite(), OptNoRetry())
 		case *CodeMigration:
 			if DbMigrationVerbose {
 				glog.Infof("[migrate][%d/%d]code = %v\n", i+1, len(migrations), v.callback)
@@ -3742,13 +3795,12 @@ var migrations = []any{
         ON verify_provider_stats (period_end)
     `),
 
-	// CancelHungAccountPayments (model/account_payment_model.go, daily): `UPDATE
-	// account_payment SET canceled = true ... WHERE NOT completed AND NOT
-	// canceled AND create_time < $1`. No index served it; it scanned the whole
-	// non-completed band, which grows monotonically (canceled rows stay
-	// completed = false and account_payment is never deleted). This partial
-	// indexes exactly the truly-pending set, ordered by create_time so the scan
-	// is a tight range that stops early.
+	// CancelHungAccountPayments (model/account_payment_model.go, daily) selects
+	// old pending rows and then filters out all Circle retry markers. No index
+	// served its create_time bound; it scanned the whole non-completed band,
+	// which grows monotonically (canceled rows stay completed = false and
+	// account_payment is never deleted). This partial index bounds that scan to
+	// pending rows and orders it by create_time so the range stops early.
 	newSqlMigration(`
         CREATE INDEX IF NOT EXISTS account_payment_pending_create_time
         ON account_payment (create_time) WHERE (NOT completed AND NOT canceled)
@@ -4151,13 +4203,12 @@ var migrations = []any{
         )
     `),
 
-	// The payout planner (planPayments) re-picks sweeps whose payment was
-	// canceled (CancelHungAccountPayments sets canceled=true but does not null the
-	// sweep's payment_id). The payout query's canceled UNION arm drives from the
-	// small canceled set joined to sweeps by payment_id; this partial index over
-	// just the canceled rows makes finding those payment_ids an index-only scan
-	// instead of a seq scan of account_payment. account_payment is large: pre-
-	// create manually with CREATE INDEX CONCURRENTLY out of band; the IF NOT
+	// The payout planner (planPayments) re-picks sweeps whose payment was safely
+	// canceled and has no Circle retry markers. Its canceled UNION arm drives
+	// from the small canceled set joined to sweeps by payment_id; this partial
+	// index over canceled rows makes finding those payment_ids an indexed scan
+	// instead of a seq scan of account_payment. account_payment is large:
+	// pre-create manually with CREATE INDEX CONCURRENTLY out of band; the IF NOT
 	// EXISTS gate makes this migration a no-op once it is pre-created.
 	newSqlMigration(`
         CREATE INDEX IF NOT EXISTS account_payment_canceled_payment_id
@@ -5914,10 +5965,12 @@ var migrations = []any{
 	//
 	// The rows come from `AddDefaultLocations`' location-group member path,
 	// which built a `Location` with only a `CountryCode` and no `Country`;
-	// `CreateLocation` wrote `location_name` straight from that empty field. On
-	// the live beta deployment that is 161 country rows and 2 region rows (`hk`,
-	// `sg`) -- 163 of 565. The creating path is fixed in the two commits before
-	// this one; this is the data those commits arrived too late to prevent.
+	// `CreateLocation` wrote `location_name` straight from that empty field. In
+	// the first beta snapshot that exposed the bug there were 161 country rows
+	// and 2 region rows (`hk`, `sg`) -- 163 of 565. A deployment can keep
+	// receiving old-writer traffic while this migration is pending, though, so
+	// the repair must handle every ISO country and must not assume those rows are
+	// the only ones present.
 	//
 	// The 249-entry mapping below is GENERATED from `model.ISOCountryName` --
 	// the same table `CreateLocation` now resolves through -- by probing all 676
@@ -5934,6 +5987,13 @@ var migrations = []any{
 	//  2. The city `location_full_name` repair must precede the region rename,
 	//     because it selects its rows by the region still being blank. Renaming
 	//     first would leave the cities holding ", ," forever.
+	//
+	// A canonical region/city may already coexist with a later blank-name row.
+	// `location_full_name` is globally unique, so blindly normalizing the later
+	// row would collide with the canonical one. In that case the legacy full
+	// name remains as its stable unique key; `location_name` is still repaired,
+	// which is the value callers display and the value constrained below. Rows
+	// without a canonical collision get the fully normalized key.
 	//
 	// Appended, never inserted: migrations here apply by slice index
 	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
@@ -6213,29 +6273,47 @@ var migrations = []any{
             city.location_type = 'city' AND
             city.region_location_id = region.location_id AND
             region.location_type = 'region' AND
-            region.location_name = '';
+            region.location_name = '' AND
+            NOT EXISTS (
+                SELECT 1
+                FROM location AS canonical_city
+                WHERE
+                    canonical_city.location_id <> city.location_id AND
+                    canonical_city.location_full_name =
+                        city.location_name || ', ' || iso.country_name || ', ' || city.country_code
+            );
 
-        -- The 2 blank region rows are RENAMED, not deleted: each has a city child
-        -- pointing at it through region_location_id (Hong Kong under hk,
-        -- Singapore under sg), so dropping them would orphan a live city. They
-        -- exist because the geolocation database returns no subdivision for a
-        -- subdivision-less country, so the region was created with an empty name;
-        -- the only fact such a row carries is "the whole of this country", which is
-        -- why it is named after its country rather than after a subdivision that
-        -- was never in the source data. location_full_name is composed the way
-        -- the region INSERT composes it, name, code.
+        -- Blank region rows are RENAMED, not deleted: they can have city children
+        -- and live references through region_location_id, so dropping them would
+        -- orphan those references. They exist because the geolocation database
+        -- returns no subdivision for subdivision-less countries; the only fact
+        -- such a row carries is "the whole of this country", which is why it is
+        -- named after its country rather than after a subdivision that was never
+        -- in the source data. location_full_name is composed the way the region
+        -- INSERT composes it when that value is not already owned by a canonical
+        -- row.
         UPDATE location AS region
         SET
             location_name = iso.country_name,
-            location_full_name = iso.country_name || ', ' || region.country_code
+            location_full_name = CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM location AS canonical_region
+                    WHERE
+                        canonical_region.location_id <> region.location_id AND
+                        canonical_region.location_full_name =
+                            iso.country_name || ', ' || region.country_code
+                ) THEN region.location_full_name
+                ELSE iso.country_name || ', ' || region.country_code
+            END
         FROM iso_country_name_backfill AS iso
         WHERE
             region.location_type = 'region' AND
             region.location_name = '' AND
             iso.country_code = region.country_code;
 
-        -- The 161 country rows. location_full_name is deliberately NOT touched:
-        -- the country INSERT writes the bare country code into it, so these rows
+        -- Blank country rows. location_full_name is deliberately NOT touched: the
+        -- country INSERT writes the bare country code into it, so these rows
         -- already hold exactly what a correctly-named country row holds. Only the
         -- name was ever missing.
         UPDATE location AS country
@@ -6291,4 +6369,62 @@ var migrations = []any{
         CREATE INDEX IF NOT EXISTS provider_blackhole_check_checked_at
             ON provider_blackhole_check (checked_at ASC, client_id ASC)
     `),
+	// A leaked application connection held an UPDATE transaction idle for more
+	// than 80 minutes, pinning xmin and blocking handler cleanup. New sessions
+	// inherit this database-level backstop; legitimate long-running statements
+	// are unaffected because the timer runs only while a transaction is idle.
+	newCodeMigration(migrationSetIdleInTransactionTimeout),
+
+	// pending_task has a few hundred live rows but updates its scheduling columns
+	// on every claim and heartbeat. Fixed thresholds keep vacuum cadence tied to
+	// churn rather than table size; the subsequent online vacuum clears the debt
+	// that accumulated behind the leaked xmin horizon.
+	newSqlMigration(`
+		ALTER TABLE pending_task SET (
+			autovacuum_vacuum_scale_factor = 0,
+			autovacuum_vacuum_threshold = 50,
+			autovacuum_vacuum_cost_delay = 0,
+			autovacuum_analyze_scale_factor = 0,
+			autovacuum_analyze_threshold = 50
+		)
+	`),
+	newCodeMigration(migrationVacuumPendingTask),
+
+	// Superseded companion lookup index: since the 2026-08-09 stats reset this
+	// 99GB index served only eight scans, while the hot open branch uses the
+	// narrow pair partial index and the closed branch uses destination/close_time.
+	// Drop concurrently so contract writes continue throughout the removal. The
+	// audit form is identical except for CONCURRENTLY, which is forbidden inside
+	// the audit transaction.
+	newOnlineSqlMigration(
+		`DROP INDEX CONCURRENTLY IF EXISTS transfer_contract_open_source_id_companion_contract_id`,
+		`DROP INDEX IF EXISTS transfer_contract_open_source_id_companion_contract_id`,
+	),
+
+	// A 30-day hung-payment sweep briefly canceled Circle retries and made their
+	// sweeps eligible for another payout. The age relationship fingerprints that
+	// sweep, and an attached sweep proves the planner has not already reassigned
+	// it. Restore only rows satisfying both; ambiguous rows remain canceled for
+	// manual reconciliation rather than risking two live payments.
+	newSqlMigration(`
+		/* restore_canceled_circle_retries */
+		UPDATE account_payment AS payment
+		SET
+			canceled = false,
+			cancel_time = NULL
+		WHERE
+			payment.canceled AND
+			NOT payment.completed AND
+			payment.cancel_time >= payment.create_time + INTERVAL '30 days' AND
+			(
+				payment.circle_idempotency_key IS NOT NULL OR
+				payment.payment_record IS NOT NULL OR
+				payment.tx_hash IS NOT NULL
+			) AND
+			EXISTS (
+				SELECT 1
+				FROM transfer_escrow_sweep AS sweep
+				WHERE sweep.payment_id = payment.payment_id
+			)
+	`),
 }

@@ -1104,10 +1104,20 @@ func GetProviderEgressLocationDueSharded(
 		// ProviderEgressHealthMaxAge and never be re-measured, and the list
 		// would drain to nothing.
 		//
-		// Driven from network_client_location_reliability, in the same shape as
-		// pass 1, so it catches both a stale tally and a provider that somehow
-		// has a location but no health row at all -- the latter is invisible to
-		// a health-driven query and would otherwise be stuck out permanently.
+		// Scoped to providers that HAVE a health row which has aged out, not to
+		// every provider lacking fresh health. The difference matters: "no fresh
+		// health" is also true of a provider that has never been measured at
+		// all, and offering those here would re-probe a provider whose location
+		// was taken minutes ago purely because no health row accompanies it --
+		// which is what pass 1 and the attempt backoff already govern. It also
+		// silently broke TestGetProviderEgressLocationDue, whose fixtures write
+		// locations without health rows: every one of them became due.
+		//
+		// A provider with a location but no health row is therefore left to
+		// passes 1 and 2. It is excluded from the list meanwhile (passesHealth
+		// fails closed on a missing row) and is re-offered when its location
+		// goes stale, so it is not stranded -- only deferred.
+		//
 		// Ordered by client_id: the 6h attempt backoff, not the ordering, is
 		// what rotates the sweep across the population.
 		minMeasuredAt := server.NowUtc().Add(-ProviderEgressHealthMaxAge / 2)
@@ -1128,11 +1138,11 @@ func GetProviderEgressLocationDueSharded(
 						provide_key.client_id = network_client_location_reliability.client_id AND
 						provide_key.provide_mode = $1
 				) AND
-				NOT EXISTS (
+				EXISTS (
 					SELECT 1 FROM provider_egress_health
 					WHERE
 						provider_egress_health.client_id = network_client_location_reliability.client_id AND
-						$2 <= provider_egress_health.measured_at
+						provider_egress_health.measured_at < $2
 				) AND
 				NOT EXISTS (
 					SELECT 1 FROM provider_egress_probe_attempt

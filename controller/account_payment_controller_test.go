@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -17,6 +18,122 @@ import (
 )
 
 var sendPaymentTransactionId = "123456"
+
+func TestSendPaymentsUsesBoundedPlannerAndPreservesPartialError(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+		defer clientSession.Cancel()
+
+		laterSliceErr := errors.New("later slice failed")
+		called := false
+		err := sendPaymentsWithPlanner(clientSession, func(
+			plannerCtx context.Context,
+			maxDuration time.Duration,
+			onSlice func(*model.PaymentPlan),
+		) ([]*model.PaymentPlan, error) {
+			called = true
+			if plannerCtx != clientSession.Ctx {
+				t.Fatal("planner did not receive the client session context")
+			}
+			wantMaxDuration := boundedPaymentPlanSliceDuration(model.EnvSubsidyConfig().MinDurationPerPayout())
+			if maxDuration != wantMaxDuration {
+				t.Fatalf("planner maxDuration = %s, want %s", maxDuration, wantMaxDuration)
+			}
+			if onSlice != nil {
+				t.Fatal("send path unexpectedly supplied an onSlice callback")
+			}
+			// The first slice is already durable even though a later slice failed.
+			return []*model.PaymentPlan{{
+				PaymentPlanId:   server.NewId(),
+				NetworkPayments: map[server.Id]*model.AccountPayment{},
+			}}, laterSliceErr
+		})
+
+		if !called {
+			t.Fatal("bounded planner was not called")
+		}
+		if !errors.Is(err, laterSliceErr) {
+			t.Fatalf("send error = %v, want %v", err, laterSliceErr)
+		}
+	})
+}
+
+func TestBoundedPaymentPlanSliceDurationExceedsMinimumSubsidyDuration(t *testing.T) {
+	tests := []struct {
+		name                string
+		minSubsidyDuration  time.Duration
+		wantPaymentDuration time.Duration
+	}{
+		{
+			name:                "normal production minimum",
+			minSubsidyDuration:  3 * 24 * time.Hour,
+			wantPaymentDuration: 4 * 24 * time.Hour,
+		},
+		{
+			name:                "configured minimum exceeds preferred slice",
+			minSubsidyDuration:  10 * 24 * time.Hour,
+			wantPaymentDuration: 11 * 24 * time.Hour,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := boundedPaymentPlanSliceDuration(test.minSubsidyDuration)
+			if got != test.wantPaymentDuration {
+				t.Fatalf("slice duration = %s, want %s", got, test.wantPaymentDuration)
+			}
+			if got <= test.minSubsidyDuration {
+				t.Fatalf("slice duration %s does not exceed minimum subsidy duration %s", got, test.minSubsidyDuration)
+			}
+		})
+	}
+}
+
+func TestCollectMissingWalletNoticesDeduplicatesAcrossSlices(t *testing.T) {
+	networkId := server.NewId()
+	firstPaymentId := server.NewId()
+	walletNetworkId := server.NewId()
+	walletId := server.NewId()
+
+	notices := collectMissingWalletNotices([]*model.PaymentPlan{
+		{
+			NetworkPayments: map[server.Id]*model.AccountPayment{
+				networkId: {
+					PaymentId: firstPaymentId,
+					Payout:    125,
+				},
+				walletNetworkId: {
+					PaymentId: server.NewId(),
+					WalletId:  &walletId,
+					Payout:    999,
+				},
+			},
+		},
+		{
+			NetworkPayments: map[server.Id]*model.AccountPayment{
+				networkId: {
+					PaymentId: server.NewId(),
+					Payout:    375,
+				},
+			},
+		},
+	})
+
+	if len(notices) != 1 {
+		t.Fatalf("missing-wallet notices = %v, want one network", notices)
+	}
+	notice := notices[networkId]
+	if notice == nil {
+		t.Fatalf("missing-wallet notice for %s was not collected", networkId)
+	}
+	if notice.paymentId != firstPaymentId {
+		t.Fatalf("notice payment id = %s, want first slice id %s", notice.paymentId, firstPaymentId)
+	}
+	if notice.payout != 500 {
+		t.Fatalf("notice payout = %d, want 500", notice.payout)
+	}
+}
 
 func TestSubscriptionSendPayment(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
@@ -464,6 +581,197 @@ func TestAdvancePaymentWalletSafetyAndIdempotency(t *testing.T) {
 		connect.AssertEqual(t, *completedPayment.WalletId, *wallet2Id)
 		connect.AssertEqual(t, *completedPayment.WalletAddress, wallet2Address)
 
+	})
+}
+
+// Circle retry states must remain pending regardless of age. CONFIRMED already
+// has an on-chain hash, so persisting that hash makes the retry reconcilable;
+// only a non-contradictory terminal CANCELLED state may clear retry markers and
+// release a payment for replacement.
+func TestAdvancePaymentRetryAndTerminalCancellationState(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkId := server.NewId()
+		clientSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
+			NetworkId: networkId,
+		})
+		defer clientSession.Cancel()
+
+		insertRetryPayment := func(record string, txHash *string) *model.AccountPayment {
+			paymentId := server.NewId()
+			server.Tx(ctx, func(tx server.PgTx) {
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`
+					INSERT INTO account_payment (
+						payment_id,
+						payment_plan_id,
+						network_id,
+						wallet_id,
+						payout_byte_count,
+						payout_nano_cents,
+						min_sweep_time,
+						payment_record,
+						circle_idempotency_key,
+						tx_hash
+					) VALUES ($1, $2, $3, NULL, 100, 100, $4, $5, $6, $7)
+					`,
+					paymentId,
+					server.NewId(),
+					networkId,
+					server.NowUtc(),
+					record,
+					server.NewId(),
+					txHash,
+				))
+			})
+			payment, err := model.GetPayment(ctx, paymentId)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertNotEqual(t, payment, nil)
+			return payment
+		}
+		paymentHasIdempotencyKey := func(paymentId server.Id) bool {
+			var hasIdempotencyKey bool
+			server.Db(ctx, func(conn server.PgConn) {
+				result, queryErr := conn.Query(
+					ctx,
+					`SELECT circle_idempotency_key IS NOT NULL FROM account_payment WHERE payment_id = $1`,
+					paymentId,
+				)
+				server.WithPgResult(result, queryErr, func() {
+					if result.Next() {
+						server.Raise(result.Scan(&hasIdempotencyKey))
+					}
+				})
+			})
+			return hasIdempotencyKey
+		}
+
+		{
+			payment := insertRetryPayment("circle-confirmed", nil)
+			const txHash = "confirmed-chain-hash"
+			const receipt = `{"state":"CONFIRMED","txHash":"confirmed-chain-hash"}`
+			SetCircleClient(&mockCircleApiClient{
+				GetTransactionFunc: func(context.Context, string) (*GetTransactionResult, error) {
+					return &GetTransactionResult{
+						Transaction: CircleTransaction{
+							State:  "CONFIRMED",
+							TxHash: txHash,
+						},
+						ResponseBodyBytes: []byte(receipt),
+					}, nil
+				},
+			})
+
+			complete, canceled, err := advancePayment(payment, clientSession)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, complete, false)
+			connect.AssertEqual(t, canceled, false)
+
+			updated, err := model.GetPayment(ctx, payment.PaymentId)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, updated.Completed, false)
+			connect.AssertEqual(t, updated.Canceled, false)
+			connect.AssertNotEqual(t, updated.PaymentRecord, nil)
+			connect.AssertNotEqual(t, updated.TxHash, nil)
+			connect.AssertNotEqual(t, updated.PaymentReceipt, nil)
+			connect.AssertEqual(t, *updated.PaymentRecord, "circle-confirmed")
+			connect.AssertEqual(t, *updated.TxHash, txHash)
+			connect.AssertEqual(t, *updated.PaymentReceipt, receipt)
+		}
+
+		{
+			// Reproduce the old cancel/complete race with the stale payment object
+			// already held by the worker. A rejected DB completion must not be
+			// reported as complete, or this worker would silently stop retrying.
+			payment := insertRetryPayment("circle-complete-race", nil)
+			server.Tx(ctx, func(tx server.PgTx) {
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`UPDATE account_payment SET canceled = true, cancel_time = now() WHERE payment_id = $1`,
+					payment.PaymentId,
+				))
+			})
+			SetCircleClient(&mockCircleApiClient{
+				GetTransactionFunc: func(context.Context, string) (*GetTransactionResult, error) {
+					return &GetTransactionResult{
+						Transaction: CircleTransaction{
+							State:  "COMPLETE",
+							TxHash: "complete-chain-hash",
+						},
+						ResponseBodyBytes: []byte(`{"state":"COMPLETE"}`),
+					}, nil
+				},
+			})
+
+			complete, canceled, err := advancePayment(payment, clientSession)
+			connect.AssertNotEqual(t, err, nil)
+			connect.AssertEqual(t, complete, false)
+			connect.AssertEqual(t, canceled, false)
+
+			updated, err := model.GetPayment(ctx, payment.PaymentId)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, updated.Completed, false)
+			connect.AssertEqual(t, updated.Canceled, true)
+			connect.AssertNotEqual(t, updated.PaymentRecord, nil)
+		}
+
+		{
+			oldHash := "mempool-hash"
+			payment := insertRetryPayment("circle-cancelled-after-sent", &oldHash)
+			const receipt = `{"state":"CANCELLED"}`
+			SetCircleClient(&mockCircleApiClient{
+				GetTransactionFunc: func(context.Context, string) (*GetTransactionResult, error) {
+					return &GetTransactionResult{
+						Transaction:       CircleTransaction{State: "CANCELLED"},
+						ResponseBodyBytes: []byte(receipt),
+					}, nil
+				},
+			})
+
+			complete, canceled, err := advancePayment(payment, clientSession)
+			connect.AssertNotEqual(t, err, nil)
+			connect.AssertEqual(t, complete, false)
+			connect.AssertEqual(t, canceled, false)
+
+			updated, err := model.GetPayment(ctx, payment.PaymentId)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, updated.Canceled, false)
+			connect.AssertNotEqual(t, updated.PaymentRecord, nil)
+			connect.AssertNotEqual(t, updated.TxHash, nil)
+			connect.AssertNotEqual(t, updated.PaymentReceipt, nil)
+			connect.AssertEqual(t, *updated.PaymentRecord, "circle-cancelled-after-sent")
+			connect.AssertEqual(t, *updated.TxHash, oldHash)
+			connect.AssertEqual(t, *updated.PaymentReceipt, receipt)
+			connect.AssertEqual(t, paymentHasIdempotencyKey(payment.PaymentId), true)
+		}
+
+		{
+			payment := insertRetryPayment("circle-cancelled", nil)
+			const receipt = `{"state":"CANCELLED"}`
+			SetCircleClient(&mockCircleApiClient{
+				GetTransactionFunc: func(context.Context, string) (*GetTransactionResult, error) {
+					return &GetTransactionResult{
+						Transaction:       CircleTransaction{State: "CANCELLED"},
+						ResponseBodyBytes: []byte(receipt),
+					}, nil
+				},
+			})
+
+			complete, canceled, err := advancePayment(payment, clientSession)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, complete, false)
+			connect.AssertEqual(t, canceled, true)
+
+			updated, err := model.GetPayment(ctx, payment.PaymentId)
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, updated.Canceled, true)
+			connect.AssertEqual(t, updated.PaymentRecord, nil)
+			connect.AssertEqual(t, updated.TxHash, nil)
+			connect.AssertNotEqual(t, updated.PaymentReceipt, nil)
+			connect.AssertEqual(t, *updated.PaymentReceipt, receipt)
+			connect.AssertEqual(t, paymentHasIdempotencyKey(payment.PaymentId), false)
+		}
 	})
 }
 

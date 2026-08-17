@@ -6,6 +6,7 @@ import (
 	"strings"
 	// "strconv"
 	// "encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"maps"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/urnetwork/glog"
 
@@ -27,6 +28,44 @@ import (
 	"github.com/urnetwork/server/jwt"
 	"github.com/urnetwork/server/session"
 )
+
+// taskPanicError converts a recovered task panic into the task's error.
+//
+// `server.IsDoneError` already classifies torn-down-connection pg panics
+// ("context canceled", "failed to deallocate cached statement(s)") as an
+// expected shutdown pattern, and `server.HandleError` drops them silently.
+// The task layer saw the same class and did the opposite — a multi-KB
+// "Unhandled:" blob with a full stack on every occurrence — because the
+// recover here runs BEFORE HandleError ever sees the panic, so that
+// classification never applied. Keep the failure itself loud (the task still
+// errors, reschedules, and names its cause) and drop only the stack for the
+// already-benign class; V(1) restores it when someone is debugging.
+func taskPanicError(r any) error {
+	if server.IsDoneError(r) {
+		if glog.V(1) {
+			return fmt.Errorf("Interrupted: %s", server.ErrorJson(r, debug.Stack()))
+		}
+		return fmt.Errorf("Interrupted: %v", r)
+	}
+	return fmt.Errorf("Unhandled: %s", server.ErrorJson(r, debug.Stack()))
+}
+
+// orphanedRunPostCounter counts RunPost tasks whose finished_task row was
+// reaped before the post ran. These used to reschedule forever; they now
+// complete as a no-op, and this is the only remaining signal that post
+// processing was skipped.
+var orphanedRunPostCounter = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Namespace: "urnetwork",
+		Subsystem: "task",
+		Name:      "run_post_orphaned_total",
+		Help:      "RunPost tasks completed as a no-op because their finished_task row was reaped",
+	},
+)
+
+func init() {
+	prometheus.MustRegister(orphanedRunPostCounter)
+}
 
 // the task system captures work that needs to be done to advance the platform
 // tasks have work and post-work that can atomically schedule new tasks
@@ -51,7 +90,72 @@ import (
 const BlockSizeSeconds = 1
 
 var DefaultMaxTime = 2 * time.Minute
+
+// ReleaseTimeout is the heartbeat freshness window. Active workers refresh
+// claim_time every ReleaseTimeout/3 so operators and monitors can distinguish a
+// live long-running task from a dead owner.
 var ReleaseTimeout = 30 * time.Second
+
+// TaskLeaseTimeout is the maximum timestamp delay before a task can be
+// reconsidered after its owner's PostgreSQL session disappears. It is
+// deliberately independent of the task's declared MaxTime: MaxTime bounds
+// execution, the session advisory lock prevents duplicate live execution, and
+// this timeout bounds crash recovery. Five minutes comfortably covers routine
+// scheduler/DB stalls without stranding a two-hour task for the full two hours.
+var TaskLeaseTimeout = 5 * time.Minute
+
+// A timestamp lease bounds recovery after a dead worker, while this
+// session-scoped advisory lock prevents a live-but-starved worker from losing
+// ownership when that timestamp expires. The lock is held on a direct postgres
+// connection (never transaction-pooled PgBouncer), so PostgreSQL releases it
+// automatically when the worker process/connection dies.
+const taskAdvisoryLockNamespace = uint64(0x75726e7461736b31)
+
+func taskAdvisoryLockKey(taskId server.Id) int64 {
+	return int64(
+		binary.BigEndian.Uint64(taskId[0:8]) ^
+			binary.BigEndian.Uint64(taskId[8:16]) ^
+			taskAdvisoryLockNamespace,
+	)
+}
+
+type taskClaimGuard struct {
+	conn        server.PgConn
+	releaseOnce sync.Once
+}
+
+func (self *taskClaimGuard) ping(ctx context.Context) error {
+	if self == nil || self.conn == nil {
+		return errors.New("task claim guard is not active")
+	}
+	return self.conn.Ping(ctx)
+}
+
+func (self *taskClaimGuard) release() {
+	if self == nil {
+		return
+	}
+	self.releaseOnce.Do(func() {
+		if self.conn == nil {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), DefaultTaskFinalizeTimeout)
+		_, err := self.conn.Exec(ctx, `SELECT pg_advisory_unlock_all()`)
+		cancel()
+		if err == nil {
+			self.conn.Release()
+		} else {
+			// Never return a session with a possibly-held advisory lock to the
+			// pool. Closing the physical connection makes PostgreSQL release it.
+			pgxConn := self.conn.Hijack()
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), DefaultTaskFinalizeTimeout)
+			_ = pgxConn.Close(closeCtx)
+			closeCancel()
+		}
+		self.conn = nil
+	})
+}
 
 // the reschedule time is uniformly chosen on [0, t] so the expected mean will be t/2
 var RescheduleTimeout = 2 * BlockSizeSeconds * time.Second
@@ -730,6 +834,28 @@ func RemovePendingTask(ctx context.Context, taskId server.Id) {
 	})
 }
 
+// RemovePendingTasksForFunctionInTx deletes every pending task targeting a
+// function that has been removed from the codebase. Such rows can never run
+// again: the runner fails them with ErrTargetNotFound and reschedules on the
+// clamped skew backoff forever, because at claim time deploy version skew is
+// indistinguishable from permanent removal. Call this from the startup
+// seeding (taskworker InitTasks) for each deliberately removed target. The
+// delete ignores claims on purpose — a row for a removed target is claimed
+// and re-errored every few seconds, so a claim filter would race with that
+// cycle. A rollback to a build that still schedules the function re-seeds
+// it, and the next roll-forward cleans it again.
+func RemovePendingTasksForFunctionInTx(ctx context.Context, tx server.PgTx, functionName string) (removedCount int64) {
+	tag := server.RaisePgResult(tx.Exec(
+		ctx,
+		`
+			DELETE FROM pending_task
+			WHERE function_name = $1
+		`,
+		functionName,
+	))
+	return tag.RowsAffected()
+}
+
 // ReleaseTask clears the claim lease on a pending task, making it claimable
 // again per its run_at (release_time <= run_at puts available_block back on
 // the run_at schedule). This is the operator recovery for a claim stranded
@@ -1020,7 +1146,7 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 
 	defer func() {
 		if r := recover(); r != nil {
-			returnErr = fmt.Errorf("Unhandled: %s", server.ErrorJson(r, debug.Stack()))
+			returnErr = taskPanicError(r)
 		}
 	}()
 
@@ -1109,7 +1235,7 @@ func (self *TaskTarget[T, R]) RunPost(
 
 	defer func() {
 		if r := recover(); r != nil {
-			returnErr = fmt.Errorf("Unhandled: %s", server.ErrorJson(r, debug.Stack()))
+			returnErr = taskPanicError(r)
 		}
 	}()
 
@@ -1368,6 +1494,15 @@ func (self *TaskWorker) waitRunDone(timeout time.Duration) bool {
 	}
 }
 
+// HasTarget reports whether a function name resolves to a registered target
+// (including alternate names). Like AddTargets, registration is expected to
+// finish before Run, so this is for setup-time checks — e.g. guarding the
+// removed-target reap list against a live function name.
+func (self *TaskWorker) HasTarget(functionName string) bool {
+	_, ok := self.targets[functionName]
+	return ok
+}
+
 func (self *TaskWorker) AddTargets(taskTargets ...Target) {
 	for _, taskTarget := range taskTargets {
 		self.targets[taskTarget.TargetFunctionName()] = taskTarget
@@ -1385,8 +1520,21 @@ func (self *TaskWorker) RunPost(
 	finishedTasks := GetFinishedTasks(clientSession.Ctx, runPost.TaskId)
 	finishedTask, ok := finishedTasks[runPost.TaskId]
 	if !ok {
-		returnErr = errors.New("Finished task not found.")
-		return
+		// The finished_task row is gone, and it is never coming back:
+		// RunPost is scheduled in the same tx that writes the row, so the
+		// only way to observe its absence is `RemoveFinishedTasks` having
+		// reaped it (which it does unconditionally past postErrorMinTime, so
+		// a repeatedly-failing post "cannot strand forever"). Erroring here
+		// rescheduled the orphan against a row that will never return, so the
+		// reap traded a stranded finished_task for a pending_task that
+		// retries until the end of time. Complete instead — there is no post
+		// work to do — and count it. RunPostPost's UPDATE matches zero rows
+		// and succeeds, so the orphan clears.
+		orphanedRunPostCounter.Inc()
+		if glog.V(1) {
+			glog.Infof("[task]run post orphaned: finished task %s was reaped\n", runPost.TaskId)
+		}
+		return &RunPostResult{}, nil
 	}
 
 	// attach the finished task function name and args (%w keeps the error
@@ -1436,126 +1584,194 @@ func (self *TaskWorker) RunPostPost(
 	return err
 }
 
-// takes the n next available tasks and makes an initial claim
-func (self *TaskWorker) takeTasks(n int) (map[server.Id]*Task, error) {
-	// select from the backlog as well as the current block
-	// run the current block first so that the current block doesn't get starved by the backlog
+// takes the n next available tasks, makes an initial timestamp claim, and
+// returns the session guard that proves ownership while the tasks run.
+func (self *TaskWorker) takeTasks(n int) (
+	claimedTasks map[server.Id]*Task,
+	claimGuard *taskClaimGuard,
+	returnErr error,
+) {
+	if n <= 0 {
+		return map[server.Id]*Task{}, nil, nil
+	}
 
+	// The advisory lock must live on a direct PostgreSQL session. A
+	// transaction-pooled PgBouncer connection cannot safely own session state.
+	conn, err := server.AcquireMaintenanceDbConn(self.ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	guard := &taskClaimGuard{conn: conn}
+	retainGuard := false
+	defer func() {
+		if !retainGuard {
+			guard.release()
+		}
+	}()
+
+	tx, err := conn.Begin(self.ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), DefaultTaskFinalizeTimeout)
+		_ = tx.Rollback(rollbackCtx)
+		rollbackCancel()
+	}()
+
+	// Select from the backlog as well as the current block. The extra candidates
+	// let this worker step past expired timestamp leases that are still protected
+	// by a live owner's advisory lock, rather than repeatedly sticking on the
+	// queue head. Only n advisory locks are actually attempted successfully.
 	type taskPriority struct {
 		priority       int
 		maxTimeSeconds int
 	}
+	type taskCandidate struct {
+		taskId   server.Id
+		priority taskPriority
+	}
 
-	var taskIds []server.Id
+	nowBlock := server.NowUtc().Unix() / BlockSizeSeconds
+	candidateLimit := n + 64
+	result, err := tx.Query(
+		self.ctx,
+		`
+			SELECT
+				task_id,
+				run_priority,
+				run_max_time_seconds
+			FROM pending_task
+			WHERE available_block <= $1
+			ORDER BY available_block, run_priority DESC, run_max_time_seconds DESC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		`,
+		nowBlock,
+		candidateLimit,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	candidates := []taskCandidate{}
+	for result.Next() {
+		candidate := taskCandidate{}
+		if err := result.Scan(
+			&candidate.taskId,
+			&candidate.priority.priority,
+			&candidate.priority.maxTimeSeconds,
+		); err != nil {
+			result.Close()
+			return nil, nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := result.Err(); err != nil {
+		result.Close()
+		return nil, nil, err
+	}
+	result.Close()
 
-	server.Tx(self.ctx, func(tx server.PgTx) {
+	taskIds := []server.Id{}
+	taskIdPriorities := map[server.Id]taskPriority{}
+	for _, candidate := range candidates {
+		lockKey := taskAdvisoryLockKey(candidate.taskId)
+		var acquired bool
+		if err := tx.QueryRow(
+			self.ctx,
+			`SELECT pg_try_advisory_lock($1)`,
+			lockKey,
+		).Scan(&acquired); err != nil {
+			return nil, nil, err
+		}
+		if !acquired {
+			continue
+		}
+		taskIds = append(taskIds, candidate.taskId)
+		taskIdPriorities[candidate.taskId] = candidate.priority
+		if len(taskIds) == n {
+			break
+		}
+	}
 
-		now := server.NowUtc()
-		nowBlock := now.Unix() / BlockSizeSeconds
+	mathrand.Shuffle(len(taskIds), func(i int, j int) {
+		taskIds[i], taskIds[j] = taskIds[j], taskIds[i]
+	})
+	slices.SortStableFunc(taskIds, func(a server.Id, b server.Id) int {
+		aPriority := taskIdPriorities[a]
+		bPriority := taskIdPriorities[b]
+		// descending
+		if c := bPriority.priority - aPriority.priority; c != 0 {
+			return c
+		}
+		// descending
+		if c := bPriority.maxTimeSeconds - aPriority.maxTimeSeconds; c != 0 {
+			return c
+		}
+		return 0
+	})
 
-		taskIdPriorities := map[server.Id]taskPriority{}
+	// Isolate higher-priority and longer-running work. Unlock any candidates
+	// acquired speculatively but excluded by this existing batching rule.
+	selectedCount := 0
+	for k := min(n, len(taskIds)); selectedCount < k; {
+		priority := taskIdPriorities[taskIds[selectedCount]]
+		selectedCount += 1
+		if DefaultPriority < priority.priority {
+			break
+		}
+		if DefaultMaxTime < time.Duration(priority.maxTimeSeconds)*time.Second {
+			break
+		}
+	}
+	for _, taskId := range taskIds[selectedCount:] {
+		var unlocked bool
+		if err := tx.QueryRow(
+			self.ctx,
+			`SELECT pg_advisory_unlock($1)`,
+			taskAdvisoryLockKey(taskId),
+		).Scan(&unlocked); err != nil {
+			return nil, nil, err
+		}
+		if !unlocked {
+			return nil, nil, fmt.Errorf("task advisory lock was not held for %s", taskId)
+		}
+	}
+	taskIds = taskIds[:selectedCount]
 
-		result, err := tx.Query(
+	claimTime := server.NowUtc()
+	releaseTime := claimTime.Add(TaskLeaseTimeout)
+	for _, taskId := range taskIds {
+		// The short timestamp bounds crash recovery; the session advisory lock
+		// above is the durable duplicate-execution guard for a live owner.
+		if _, err := tx.Exec(
 			self.ctx,
 			`
-			    SELECT
-			    	task_id,
-			    	run_priority,
-			    	run_max_time_seconds
-			    FROM pending_task
-			    WHERE
-			        available_block <= $1
-			    ORDER BY available_block, run_priority DESC, run_max_time_seconds DESC
-			    LIMIT $2
-			    FOR UPDATE SKIP LOCKED
-		    `,
-			nowBlock,
-			n,
-		)
-
-		server.WithPgResult(result, err, func() {
-			for result.Next() {
-				var taskId server.Id
-				var priority taskPriority
-				server.Raise(result.Scan(
-					&taskId,
-					&priority.priority,
-					&priority.maxTimeSeconds,
-				))
-				taskIdPriorities[taskId] = priority
-			}
-		})
-
-		taskIds = slices.Collect(maps.Keys(taskIdPriorities))
-		mathrand.Shuffle(len(taskIds), func(i int, j int) {
-			taskIds[i], taskIds[j] = taskIds[j], taskIds[i]
-		})
-		slices.SortStableFunc(taskIds, func(a server.Id, b server.Id) int {
-			aPriority := taskIdPriorities[a]
-			bPriority := taskIdPriorities[b]
-			// descending
-			if c := bPriority.priority - aPriority.priority; c != 0 {
-				return c
-			}
-			// descending
-			if c := bPriority.maxTimeSeconds - aPriority.maxTimeSeconds; c != 0 {
-				return c
-			}
-			return 0
-		})
-
-		// isolate higher priority and longer running tasks
-		// this ensures that they don't block or get blocked with rescheduling
-		i := 0
-		for k := min(n, len(taskIds)); i < k; {
-			priority := taskIdPriorities[taskIds[i]]
-			i += 1
-			if DefaultPriority < priority.priority {
-				break
-			}
-			if DefaultMaxTime < time.Duration(priority.maxTimeSeconds)*time.Second {
-				break
-			}
+				UPDATE pending_task
+				SET
+					claim_time = $2,
+					release_time = $3
+				WHERE task_id = $1
+			`,
+			taskId,
+			claimTime,
+			releaseTime,
+		); err != nil {
+			return nil, nil, err
 		}
-		taskIds = taskIds[0:i]
+	}
 
-		claimTime := server.NowUtc()
+	if err := tx.Commit(self.ctx); err != nil {
+		return nil, nil, err
+	}
+	if len(taskIds) == 0 {
+		return map[server.Id]*Task{}, nil, nil
+	}
 
-		server.BatchInTx(self.ctx, tx, func(batch server.PgBatch) {
-			for _, taskId := range taskIds {
-				// the initial lease covers the task's own declared max runtime,
-				// not just ReleaseTimeout: the keepalive extender re-extends the
-				// lease while the task runs, but under cpu saturation the
-				// extender can starve past ReleaseTimeout, and an expired lease
-				// lets another worker claim a DUPLICATE concurrent execution of
-				// a long task (observed on prod 2026-07-15: a 20+ minute
-				// reliability recompute was re-claimed mid-run at ~25 minute
-				// intervals, and the contending duplicates slowed each other
-				// into a pile-up). Trade-off: if a worker dies mid-run, the
-				// task is not re-claimable until its max time passes -- correct
-				// for long maintenance tasks, and the keepalive still shortens
-				// nothing here since release_time is only ever extended.
-				releaseTime := claimTime.Add(max(
-					ReleaseTimeout,
-					time.Duration(taskIdPriorities[taskId].maxTimeSeconds)*time.Second,
-				))
-				batch.Queue(
-					`
-					    UPDATE pending_task
-					    SET
-					    	claim_time = $2,
-					    	release_time = $3
-					    WHERE task_id = $1
-			    	`,
-					taskId,
-					claimTime,
-					releaseTime,
-				)
-			}
-		})
-	}, server.TxReadCommitted)
-
-	return GetTasks(self.ctx, taskIds...), nil
+	claimedTasks = GetTasks(self.ctx, taskIds...)
+	claimGuard = guard
+	retainGuard = true
+	return claimedTasks, claimGuard, nil
 }
 
 // return taskIds of the finished tasks, rescheduled tasks
@@ -1565,10 +1781,13 @@ func (self *TaskWorker) EvalTasks(n int) (
 	postRescheduledTaskIds []server.Id,
 	returnErr error,
 ) {
-	tasks, err := self.takeTasks(n)
+	tasks, claimGuard, err := self.takeTasks(n)
 	if err != nil {
 		returnErr = err
 		return
+	}
+	if claimGuard != nil {
+		defer claimGuard.release()
 	}
 	if len(tasks) == 0 {
 		return
@@ -1733,15 +1952,18 @@ func (self *TaskWorker) EvalTasks(n int) (
 					context.WithoutCancel(self.ctx),
 					heartbeatTimeout,
 				)
+				// Keep the direct session carrying the advisory ownership lock
+				// active and fail this evaluation if that ownership session is lost.
+				server.Raise(claimGuard.ping(heartbeatCtx))
 				server.Tx(heartbeatCtx, func(tx server.PgTx) {
 					server.BatchInTx(heartbeatCtx, tx, func(batch server.PgBatch) {
 						claimTime := server.NowUtc()
-						releaseTime := claimTime.Add(ReleaseTimeout)
+						releaseTime := claimTime.Add(TaskLeaseTimeout)
 
 						for _, task := range tasks {
-							// GREATEST: the claim set release_time to cover the task's
-							// declared max runtime; a beat must never shorten that floor,
-							// or a starved extender re-opens the duplicate-claim window
+							// GREATEST prevents a backwards clock adjustment from
+							// shortening an existing lease. Under a normal clock every
+							// heartbeat advances the bounded recovery deadline.
 							batch.Queue(
 								`
 									UPDATE pending_task

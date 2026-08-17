@@ -1287,26 +1287,31 @@ func TestPaymentPlanSubsidy(t *testing.T) {
 
 // TestPlanPaymentsNeedsRepaymentSetEquivalence pins the payout planner's
 // "needs (re)payment" selection (the temp_account_payment set built at the top
-// of planPayments) to be identical under the new UNION-ALL query and the old
-// LEFT-JOIN anti-join it replaced. It seeds sweeps in every payment state and
-// asserts the selected (contract_id, balance_id) multiset is byte-for-byte the
-// same as the old query's, for both the unbounded (live) plan and the bounded
+// of planPayments) to be identical under the index-driven UNION-ALL query and
+// an equivalent LEFT-JOIN reference query. It seeds sweeps in every payment
+// state and asserts the selected (contract_id, balance_id) multiset is
+// byte-for-byte the same for both the unbounded (live) plan and the bounded
 // (backlog-slice, close_time < upperBound) plan.
 //
 // Payment states:
-//   - unpaid    (payment_id NULL)                 -> selected (unpaid arm)
-//   - canceled  (payment_id -> canceled payment)  -> selected (canceled arm)
-//   - completed (payment_id -> completed payment) -> NOT selected
-//   - active    (payment_id -> pending payment)   -> NOT selected
+//   - unpaid            (payment_id NULL)                    -> selected (unpaid arm)
+//   - canceled          (safe canceled payment)              -> selected (canceled arm)
+//   - canceled_retry    (canceled with Circle retry markers) -> NOT selected
+//   - canceled_hash     (canceled with an on-chain hash)      -> NOT selected
+//   - completed_canceled (defensively, both terminal flags)   -> NOT selected
+//   - completed         (completed payment)                  -> NOT selected
+//   - active            (pending payment)                    -> NOT selected
 //
-// Canceling a payment sets account_payment.canceled = true but does not null the
-// sweep's payment_id (see CancelHungAccountPayments), which is exactly why the
-// canceled arm joins the canceled-payment set back to its sweeps by payment_id.
+// A safe cancellation leaves the sweep payment_id in place, which is why the
+// canceled arm joins back by payment_id. Retry markers are an independent
+// safety gate: even a legacy row incorrectly marked canceled cannot be paid
+// again while it still has an idempotency key, processor record, or tx hash.
 func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
 
 		networkId := server.NewId()
+		secondNetworkId := server.NewId()
 		planId := server.NewId()
 		now := server.NowUtc()
 
@@ -1324,6 +1329,9 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 		fixtures := []sweepFixture{
 			{server.NewId(), server.NewId(), "unpaid", oldCloseTime, true},
 			{server.NewId(), server.NewId(), "canceled", oldCloseTime, true},
+			{server.NewId(), server.NewId(), "canceled_retry", oldCloseTime, false},
+			{server.NewId(), server.NewId(), "canceled_hash", oldCloseTime, false},
+			{server.NewId(), server.NewId(), "completed_canceled", oldCloseTime, false},
 			{server.NewId(), server.NewId(), "completed", oldCloseTime, false},
 			{server.NewId(), server.NewId(), "active", oldCloseTime, false},
 			// a second unpaid + canceled pair closing recently, so the bounded
@@ -1340,17 +1348,33 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 				if f.state != "unpaid" {
 					pid := server.NewId()
 					paymentId = &pid
+					var paymentRecord *string
+					var idempotencyKey *server.Id
+					var txHash *string
+					if f.state == "canceled_retry" {
+						record := "circle-retry-transaction"
+						key := server.NewId()
+						paymentRecord = &record
+						idempotencyKey = &key
+					}
+					if f.state == "canceled_hash" {
+						hash := "on-chain-transaction"
+						txHash = &hash
+					}
 					server.RaisePgResult(tx.Exec(ctx,
 						`
 						INSERT INTO account_payment (
 							payment_id, payment_plan_id, wallet_id,
 							payout_byte_count, payout_nano_cents, min_sweep_time,
-							completed, canceled
-						) VALUES ($1, $2, NULL, 0, 0, $3, $4, $5)
+							completed, canceled, payment_record, circle_idempotency_key, tx_hash
+						) VALUES ($1, $2, NULL, 0, 0, $3, $4, $5, $6, $7, $8)
 						`,
 						pid, planId, now,
-						f.state == "completed",
-						f.state == "canceled",
+						f.state == "completed" || f.state == "completed_canceled",
+						f.state == "canceled" || f.state == "canceled_retry" || f.state == "canceled_hash" || f.state == "completed_canceled",
+						paymentRecord,
+						idempotencyKey,
+						txHash,
 					))
 				}
 				server.RaisePgResult(tx.Exec(ctx,
@@ -1374,9 +1398,26 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 					f.contractId, f.balanceId, networkId, paymentId,
 				))
 			}
+
+			// The table's key includes network_id, so one contract/balance can
+			// legitimately have more than one payout row. The selected temp set
+			// must retain that third key column or later joins multiply both rows.
+			server.RaisePgResult(tx.Exec(ctx,
+				`
+				INSERT INTO transfer_escrow_sweep (
+					contract_id, balance_id, network_id,
+					payout_byte_count, payout_net_revenue_nano_cents
+				) VALUES ($1, $2, $3, 200, 200)
+				`,
+				fixtures[0].contractId,
+				fixtures[0].balanceId,
+				secondNetworkId,
+			))
 		})
 
-		key := func(c, b server.Id) string { return c.String() + ":" + b.String() }
+		key := func(c, b, n server.Id) string {
+			return c.String() + ":" + b.String() + ":" + n.String()
+		}
 
 		runSet := func(query string, args ...any) []string {
 			set := []string{}
@@ -1384,9 +1425,9 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 				result, err := conn.Query(ctx, query, args...)
 				server.WithPgResult(result, err, func() {
 					for result.Next() {
-						var c, b server.Id
-						server.Raise(result.Scan(&c, &b))
-						set = append(set, key(c, b))
+						var c, b, n server.Id
+						server.Raise(result.Scan(&c, &b, &n))
+						set = append(set, key(c, b, n))
 					}
 				})
 			})
@@ -1394,33 +1435,41 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 			return set
 		}
 
-		// the exact pre-fix anti-join query, parameterized by the same
+		// the equivalent anti-join query, parameterized by the same
 		// closeTimeJoin/closeTimeBound fragments the planner substitutes.
 		oldQuery := func(closeTimeJoin, closeTimeBound string) string {
 			return fmt.Sprintf(`
 				SELECT
 					transfer_escrow_sweep.contract_id,
-					transfer_escrow_sweep.balance_id
+					transfer_escrow_sweep.balance_id,
+					transfer_escrow_sweep.network_id
 				FROM transfer_escrow_sweep
 				LEFT JOIN account_payment ON
 					account_payment.payment_id = transfer_escrow_sweep.payment_id
 				%s
 				WHERE
-					(account_payment.payment_id IS NULL OR
-					account_payment.canceled = true)
+					(account_payment.payment_id IS NULL OR (
+						account_payment.canceled = true AND
+						NOT account_payment.completed AND
+						account_payment.circle_idempotency_key IS NULL AND
+						account_payment.payment_record IS NULL AND
+						account_payment.tx_hash IS NULL
+					))
 					%s
 			`, closeTimeJoin, closeTimeBound)
 		}
-		// the post-fix UNION-ALL query, mirroring planPayments.
+		// the index-driven UNION-ALL query, mirroring planPayments.
 		newQuery := func(closeTimeJoin, closeTimeBound string) string {
 			return fmt.Sprintf(`
 				SELECT
 					u.contract_id,
-					u.balance_id
+					u.balance_id,
+					u.network_id
 				FROM (
 					SELECT
 						transfer_escrow_sweep.contract_id,
-						transfer_escrow_sweep.balance_id
+						transfer_escrow_sweep.balance_id,
+						transfer_escrow_sweep.network_id
 					FROM transfer_escrow_sweep
 					WHERE transfer_escrow_sweep.payment_id IS NULL
 
@@ -1428,11 +1477,17 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 
 					SELECT
 						s.contract_id,
-						s.balance_id
+						s.balance_id,
+						s.network_id
 					FROM account_payment ap
 					INNER JOIN transfer_escrow_sweep s ON
 						s.payment_id = ap.payment_id
-					WHERE ap.canceled = true
+					WHERE
+						ap.canceled = true AND
+						NOT ap.completed AND
+						ap.circle_idempotency_key IS NULL AND
+						ap.payment_record IS NULL AND
+						ap.tx_hash IS NULL
 				) u
 				%s
 				%s
@@ -1447,9 +1502,10 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 		expectedUnbounded := []string{}
 		for _, f := range fixtures {
 			if f.eligible {
-				expectedUnbounded = append(expectedUnbounded, key(f.contractId, f.balanceId))
+				expectedUnbounded = append(expectedUnbounded, key(f.contractId, f.balanceId, networkId))
 			}
 		}
+		expectedUnbounded = append(expectedUnbounded, key(fixtures[0].contractId, fixtures[0].balanceId, secondNetworkId))
 		slices.Sort(expectedUnbounded)
 		connect.AssertEqual(t, newUnbounded, expectedUnbounded)
 
@@ -1479,9 +1535,10 @@ func TestPlanPaymentsNeedsRepaymentSetEquivalence(t *testing.T) {
 		expectedBounded := []string{}
 		for _, f := range fixtures {
 			if f.eligible && f.closeTime.Before(upperBound) {
-				expectedBounded = append(expectedBounded, key(f.contractId, f.balanceId))
+				expectedBounded = append(expectedBounded, key(f.contractId, f.balanceId, networkId))
 			}
 		}
+		expectedBounded = append(expectedBounded, key(fixtures[0].contractId, fixtures[0].balanceId, secondNetworkId))
 		slices.Sort(expectedBounded)
 		connect.AssertEqual(t, newBounded, expectedBounded)
 	})

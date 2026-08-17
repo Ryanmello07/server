@@ -481,6 +481,11 @@ type ProxyDevice struct {
 	receiveMonitor *connect.Monitor
 	receiveNotify  chan struct{}
 	receive        chan []byte
+
+	// Nil in production. Ownership tests replace the final asynchronous sends
+	// while retaining the same borrowed-to-owned copy boundary.
+	sendOwnedPacketForTest  func([]byte) bool
+	sendOwnedPacketsForTest func([][]byte) int
 }
 
 func NewProxyDeviceWithDefaults(
@@ -666,38 +671,39 @@ func (self *ProxyDevice) PushDeviceRpc(ws sdk.DeviceRpcWs) error {
 func (self *ProxyDevice) Run() {
 	defer self.cancel()
 
-	// note the packet is only retained for the duration of the callback
-	// use `MessagePoolShareReadOnly` to share it outside of the callback
-	receiveCallback := func(source connect.TransferPath, provideMode protocol.ProvideMode, ipPath *connect.IpPath, packet []byte) {
+	// A callback batch is borrowed for this call. The ordinary proxy mode
+	// injects it into gVisor with one GRO-aware write. The legacy external
+	// receive mode gets nonblocking shared copies; a full consumer is loss,
+	// never head-of-line blocking on the SDK receive pump.
+	receivePacketsCallback := func(
+		source connect.TransferPath,
+		provideMode protocol.ProvideMode,
+		ipPath *connect.IpPath,
+		packets [][]byte,
+	) {
 		if !self.UpdateActivity() {
 			return
 		}
-		for {
-			receive, notify := self.receiveWithNotify()
-			if receive != nil {
-				// the callback only borrows packet (ownership stays with the
-				// caller, which recycles it after we return). share a copy so
-				// ownership transfers to the receive consumer on a successful
-				// send; the consumer returns it to the pool after use.
-				sharedPacket := connect.MessagePoolShareReadOnly(packet)
-				select {
-				case <-self.ctx.Done():
-					connect.MessagePoolReturn(sharedPacket)
-					return
-				case receive <- sharedPacket:
-					self.UpdateActivity()
-					return
-				case <-notify:
-					connect.MessagePoolReturn(sharedPacket)
-				}
-			} else {
-				self.tun.Write(packet)
-				self.UpdateActivity()
+		receive, _ := self.receiveWithNotify()
+		if receive == nil {
+			_, _ = self.tun.WriteBatch(packets)
+			self.UpdateActivity()
+			return
+		}
+		for _, packet := range packets {
+			sharedPacket := connect.MessagePoolShareReadOnly(packet)
+			select {
+			case <-self.ctx.Done():
+				connect.MessagePoolReturn(sharedPacket)
 				return
+			case receive <- sharedPacket:
+				self.UpdateActivity()
+			default:
+				connect.MessagePoolReturn(sharedPacket)
 			}
 		}
 	}
-	sub := self.deviceLocal.AddReceivePacketCallback(receiveCallback)
+	sub := self.deviceLocal.AddReceivePacketsCallback(receivePacketsCallback)
 	defer sub()
 
 	// read in batches to reduce wakeups under load
@@ -713,12 +719,7 @@ func (self *ProxyDevice) Run() {
 		if !self.UpdateActivity() {
 			return
 		}
-		for _, packet := range packets[0:n] {
-			success := self.deviceLocal.SendPacketNoCopy(packet, int32(len(packet)))
-			if !success {
-				connect.MessagePoolReturn(packet)
-			}
-		}
+		self.deviceLocal.SendPacketsNoCopy(packets[:n])
 	}
 }
 
@@ -726,7 +727,43 @@ func (self *ProxyDevice) Send(packet []byte) bool {
 	if !self.UpdateActivity() {
 		return false
 	}
-	return self.deviceLocal.SendPacketNoCopy(packet, int32(len(packet)))
+	ownedPacket := connect.MessagePoolCopy(packet)
+	sent := false
+	if self.sendOwnedPacketForTest != nil {
+		sent = self.sendOwnedPacketForTest(ownedPacket)
+	} else {
+		sent = self.deviceLocal.SendPacketNoCopy(ownedPacket, int32(len(ownedPacket)))
+	}
+	if sent {
+		return true
+	}
+	connect.MessagePoolReturn(ownedPacket)
+	return false
+}
+
+// Copies one borrowed userwireguard burst into Connect-owned buffers before
+// handing it to the asynchronous DeviceLocal group path.
+func (self *ProxyDevice) SendBorrowedBatch(packets [][]byte, offset int) int {
+	if !self.UpdateActivity() {
+		return 0
+	}
+	ownedPackets := make([][]byte, len(packets))
+	for packetIndex, packet := range packets {
+		ownedPackets[packetIndex] = connect.MessagePoolCopy(packet[offset:])
+	}
+	if self.sendOwnedPacketsForTest != nil {
+		sentPacketCount := min(
+			max(0, self.sendOwnedPacketsForTest(ownedPackets)),
+			len(ownedPackets),
+		)
+		for _, ownedPacket := range ownedPackets[sentPacketCount:] {
+			connect.MessagePoolReturn(ownedPacket)
+		}
+		return sentPacketCount
+	}
+	// DeviceLocal's batch contract consumes every pooled packet, including
+	// members rejected by the selected route.
+	return self.deviceLocal.SendPacketsNoCopy(ownedPackets)
 }
 
 func (self *ProxyDevice) SetReceive(receive chan []byte) {

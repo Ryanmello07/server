@@ -63,27 +63,79 @@ func SchedulePendingPayments(clientSession *session.ClientSession) {
 	}
 }
 
-func SendPayments(clientSession *session.ClientSession) error {
-	plan, err := model.PlanPayments(clientSession.Ctx)
-	if err != nil {
-		return err
-	}
+// PaymentPlanSliceDuration is the preferred bound for each committed payout
+// transaction. It must remain longer than the configured minimum subsidy
+// duration: a shorter slice can commit pass-through revenue without recording a
+// subsidy epoch, leaving the bounded payout frontier unable to advance.
+const PaymentPlanSliceDuration = 4 * 24 * time.Hour
 
-	// for any newtork that is missing a wallet id, send a notice
-	for networkId, payment := range plan.NetworkPayments {
-		if payment.WalletId == nil {
-			userAuth, err := model.GetUserAuth(clientSession.Ctx, networkId)
-			if err == nil {
-				awsMessageSender := GetAWSMessageSender()
-				// TODO handler error
+const paymentPlanSliceSafetyMargin = 24 * time.Hour
 
-				awsMessageSender.SendAccountMessageTemplate(userAuth, &MissingWalletTemplate{
-					PaymentId: payment.PaymentId,
-					AmountUsd: fmt.Sprintf("%.2f", model.NanoCentsToUsd(payment.Payout)),
-				})
-			} else {
-				glog.Warningf("[%s]Missing user auth. Cannot send missing wallet notice.", networkId)
+func boundedPaymentPlanSliceDuration(minSubsidyDuration time.Duration) time.Duration {
+	return max(
+		PaymentPlanSliceDuration,
+		minSubsidyDuration+paymentPlanSliceSafetyMargin,
+	)
+}
+
+type paymentPlanLoop func(
+	context.Context,
+	time.Duration,
+	func(*model.PaymentPlan),
+) ([]*model.PaymentPlan, error)
+
+type missingWalletNotice struct {
+	paymentId server.Id
+	payout    model.NanoCents
+}
+
+func collectMissingWalletNotices(plans []*model.PaymentPlan) map[server.Id]*missingWalletNotice {
+	notices := map[server.Id]*missingWalletNotice{}
+	for _, plan := range plans {
+		for networkId, payment := range plan.NetworkPayments {
+			if payment.WalletId != nil {
+				continue
 			}
+			notice, ok := notices[networkId]
+			if !ok {
+				notice = &missingWalletNotice{paymentId: payment.PaymentId}
+				notices[networkId] = notice
+			}
+			notice.payout += payment.Payout
+		}
+	}
+	return notices
+}
+
+func SendPayments(clientSession *session.ClientSession) error {
+	return sendPaymentsWithPlanner(clientSession, model.PlanPaymentsWithMaxDurationLoop)
+}
+
+func sendPaymentsWithPlanner(clientSession *session.ClientSession, planner paymentPlanLoop) error {
+	plans, planErr := planner(
+		clientSession.Ctx,
+		boundedPaymentPlanSliceDuration(model.EnvSubsidyConfig().MinDurationPerPayout()),
+		nil,
+	)
+
+	// Several slices can include the same network. Notify it at most once per
+	// payout run instead of once per committed slice.
+	missingWalletNotices := collectMissingWalletNotices(plans)
+
+	// For any network that is missing a wallet id, send one notice carrying the
+	// total withheld across every slice in this run.
+	for networkId, notice := range missingWalletNotices {
+		userAuth, err := model.GetUserAuth(clientSession.Ctx, networkId)
+		if err == nil {
+			awsMessageSender := GetAWSMessageSender()
+			// TODO handler error
+
+			awsMessageSender.SendAccountMessageTemplate(userAuth, &MissingWalletTemplate{
+				PaymentId: notice.paymentId,
+				AmountUsd: fmt.Sprintf("%.2f", model.NanoCentsToUsd(notice.payout)),
+			})
+		} else {
+			glog.Warningf("[%s]Missing user auth. Cannot send missing wallet notice.", networkId)
 		}
 	}
 
@@ -91,7 +143,10 @@ func SendPayments(clientSession *session.ClientSession) error {
 	// and payments held from earlier plans (e.g. waiting on a valid wallet)
 	SchedulePendingPayments(clientSession)
 
-	return nil
+	// The loop can return already-committed plans together with an error from a
+	// later slice. Those durable payments were scheduled above; return the error
+	// so the payout task still retries the remaining frontier.
+	return planErr
 }
 
 // run at start
@@ -250,36 +305,84 @@ func advancePayment(
 		txResponseBodyBytes = txResult.ResponseBodyBytes
 		status = tx.State
 
-		// Check the Circle Status of the payment
-		// INITIATED, PENDING_RISK_SCREENING, DENIED, QUEUED, SENT, CONFIRMED, COMPLETE, FAILED, CANCELLED
+		// Check the Circle status of the payment. Every non-terminal state stays
+		// in retry; age is not a cancellation condition.
 		switch strings.ToUpper(status) {
-		case "INITIATED", "PENDING_RISK_SCREENING", "QUEUED", "SENT", "CONFIRMED":
+		case "INITIATED", "PENDING_RISK_SCREENING", "CLEARED", "QUEUED":
 			// check later
+			return
+
+		case "SENT", "STUCK", "CONFIRMED":
+			// Circle has assigned a chain transaction hash by SENT. Persist it
+			// before terminal completion so a long-running retry remains
+			// externally reconcilable and visible to the account holder.
+			if tx.TxHash != "" {
+				if err := model.UpdatePaymentProgress(
+					clientSession.Ctx,
+					payment.PaymentId,
+					string(txResponseBodyBytes),
+					tx.TxHash,
+				); err != nil {
+					returnErr = fmt.Errorf("[%s]Payment progress error = %s", payment.PaymentId, err)
+				}
+			}
 			return
 
 		case "DENIED", "FAILED":
 			returnErr = fmt.Errorf("[%s]error = %s", payment.PaymentId, status)
 			// remove the payment record so it can be recreated
-			model.RemovePaymentRecord(
+			if err := model.RemovePaymentRecord(
 				clientSession.Ctx,
 				payment.PaymentId,
-			)
+			); err != nil {
+				returnErr = fmt.Errorf("[%s]error = %s; payment reset error = %s", payment.PaymentId, status, err)
+			}
 			return
 
 		case "CANCELLED":
-			model.CancelPayment(clientSession.Ctx, payment.PaymentId)
+			// A chain hash and CANCELLED are contradictory. Preserve both pieces
+			// of evidence and keep reconciling; releasing the sweeps here could
+			// pay an already-broadcast transaction twice.
+			if tx.TxHash != "" || payment.TxHash != nil {
+				txHash := tx.TxHash
+				if txHash == "" {
+					txHash = *payment.TxHash
+				}
+				if err := model.UpdatePaymentProgress(
+					clientSession.Ctx,
+					payment.PaymentId,
+					string(txResponseBodyBytes),
+					txHash,
+				); err != nil {
+					returnErr = fmt.Errorf("[%s]Payment progress error = %s", payment.PaymentId, err)
+					return
+				}
+				returnErr = fmt.Errorf("[%s]Circle returned CANCELLED for a payment with transaction hash %s", payment.PaymentId, txHash)
+				return
+			}
+			if err := model.CancelPaymentAfterProcessorCancellation(
+				clientSession.Ctx,
+				payment.PaymentId,
+				string(txResponseBodyBytes),
+			); err != nil {
+				returnErr = fmt.Errorf("[%s]Payment cancellation error = %s", payment.PaymentId, err)
+				return
+			}
 			canceled = true
 			return
 
 		case "COMPLETE":
 
 			// mark the payment complete in our DB
-			model.CompletePayment(
+			if err := model.CompletePayment(
 				clientSession.Ctx,
 				payment.PaymentId,
 				string(txResponseBodyBytes),
 				tx.TxHash,
-			)
+			); err != nil {
+				returnErr = fmt.Errorf("[%s]Payment completion error = %s", payment.PaymentId, err)
+				return
+			}
 			complete = true
 
 			userAuth, err := model.GetUserAuth(clientSession.Ctx, payment.NetworkId)
@@ -379,7 +482,10 @@ func advancePayment(
 			// to the payment not being large enough to cover the transfer fee.
 			glog.Info("[payout][%s]payout - fee is negative\n", payment.PaymentId)
 
-			model.CancelPayment(clientSession.Ctx, payment.PaymentId)
+			if err := model.CancelPayment(clientSession.Ctx, payment.PaymentId); err != nil {
+				returnErr = fmt.Errorf("[%s]Payment cancellation error = %s", payment.PaymentId, err)
+				return
+			}
 			canceled = true
 			return
 		}

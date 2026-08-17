@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -295,6 +296,75 @@ func TestCreateLocationUnnamedRegionCreatesNoRow(t *testing.T) {
 	})
 }
 
+// A migration can find both an older canonical region/city and a later legacy
+// row whose name was blank. The backfill gives the legacy row a display name
+// but preserves its old full name when the canonical key is already occupied.
+// Lookups must prefer the canonical hierarchy and must also recognize a
+// normalized city that still belongs to the legacy region id.
+func TestCreateLocationHandlesBackfilledCanonicalCollisions(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		canonical := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Bedok",
+			Region:       "Singapore",
+			Country:      "Singapore",
+			CountryCode:  "sg",
+		}
+		CreateLocation(ctx, canonical)
+
+		legacyRegionId := server.RequireParseId("00000000-0000-0000-0000-000000000001")
+		legacyDuplicateCityId := server.RequireParseId("00000000-0000-0000-0000-000000000002")
+		legacyNormalizedCityId := server.RequireParseId("00000000-0000-0000-0000-000000000003")
+		server.Db(ctx, func(conn server.PgConn) {
+			server.RaisePgResult(conn.Exec(ctx, `
+				INSERT INTO location (
+					location_id,
+					location_type,
+					location_name,
+					city_location_id,
+					region_location_id,
+					country_location_id,
+					country_code,
+					location_full_name
+				)
+				VALUES
+					($1, 'region', 'Singapore', NULL, $1, $4, 'sg', ', sg'),
+					($2, 'city', 'Bedok', $2, $1, $4, 'sg', 'Bedok, , sg'),
+					($3, 'city', 'Jurong', $3, $1, $4, 'sg', 'Jurong, Singapore, sg')
+			`,
+				legacyRegionId,
+				legacyDuplicateCityId,
+				legacyNormalizedCityId,
+				canonical.CountryLocationId,
+			))
+		})
+
+		duplicate := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Bedok",
+			Region:       "Singapore",
+			Country:      "Singapore",
+			CountryCode:  "sg",
+		}
+		CreateLocation(ctx, duplicate)
+		connect.AssertEqual(t, duplicate.LocationId, canonical.LocationId)
+		connect.AssertEqual(t, duplicate.RegionLocationId, canonical.RegionLocationId)
+
+		normalizedLegacy := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Jurong",
+			Region:       "Singapore",
+			Country:      "Singapore",
+			CountryCode:  "sg",
+		}
+		CreateLocation(ctx, normalizedLegacy)
+		connect.AssertEqual(t, normalizedLegacy.LocationId, legacyNormalizedCityId)
+		connect.AssertEqual(t, normalizedLegacy.RegionLocationId, legacyRegionId)
+	})
+}
+
 // TestCreateLocationUnknownLocationTypeCreatesNoRow closes the last route to a
 // blank name: `LocationType` is what selects which insert runs, so a value that
 // is none of the three (the zero value included, from a `Location` built without
@@ -360,17 +430,50 @@ func TestAddDefaultLocationsHasNoBlankNames(t *testing.T) {
 			t.Fatalf("expected at least the 58 configured countries, found %d", countryCount)
 		}
 
-		// `cz` is named by both sources and they disagree -- the config's
-		// "Czech Republic", not the table's "Czechia"
-		name, ok := ISOCountryName("cz")
-		connect.AssertEqual(t, ok, true)
-		connect.AssertEqual(t, name, "Czechia")
-
-		czLocation := &Location{
-			LocationType: LocationTypeCountry,
-			CountryCode:  "cz",
+		// Where both sources name a code and disagree, the config's name is the
+		// one that lands. The code is taken from the config this deployment
+		// actually ships rather than hardcoded: which names differ is config
+		// data, so naming one here pins the test to one deployment's file and
+		// makes it assert nothing the day that row changes to agree.
+		countryCode, configName, ok := disagreeingCountryCode(t)
+		if !ok {
+			return
 		}
-		CreateLocation(ctx, czLocation)
-		connect.AssertEqual(t, locationName(ctx, t, czLocation.LocationId), "Czech Republic")
+		location := &Location{
+			LocationType: LocationTypeCountry,
+			CountryCode:  countryCode,
+		}
+		CreateLocation(ctx, location)
+		connect.AssertEqual(t, locationName(ctx, t, location.LocationId), configName)
 	})
+}
+
+// disagreeingCountryCode returns one country code that iso-country-list.yml and
+// the built-in table both name, and name differently, with the config's name.
+func disagreeingCountryCode(t testing.TB) (countryCode string, configName string, found bool) {
+	t.Helper()
+	resource, err := server.Config.SimpleResource("iso-country-list.yml")
+	if err != nil {
+		t.Fatalf("read iso-country-list.yml: %s", err)
+	}
+	// sorted so a failure names the same code on every run
+	codes := []string{}
+	names := map[string]string{}
+	for code, name := range resource.Parse() {
+		configName, ok := name.(string)
+		if !ok || configName == "" {
+			continue
+		}
+		code = strings.ToLower(code)
+		codes = append(codes, code)
+		names[code] = configName
+	}
+	slices.Sort(codes)
+	for _, code := range codes {
+		tableName, ok := ISOCountryName(code)
+		if ok && tableName != names[code] {
+			return code, names[code], true
+		}
+	}
+	return "", "", false
 }
