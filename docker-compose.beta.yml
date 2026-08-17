@@ -352,6 +352,26 @@ services:
       # constraint. This was 2 for the old 7.9G/4-core box, below the binary's
       # own default of 4.
       - --concurrency=24
+      # The blackhole sweep is a SEPARATE loop from the full pass above, and the
+      # reason it exists is that the full pass is too slow to notice a provider
+      # going dark: it spends minutes per provider, so the fleet takes hours to
+      # days, and until it comes back round the provider keeps its last passing
+      # measurement and stays in the public list. Measured here: 98.6% of
+      # advertised providers were judged on evidence over six hours old, and 12
+      # sampled from the stalest cohort answered ok=0/131 while still being
+      # handed to clients.
+      #
+      # Hourly over ~2,700 eligible providers is ~0.75/sec, which one round trip
+      # through an already-required tunnel comfortably sustains at concurrency
+      # 32. The limit is the server's per-request ceiling, not the sweep size --
+      # a pass keeps asking until the queue is empty.
+      - --blackhole-interval=1h
+      - --blackhole-limit=500
+      - --blackhole-concurrency=32
+      # NOT --probe-timeout's 2m20s: a dark provider must fail fast or the sweep
+      # costs the full timeout on every one, and on a mostly-dark fleet the cheap
+      # loop runs as slowly as the full pass it complements.
+      - --blackhole-timeout=15s
       # Ask for the server's maximum batch (maxProviderEgressDueLimit=500)
       # rather than the 100 default. With a 6h re-probe backoff and ~2400
       # providers, 100 per pass can never cover the fleet: it capped coverage
