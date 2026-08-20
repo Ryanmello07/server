@@ -67,6 +67,9 @@ func TestPerfvarDefaultResourceProfile(t *testing.T) {
 	if resources.AppDelay != 0 {
 		t.Errorf("application delay=%s, want none", resources.AppDelay)
 	}
+	if resources.ApplicationMtu != 0 {
+		t.Errorf("application MTU=%d, want profile default", resources.ApplicationMtu)
+	}
 }
 
 // The constrained profile pins every documented synthetic TUN and application
@@ -90,6 +93,38 @@ func TestPerfvarMobileSurrogateResourceProfile(t *testing.T) {
 	}
 	if resources.AppDelay != 100*time.Microsecond {
 		t.Errorf("application delay=%s, want %s", resources.AppDelay, 100*time.Microsecond)
+	}
+	if resources.ApplicationMtu != 0 {
+		t.Errorf("application MTU=%d, want profile default", resources.ApplicationMtu)
+	}
+}
+
+// Full-route fixtures advertise the same MTU as the product VPN by default,
+// without conflating it with the independently modeled physical link MTU.
+func TestResolvedFullTunApplicationMtu(t *testing.T) {
+	profile := initialNetworkProfiles(20260819)["clean-lan"]
+	if got := resolvedFullTunApplicationMtu(profile, defaultTunResourceProfile()); got != clientconnect.DefaultMtu {
+		t.Fatalf("default full-TUN application MTU=%d want=%d", got, clientconnect.DefaultMtu)
+	}
+
+	smallProfile := profile
+	smallProfile.InnerMtu = clientconnect.DefaultMtu - 100
+	if got := resolvedFullTunApplicationMtu(smallProfile, defaultTunResourceProfile()); got != smallProfile.InnerMtu {
+		t.Fatalf("small-profile application MTU=%d want=%d", got, smallProfile.InnerMtu)
+	}
+
+	resources := defaultTunResourceProfile()
+	resources.ApplicationMtu = 1200
+	if got := resolvedFullTunApplicationMtu(profile, resources); got != resources.ApplicationMtu {
+		t.Fatalf("explicit application MTU=%d want=%d", got, resources.ApplicationMtu)
+	}
+
+	if fullTunQUICInitialPacketSize <= clientconnect.DefaultMtu {
+		t.Fatalf(
+			"QUIC Initial=%d must exercise IPv4 fragmentation above product MTU=%d",
+			fullTunQUICInitialPacketSize,
+			clientconnect.DefaultMtu,
+		)
 	}
 }
 

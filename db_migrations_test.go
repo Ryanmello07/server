@@ -8,28 +8,44 @@ import (
 	// "github.com/urnetwork/connect"
 )
 
-func locationNameBackfillMigrationIndex(t testing.TB) int {
+func sqlMigrationIndex(t testing.TB, marker string) int {
 	t.Helper()
 	for i, migration := range migrations {
 		if sqlMigration, ok := migration.(*SqlMigration); ok &&
-			strings.Contains(sqlMigration.sql, "iso_country_name_backfill") {
+			strings.Contains(sqlMigration.sql, marker) {
 			return i
 		}
 	}
-	t.Fatal("location-name backfill migration not found")
+	t.Fatalf("SQL migration containing %q not found", marker)
 	return -1
 }
 
+func locationNameBackfillMigrationIndex(t testing.TB) int {
+	return sqlMigrationIndex(t, "iso_country_name_backfill")
+}
+
 func canceledCircleRetryRestoreMigrationIndex(t testing.TB) int {
-	t.Helper()
-	for i, migration := range migrations {
-		if sqlMigration, ok := migration.(*SqlMigration); ok &&
-			strings.Contains(sqlMigration.sql, "restore_canceled_circle_retries") {
-			return i
+	return sqlMigrationIndex(t, "restore_canceled_circle_retries")
+}
+
+// Competition migrations were developed against an older main. They must
+// remain a contiguous suffix so every migration integrated from origin runs
+// first and retains its published version number.
+func TestCompetitionMigrationsFollowOriginMigrations(t *testing.T) {
+	markers := []string{
+		"CREATE TABLE competition_round",
+		"competition_append_only_guard",
+		"competition_workload_backfill_guard",
+	}
+	firstCompetitionIndex := len(migrations) - len(markers)
+	if firstCompetitionIndex <= canceledCircleRetryRestoreMigrationIndex(t) {
+		t.Fatalf("competition migration suffix starts at %d before latest origin migration", firstCompetitionIndex)
+	}
+	for i, marker := range markers {
+		if index := sqlMigrationIndex(t, marker); index != firstCompetitionIndex+i {
+			t.Fatalf("competition migration %q index = %d, want suffix index %d", marker, index, firstCompetitionIndex+i)
 		}
 	}
-	t.Fatal("canceled Circle retry restore migration not found")
-	return -1
 }
 
 // A pending migration can race ahead of the runtime fix that stopped blank

@@ -15,6 +15,7 @@ import (
 	clientconnect "github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
 	"github.com/urnetwork/server"
+	connectserver "github.com/urnetwork/server/connect"
 )
 
 const (
@@ -93,14 +94,44 @@ func newPerfvarCorrectnessFixture(
 	resources tunResourceProfile,
 	timeout time.Duration,
 ) (*perfvarCorrectnessFixture, error) {
+	return newPerfvarCorrectnessFixtureWithHooks(
+		t,
+		route,
+		directProfile,
+		deviceAccessProfile,
+		providerAccessProfile,
+		resources,
+		timeout,
+		nil,
+	)
+}
+
+// Builds the same correctness fixture while allowing a test to observe exact
+// construction seams without changing production-equivalent defaults.
+func newPerfvarCorrectnessFixtureWithHooks(
+	t testing.TB,
+	route fullTunRoute,
+	directProfile networkProfile,
+	deviceAccessProfile networkProfile,
+	providerAccessProfile networkProfile,
+	resources tunResourceProfile,
+	timeout time.Duration,
+	hooks *fullTunConstructionTestHooks,
+) (*perfvarCorrectnessFixture, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	enableNetworkPeers := route == fullTunRouteP2pFast || route == fullTunRouteP2pLegacy
-	environment := newRouteEnvironmentWithNetworkPeers(
+	var configureHandlerSettings func(*connectserver.ConnectHandlerSettings)
+	if hooks != nil {
+		configureHandlerSettings = hooks.configureConnectHandlerSettings
+	}
+	environment := newRouteEnvironmentWithNetworkPeersAndHandlerSettings(
 		ctx,
 		t,
 		directProfile,
 		enableNetworkPeers,
+		nil,
+		configureHandlerSettings,
 	)
 	environment.accessProfile = deviceAccessProfile
 	environment.deviceAccessProfile = deviceAccessProfile
@@ -111,7 +142,7 @@ func newPerfvarCorrectnessFixture(
 		environment: environment,
 	}
 	t.Cleanup(fixture.close)
-	path, err := tryNewFullTunPathWithTopology(
+	path, err := tryNewFullTunPathWithTopologyHooks(
 		ctx,
 		t,
 		environment,
@@ -119,6 +150,7 @@ func newPerfvarCorrectnessFixture(
 		false,
 		resources,
 		1,
+		hooks,
 	)
 	if err != nil {
 		fixture.close()
@@ -531,6 +563,20 @@ func measurePerfvarFreshApplicationWorkload(
 		return perfvarCorrectnessObservation{}, err
 	}
 	observation, measureErr := fixture.measure(workload, direction, measure)
+	if measureErr != nil && (route == fullTunRouteExchangeH3 || route == fullTunRouteExchangeAuto) {
+		measureErr = fmt.Errorf(
+			"%w; device_h3=%+v provider_h3=%+v device_receive=%+v provider_receive=%+v device_packets=%+v provider_packets=%+v device_recovery=%+v provider_recovery=%+v",
+			measureErr,
+			fixture.path.deviceH3DatagramStats.Snapshot(),
+			fixture.path.providerH3DatagramStats.Snapshot(),
+			fixture.path.devicePlatformReceiveStats.Snapshot(),
+			fixture.path.providerPlatformReceiveStats.Snapshot(),
+			observation.Carrier.DevicePacketStats,
+			observation.Carrier.ProviderPacketStats,
+			observation.Carrier.DeviceSendRecovery,
+			observation.Carrier.ProviderSendRecovery,
+		)
+	}
 	fixture.close()
 	return observation, measureErr
 }
@@ -671,6 +717,26 @@ func testPerfvarApplicationWorkloads(
 		loaded.Result.IdleLatency.P50 <= 0 || loaded.Result.PostLoadLatency.P50 <= 0 ||
 		loaded.Result.LoadedProbeSuccessCount < minimumLatencyProbeSuccessCount {
 		return fmt.Errorf("latency under load result=%+v", loaded.Result)
+	}
+	loadedDownload, err := measurePerfvarFreshApplicationWorkload(
+		t,
+		route,
+		profile,
+		perfvarWorkloadLatencyUnderLoad,
+		perfvarDirectionDownload,
+		func(ctx context.Context, path *fullTunPath) (workloadResult, error) {
+			return measureFullTunLatencyUnderLoadDirection(ctx, path, loadedByteCount, false)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("download latency under load: %w", err)
+	}
+	if loadedDownload.Result.UsefulByteCount != loadedByteCount ||
+		loadedDownload.Result.ContentHash != deterministicPayloadHash(loadedByteCount) ||
+		loadedDownload.Result.IdleLatency.P50 <= 0 ||
+		loadedDownload.Result.PostLoadLatency.P50 <= 0 ||
+		loadedDownload.Result.LoadedProbeSuccessCount < minimumLatencyProbeSuccessCount {
+		return fmt.Errorf("download latency under load result=%+v", loadedDownload.Result)
 	}
 	return nil
 }
