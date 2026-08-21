@@ -75,6 +75,14 @@ func Routes() []*router.Route {
 		router.NewRoute("GET", "/network/provider-blackhole-due", handlers.ProviderBlackholeCheckDue),
 		router.NewRoute("POST", "/network/provider-blackhole-checks", handlers.SubmitProviderBlackholeChecks),
 		router.NewRoute("POST", "/network/provider-egress-attempt", handlers.ProviderEgressLocationAttempt),
+		// operator-to-server, same operator secret as the egress routes above:
+		// the prober fetching the network client jwt that the bootstrap task
+		// minted for it. This is what makes the credential arrive without a
+		// human -- until it existed the task stored a jwt nothing ever read, and
+		// an operator still had to hand-carry one into the prober's env. Returns
+		// the delivery credential ONLY; the account identity behind it never
+		// leaves the server. See ProberCredentialResult.
+		router.NewRoute("GET", "/network/prober-credential", handlers.ProberCredential),
 		// operator-to-server, same operator secret: the certificate pins this
 		// server observed DIRECTLY for the geolocation source hosts. The
 		// prober fetches them here instead of carrying a compile-time
