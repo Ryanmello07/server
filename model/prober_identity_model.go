@@ -457,6 +457,48 @@ func createProberNetwork(
 		return false, nil
 	}
 
+	// result.Seedphrase (model/network_model.go:95, populated at :197) is
+	// DISCARDED here, on purpose. Only the network id, the admin user id and the
+	// name are kept, and prober_identity has no column that could hold a phrase
+	// (db_migrations.go:6455). Do not "fix" that by adding one.
+	//
+	// Nothing in this system needs it. This server holds the jwt signing keys
+	// (jwt/by_jwt.go:68, byPrivateKeys), so mintProberClientJwt below re-mints
+	// this account's client credential from the stored network_id/user_id
+	// whenever it likes -- the only identity jwt.NewByJwt takes is those three
+	// stored fields; its other two arguments are flags (jwt/by_jwt.go:217-223).
+	// A seedphrase is a HUMAN login credential, and no human ever logs into a
+	// machine-operated identity.
+	//
+	// Persisting it would therefore write a root credential into postgres --
+	// recoverable from any dump, backup or replica, forever -- to enable a login
+	// nobody performs. Note what that would undo: the platform deliberately keeps
+	// only a salted hash of a seedphrase, never the phrase
+	// (model/seedphrase_auth_model.go:44-45, model/auth_model_identity.go:136).
+	// Writing the phrase into prober_identity would make this account the
+	// exception to that, and the one worth stealing.
+	//
+	// The honest cost, stated plainly: this makes the account unrecoverable by a
+	// human, by design. No person holds a login credential for it and none is
+	// written down anywhere. The prober account this one replaced was lost in
+	// exactly that way -- a seedphrase-only account whose phrase nobody recorded,
+	// and a seedphrase has no reset path. Two things make it acceptable here and
+	// only here.
+	//
+	// It is not a dead end. This account is created down the seedphrase branch, so
+	// it HAS seedphrase auth (CreateSeedphraseAuthInTx, model/network_model.go:893)
+	// -- and the stored by_client_jwt authenticates as the account, which is enough
+	// to call /auth/regenerate-seedphrase and mint a fresh phrase on demand (see
+	// the note on api/handlers.ProberCredentialResult for that chain). If the jwt
+	// has expired, mintProberClientJwt makes another. So even the human-login case
+	// does not want a stored phrase: the login can be manufactured from what is
+	// already here, which is the last argument against persisting one.
+	//
+	// And it is re-creatable. DELETE this row -- not merely NULL its network_id,
+	// which takes claimProberIdentityCreate's DO UPDATE branch and carries
+	// create_attempts forward -- and the next pass claims a fresh row at
+	// create_attempts = 0 and builds a new account. The worst case is an orphaned
+	// network to clean up, not an outage nobody can undo.
 	if !setProberIdentityNetwork(ctx, networkId, userId, result.Network.NetworkName) {
 		// Another run recorded an identity first, so this network is an orphan.
 		// It is named here because an account nobody knows about is exactly what

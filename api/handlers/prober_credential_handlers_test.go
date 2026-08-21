@@ -63,14 +63,19 @@ func TestProberCredentialRejectsAlteredSecret(t *testing.T) {
 }
 
 // TestProberCredentialResultExposesOnlyTheDeliveryCredential pins the response
-// SHAPE, which is the security property this endpoint turns on.
+// SHAPE, so the handler keeps returning a deliberate, documented field set
+// rather than whatever a model struct happens to have.
 //
 // The failure it exists to catch is a quiet one: someone "simplifies" the
 // handler by encoding model.ProberIdentity directly, or adds a field here for
-// debugging. Either compiles, builds green, passes every status-code test
-// above -- and starts publishing network_id / user_id / network_name, the
-// non-revocable root identity that account recovery keys on. Asserting the
-// exact field set is the only check that fails when that happens.
+// debugging. Either compiles, builds green, and passes every status-code test
+// above. Asserting the exact field set is the only check that fails.
+//
+// It is NOT what makes this endpoint safe, and it is not a substitute for the
+// auth tests above. See the note on ProberCredentialResult: network_id, user_id
+// and network_name are already inside the by_client_jwt this response carries,
+// so omitting them withholds nothing from a caller who got past the operator
+// secret. That secret is the gate; this test is change detection.
 func TestProberCredentialResultExposesOnlyTheDeliveryCredential(t *testing.T) {
 	want := []string{"by_client_jwt", "client_id"}
 
