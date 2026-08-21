@@ -80,8 +80,12 @@ func Routes() []*router.Route {
 		// minted for it. This is what makes the credential arrive without a
 		// human -- until it existed the task stored a jwt nothing ever read, and
 		// an operator still had to hand-carry one into the prober's env. Returns
-		// the delivery credential ONLY; the account identity behind it never
-		// leaves the server. See ProberCredentialResult.
+		// Returns the jwt and the client id it names, and nothing else -- but do
+		// NOT read that narrowness as containment. The jwt itself carries
+		// network_id, user_id and network_name as readable claims, and holding
+		// it is enough to regenerate this account's seedphrase. The operator
+		// secret checked in the handler is the actual gate. See
+		// ProberCredentialResult, which spells this out.
 		router.NewRoute("GET", "/network/prober-credential", handlers.ProberCredential),
 		// operator-to-server, same operator secret: the certificate pins this
 		// server observed DIRECTLY for the geolocation source hosts. The
