@@ -248,6 +248,30 @@ func setProberIdentityClient(
 	})
 }
 
+// clearProberIdentityClient forgets the stored client, so the next mint
+// provisions a fresh one. The network identity -- the part that must never be
+// duplicated -- is deliberately untouched; only the client is replaced, and
+// clients are re-provisionable by design.
+//
+// by_client_jwt is dropped with it. A credential naming a client that no longer
+// exists is refused at auth anyway (see jwt.ValidateByJwtState), so keeping it
+// would only make a dead token look like a live one.
+func clearProberIdentityClient(ctx context.Context) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
+				UPDATE prober_identity
+				SET
+					client_id = NULL,
+					by_client_jwt = NULL,
+					last_mint_time = NULL
+				WHERE singleton
+			`,
+		))
+	})
+}
+
 // getNetworkAdminUserId reads back the user the network was created for.
 //
 // NetworkCreate's result carries the network id but NOT the user id, and the
@@ -456,12 +480,6 @@ func createProberNetwork(
 // The session it builds is the only place a ByJwt is involved, and it is built
 // from the STORED identity rather than from anything the task was handed -- the
 // task's session is unauthenticated by construction.
-//
-// No roles and no principal are passed. validateClientIdentityArgs applies its
-// network-session gate only when one of them is set, and the re-auth branch
-// rejects them outright, so leaving both empty is what lets the first mint and
-// every later re-mint take the same path. The client is labelled by its
-// description instead.
 func mintProberClientJwt(
 	ctx context.Context,
 	identity *ProberIdentity,
@@ -483,17 +501,38 @@ func mintProberClientJwt(
 	// identity.ClientId is nil only on the first mint. Every later mint passes
 	// the stored id, which re-auths that same client and returns a fresh
 	// by_client_jwt for it -- one durable prober identity, not one per refresh.
-	result, err := AuthNetworkClient(
-		&AuthNetworkClientArgs{
-			ClientId:    identity.ClientId,
-			Description: ProberClientDescription,
-			DeviceSpec:  ProberClientDeviceSpec,
-		},
-		proberSession,
-	)
+	result, err := authProberClient(proberSession, identity.ClientId)
 	if err != nil {
 		return err
 	}
+
+	if result.Error != nil && identity.ClientId != nil {
+		// The stored client cannot be re-authed. AuthNetworkClient's re-auth
+		// branch fails for exactly one reason that can reach here -- the client
+		// or its device is gone or inactive ("Client does not exist.", "Client
+		// needs to be migrated", "Device does not exist.") -- since the only
+		// other error it returns is for roles/principal, which this caller never
+		// sends. So any error on this path means the stored client is unusable,
+		// and no message parsing is needed to know it.
+		//
+		// Without this, a client removed by any of the sweepers would strand the
+		// refresh permanently: every later pass would read the same dead id and
+		// fail identically, forever, which is precisely the silent-stop this
+		// feature exists to remove. Forget the client and provision another
+		// against the same network.
+		glog.Errorf(
+			"[proberboot]stored prober client %s could not be re-authed (%s); provisioning a new client\n",
+			identity.ClientId,
+			result.Error.Message,
+		)
+		clearProberIdentityClient(ctx)
+
+		result, err = authProberClient(proberSession, nil)
+		if err != nil {
+			return err
+		}
+	}
+
 	if result.Error != nil {
 		return fmt.Errorf("could not auth the prober client: %s", result.Error.Message)
 	}
@@ -507,4 +546,26 @@ func mintProberClientJwt(
 	// the jwt itself is never logged; it is the credential
 	glog.Infof("[proberboot]minted a client jwt for prober client %s\n", *result.ClientId)
 	return nil
+}
+
+// authProberClient mints one credential: a new client when clientId is nil, a
+// fresh jwt for that same client when it is not.
+//
+// No roles and no principal are passed, on either path. validateClientIdentityArgs
+// applies its network-session gate only when one of them is set, and the re-auth
+// branch rejects them outright, so leaving both empty is what lets the first mint
+// and every later re-mint take the same path. The client is labelled by its
+// description instead.
+func authProberClient(
+	proberSession *session.ClientSession,
+	clientId *server.Id,
+) (*AuthNetworkClientResult, error) {
+	return AuthNetworkClient(
+		&AuthNetworkClientArgs{
+			ClientId:    clientId,
+			Description: ProberClientDescription,
+			DeviceSpec:  ProberClientDeviceSpec,
+		},
+		proberSession,
+	)
 }
