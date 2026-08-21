@@ -6428,6 +6428,46 @@ var migrations = []any{
 			)
 	`),
 
+	// The egress prober's own network identity, as a single row.
+	//
+	// The prober authenticates to the platform with a network CLIENT jwt. Until
+	// now an operator minted that by hand -- create a network, POST
+	// /network/auth-client, paste the by_client_jwt into beta-vault/prober.env --
+	// so a deployment that had not had that done had no egress probing at all,
+	// silently. taskworker/work/prober_bootstrap_work.go does it instead, and
+	// this table is what makes a job that re-runs every six hours FOREVER safe:
+	// it is the only record that the account already exists.
+	//
+	// Looking the network up by name could not replace it. The seedphrase branch
+	// of model.NetworkCreate ignores the requested name and calls
+	// generateRandomNetworkName() unconditionally, so the name is not knowable in
+	// advance and there is nothing to search for on the next run.
+	//
+	// `singleton bool PRIMARY KEY DEFAULT true CHECK (singleton)` makes "at most
+	// one prober identity" a fact of the schema rather than a convention every
+	// future caller has to remember: every insert names the same row and
+	// therefore collides with it, which is exactly what the create-claim upsert
+	// in model/prober_identity_model.go is built on. client_id is stored so each
+	// re-mint re-auths the SAME client instead of accumulating one client per
+	// refresh, and create_attempts bounds account creation if the create keeps
+	// failing (see MaxProberBootstrapAttempts).
+	newSqlMigration(`
+		CREATE TABLE prober_identity (
+			singleton bool PRIMARY KEY DEFAULT true CHECK (singleton),
+
+			network_id uuid NULL,
+			user_id uuid NULL,
+			network_name varchar(256) NULL,
+
+			client_id uuid NULL,
+			by_client_jwt text NULL,
+
+			create_attempts int NOT NULL DEFAULT 0,
+			create_time timestamp NULL,
+			last_mint_time timestamp NULL
+		)
+	`),
+
 	// Durable sim-latency competition control plane. The queue is deliberately
 	// independent of pending_task: untrusted submissions are claimed by a
 	// dedicated evaluator identity, and the singleton slot below makes the FIFO
