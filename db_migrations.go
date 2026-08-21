@@ -6451,8 +6451,35 @@ var migrations = []any{
 	// re-mint re-auths the SAME client instead of accumulating one client per
 	// refresh, and create_attempts bounds account creation if the create keeps
 	// failing (see MaxProberBootstrapAttempts).
+	// NOTE: on an ALREADY-DEPLOYED database this migration does not run, and that
+	// is a property of where it sits, not a mistake to correct by moving it.
+	//
+	// ApplyDbMigrationsUpTo iterates `for i := DbVersion(ctx); i < upTo; i += 1`,
+	// so a migration only executes when its INDEX is at or past the deployed
+	// version. This one is placed before the three competition migrations,
+	// which TestCompetitionMigrationsFollowOriginMigrations requires to remain a
+	// contiguous suffix -- so on a database already at that suffix's version the
+	// index is behind and is skipped. Reachability and that suffix invariant
+	// cannot both hold for a new fork-local migration; the suffix won.
+	//
+	// Hence IF NOT EXISTS, matching every other fork-local table in this file:
+	// the statement has to be safe to apply out of band and safe to re-apply.
+	// `bringyourctl db audit --fix` emits CREATE TABLE for a missing table and is
+	// what actually creates this one on a deployed database -- the same tool that
+	// recovered mainnet from a comparable gap.
+	//
+	// SO: after deploying this to an existing database, run
+	//   bringyourctl db audit --fix
+	// or prober_identity will not exist and the bootstrap task, GetProberIdentity
+	// and GET /network/prober-credential all fail with
+	// `relation "prober_identity" does not exist`.
+	//
+	// The durable fix is not to shuffle this entry: it is to resolve migrations
+	// by identity rather than by list index, or to agree where fork-local
+	// migrations live relative to the competition suffix. Until then every new
+	// fork-local table hits this.
 	newSqlMigration(`
-		CREATE TABLE prober_identity (
+		CREATE TABLE IF NOT EXISTS prober_identity (
 			singleton bool PRIMARY KEY DEFAULT true CHECK (singleton),
 
 			network_id uuid NULL,
