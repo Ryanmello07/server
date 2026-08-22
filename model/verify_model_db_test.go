@@ -148,21 +148,51 @@ func TestVerifyTrailLockMutualExclusion(t *testing.T) {
 		ctx := context.Background()
 		trailId := server.NewId()
 
-		if !AcquireVerifyTrailLock(ctx, trailId, 30*time.Second) {
+		firstToken := AcquireVerifyTrailLock(ctx, trailId, 30*time.Second)
+		if firstToken == "" {
 			t.Fatal("first acquire must succeed")
 		}
-		if AcquireVerifyTrailLock(ctx, trailId, 30*time.Second) {
+		if token := AcquireVerifyTrailLock(ctx, trailId, 30*time.Second); token != "" {
 			t.Fatal("second acquire must be excluded (V3)")
 		}
-		ReleaseVerifyTrailLock(ctx, trailId)
-		if !AcquireVerifyTrailLock(ctx, trailId, 200*time.Millisecond) {
+		ReleaseVerifyTrailLock(ctx, trailId, firstToken)
+		crashedToken := AcquireVerifyTrailLock(ctx, trailId, 200*time.Millisecond)
+		if crashedToken == "" {
 			t.Fatal("acquire after release must succeed")
 		}
 		// the ttl self-heals a crashed holder
 		time.Sleep(400 * time.Millisecond)
-		if !AcquireVerifyTrailLock(ctx, trailId, time.Second) {
+		if token := AcquireVerifyTrailLock(ctx, trailId, time.Second); token == "" {
 			t.Fatal("acquire after ttl expiry must succeed")
 		}
+	})
+}
+
+func TestVerifyTrailLockStaleReleasePreservesSuccessor(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		trailId := server.NewId()
+		staleToken := AcquireVerifyTrailLock(ctx, trailId, time.Minute)
+		if staleToken == "" {
+			t.Fatal("initial lock acquire failed")
+		}
+		successorToken := server.NewId().String()
+		server.Redis(ctx, func(r server.RedisClient) {
+			if err := r.Set(ctx, verifyTrailLockKey(trailId), successorToken, time.Minute).Err(); err != nil {
+				t.Fatal(err)
+			}
+		})
+		ReleaseVerifyTrailLock(ctx, trailId, staleToken)
+		server.Redis(ctx, func(r server.RedisClient) {
+			current, err := r.Get(ctx, verifyTrailLockKey(trailId)).Result()
+			if err != nil || current != successorToken {
+				t.Fatalf("stale release left token=%q error=%v, want successor", current, err)
+			}
+		})
+		if token := AcquireVerifyTrailLock(ctx, trailId, time.Minute); token != "" {
+			t.Fatal("stale release deleted the successor lock")
+		}
+		ReleaseVerifyTrailLock(ctx, trailId, successorToken)
 	})
 }
 
@@ -463,6 +493,56 @@ func TestSweepExpiredVerifyTrails(t *testing.T) {
 	})
 }
 
+func TestSweepExpiredVerifyTrailsDefersToMutationLock(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		settings := DefaultVerifySettings()
+		now := server.NowUtc()
+		deadline := uint64((settings.StepTimeout + settings.StepTimeoutGrace) / time.Millisecond)
+		trail := testVerifyBuildTrail(false, uint64(now.UnixMilli())-deadline-1)
+		CreateVerifyTrail(ctx, trail, `{}`, settings)
+		IncrVerifyActiveTrails(ctx, trail.Vpk, settings)
+
+		token := AcquireVerifyTrailLock(ctx, trail.TrailId, VerifyTrailMutationLockTtl(settings, trail.M))
+		if token == "" {
+			t.Fatal("in-flight EXTEND lock acquire failed")
+		}
+		if swept := SweepExpiredVerifyTrails(ctx, now, settings); swept != 0 {
+			t.Fatalf("sweeper expired an in-flight EXTEND: swept=%d", swept)
+		}
+		if got := GetVerifyTrail(ctx, trail.TrailId); got == nil || got.Status != VerifyTrailStatusActive {
+			t.Fatalf("locked trail changed during sweep: %+v", got)
+		}
+		if _, ok := testVerifyReapScore(ctx, trail.TrailId); !ok {
+			t.Fatal("contended sweep removed the due registry entry")
+		}
+
+		ReleaseVerifyTrailLock(ctx, trail.TrailId, token)
+		if swept := SweepExpiredVerifyTrails(ctx, now, settings); swept != 1 {
+			t.Fatalf("sweeper did not retry after EXTEND unlock: swept=%d", swept)
+		}
+		if got := GetVerifyTrail(ctx, trail.TrailId); got == nil || got.Status != VerifyTrailStatusExpired {
+			t.Fatalf("unlocked due trail status: %+v", got)
+		}
+	})
+}
+
+func TestVerifyTrailMutationLockTtlCoversLoadedTrail(t *testing.T) {
+	settings := DefaultVerifySettings()
+	settings.TrailLockTtl = time.Second
+	want := settings.TrailTtl(7)
+	if got := VerifyTrailMutationLockTtl(settings, 7); got != want {
+		t.Fatalf("mutation lock ttl=%s, want trail ttl=%s", got, want)
+	}
+	settings.TrailLockTtl = want + time.Second
+	if got := VerifyTrailMutationLockTtl(settings, 7); got != settings.TrailLockTtl {
+		t.Fatalf("configured lock ttl=%s, got=%s", settings.TrailLockTtl, got)
+	}
+	if got := VerifyTrailMutationLockTtl(nil, 7); got != 0 {
+		t.Fatalf("nil settings lock ttl=%s, want zero", got)
+	}
+}
+
 func TestVerifyStatsRollupIdempotent(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
@@ -577,10 +657,10 @@ func TestSampleVerifyNextHop(t *testing.T) {
 	})
 }
 
-// The egress index must never hold a raw client ip — keys and reverse-hash
-// fields are the peppered subnet-bucket hash (VerifyEgressIpHash). The
-// validator scores subnet blocks, not individual addresses, so two ips in
-// one bucket are one egress identity.
+// The egress index must never hold a raw client IP. Its keys and reverse-hash
+// fields use a peppered exact-address hash, while the public trail score uses
+// a separate coarser prefix hash. This lets two exact-address-bijective
+// providers share one scored /29 without either becoming ambiguous.
 func TestVerifyEgressIndexStoresNoRawIp(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
@@ -619,14 +699,24 @@ func TestVerifyEgressIndexStoresNoRawIp(t *testing.T) {
 			}
 		})
 
-		// same /29 bucket (default v4 prefix): .72 and .73 are one identity.
-		// the same client feeding both keeps exactly one live bucket, so it
-		// stays eligible-shaped (one egress), and both addresses resolve.
-		c2 := server.NewId()
-		FeedVerifyEgress(ctx, c2, netip.MustParseAddr("198.51.100.88"), settings)
-		FeedVerifyEgress(ctx, c2, netip.MustParseAddr("198.51.100.89"), settings)
-		if got := ResolveVerifyEgress(ctx, netip.MustParseAddr("198.51.100.89"), settings); got == nil || *got != c2 {
-			t.Fatalf("same-bucket second ip did not resolve to the claimant: %v", got)
+		// Same /29, different exact IPs and different clients: both remain
+		// independently eligible, while their signed score hash is identical.
+		c2, c3 := server.NewId(), server.NewId()
+		ip2 := netip.MustParseAddr("198.51.100.88")
+		ip3 := netip.MustParseAddr("198.51.100.89")
+		FeedVerifyEgress(ctx, c2, ip2, settings)
+		FeedVerifyEgress(ctx, c3, ip3, settings)
+		if got := ResolveVerifyEgress(ctx, ip2, settings); got == nil || *got != c2 {
+			t.Fatalf("first same-prefix address did not resolve to c2: %v", got)
+		}
+		if got := ResolveVerifyEgress(ctx, ip3, settings); got == nil || *got != c3 {
+			t.Fatalf("second same-prefix address did not resolve to c3: %v", got)
+		}
+		if VerifyEgressIndexHashWithSettings(ip2, settings) == VerifyEgressIndexHashWithSettings(ip3, settings) {
+			t.Fatal("exact-address index hashes collided inside one /29")
+		}
+		if VerifyEgressIpHashWithSettings(ip2, settings) != VerifyEgressIpHashWithSettings(ip3, settings) {
+			t.Fatal("same-/29 providers did not share the public score hash")
 		}
 		server.Redis(ctx, func(r server.RedisClient) {
 			entries, err := r.HGetAll(ctx, verifyClientEgressKey(c2)).Result()
@@ -634,16 +724,16 @@ func TestVerifyEgressIndexStoresNoRawIp(t *testing.T) {
 				t.Fatal(err)
 			}
 			if len(entries) != 1 {
-				t.Fatalf("same-bucket ips should collapse to one reverse entry, got %d", len(entries))
+				t.Fatalf("c2 exact-address reverse entries = %d, want 1", len(entries))
 			}
 		})
 
-		// a different client feeding an ip in the SAME bucket contends: the
-		// bucket goes ambiguous and resolves to nobody (never guess)
-		c3 := server.NewId()
-		FeedVerifyEgress(ctx, c3, netip.MustParseAddr("198.51.100.90"), settings)
-		if got := ResolveVerifyEgress(ctx, netip.MustParseAddr("198.51.100.88"), settings); got != nil {
-			t.Fatalf("contended bucket resolved to %v, want nil", got)
+		// A different client feeding the exact SAME address still contends:
+		// the exact address goes ambiguous and resolves to nobody (never guess).
+		c4 := server.NewId()
+		FeedVerifyEgress(ctx, c4, ip2, settings)
+		if got := ResolveVerifyEgress(ctx, ip2, settings); got != nil {
+			t.Fatalf("contended exact address resolved to %v, want nil", got)
 		}
 	})
 }
