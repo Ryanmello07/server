@@ -15,6 +15,11 @@ COPY ./userwireguard /workspace/userwireguard
 COPY ./sn /workspace/sn
 # required since the upstream merge: go.mod replaces goidenticons with ../goidenticons
 COPY ./goidenticons /workspace/goidenticons
+# required since the 2026-09-10 upstream merge: the egress prober moved into the
+# server taskworker (taskworker/work/provider_egress_probe_work.go imports
+# operator-proxy directly), so it is now a build dependency, not just a
+# separately-deployed service.
+COPY ./operator-proxy /workspace/operator-proxy
 
 WORKDIR /workspace/server
 # Build only the binaries the beta stack runs, not ./... . Beta ships these

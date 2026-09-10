@@ -122,6 +122,12 @@ services:
       dockerfile: server/Dockerfile.beta
     restart: unless-stopped
     environment:
+      # The ingress proxy (caddy) reaches api from this bridge. Without it,
+      # ResolveClientAddress falls back to caddy's own address and EVERY client
+      # in the deployment shares one signup budget -- which is what wedged
+      # signups on both deployments. Enumerating it is what makes the
+      # forwarded client address readable at all.
+      BRINGYOUR_TRUSTED_PROXY_CIDRS: "172.18.0.0/16"
       WARP_ENV: local
       WARP_BLOCK: local
       WARP_SERVICE: api
@@ -280,8 +286,8 @@ services:
       # The prober lives in its own repo. Clone it next to this one (the same
       # urnetwork parent directory Dockerfile.beta builds from), or point
       # PROBER_CONTEXT at the checkout:
-      #   git clone https://github.com/Ryanmello07/urnetwork-operator-proxy.git
-      context: ${PROBER_CONTEXT:-../urnetwork-operator-proxy}
+      #   git clone https://github.com/Ryanmello07/urnetwork-operator-proxy.git operator-proxy
+      context: ${PROBER_CONTEXT:-../operator-proxy}
       # Its go.mod replaces github.com/urnetwork/connect and .../glog with
       # ../connect and ../glog, so those two checkouts have to be in the build
       # as well. Named contexts keep each one small -- a single context over
@@ -292,7 +298,7 @@ services:
       dockerfile_inline: |
         FROM golang:1.26.5-alpine AS build
         # layout mirrors the local urnetwork monorepo so the ../ replaces resolve
-        WORKDIR /src/urnetwork-operator-proxy
+        WORKDIR /src/operator-proxy
         COPY . .
         COPY --from=connect / /src/connect
         COPY --from=glog / /src/glog
