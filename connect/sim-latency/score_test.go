@@ -18,18 +18,19 @@ import (
 )
 
 type scoreFixtureOptions struct {
-	evaluationId    string
-	rowCount        int
-	failures        int
-	totalMs         float64
-	bytesPerRow     int64
-	loadMillis      float32
-	poolCount       int32
-	emptyPool       bool
-	sampleOffsetMs  int64
-	accountingBytes int64
-	stderrExtra     string
-	resource        ResourceReport
+	evaluationId      string
+	rowCount          int
+	failures          int
+	totalMs           float64
+	bytesPerRow       int64
+	loadMillis        float32
+	poolCount         int32
+	emptyPool         bool
+	sampleOffsetMs    int64
+	sampleEndOffsetMs int64
+	accountingBytes   int64
+	stderrExtra       string
+	resource          ResourceReport
 }
 
 type scoreFixture struct {
@@ -48,13 +49,14 @@ type scoreFixture struct {
 
 func defaultScoreFixtureOptions() scoreFixtureOptions {
 	return scoreFixtureOptions{
-		rowCount:        100,
-		totalMs:         100,
-		bytesPerRow:     100,
-		loadMillis:      10,
-		poolCount:       100,
-		sampleOffsetMs:  10,
-		accountingBytes: 10_000,
+		rowCount:          100,
+		totalMs:           100,
+		bytesPerRow:       100,
+		loadMillis:        10,
+		poolCount:         100,
+		sampleOffsetMs:    10,
+		sampleEndOffsetMs: 910,
+		accountingBytes:   10_000,
 		resource: ResourceReport{
 			Schema:             1,
 			Kind:               resourceReportKind,
@@ -189,17 +191,19 @@ func newScoreFixture(t *testing.T, options scoreFixtureOptions) *scoreFixture {
 		poolCount = 0
 		candidates = nil
 	}
-	sampleBytes, err := proto.Marshal(&sample.FindProviders2Sample{
-		TimeUnixMilli: uint64(startMs + options.sampleOffsetMs),
-		LoadMillis:    options.loadMillis,
-		PoolCount:     poolCount,
-		Candidates:    candidates,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.WriteFrame(sampleBytes); err != nil {
-		t.Fatal(err)
+	for _, offsetMs := range []int64{options.sampleOffsetMs, options.sampleEndOffsetMs} {
+		sampleBytes, err := proto.Marshal(&sample.FindProviders2Sample{
+			TimeUnixMilli: uint64(startMs + offsetMs),
+			LoadMillis:    options.loadMillis,
+			PoolCount:     poolCount,
+			Candidates:    candidates,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.WriteFrame(sampleBytes); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
@@ -215,12 +219,13 @@ func newScoreFixture(t *testing.T, options scoreFixtureOptions) *scoreFixture {
 		flags,
 		0.01,
 		[]ScoreBaselineReplicate{{
-			RawScore:               100,
-			SuccessRate:            1,
-			RequestCount:           100,
-			ReceivedBytes:          10_000,
-			FindProvidersLoadP95Ms: 10,
-			FindProvidersPoolP05:   100,
+			RawScore:                        100,
+			SuccessRate:                     1,
+			RequestCount:                    100,
+			ReceivedBytes:                   10_000,
+			FindProvidersLoadP95Ms:          10,
+			FindProvidersPoolP05:            100,
+			FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction,
 		}},
 	)
 	writeScoreJSON(t, fixture.baseline, fixture.baselineData)
@@ -313,7 +318,8 @@ func TestBuildScoreBaselineUsesOfficialArtifactValidation(t *testing.T) {
 	replicate := baseline.Replicates[0]
 	if replicate.RawScore != 100 || replicate.SuccessRate != 1 ||
 		replicate.RequestCount != 100 || replicate.ReceivedBytes != 10_000 ||
-		replicate.FindProvidersLoadP95Ms != 10 || replicate.FindProvidersPoolP05 != 100 {
+		replicate.FindProvidersLoadP95Ms != 10 || replicate.FindProvidersPoolP05 != 100 ||
+		replicate.FindProvidersSampleSpanFraction != minimumFindProvidersSampleSpanFraction {
 		t.Fatalf("unexpected baseline diagnostics: %+v", replicate)
 	}
 
@@ -379,6 +385,16 @@ func TestBuildScoreBaselineRejectsPrewindowMatchmakingSample(t *testing.T) {
 	}
 }
 
+func TestBuildScoreBaselineRejectsIncompleteMatchmakingWindow(t *testing.T) {
+	options := defaultScoreFixtureOptions()
+	options.sampleEndOffsetMs = 600
+	fixture := newScoreFixture(t, options)
+	if _, err := BuildScoreBaseline(baselineInputsFromFixture(fixture)); err == nil ||
+		!strings.Contains(err.Error(), "matchmaking integrity") {
+		t.Fatalf("expected incomplete matchmaking window rejection, got %v", err)
+	}
+}
+
 func TestScoreBaselinePlaceable(t *testing.T) {
 	fixture := newScoreFixture(t, defaultScoreFixtureOptions())
 	result := Score(fixture.inputs)
@@ -405,8 +421,51 @@ func TestScoreGenuineImprovement(t *testing.T) {
 	if result.RawScore != 80 || result.NormalizedScore != 125 {
 		t.Fatalf("unexpected improved score: %+v", result)
 	}
-	requireTakeoverEligibility(t, result, true)
+	// A single replicate can still produce a placeable diagnostic score, but it
+	// cannot estimate variance and therefore cannot win a production epoch.
+	requireTakeoverEligibility(t, result, false)
+	if result.Significance == nil || result.Significance.OneSidedPValue != nil ||
+		result.Significance.StatisticallySignificant {
+		t.Fatalf("single-replicate significance = %+v", result.Significance)
+	}
 	requireScoreGolden(t, "improvement", result)
+}
+
+func TestScoreReplicatedImprovementIsStatisticallyEligible(t *testing.T) {
+	values := []float64{70, 72, 71}
+	fixtures := make([]*scoreFixture, 0, len(values))
+	for i, value := range values {
+		options := defaultScoreFixtureOptions()
+		options.evaluationId = fmt.Sprintf("eval-significant-%d", i+1)
+		options.totalMs = value
+		fixtures = append(fixtures, newScoreFixture(t, options))
+	}
+	baseline := fixtures[0].baselineData
+	baseline.Replicates = []ScoreBaselineReplicate{
+		{RawScore: 99, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100, FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction},
+		{RawScore: 101, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100, FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction},
+		{RawScore: 100, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100, FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction},
+	}
+	writeScoreJSON(t, fixtures[0].baseline, baseline)
+	inputs := ScoreInputs{BaselineManifest: fixtures[0].baseline}
+	for _, fixture := range fixtures {
+		inputs.Runs = append(inputs.Runs, fixture.run)
+		inputs.Stderr = append(inputs.Stderr, fixture.stderr)
+		inputs.Accounting = append(inputs.Accounting, fixture.accounting)
+		inputs.Samples = append(inputs.Samples, fixture.samples)
+		inputs.ResourceReports = append(inputs.ResourceReports, fixture.resource)
+		inputs.Markers = append(inputs.Markers, fixture.marker)
+	}
+	result := Score(inputs)
+	if result.EvalError != nil || !result.Placeable || result.RawScore != 71 {
+		t.Fatalf("replicated improvement failed: %+v", result)
+	}
+	requireTakeoverEligibility(t, result, true)
+	if result.Significance == nil || !result.Significance.StatisticallySignificant ||
+		result.Significance.BaselineSampleVariance == nil ||
+		result.Significance.CandidateSampleVariance == nil {
+		t.Fatalf("replicated significance is incomplete: %+v", result.Significance)
+	}
 }
 
 func TestScoreRegression(t *testing.T) {
@@ -435,9 +494,9 @@ func TestScoreReplicateMedian(t *testing.T) {
 	}
 	baseline := fixtures[0].baselineData
 	baseline.Replicates = []ScoreBaselineReplicate{
-		{RawScore: 99, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100},
-		{RawScore: 101, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100},
-		{RawScore: 100, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100},
+		{RawScore: 99, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100, FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction},
+		{RawScore: 101, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100, FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction},
+		{RawScore: 100, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100, FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction},
 	}
 	writeScoreJSON(t, fixtures[0].baseline, baseline)
 	inputs := ScoreInputs{BaselineManifest: fixtures[0].baseline}
@@ -523,6 +582,21 @@ func TestScoreRejectsMatchmakingPoolCollapse(t *testing.T) {
 	}
 }
 
+func TestScoreRejectsIncompleteMatchmakingWindow(t *testing.T) {
+	options := defaultScoreFixtureOptions()
+	options.sampleEndOffsetMs = 600
+	fixture := newScoreFixture(t, options)
+	result := Score(fixture.inputs)
+	requireGate(t, result, "G4_matchmaking", false)
+	if result.Placeable {
+		t.Fatal("candidate whose samples stop before 90% of the window is placeable")
+	}
+	gate := result.Gates["G4_matchmaking"]
+	if complete, ok := gate.Details["all_replicates_span_at_least_minimum"].(bool); !ok || complete {
+		t.Fatalf("matchmaking span detail = %#v, want false", gate.Details)
+	}
+}
+
 func TestScoreNonPlaceableImprovementCannotTakeOver(t *testing.T) {
 	options := defaultScoreFixtureOptions()
 	options.totalMs = 80
@@ -540,13 +614,19 @@ func TestScoreNonPlaceableImprovementCannotTakeOver(t *testing.T) {
 func TestScoreGateBoundariesInclusive(t *testing.T) {
 	baseline := baselineAggregate{ScoreAggregateDiagnostics: ScoreAggregateDiagnostics{
 		RawScore: 100, SuccessRate: 0.98, RequestCount: 100, ReceivedBytes: 10_000, FindProvidersLoadP95Ms: 10, FindProvidersPoolP05: 100,
+		FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction,
 	}}
 	candidate := ScoreAggregateDiagnostics{
 		RawScore: 99, SuccessRate: 0.97, RequestCount: 95, ReceivedBytes: 9500,
 		AccountingCoverage: 0.95, FindProvidersLoadP95Ms: 12.5, FindProvidersPoolP05: 90,
+		FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction,
 	}
 	replicates := []candidateReplicate{{
-		diagnostics: ScoreReplicateDiagnostics{FindProvidersSamples: 1, FindProvidersPoolP05: 90},
+		diagnostics: ScoreReplicateDiagnostics{
+			FindProvidersSamples:            2,
+			FindProvidersPoolP05:            90,
+			FindProvidersSampleSpanFraction: minimumFindProvidersSampleSpanFraction,
+		},
 		stabilityOK: true,
 		resourcesOK: true,
 	}}

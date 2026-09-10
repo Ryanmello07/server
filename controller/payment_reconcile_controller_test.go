@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,14 +64,230 @@ func countReconcileEvents(events []*model.PaymentReconciliationEvent, store stri
 	return count
 }
 
+func removeProEntitlementMetadata(t testing.TB, ctx context.Context, networkId server.Id) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`UPDATE transfer_balance SET pro = false WHERE network_id = $1`,
+			networkId,
+		))
+	})
+	model.UpdateProNetwork(ctx, networkId)
+	connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), false)
+}
+
+func countProEntitlementRepairMarkers(ctx context.Context, networkId server.Id) int {
+	markerCount := 0
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			`
+			SELECT COUNT(*)
+			FROM transfer_balance
+			WHERE network_id = $1
+			  AND pro
+			  AND start_balance_byte_count = 0
+			  AND balance_byte_count = 0
+			  AND net_revenue_nano_cents = 0
+			  AND subsidy_net_revenue_nano_cents = 0
+			  AND NOT paid
+			`,
+			networkId,
+		)
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				server.Raise(result.Scan(&markerCount))
+			}
+		})
+	})
+	return markerCount
+}
+
+// A vault file is not itself a credential. SKU-only, malformed and blank-token
+// resources must skip Stripe before the reconciler reaches the strict token
+// accessor; only a nonblank api.token enables remote calls.
+func TestStripeReconcileCredentialsRequireNonblankAPIToken(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "sku only", yaml: "skus:\n  pro: price_test\n", want: false},
+		{name: "malformed", yaml: "api: [\n", want: false},
+		{name: "blank token", yaml: "api:\n  token: '   '\n", want: false},
+		{name: "numeric token", yaml: "api:\n  token: 123\n", want: false},
+		{name: "sequence token", yaml: "api:\n  token: [sk_test]\n", want: false},
+		{name: "wrong api shape", yaml: "api: scalar\n", want: false},
+		{name: "token", yaml: "api:\n  token: sk_test_reconcile\n", want: true},
+	}
+	for _, c := range cases {
+		pop := server.Vault.PushSimpleResource("stripe.yml", []byte(c.yaml))
+		got := stripeReconcileCredentialsPresent()
+		pop()
+		if got != c.want {
+			t.Errorf("%s credentials = %t, want %t", c.name, got, c.want)
+		}
+	}
+}
+
+// Malformed Apple resources are absence, not a process panic. Every required
+// field must be nonblank before the authenticated pull client can run.
+func TestAppleReconcileCredentialsRequireCompleteServerAPIIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "malformed", yaml: "issuer_id: [\n", want: false},
+		{name: "missing key", yaml: "issuer_id: issuer\nprivate_key: key\napp_store_notifications:\n  bundle_id: app\n", want: false},
+		{name: "numeric key", yaml: "app_store_server_api_key_id: 123\nissuer_id: issuer\nprivate_key: key\napp_store_notifications:\n  bundle_id: app\n", want: false},
+		{name: "blank bundle", yaml: "app_store_server_api_key_id: key-id\nissuer_id: issuer\nprivate_key: key\napp_store_notifications:\n  bundle_id: '  '\n", want: false},
+		{name: "complete", yaml: "app_store_server_api_key_id: key-id\nissuer_id: issuer\nprivate_key: key\napp_store_notifications:\n  bundle_id: app.example\n", want: true},
+	}
+	for _, c := range cases {
+		pop := server.Vault.PushSimpleResource("apple.yml", []byte(c.yaml))
+		got := appleReconcileCredentialsFromVault() != nil
+		pop()
+		if got != c.want {
+			t.Errorf("%s Apple credentials = %t, want %t", c.name, got, c.want)
+		}
+	}
+}
+
+// Play needs both the OAuth/package identity and a decodable nonempty SKU
+// catalog. File existence alone previously admitted malformed resources into
+// strict map assertions inside the run.
+func TestPlayReconcileCredentialsRequireOAuthPackageAndSKUs(t *testing.T) {
+	validGoogle := "webhook:\n  package_name: app.example\noauth:\n  client_id: client\n  client_secret: secret\n  refresh_token: refresh\n"
+	validPlay := "skus:\n  pro: {}\n"
+	cases := []struct {
+		name       string
+		googleYAML string
+		playYAML   string
+		want       bool
+	}{
+		{name: "malformed google", googleYAML: "oauth: [\n", playYAML: validPlay, want: false},
+		{name: "blank oauth", googleYAML: "webhook:\n  package_name: app.example\noauth:\n  client_id: client\n  client_secret: ''\n  refresh_token: refresh\n", playYAML: validPlay, want: false},
+		{name: "numeric oauth", googleYAML: "webhook:\n  package_name: app.example\noauth:\n  client_id: client\n  client_secret: 123\n  refresh_token: refresh\n", playYAML: validPlay, want: false},
+		{name: "malformed skus", googleYAML: validGoogle, playYAML: "skus: [\n", want: false},
+		{name: "empty skus", googleYAML: validGoogle, playYAML: "skus: {}\n", want: false},
+		{name: "complete", googleYAML: validGoogle, playYAML: validPlay, want: true},
+	}
+	for _, c := range cases {
+		popGoogle := server.Vault.PushSimpleResource("google.yml", []byte(c.googleYAML))
+		popPlay := server.Config.PushSimpleResource("play.yml", []byte(c.playYAML))
+		got := playReconcileCredentialsPresent()
+		popPlay()
+		popGoogle()
+		if got != c.want {
+			t.Errorf("%s Play credentials = %t, want %t", c.name, got, c.want)
+		}
+	}
+}
+
+// Helius reconciliation consumes helius.api_key specifically; unrelated
+// webhook fields or an invalid YAML file cannot enable Solana RPC calls.
+func TestSolanaReconcileCredentialsRequireNonblankHeliusAPIKey(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "malformed", yaml: "helius: [\n", want: false},
+		{name: "unrelated", yaml: "helius:\n  webhook_auth_header: secret\n", want: false},
+		{name: "blank", yaml: "helius:\n  api_key: '  '\n", want: false},
+		{name: "numeric", yaml: "helius:\n  api_key: 123\n", want: false},
+		{name: "complete", yaml: "helius:\n  api_key: test-key\n", want: true},
+	}
+	for _, c := range cases {
+		pop := server.Vault.PushSimpleResource("helius.yml", []byte(c.yaml))
+		got := solanaReconcileCredentialsPresent()
+		pop()
+		if got != c.want {
+			t.Errorf("%s Solana credentials = %t, want %t", c.name, got, c.want)
+		}
+	}
+}
+
+// Reproduce the simulator's SKU-only vault shape through the orchestration
+// path. It must emit skipped_store rather than entering reconcileStripe and
+// recovering an unsafe token assertion as an error event.
+func TestPaymentReconcileSkipsStripeWithSKUOnlyVault(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		previous := stripeReconcileHasCredentials
+		stripeReconcileHasCredentials = stripeReconcileCredentialsPresent
+		t.Cleanup(func() { stripeReconcileHasCredentials = previous })
+		pop := server.Vault.PushSimpleResource("stripe.yml", []byte("skus:\n  pro: price_test\n"))
+		t.Cleanup(pop)
+
+		result, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketStripe}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Errors, 0)
+		connect.AssertEqual(t, len(result.SkippedStores), 1)
+		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketStripe, model.PaymentReconcileActionSkippedStore), 1)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketStripe, model.PaymentReconcileActionError), 0)
+	})
+}
+
+// Credential checks run outside each store's panic-isolation block, so every
+// production checker must fail closed on malformed optional resources. This
+// exercises all four together through the real run orchestration.
+func TestPaymentReconcileMalformedCredentialResourcesSkipAllStores(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		previousStripe := stripeReconcileHasCredentials
+		previousApple := appleReconcileHasCredentials
+		previousPlay := playReconcileHasCredentials
+		previousSolana := solanaReconcileHasCredentials
+		stripeReconcileHasCredentials = stripeReconcileCredentialsPresent
+		appleReconcileHasCredentials = func() bool { return appleReconcileCredentialsFromVault() != nil }
+		playReconcileHasCredentials = playReconcileCredentialsPresent
+		solanaReconcileHasCredentials = solanaReconcileCredentialsPresent
+		t.Cleanup(func() {
+			stripeReconcileHasCredentials = previousStripe
+			appleReconcileHasCredentials = previousApple
+			playReconcileHasCredentials = previousPlay
+			solanaReconcileHasCredentials = previousSolana
+		})
+		pops := []func(){
+			server.Vault.PushSimpleResource("stripe.yml", []byte("api: [\n")),
+			server.Vault.PushSimpleResource("apple.yml", []byte("issuer_id: [\n")),
+			server.Vault.PushSimpleResource("google.yml", []byte("oauth: [\n")),
+			server.Vault.PushSimpleResource("helius.yml", []byte("helius: [\n")),
+			server.Config.PushSimpleResource("play.yml", []byte("skus: [\n")),
+		}
+		for _, pop := range pops {
+			t.Cleanup(pop)
+		}
+
+		result, err := RunPaymentReconciliation(reconcileTestSession(t, ctx))
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Errors, 0)
+		connect.AssertEqual(t, len(result.SkippedStores), 4)
+		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketStripe, model.PaymentReconcileActionSkippedStore), 1)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketApple, model.PaymentReconcileActionSkippedStore), 1)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketGoogle, model.PaymentReconcileActionSkippedStore), 1)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketSolana, model.PaymentReconcileActionSkippedStore), 1)
+	})
+}
+
 // ----- stripe fake backend -----
 
 type stripeReconcileTestEnv struct {
 	// raw invoice objects the GET /v1/invoices listing serves
 	listInvoices []map[string]any
 	// invoice id -> the expanded object GET /v1/invoices/{id} serves
-	fullInvoices map[string]map[string]any
-	failList     bool
+	fullInvoices   map[string]map[string]any
+	failList       bool
+	statusRequests atomic.Int64
 
 	testServer *httptest.Server
 }
@@ -93,6 +310,7 @@ func newStripeReconcileTestEnv(t testing.TB) *stripeReconcileTestEnv {
 		})
 	})
 	mux.HandleFunc("GET /v1/invoices/{invoiceId}", func(w http.ResponseWriter, r *http.Request) {
+		env.statusRequests.Add(1)
 		invoice, ok := env.fullInvoices[r.PathValue("invoiceId")]
 		if !ok {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -567,6 +785,327 @@ func TestPaymentReconcileStripeCreditRacesLateWebhook(t *testing.T) {
 	})
 }
 
+// TestPaymentReconcileStripeRepairsMissingProMetadata pins the old active
+// status fast path: a credited renewal whose balance lost Pro metadata used to
+// be accepted as healthy because Stripe still said active. The repair must add
+// only a zero-value entitlement marker, preserve the original bytes/revenue,
+// refresh the cache after commit, and be idempotent. A healthy sibling is the
+// negative control.
+func TestPaymentReconcileStripeRepairsMissingProMetadata(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		stripeEnv := newStripeReconcileTestEnv(t)
+		now := server.NowUtc().Truncate(time.Second)
+
+		networkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "reconcilestripemetadata", server.NewId())
+		invoiceId := "in_reconcile_metadata_1"
+		startTime := now.Add(-24 * time.Hour)
+		endTime := now.Add(29 * 24 * time.Hour)
+		credited, err := stripeCreditInvoicePaid(
+			ctx,
+			networkId,
+			invoiceId,
+			model.UsdToNanoCents(7.0),
+			startTime,
+			endTime,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, credited, true)
+		stripeEnv.fullInvoices[invoiceId] = stripeTestFullInvoice(
+			invoiceId,
+			"sub_reconcile_metadata_1",
+			networkId,
+			startTime,
+			endTime.Add(-SubscriptionGracePeriod),
+			"active",
+			false,
+		)
+
+		healthyNetworkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, healthyNetworkId, "reconcilestripemetadatahealthy", server.NewId())
+		healthyInvoiceId := "in_reconcile_metadata_healthy_1"
+		credited, err = stripeCreditInvoicePaid(
+			ctx,
+			healthyNetworkId,
+			healthyInvoiceId,
+			model.UsdToNanoCents(7.0),
+			startTime,
+			endTime,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, credited, true)
+		stripeEnv.fullInvoices[healthyInvoiceId] = stripeTestFullInvoice(
+			healthyInvoiceId,
+			"sub_reconcile_metadata_healthy_1",
+			healthyNetworkId,
+			startTime,
+			endTime.Add(-SubscriptionGracePeriod),
+			"active",
+			false,
+		)
+
+		mismatchedNetworkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, mismatchedNetworkId, "reconcilestripemetadatamismatch", server.NewId())
+		mismatchedInvoiceId := "in_reconcile_metadata_mismatch_1"
+		credited, err = stripeCreditInvoicePaid(
+			ctx,
+			mismatchedNetworkId,
+			mismatchedInvoiceId,
+			model.UsdToNanoCents(7.0),
+			startTime,
+			endTime,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, credited, true)
+		stripeEnv.fullInvoices[mismatchedInvoiceId] = stripeTestFullInvoice(
+			mismatchedInvoiceId,
+			"sub_reconcile_metadata_mismatch_1",
+			mismatchedNetworkId,
+			startTime,
+			endTime.Add(-SubscriptionGracePeriod),
+			"active",
+			false,
+		)
+		server.Tx(ctx, func(tx server.PgTx) {
+			// Simulate corrupted local ownership: provider metadata still names
+			// the renewal network, but the immutable credit ledger does not.
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE stripe_invoice SET network_id = $2 WHERE invoice_id = $1`,
+				mismatchedInvoiceId,
+				healthyNetworkId,
+			))
+		})
+		removeProEntitlementMetadata(t, ctx, mismatchedNetworkId)
+
+		periodMismatchedNetworkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, periodMismatchedNetworkId, "reconcilestripemetadatawindow", server.NewId())
+		periodMismatchedInvoiceId := "in_reconcile_metadata_window_1"
+		credited, err = stripeCreditInvoicePaid(
+			ctx,
+			periodMismatchedNetworkId,
+			periodMismatchedInvoiceId,
+			model.UsdToNanoCents(7.0),
+			startTime,
+			endTime,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, credited, true)
+		stripeEnv.fullInvoices[periodMismatchedInvoiceId] = stripeTestFullInvoice(
+			periodMismatchedInvoiceId,
+			"sub_reconcile_metadata_window_1",
+			periodMismatchedNetworkId,
+			startTime.Add(time.Hour),
+			endTime.Add(-SubscriptionGracePeriod),
+			"active",
+			false,
+		)
+		removeProEntitlementMetadata(t, ctx, periodMismatchedNetworkId)
+
+		var beforeByteCount model.ByteCount
+		var beforeRevenue model.NanoCents
+		var beforeBalanceCount int
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE transfer_balance SET pro = false WHERE network_id = $1`,
+				networkId,
+			))
+		})
+		model.UpdateProNetwork(ctx, networkId)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), false)
+		server.Db(ctx, func(conn server.PgConn) {
+			result, queryErr := conn.Query(
+				ctx,
+				`
+				SELECT COUNT(*),
+				       COALESCE(SUM(start_balance_byte_count), 0),
+				       COALESCE(SUM(net_revenue_nano_cents + subsidy_net_revenue_nano_cents), 0)
+				FROM transfer_balance
+				WHERE network_id = $1
+				`,
+				networkId,
+			)
+			server.WithPgResult(result, queryErr, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&beforeBalanceCount, &beforeByteCount, &beforeRevenue))
+				}
+			})
+		})
+
+		result, err := RunPaymentReconciliation(reconcileTestSession(t, ctx))
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Credited, 0)
+		connect.AssertEqual(t, result.EntitlementsRepaired, 1)
+		connect.AssertEqual(t, result.StoreResults[model.SubscriptionMarketStripe].EntitlementsRepaired, 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
+
+		var afterByteCount model.ByteCount
+		var afterRevenue model.NanoCents
+		var afterBalanceCount int
+		var markerCount int
+		server.Db(ctx, func(conn server.PgConn) {
+			queryResult, queryErr := conn.Query(
+				ctx,
+				`
+				SELECT COUNT(*),
+				       COALESCE(SUM(start_balance_byte_count), 0),
+				       COALESCE(SUM(net_revenue_nano_cents + subsidy_net_revenue_nano_cents), 0),
+				       COUNT(*) FILTER (
+				           WHERE pro
+				             AND start_balance_byte_count = 0
+				             AND balance_byte_count = 0
+				             AND net_revenue_nano_cents = 0
+				             AND subsidy_net_revenue_nano_cents = 0
+				             AND NOT paid
+				       )
+				FROM transfer_balance
+				WHERE network_id = $1
+				`,
+				networkId,
+			)
+			server.WithPgResult(queryResult, queryErr, func() {
+				if queryResult.Next() {
+					server.Raise(queryResult.Scan(&afterBalanceCount, &afterByteCount, &afterRevenue, &markerCount))
+				}
+			})
+		})
+		connect.AssertEqual(t, afterBalanceCount, beforeBalanceCount+1)
+		connect.AssertEqual(t, afterByteCount, beforeByteCount)
+		connect.AssertEqual(t, afterRevenue, beforeRevenue)
+		connect.AssertEqual(t, markerCount, 1)
+		connect.AssertEqual(t, len(model.GetActiveTransferBalances(ctx, healthyNetworkId)), 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, mismatchedNetworkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, mismatchedNetworkId), 0)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, periodMismatchedNetworkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, periodMismatchedNetworkId), 0)
+
+		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketStripe, model.PaymentReconcileActionEntitlementRepaired), 1)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketStripe, model.PaymentReconcileActionCredited), 0)
+
+		result2, err := RunPaymentReconciliation(reconcileTestSession(t, ctx))
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result2.EntitlementsRepaired, 0)
+		server.Db(ctx, func(conn server.PgConn) {
+			queryResult, queryErr := conn.Query(ctx, `SELECT COUNT(*) FROM transfer_balance WHERE network_id = $1`, networkId)
+			server.WithPgResult(queryResult, queryErr, func() {
+				if queryResult.Next() {
+					server.Raise(queryResult.Scan(&afterBalanceCount))
+				}
+			})
+		})
+		connect.AssertEqual(t, afterBalanceCount, beforeBalanceCount+1)
+	})
+}
+
+// TestPaymentReconcileDryRunReportsMissingProMetadataWithoutRepair pins the
+// metadata-only dry-run contract: provider reads and the exact-window check
+// run, but no marker/cache update lands. A later real run performs the repair.
+func TestPaymentReconcileDryRunReportsMissingProMetadataWithoutRepair(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		stripeEnv := newStripeReconcileTestEnv(t)
+		now := server.NowUtc().Truncate(time.Second)
+		networkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "reconciledryrunmetadata", server.NewId())
+		invoiceId := "in_reconcile_dryrun_metadata_1"
+		startTime := now.Add(-24 * time.Hour)
+		endTime := now.Add(29 * 24 * time.Hour)
+		credited, err := stripeCreditInvoicePaid(
+			ctx,
+			networkId,
+			invoiceId,
+			model.UsdToNanoCents(7.0),
+			startTime,
+			endTime,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, credited, true)
+		stripeEnv.fullInvoices[invoiceId] = stripeTestFullInvoice(
+			invoiceId,
+			"sub_reconcile_dryrun_metadata_1",
+			networkId,
+			startTime,
+			endTime.Add(-SubscriptionGracePeriod),
+			"active",
+			false,
+		)
+		removeProEntitlementMetadata(t, ctx, networkId)
+
+		dryResult, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{
+				DryRun: true,
+				Stores: []string{model.SubscriptionMarketStripe},
+			},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, dryResult.EntitlementsRepaired, 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, networkId), 0)
+		dryEvents := model.GetPaymentReconciliationEvents(ctx, dryResult.RunId)
+		connect.AssertEqual(t, countReconcileEvents(dryEvents, model.SubscriptionMarketStripe, model.PaymentReconcileActionWouldRepairEntitlement), 1)
+
+		realResult, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketStripe}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, realResult.EntitlementsRepaired, 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, networkId), 1)
+	})
+}
+
+// TestPaymentReconcileDeletedNetworkMakesNoProviderStatusRequest proves the
+// owning iterator excludes orphaned renewal history before any per-account
+// provider lookup. The store-wide Stripe invoice listing still runs, but no
+// request is made for the deleted account's transaction.
+func TestPaymentReconcileDeletedNetworkMakesNoProviderStatusRequest(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		stripeEnv := newStripeReconcileTestEnv(t)
+		now := server.NowUtc()
+		orphanNetworkId := server.NewId()
+		// Seed retained historical evidence directly. The production renewal
+		// writer now rejects a missing network, but the reconciler must continue
+		// to exclude orphan rows created before that invariant was enforced.
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+					INSERT INTO subscription_renewal (
+						network_id, subscription_type, start_time, end_time,
+						net_revenue_nano_cents, market, transaction_id
+					)
+					VALUES ($1, $2, $3, $4, $5, $6, $7)
+				`,
+				orphanNetworkId,
+				model.SubscriptionTypeSupporter,
+				now.Add(-24*time.Hour),
+				now.Add(29*24*time.Hour),
+				model.UsdToNanoCents(7.0),
+				model.SubscriptionMarketStripe,
+				"in_reconcile_deleted_network_1",
+			))
+		})
+
+		result, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketStripe}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Errors, 0)
+		connect.AssertEqual(t, result.EntitlementsRepaired, 0)
+		connect.AssertEqual(t, stripeEnv.statusRequests.Load(), int64(0))
+	})
+}
+
 // TestPaymentReconcileStripeEndsRevokedNotCancelAtPeriodEnd pins the stripe
 // end direction AND the cancelled ≠ expired rule: a subscription Stripe says
 // is already over (canceled) is ended at now, while cancel-at-period-end with
@@ -742,6 +1281,156 @@ func TestPaymentReconcileAppleCreditsMissedRenewal(t *testing.T) {
 	})
 }
 
+// TestPaymentReconcileAppleRepairsMissingProMetadata proves that an
+// already-ledgered App Store transaction is not a terminal fast path. An
+// entitled, validated transaction whose exact local window lost Pro metadata
+// receives one metadata-only marker; a repeat status is a no-op.
+func TestPaymentReconcileAppleRepairsMissingProMetadata(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		appleEnv := newAppleReconcileTestEnv(t, []string{"supporter_monthly"})
+
+		networkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "reconcileapplemetadata", server.NewId())
+		now := server.NowUtc().Truncate(time.Millisecond)
+		transactionId := "3000000000000001"
+		purchaseTime := now.Add(-24 * time.Hour)
+		expiresTime := now.Add(29 * 24 * time.Hour)
+		appleTestCredit(
+			t,
+			ctx,
+			networkId,
+			transactionId,
+			"supporter_monthly",
+			purchaseTime,
+			expiresTime,
+		)
+		removeProEntitlementMetadata(t, ctx, networkId)
+
+		appleEnv.statuses[transactionId] = &appleSubscriptionStatusesResponse{
+			Data: []*appleSubscriptionGroup{
+				{
+					LastTransactions: []*appleLastTransaction{
+						{
+							Status:                1,
+							OriginalTransactionId: transactionId,
+							SignedTransactionInfo: appleTestJws(t, appleTestTransactionClaims(
+								t,
+								networkId,
+								transactionId,
+								"supporter_monthly",
+								purchaseTime,
+								expiresTime,
+							)),
+						},
+					},
+				},
+			},
+		}
+
+		mismatchedNetworkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, mismatchedNetworkId, "reconcileapplemetadatamismatch", server.NewId())
+		mismatchedTransactionId := "3000000000000002"
+		appleTestCredit(
+			t,
+			ctx,
+			mismatchedNetworkId,
+			mismatchedTransactionId,
+			"supporter_monthly",
+			purchaseTime,
+			expiresTime,
+		)
+		removeProEntitlementMetadata(t, ctx, mismatchedNetworkId)
+		appleEnv.statuses[mismatchedTransactionId] = &appleSubscriptionStatusesResponse{
+			Data: []*appleSubscriptionGroup{
+				{
+					LastTransactions: []*appleLastTransaction{
+						{
+							Status:                1,
+							OriginalTransactionId: mismatchedTransactionId,
+							SignedTransactionInfo: appleTestJws(t, appleTestTransactionClaims(
+								t,
+								networkId,
+								mismatchedTransactionId,
+								"supporter_monthly",
+								purchaseTime.Add(time.Hour),
+								expiresTime,
+							)),
+						},
+					},
+				},
+			},
+		}
+
+		ledgerMismatchedNetworkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, ledgerMismatchedNetworkId, "reconcileapplemetadataledger", server.NewId())
+		ledgerMismatchedTransactionId := "3000000000000003"
+		appleTestCredit(
+			t,
+			ctx,
+			ledgerMismatchedNetworkId,
+			ledgerMismatchedTransactionId,
+			"supporter_monthly",
+			purchaseTime,
+			expiresTime,
+		)
+		removeProEntitlementMetadata(t, ctx, ledgerMismatchedNetworkId)
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE apple_subscription_transaction SET network_id = $2 WHERE transaction_id = $1`,
+				ledgerMismatchedTransactionId,
+				networkId,
+			))
+		})
+		appleEnv.statuses[ledgerMismatchedTransactionId] = &appleSubscriptionStatusesResponse{
+			Data: []*appleSubscriptionGroup{
+				{
+					LastTransactions: []*appleLastTransaction{
+						{
+							Status:                1,
+							OriginalTransactionId: ledgerMismatchedTransactionId,
+							SignedTransactionInfo: appleTestJws(t, appleTestTransactionClaims(
+								t,
+								ledgerMismatchedNetworkId,
+								ledgerMismatchedTransactionId,
+								"supporter_monthly",
+								purchaseTime,
+								expiresTime,
+							)),
+						},
+					},
+				},
+			},
+		}
+
+		result, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketApple}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Credited, 0)
+		connect.AssertEqual(t, result.EntitlementsRepaired, 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, networkId), 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, mismatchedNetworkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, mismatchedNetworkId), 0)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, ledgerMismatchedNetworkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, ledgerMismatchedNetworkId), 0)
+		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketApple, model.PaymentReconcileActionEntitlementRepaired), 1)
+
+		result2, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketApple}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result2.EntitlementsRepaired, 0)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, networkId), 1)
+	})
+}
+
 // TestPaymentReconcileAppleEndsRevoked pins the apple end direction: the
 // store says the subscription is revoked (status 5), so the active
 // entitlement is ended at now -- while a subscriber in billing grace (status
@@ -886,6 +1575,117 @@ func TestPaymentReconcileGoogleCreditsMissedRenewal(t *testing.T) {
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, result2.Credited, 0)
 		connect.AssertEqual(t, len(model.GetActiveTransferBalances(ctx, networkId)), 1)
+	})
+}
+
+// TestPaymentReconcileGoogleRepairsMissingProMetadata pins the Play overlap
+// fast path. ACTIVE is authoritative only after the shared purchase-link
+// resolver maps the obfuscated subscription-payment id to the renewal's
+// network and the provider window exactly matches. The existing data grant is
+// untouched and one Pro marker restores the entitlement.
+func TestPaymentReconcileGoogleRepairsMissingProMetadata(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		playEnv := newPlayWebhookTestEnv(t, map[string]*Sku{
+			"supporter_monthly": {
+				FeeFraction:    0.3,
+				PriceAmountUsd: 5.0,
+				Supporter:      true,
+			},
+		})
+		previousHasCredentials := playReconcileHasCredentials
+		playReconcileHasCredentials = func() bool { return true }
+		t.Cleanup(func() { playReconcileHasCredentials = previousHasCredentials })
+
+		networkId := server.NewId()
+		userId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "reconcileplaymetadata", userId)
+		clientId := server.NewId()
+		userSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
+			NetworkId: networkId,
+			ClientId:  &clientId,
+			UserId:    userId,
+		})
+		paymentIdResult, err := model.SubscriptionCreatePaymentId(
+			&model.SubscriptionCreatePaymentIdArgs{},
+			userSession,
+		)
+		connect.AssertEqual(t, err, nil)
+
+		now := server.NowUtc().Truncate(time.Second)
+		startTime := now.Add(-24 * time.Hour)
+		expiryTime := now.Add(29 * 24 * time.Hour)
+		purchaseToken := "play-reconcile-metadata-token-1"
+		playEnv.subscriptions[purchaseToken] = playTestSubscription(
+			networkId,
+			"supporter_monthly",
+			startTime,
+			expiryTime,
+		)
+		playEnv.subscriptions[purchaseToken].ExternalAccountIdentifiers.ObfuscatedExternalAccountId =
+			paymentIdResult.SubscriptionPaymentId.String()
+
+		renewalResult, err := PlaySubscriptionRenewal(
+			&PlaySubscriptionRenewalArgs{
+				NetworkId:      networkId,
+				PackageName:    playPackageNameFunc(),
+				SubscriptionId: "supporter_monthly",
+				PurchaseToken:  purchaseToken,
+			},
+			userSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, renewalResult.Renewed, true)
+		removeProEntitlementMetadata(t, ctx, networkId)
+
+		mismatchedNetworkId := server.NewId()
+		mismatchedUserId := server.NewId()
+		mismatchedClientId := server.NewId()
+		model.Testing_CreateNetwork(ctx, mismatchedNetworkId, "reconcileplaymetadatamismatch", mismatchedUserId)
+		mismatchedSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
+			NetworkId: mismatchedNetworkId,
+			ClientId:  &mismatchedClientId,
+			UserId:    mismatchedUserId,
+		})
+		mismatchedToken := "play-reconcile-metadata-token-2"
+		playEnv.subscriptions[mismatchedToken] = playTestSubscription(
+			mismatchedNetworkId,
+			"supporter_monthly",
+			startTime,
+			expiryTime,
+		)
+		mismatchedRenewalResult, err := PlaySubscriptionRenewal(
+			&PlaySubscriptionRenewalArgs{
+				NetworkId:      mismatchedNetworkId,
+				PackageName:    playPackageNameFunc(),
+				SubscriptionId: "supporter_monthly",
+				PurchaseToken:  mismatchedToken,
+			},
+			mismatchedSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, mismatchedRenewalResult.Renewed, true)
+		removeProEntitlementMetadata(t, ctx, mismatchedNetworkId)
+		// The provider response is still ACTIVE, but its shared link resolver
+		// now names the sibling and its start does not match this renewal.
+		playEnv.subscriptions[mismatchedToken].ExternalAccountIdentifiers.ObfuscatedExternalAccountId =
+			paymentIdResult.SubscriptionPaymentId.String()
+		playEnv.subscriptions[mismatchedToken].StartTime = startTime.Add(time.Hour).UTC().Format(time.RFC3339)
+
+		result, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketGoogle}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Credited, 0)
+		connect.AssertEqual(t, result.EntitlementsRepaired, 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, networkId), 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, mismatchedNetworkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, mismatchedNetworkId), 0)
+		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketGoogle, model.PaymentReconcileActionEntitlementRepaired), 1)
 	})
 }
 
@@ -1363,4 +2163,117 @@ func TestPaymentReconcileSolanaEndsVanishedPayment(t *testing.T) {
 		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
 		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketSolana, model.PaymentReconcileActionEnded), 1)
 	})
+}
+
+// TestPaymentReconcileSolanaRepairsMissingProMetadata proves that only the
+// exact completed intent owner plus a successful finalized chain status can
+// restore metadata. The already-credited plan's bytes and revenue remain on
+// the original balance; reconciliation adds one zero-value Pro marker.
+func TestPaymentReconcileSolanaRepairsMissingProMetadata(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		disableAllReconcileStores(t)
+		solanaEnv := newSolanaReconcileTestEnv(t)
+
+		networkId := server.NewId()
+		userId := server.NewId()
+		clientId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "reconcilesolanametadata", userId)
+		userSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
+			NetworkId: networkId,
+			ClientId:  &clientId,
+			UserId:    userId,
+		})
+		webhookSession := session.Testing_CreateClientSession(ctx, nil)
+		reference := "reconcile-solana-metadata-ref-1"
+		signature := "sig-reconcile-solana-metadata-1"
+		connect.AssertEqual(
+			t,
+			model.CreateSolanaPaymentIntent(reference, 5.0, model.SolanaPlanMonthly, userSession),
+			nil,
+		)
+		webhookResult, err := HeliusWebhook(
+			[]*SolanaTransaction{solanaTestPayment(reference, signature, 5.0)},
+			webhookSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, webhookResult.Message, "Processed 1 matching payments")
+		solanaEnv.onChain[signature] = true
+
+		// Cross the existing finality grace while preserving the exact renewal
+		// and balance window relationship used by the metadata repair.
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+				UPDATE subscription_renewal
+				SET start_time = start_time - interval '2 hours'
+				WHERE network_id = $1 AND market = $2
+				`,
+				networkId,
+				model.SubscriptionMarketSolana,
+			))
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+				UPDATE transfer_balance
+				SET start_time = start_time - interval '2 hours', pro = false
+				WHERE network_id = $1
+				`,
+				networkId,
+			))
+		})
+		model.UpdateProNetwork(ctx, networkId)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), false)
+
+		mismatchedNetworkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, mismatchedNetworkId, "reconcilesolanametadatamismatch", server.NewId())
+		connect.AssertEqual(t, model.AddSubscriptionRenewal(ctx, &model.SubscriptionRenewal{
+			NetworkId:          mismatchedNetworkId,
+			SubscriptionType:   model.SubscriptionTypeSupporter,
+			StartTime:          server.NowUtc().Add(-2 * time.Hour),
+			EndTime:            server.NowUtc().Add(29 * 24 * time.Hour),
+			NetRevenue:         model.UsdToNanoCents(5.0),
+			SubscriptionMarket: model.SubscriptionMarketSolana,
+			TransactionId:      reference,
+		}), nil)
+
+		result, err := RunPaymentReconciliationWithOptions(
+			reconcileTestSession(t, ctx),
+			&PaymentReconcileRunOptions{Stores: []string{model.SubscriptionMarketSolana}},
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Credited, 0)
+		connect.AssertEqual(t, result.EntitlementsRepaired, 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, networkId), 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, mismatchedNetworkId), false)
+		connect.AssertEqual(t, countProEntitlementRepairMarkers(ctx, mismatchedNetworkId), 0)
+		events := model.GetPaymentReconciliationEvents(ctx, result.RunId)
+		connect.AssertEqual(t, countReconcileEvents(events, model.SubscriptionMarketSolana, model.PaymentReconcileActionEntitlementRepaired), 1)
+	})
+}
+
+// TestSolanaStatusConfirmsPaymentRequiresSuccessfulConfirmation keeps a
+// merely present signature status from becoming payment authority. Execution
+// errors, pre-confirmation states, and missing states never permit repair.
+func TestSolanaStatusConfirmsPaymentRequiresSuccessfulConfirmation(t *testing.T) {
+	confirmed := "confirmed"
+	finalized := "finalized"
+	processed := "processed"
+	if !solanaStatusConfirmsPayment(nil, &confirmed) {
+		t.Fatal("confirmed successful status was rejected")
+	}
+	if !solanaStatusConfirmsPayment(nil, &finalized) {
+		t.Fatal("finalized successful status was rejected")
+	}
+	if solanaStatusConfirmsPayment(map[string]any{"synthetic": true}, &finalized) {
+		t.Fatal("failed finalized status permitted repair")
+	}
+	if solanaStatusConfirmsPayment(nil, &processed) {
+		t.Fatal("unconfirmed status permitted repair")
+	}
+	if solanaStatusConfirmsPayment(nil, nil) {
+		t.Fatal("missing confirmation status permitted repair")
+	}
 }

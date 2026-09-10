@@ -8,7 +8,7 @@
 // ticket per identity, with hysteresis (n consecutive failing ticks before it
 // opens) and auto-resolve (healthy band held for the resolve window). The
 // manager is not safe for concurrent use; the caller serializes ingest.
-package main
+package monitor
 
 import (
 	"context"
@@ -119,6 +119,9 @@ func (self *ticketManager) ingestBroken(ctx context.Context, f finding) {
 	t.brokenStreak += 1
 	t.healthyStreak = 0
 	t.tier = f.tier
+	if 0 < f.pageSustain && f.pageSustain <= t.brokenStreak {
+		t.tier = tierPage
+	}
 	t.last = f
 	t.updated = now
 

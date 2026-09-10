@@ -16,8 +16,8 @@ package proxy
 // client, loading https://ur.io through each path.
 //
 // The SDK is pointed at the local servers via sdk.Testing_NewNetworkSpaceWithUrls.
-// The default platform transport mode (auto) uses H1 (plain websocket), so no
-// TLS/quic is required between the SDK and the local servers.
+// Hosted proxy devices are pinned to H1 (plain websocket), so no TLS/quic is
+// required between the SDK and the local servers.
 //
 // NOTE: like connect_test, this expects the standard local test environment
 // (WARP_ENV=local plus the local postgres/redis and vault, e.g. via test.sh)
@@ -151,6 +151,7 @@ type proxyTestHarness struct {
 	deviceRpcUrl  string
 	connectServer *connectserver.ConnectHandler
 	exchange      *connectserver.Exchange
+	closeProvider func(testing.TB)
 
 	socksPort int
 	httpPort  int
@@ -163,8 +164,29 @@ type proxyTestHarness struct {
 
 func (self *proxyTestHarness) close(t testing.TB) {
 	self.closeOnce.Do(func() {
+		closeProxyDeviceManager(t, self.proxyDeviceManager)
+		if self.closeProvider != nil {
+			self.closeProvider(t)
+		}
+		if self.networkSpace != nil {
+			self.networkSpace.Close()
+		}
 		closeProxyConnectLifecycles(t, self.connectServer, self.exchange, self.cancel)
 	})
+}
+
+// Joins every admitted hosted device while its in-process Connect peer is
+// still available for final contract cleanup. Returning from one acceptance
+// test must not leave netstacks competing with the next test in the package.
+func closeProxyDeviceManager(t testing.TB, manager *ProxyDeviceManager) {
+	if manager == nil {
+		return
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer closeCancel()
+	if err := manager.CloseAndWait(closeCtx); err != nil {
+		t.Errorf("proxy device manager did not finish during harness teardown: %v", err)
+	}
 }
 
 // Describes the shutdown boundary shared by the in-process connect handler
@@ -259,6 +281,7 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 	setProxyTestEnv()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	// ---- local connect server (plain ws, in-process) -------------------------
 	connectHost := "proxytest"
@@ -310,13 +333,13 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 
 	// ---- the test network space pointing the SDK at the local servers --------
 	connectSettings := connect.DefaultConnectSettings()
-	connectSettings.DisableIpv6 = true
 	networkSpace := sdk.Testing_NewNetworkSpaceWithUrls(
 		ctx,
 		fmt.Sprintf("http://127.0.0.1:%d", testApiPort),
 		fmt.Sprintf("ws://127.0.0.1:%d", connectClientPort),
 		connectSettings,
 	)
+	t.Cleanup(networkSpace.Close)
 
 	apiUrl := fmt.Sprintf("http://127.0.0.1:%d", testApiPort)
 	platformUrl := fmt.Sprintf("ws://127.0.0.1:%d", connectClientPort)
@@ -336,6 +359,8 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 	model.Testing_CreateDevice(ctx, providerNetworkId, providerDeviceId, providerClientId, "provider", "provider")
 	redeemBalance(t, ctx, providerNetworkId, opts.providerInitialBalance)
 
+	var closeProvider func(testing.TB)
+	var closeProviderOnce sync.Once
 	if !opts.controlPlaneOnly {
 		providerByJwt := jwt.NewByJwt(providerNetworkId, providerUserId, providerNetworkName, false, false).
 			Client(providerDeviceId, providerClientId).Sign()
@@ -399,6 +424,27 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 			return err == nil && len(modes) > 0
 		})
 		fmt.Printf("[progress]provider provide registered\n")
+		closeProvider = func(t testing.TB) {
+			closeProviderOnce.Do(func() {
+				providerRemoteNat.Close()
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer closeCancel()
+				if err := providerTransport.CloseAndWait(closeCtx); err != nil {
+					t.Errorf("provider transport did not finish during harness teardown: %v", err)
+				}
+				if err := providerLocalUserNat.CloseAndWait(closeCtx); err != nil {
+					t.Errorf("provider local NAT did not finish during harness teardown: %v", err)
+				}
+				if err := providerClient.CloseAndWait(closeCtx); err != nil {
+					t.Errorf("provider client did not finish during harness teardown: %v", err)
+				}
+				if err := providerOob.CloseAndWait(closeCtx); err != nil {
+					t.Errorf("provider out-of-band control did not finish during harness teardown: %v", err)
+				}
+				providerClientStrategy.Close()
+			})
+		}
+		t.Cleanup(func() { closeProvider(t) })
 	}
 
 	// ---- the proxy device's network/device/client + balance ------------------
@@ -471,7 +517,7 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 	proxyDeviceManager := NewProxyDeviceManager(ctx, pdmSettings)
 	go func() {
 		<-ctx.Done()
-		proxyDeviceManager.Close()
+		_ = proxyDeviceManager.CloseAndWait(context.Background())
 	}()
 
 	deviceRpcUrl := ""
@@ -565,6 +611,7 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 		deviceRpcUrl:       deviceRpcUrl,
 		connectServer:      connectHandler,
 		exchange:           exchange,
+		closeProvider:      closeProvider,
 		socksPort:          testPorts.socks,
 		httpPort:           testPorts.http,
 		httpsPort:          testPorts.https,
@@ -829,18 +876,12 @@ func TestProxyIdleDeviceRecreate(t *testing.T) {
 	})
 }
 
-// TestProxyDeadDeviceRecreate covers the case the idle path does not: the
-// device's egress dies while its context stays live. In production this is the
-// resident moving / the connection idling out and the egress window collapsing —
-// none of which cancel the proxy device context, so UpdateActivity (a context-only
-// check) keeps reporting the device active. OpenProxyDevice must instead notice
-// the device can no longer serve and recreate it.
-//
-// The egress death is simulated by closing the DeviceLocal directly, which leaves
-// the proxy device context live but collapses the egress window
-// (GetWindowStatus().MinSatisfied == false) — the same observable a real resident
-// move / idle collapse produces.
-func TestProxyDeadDeviceRecreate(t *testing.T) {
+// TestProxyClosedDeviceRecreate covers the case the proxy context alone does
+// not: its DeviceLocal lifecycle can be closed directly while the outer proxy
+// context remains live. OpenProxyDevice must replace that truly closed device,
+// while TestProxyDeviceActiveKeepsUnsatisfiedWindowForForeverRetry separately
+// proves that a live but unsatisfied window is retained.
+func TestProxyClosedDeviceRecreate(t *testing.T) {
 	if testing.Short() {
 		return
 	}
@@ -858,14 +899,14 @@ func TestProxyDeadDeviceRecreate(t *testing.T) {
 		if ready := pd1.WaitForReady(h.ctx, 60*time.Second); !ready {
 			t.Fatalf("proxy device did not become ready")
 		}
-		// confirm it serves https, which also marks it everReady via the reuse gate
+		// confirm it serves https before closing the inner lifecycle
 		testProxyHttps(t, h)
 
 		// ---- kill the egress without canceling the device context ----
 		pd1.deviceLocal.Close()
 
-		// precondition: the old context-only check still reports the dead device
-		// as active (this is the bug), but its egress window is gone
+		// The outer proxy context remains live, while DeviceLocal now reports its
+		// distinct lifecycle completion and the egress window is gone.
 		if !pd1.UpdateActivity() {
 			t.Fatalf("precondition: expected pd1 context still live after deviceLocal.Close()")
 		}
@@ -992,21 +1033,13 @@ func startWgClient(t testing.TB, ctx context.Context, wgConfig *model.WgConfig, 
 
 	mtu := 1420
 
+	clientCtx, clientCancel := context.WithCancel(ctx)
 	clientTun := tuntest.NewChannelTUN()
 	clientDevice := uwgdevice.NewDevice(
 		clientTun.TUN(),
 		conn.NewDefaultBind(),
 		logger.NewLogger(logger.LogLevelError, "wgclient: "),
 	)
-	var closeOnce sync.Once
-	closeWgClient := func() {
-		closeOnce.Do(clientDevice.Close)
-	}
-	go func() {
-		<-ctx.Done()
-		closeWgClient()
-	}()
-
 	zeroPort := 0
 	wgClientConfig := wgtypes.Config{
 		PrivateKey:   &clientPrivate,
@@ -1027,20 +1060,46 @@ func startWgClient(t testing.TB, ctx context.Context, wgConfig *model.WgConfig, 
 		},
 	}
 	if err := clientDevice.IpcSet(&wgClientConfig); err != nil {
+		clientCancel()
+		clientDevice.Close()
 		t.Fatalf("wg: configure client device: %v", err)
 	}
 	if err := clientDevice.Up(); err != nil {
+		clientCancel()
+		clientDevice.Close()
 		t.Fatalf("wg: bring client up: %v", err)
 	}
 
-	wgStack, err := newWgClientStack(ctx, wgConfig.ClientIpv4, mtu, clientTun)
+	wgStack, err := newWgClientStack(clientCtx, wgConfig.ClientIpv4, mtu, clientTun)
 	if err != nil {
+		clientCancel()
+		clientDevice.Close()
 		t.Fatalf("wg: create client netstack: %v", err)
 	}
-
-	return &http.Transport{
+	transport := &http.Transport{
 		DialContext: wgStack.DialContext,
-	}, closeWgClient
+	}
+	var closeOnce sync.Once
+	closeDone := make(chan struct{})
+	closeWgClient := func() {
+		closeOnce.Do(func() {
+			defer close(closeDone)
+			transport.CloseIdleConnections()
+			clientCancel()
+			clientDevice.Close()
+			wgStack.CloseAndWait()
+		})
+		<-closeDone
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeWgClient()
+		case <-closeDone:
+		}
+	}()
+
+	return transport, closeWgClient
 }
 
 // requireProxyGet issues a GET to the real target through the given transport,
@@ -1091,11 +1150,16 @@ func requireProxyGet(t testing.TB, leg string, transport *http.Transport) {
 // from the netstack are fed to the wg device (encrypted, sent to the wg server);
 // inbound decrypted packets are injected back into the netstack.
 type wgClientStack struct {
-	stack *stack.Stack
-	nicId tcpip.NICID
+	stack     *stack.Stack
+	nicId     tcpip.NICID
+	endpoint  *channel.Endpoint
+	cancel    context.CancelFunc
+	workers   sync.WaitGroup
+	closeOnce sync.Once
 }
 
 func newWgClientStack(ctx context.Context, clientIPv4 netip.Addr, mtu int, tunDev *tuntest.ChannelTUN) (*wgClientStack, error) {
+	stackCtx, cancel := context.WithCancel(ctx)
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
@@ -1110,8 +1174,13 @@ func newWgClientStack(ctx context.Context, clientIPv4 netip.Addr, mtu int, tunDe
 
 	nicId := tcpip.NICID(1)
 	ep := channel.New(512, uint32(mtu), "")
+	result := &wgClientStack{stack: s, nicId: nicId, endpoint: ep, cancel: cancel}
+	cleanup := func() {
+		result.CloseAndWait()
+	}
 
 	if tcpipErr := s.CreateNIC(nicId, ep); tcpipErr != nil {
+		cleanup()
 		return nil, fmt.Errorf("create nic: %v", tcpipErr)
 	}
 	protoAddr := tcpip.ProtocolAddress{
@@ -1119,14 +1188,17 @@ func newWgClientStack(ctx context.Context, clientIPv4 netip.Addr, mtu int, tunDe
 		AddressWithPrefix: tcpip.AddrFromSlice(clientIPv4.AsSlice()).WithPrefix(),
 	}
 	if tcpipErr := s.AddProtocolAddress(nicId, protoAddr, stack.AddressProperties{}); tcpipErr != nil {
+		cleanup()
 		return nil, fmt.Errorf("add address: %v", tcpipErr)
 	}
 	s.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicId})
 
 	// netstack -> wg device (app sends): drain ep, write to the tun outbound.
+	result.workers.Add(1)
 	go func() {
+		defer result.workers.Done()
 		for {
-			pkt := ep.ReadContext(ctx)
+			pkt := ep.ReadContext(stackCtx)
 			if pkt == nil {
 				return
 			}
@@ -1134,19 +1206,24 @@ func newWgClientStack(ctx context.Context, clientIPv4 netip.Addr, mtu int, tunDe
 			pkt.DecRef()
 			select {
 			case tunDev.Outbound <- b:
-			case <-ctx.Done():
+			case <-stackCtx.Done():
 				return
 			}
 		}
 	}()
 
 	// wg device -> netstack (app receives): inject decrypted packets.
+	result.workers.Add(1)
 	go func() {
+		defer result.workers.Done()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-stackCtx.Done():
 				return
-			case p := <-tunDev.Inbound:
+			case p, ok := <-tunDev.Inbound:
+				if !ok {
+					return
+				}
 				pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buffer.MakeWithData(p),
 				})
@@ -1156,7 +1233,20 @@ func newWgClientStack(ctx context.Context, clientIPv4 netip.Addr, mtu int, tunDe
 		}
 	}()
 
-	return &wgClientStack{stack: s, nicId: nicId}, nil
+	return result, nil
+}
+
+// CloseAndWait retires the link bridges and every gVisor protocol worker. A
+// canceled bridge context alone does not stop the TCP dispatcher created by a
+// dial, so each acceptance-test leg must close and join the stack itself.
+func (self *wgClientStack) CloseAndWait() {
+	self.closeOnce.Do(func() {
+		self.cancel()
+		self.endpoint.Close()
+		self.stack.Close()
+		self.stack.Wait()
+		self.workers.Wait()
+	})
 }
 
 func (self *wgClientStack) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {

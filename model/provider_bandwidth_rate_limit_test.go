@@ -5,8 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-playground/assert/v2"
-
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
 )
 
@@ -23,20 +22,20 @@ func TestReserveProviderBandwidthSlotFillsBucketThenSpillsToNext(t *testing.T) {
 		half := MaxProviderBandwidthBytesPerBucket() / 2
 
 		_, bucket1, err := ReserveProviderBandwidthSlot(ctx, clientIdA, half)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, bucket1, currentBucket)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, bucket1, currentBucket)
 
 		// the remaining half fits exactly at the current bucket's ceiling,
 		// even though it's a different provider
 		_, bucketStart, err := ReserveProviderBandwidthSlot(ctx, clientIdB, MaxProviderBandwidthBytesPerBucket()-half)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, bucketStart, currentBucket)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, bucketStart, currentBucket)
 
 		// the current bucket is now fully spent; the next reservation must
 		// spill into the next hour instead of being rejected
 		_, bucket2, err := ReserveProviderBandwidthSlot(ctx, clientIdA, 1)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, bucket2, currentBucket.Add(ProviderBandwidthBucketDuration))
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, bucket2, currentBucket.Add(ProviderBandwidthBucketDuration))
 	})
 }
 
@@ -49,12 +48,12 @@ func TestReserveProviderBandwidthSlotErrorsWhenAllBucketsFull(t *testing.T) {
 
 		for i := 0; i < MaxProviderBandwidthLookaheadBuckets; i++ {
 			_, _, err := ReserveProviderBandwidthSlot(ctx, server.NewId(), MaxProviderBandwidthBytesPerBucket())
-			assert.Equal(t, err, nil)
+			connect.AssertEqual(t, err, nil)
 		}
 
 		// every bucket in the lookahead window is now full
 		_, _, err := ReserveProviderBandwidthSlot(ctx, server.NewId(), 1)
-		assert.NotEqual(t, err, nil)
+		connect.AssertNotEqual(t, err, nil)
 	})
 }
 
@@ -69,15 +68,15 @@ func TestCancelProviderBandwidthReservationFreesSlot(t *testing.T) {
 		currentBucket := providerBandwidthBucketStart(server.NowUtc())
 
 		reservationId, bucketStart, err := ReserveProviderBandwidthSlot(ctx, clientId, MaxProviderBandwidthBytesPerBucket())
-		assert.Equal(t, err, nil)
-		assert.Equal(t, bucketStart, currentBucket)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, bucketStart, currentBucket)
 
 		CancelProviderBandwidthReservation(ctx, reservationId)
 
 		// the current bucket's full ceiling must be available again
 		_, bucketStart, err = ReserveProviderBandwidthSlot(ctx, clientId, MaxProviderBandwidthBytesPerBucket())
-		assert.Equal(t, err, nil)
-		assert.Equal(t, bucketStart, currentBucket)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, bucketStart, currentBucket)
 	})
 }
 
@@ -101,7 +100,7 @@ func TestRemoveExpiredProviderBandwidthQuota(t *testing.T) {
 		})
 
 		_, _, err := ReserveProviderBandwidthSlot(ctx, server.NewId(), 7)
-		assert.Equal(t, err, nil)
+		connect.AssertEqual(t, err, nil)
 
 		RemoveExpiredProviderBandwidthQuota(ctx, currentBucket.Add(-48*time.Hour))
 
@@ -116,7 +115,7 @@ func TestRemoveExpiredProviderBandwidthQuota(t *testing.T) {
 		})
 		// the old (72h back) row must be gone; the current-bucket row (7)
 		// from ReserveProviderBandwidthSlot must remain
-		assert.Equal(t, total, int64(7))
+		connect.AssertEqual(t, total, int64(7))
 	})
 }
 
@@ -125,9 +124,9 @@ func TestRemoveExpiredProviderBandwidthQuota(t *testing.T) {
 // the CONSERVATIVE default -- never to something larger than a small
 // deployment can afford.
 func TestActiveBandwidthBudgetFallsBackToTheConservativeDefault(t *testing.T) {
-	// beta supplies provider_bandwidth.yml, so this asserts the relationship
-	// rather than a fixed number: whatever is configured, the default it would
-	// fall back to must be the smaller, safer value.
+	// a deployment may supply provider_bandwidth.yml, so this asserts the
+	// relationship rather than a fixed number: whatever is configured, the
+	// default it would fall back to must be the smaller, safer value.
 	if defaultActiveBandwidthProbesPerBucket <= 0 {
 		t.Fatal("the default budget must be positive; zero would reject every probe")
 	}

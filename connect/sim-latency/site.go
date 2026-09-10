@@ -8,8 +8,9 @@ package main
 // continues deeper (a "next page" link) and the rest are leaves (sub-
 // resources), so a crawl loads ~1 + depth*branching pages with a mean depth of
 // K — bounded, but deep enough to exercise sequential discovery. Responses are
-// deterministic from (seed, path) so runs reproduce, and carry a random-sized
-// body so throughput is actually moved.
+// deterministic from (seed, crawl index, path) so paired runs reproduce while
+// one workload contains a real distribution of depths and body sizes. Without
+// the crawl index every arrival shares the root page's single geometric draw.
 //
 // The site listens on a real socket; providers egress to it over real OS
 // sockets (loopback), which the disabled security policy permits.
@@ -30,7 +31,11 @@ import (
 	"time"
 )
 
-const siteMaxDepth = 24
+const (
+	siteMaxDepth        = 24
+	siteWarmupPath      = "/.well-known/sim-latency-warmup"
+	siteWarmupBodyBytes = 4 * 1024
+)
 
 type siteHandler struct {
 	seed     int64
@@ -121,13 +126,24 @@ func (self *siteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if n := self.requests.Add(1); n <= 5 || n%1000 == 0 {
 		logf("fake site received request #%d: %s", n, r.URL.Path)
 	}
+	// Path establishment must not inherit a scored page's seeded body size. A
+	// download-tier root can otherwise turn a usable slow exit into a false
+	// establishment failure at the warmup cohort deadline.
+	if r.URL.Path == siteWarmupPath {
+		self.writePage(w, sitePage{Size: siteWarmupBodyBytes})
+		return
+	}
 	remaining, ok := self.parsePath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 
-	pageRng := self.pathRng(r.URL.Path)
+	// The client gives each admitted crawl a stable query index. Include it in
+	// the root identity so depth and body-size sampling happen per crawl; child
+	// tokens carry that identity through the rest of the tree.
+	pageIdentity := r.URL.RequestURI()
+	pageRng := self.pathRng(pageIdentity)
 
 	if r.URL.Path == "/" {
 		// draw the crawl depth (mean K), capped
@@ -165,20 +181,25 @@ func (self *siteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// one child continues deeper; the rest are leaves
 				childRemaining = remaining - 1
 			}
-			token := self.childToken(r.URL.Path, i)
+			token := self.childToken(pageIdentity, i)
 			urls = append(urls, fmt.Sprintf("/p/%d/%s", childRemaining, token))
 		}
 	}
 
-	page := sitePage{Urls: urls, Size: bodySize}
+	self.writePage(w, sitePage{Urls: urls, Size: bodySize})
+}
+
+// Writes the page header and deterministic padding shared by scored and
+// warmup responses.
+func (self *siteHandler) writePage(w http.ResponseWriter, page sitePage) {
 	headerBytes, _ := json.Marshal(page)
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(headerBytes)+1+bodySize))
+	w.Header().Set("Content-Length", strconv.Itoa(len(headerBytes)+1+page.Size))
 	w.WriteHeader(http.StatusOK)
 	w.Write(headerBytes)
 	w.Write([]byte("\n"))
-	writePadding(w, bodySize)
+	writePadding(w, page.Size)
 }
 
 // parsePath returns the remaining depth encoded in the path. "/" is the root;

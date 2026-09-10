@@ -4,25 +4,29 @@
 # github.com/urnetwork/server and point the well-known hostnames at them.
 #
 # It:
-#   1. reads the postgres/redis credentials + ports from vault/local/{pg,redis}.yml
-#      (the single source of truth),
+#   1. reads the postgres/redis credentials + ports from the selected local
+#      vault resources (or the checked-in throwaway fallback),
 #   2. on Linux, temporarily widens the ephemeral TCP port range and listen
 #      queues for full-scale local load simulations,
-#   3. adds a dedicated loopback-alias IP (LOCAL_HOST_IP, default 10.213.0.1) to
-#      the loopback interface -- deliberately NOT 127.0.0.1 (see SAFETY below),
-#   4. points  local-pg.bringyour.com / local-redis.bringyour.com  at that IP in
-#      /etc/hosts for as long as this script runs,
+#   3. claims exclusive ownership of the local service names and points them at
+#      a dedicated address (LOCAL_HOST_IP, default 10.213.0.1) in /etc/hosts,
+#   4. adds that address to the loopback interface -- deliberately NOT
+#      127.0.0.1 (see SAFETY below),
 #   5. starts postgres + redis on a dedicated docker network, publishing their
 #      ports on LOCAL_HOST_IP,
-#   6. blocks in the foreground streaming container logs, and
-#   7. on exit (Ctrl-C or otherwise) restores the port range and /etc/hosts,
-#      stops the containers, and removes the loopback alias.
+#   6. publishes a token-bound readiness attestation for the test harness,
+#   7. blocks in the foreground streaming container logs, and
+#   8. on exit (Ctrl-C or otherwise) withdraws readiness first, restores the
+#      port range and /etc/hosts, stops the containers, and removes the loopback
+#      alias.
 #
-# SAFETY: the local hostnames must never resolve to 127.0.0.1. Tests create and
-# DROP databases, and a tunnel to a real (prod) database commonly listens on
-# 127.0.0.1:5432 -- so a stray 127.0.0.1 mapping could let a test wipe prod.
-# LOCAL_HOST_IP is a distinct dedicated address; the worst case when the stack
-# is down is "connection refused", never a real database.
+# SAFETY: each local hostname must resolve only to LOCAL_HOST_IP, never to a
+# second address or 127.0.0.1. Tests create and DROP databases, and a tunnel to
+# a real (prod) database commonly listens on 127.0.0.1:5432. The launcher does
+# not guess which resolver result is safe or rewrite operator-owned aliases: an
+# unmanaged alias, legacy managed block, or existing launcher lock stops startup
+# before host/network/Docker mutation. LOCAL_HOST_IP is a distinct dedicated
+# address; the worst case when the stack is down is "connection refused".
 #
 # Run it in its own terminal, then run the tests from another, e.g.:
 #   ./test.sh -run TestFoo
@@ -63,16 +67,31 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 SERVER_DIR="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 URNETWORK_HOME="$(cd -- "$SERVER_DIR/.." >/dev/null 2>&1 && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+LOCAL_STATE_FILE="$SCRIPT_DIR/run-local-state.sh"
+LOCAL_SERVICES_FILE="$SCRIPT_DIR/run-local-services.sh"
 OS="$(uname -s)"
 
+[[ -f "$LOCAL_STATE_FILE" ]] || die "local state helper not found: $LOCAL_STATE_FILE"
+source "$LOCAL_STATE_FILE"
+[[ -f "$LOCAL_SERVICES_FILE" ]] || die "local services helper not found: $LOCAL_SERVICES_FILE"
+source "$LOCAL_SERVICES_FILE"
+
 WARP_ENV="${WARP_ENV:-local}"
-# Prefer explicit warp overrides, else $WARP_HOME/vault, else the repo layout.
-if [[ -n "${WARP_VAULT_HOME:-}" ]]; then
+[[ "$WARP_ENV" == "local" ]] || die "refusing WARP_ENV=$WARP_ENV; the local test stack requires WARP_ENV=local"
+
+# Prefer an explicit warp override, then an existing sibling vault checkout, and
+# finally the checked-in throwaway fixture. An explicit override remains
+# fail-closed so a typo never silently selects different credentials.
+if [[ "${WARP_TEST_ENV_USE_PORTABLE_RESOURCES:-0}" == "1" ]]; then
+  VAULT_ROOT="$SCRIPT_DIR/testdata/vault"
+elif [[ -n "${WARP_VAULT_HOME:-}" ]]; then
   VAULT_ROOT="$WARP_VAULT_HOME"
-elif [[ -n "${WARP_HOME:-}" ]]; then
+elif [[ -n "${WARP_HOME:-}" && -f "$WARP_HOME/vault/$WARP_ENV/pg.yml" && -f "$WARP_HOME/vault/$WARP_ENV/redis.yml" ]]; then
   VAULT_ROOT="$WARP_HOME/vault"
-else
+elif [[ -f "$URNETWORK_HOME/vault/$WARP_ENV/pg.yml" && -f "$URNETWORK_HOME/vault/$WARP_ENV/redis.yml" ]]; then
   VAULT_ROOT="$URNETWORK_HOME/vault"
+else
+  VAULT_ROOT="$SCRIPT_DIR/testdata/vault"
 fi
 VAULT_LOCAL="$VAULT_ROOT/$WARP_ENV"
 PG_YML="$VAULT_LOCAL/pg.yml"
@@ -81,6 +100,7 @@ REDIS_YML="$VAULT_LOCAL/redis.yml"
 [[ -f "$COMPOSE_FILE" ]] || die "compose file not found: $COMPOSE_FILE"
 [[ -f "$PG_YML" ]]       || die "postgres vault config not found: $PG_YML (set WARP_VAULT_HOME?)"
 [[ -f "$REDIS_YML" ]]    || die "redis vault config not found: $REDIS_YML (set WARP_VAULT_HOME?)"
+log "using local test resources from $VAULT_LOCAL"
 
 # --- dedicated addressing (never 127.0.0.1) ----------------------------------
 
@@ -134,6 +154,7 @@ export POSTGRES_SUPERUSER_PASSWORD="${POSTGRES_SUPERUSER_PASSWORD:-postgres}"
 
 # --- docker / compose plumbing ----------------------------------------------
 
+command -v nc >/dev/null 2>&1 || die "nc not found on PATH (required for bounded service probes)"
 command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 DOCKER=(docker)
 COMPOSE_ENV_VARS="APP_DB_USER,APP_DB_PASSWORD,APP_DB_NAME,POSTGRES_PORT,REDIS_PORT,LOCAL_BIND_IP,LOCAL_DOCKER_SUBNET,POSTGRES_SUPERUSER_PASSWORD"
@@ -176,11 +197,7 @@ wait_healthy() { # wait_healthy CONTAINER TIMEOUT_SECONDS
 }
 
 port_open() { # port_open HOST PORT
-  if command -v nc >/dev/null 2>&1; then
-    nc -z -w2 "$1" "$2" >/dev/null 2>&1
-  else
-    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&-; return 0; } || return 1
-  fi
+  nc -z -w 2 -- "$1" "$2" </dev/null >/dev/null 2>&1
 }
 
 verify_reachable() { # confirm the dedicated address actually serves the DBs
@@ -397,46 +414,48 @@ loopback_alias() { # loopback_alias add|del
 # --- /etc/hosts management ---------------------------------------------------
 
 HOSTS_FILE=/etc/hosts
+RUN_LOCK_DIR=/tmp/urnetwork-server-run-local.lock
 MARKER_BEGIN="# >>> urnetwork local-env (server/local/run-local.sh) >>>"
 MARKER_END="# <<< urnetwork local-env (server/local/run-local.sh) <<<"
-HOSTS_BACKUP="$(mktemp -t urnetwork-hosts.XXXXXX)"
-cp "$HOSTS_FILE" "$HOSTS_BACKUP"   # full safety copy of the original
+HOSTS_BACKUP=""
+HOSTS_APPLIED=""
 
-# print /etc/hosts with any managed block (from a prior/crashed run) removed
-strip_block() {
-  awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
-    $0 == b { inblk = 1 }
-    inblk != 1 { print }
-    $0 == e { inblk = 0 }
-  ' "$HOSTS_FILE"
+# The state helper defaults to an unprivileged copy for isolated unit tests.
+# The real hosts file is the one operation here that requires elevation.
+local_hosts_replace_file() {
+  sudo cp "$1" "$2"
 }
 
-install_hosts() {
-  local tmp; tmp="$(mktemp -t urnetwork-hosts.XXXXXX)"
-  {
-    strip_block
-    printf '%s\n' "$MARKER_BEGIN"
-    printf '%s\t%s\n' "$HOSTS_IP" "$PG_HOST"
-    printf '%s\t%s\n' "$HOSTS_IP" "$REDIS_HOST"
-    printf '%s\n' "$MARKER_END"
-  } > "$tmp"
-  sudo cp "$tmp" "$HOSTS_FILE"
-  rm -f "$tmp"
+flush_hosts_cache() {
   if [[ "$OS" == Darwin ]]; then
     sudo dscacheutil -flushcache 2>/dev/null || true
     sudo killall -HUP mDNSResponder 2>/dev/null || true
   fi
 }
 
-restore_hosts() {
-  # Re-strip our block from the *current* file, so concurrent edits survive.
-  local tmp; tmp="$(mktemp -t urnetwork-hosts.XXXXXX)"
-  if strip_block > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
-    sudo cp "$tmp" "$HOSTS_FILE"
-  else
-    sudo cp "$HOSTS_BACKUP" "$HOSTS_FILE"   # fallback to the original
+install_hosts() {
+  if ! local_hosts_install \
+      "$HOSTS_FILE" "$HOSTS_BACKUP" "$HOSTS_APPLIED" "$HOSTS_IP" \
+      "$PG_HOST" "$REDIS_HOST" "$MARKER_BEGIN" "$MARKER_END"; then
+    [[ "$LOCAL_HOSTS_FILE_MUTATED" == 1 ]] && HOSTS_INSTALLED=1
+    return 1
   fi
-  rm -f "$tmp"
+  HOSTS_INSTALLED=1
+  flush_hosts_cache
+}
+
+restore_hosts() {
+  if ! local_hosts_restore \
+      "$HOSTS_FILE" "$HOSTS_BACKUP" "$HOSTS_APPLIED" "$MARKER_BEGIN" "$MARKER_END"; then
+    HOSTS_BACKUP_RETAIN=1
+    return 1
+  fi
+  flush_hosts_cache
+  if [[ "$LOCAL_HOSTS_RESTORE_EXACT" != 1 ]]; then
+    HOSTS_BACKUP_RETAIN=1
+    log "warning: $HOSTS_FILE changed externally; preserved that edit and removed only the managed block"
+  fi
+  HOSTS_INSTALLED=0
 }
 
 # --- lifecycle / cleanup -----------------------------------------------------
@@ -444,18 +463,28 @@ restore_hosts() {
 MAIN_PID=$$
 SUDO_KEEPALIVE_PID=""
 HOSTS_INSTALLED=0
+HOSTS_BACKUP_RETAIN=0
 ALIAS_ADDED=0
+STACK_OWNED=0
 CLEANED=0
+RUN_LOCK_HELD=0
+RUN_LOCK_OWNER="v1:${MAIN_PID}:${RANDOM}:${RANDOM}"
 
 cleanup() {
   [[ "$CLEANED" == 1 ]] && return
   CLEANED=1
+  if [[ "$RUN_LOCK_HELD" == 1 ]]; then
+    local_run_attestation_remove "$RUN_LOCK_DIR" "$RUN_LOCK_OWNER" ||
+      log "warning: failed to withdraw local launcher readiness from $RUN_LOCK_DIR"
+  fi
   echo
   if [[ "$HOSTS_INSTALLED" == 1 ]]; then
     log "restoring $HOSTS_FILE"
     restore_hosts || log "warning: failed to restore $HOSTS_FILE (backup: $HOSTS_BACKUP)"
   fi
-  if [[ "$KEEP_UP" == 1 ]]; then
+  if [[ "$STACK_OWNED" != 1 ]]; then
+    :
+  elif [[ "$KEEP_UP" == 1 ]]; then
     log "leaving containers running (--keep-up); stop them with: cd $SCRIPT_DIR && ${DC[*]} down"
   else
     log "stopping containers"
@@ -474,11 +503,37 @@ cleanup() {
     restore_tcp_backlogs || log "warning: failed to restore Linux network queue/conntrack limits"
   fi
   [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-  rm -f "$HOSTS_BACKUP"
+  if [[ -n "$HOSTS_BACKUP" ]]; then
+    if [[ "$HOSTS_BACKUP_RETAIN" == 1 ]]; then
+      log "hosts backup retained for manual recovery: $HOSTS_BACKUP"
+    else
+      rm -f "$HOSTS_BACKUP"
+    fi
+  fi
+  if [[ -n "$HOSTS_APPLIED" ]]; then
+    rm -f "$HOSTS_APPLIED"
+  fi
+  if [[ "$RUN_LOCK_HELD" == 1 ]]; then
+    local_run_lock_release "$RUN_LOCK_DIR" "$RUN_LOCK_OWNER" ||
+      log "warning: failed to release local launcher lock $RUN_LOCK_DIR"
+    RUN_LOCK_HELD=0
+  fi
 }
+
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+HOSTS_BACKUP="$(mktemp -t urnetwork-hosts-backup.XXXXXX)"
+HOSTS_APPLIED="$(mktemp -t urnetwork-hosts-applied.XXXXXX)"
+# Arm the token-checked release before acquisition. If a signal lands after the
+# helper publishes our owner token but before it returns, cleanup still owns it.
+RUN_LOCK_HELD=1
+if ! local_run_lock_acquire "$RUN_LOCK_DIR" "$RUN_LOCK_OWNER"; then
+  RUN_LOCK_HELD=0
+  rm -f "$HOSTS_BACKUP" "$HOSTS_APPLIED"
+  die "another local launcher owns $RUN_LOCK_DIR; inspect it before removing a stale lock"
+fi
 
 # --- run ---------------------------------------------------------------------
 
@@ -495,25 +550,27 @@ fi
 ( while kill -0 "$MAIN_PID" 2>/dev/null; do sudo -n true 2>/dev/null || exit; sleep 30; done ) &
 SUDO_KEEPALIVE_PID=$!
 
+# Claim the resolver names before every network, kernel, or Docker mutation.
+# A legacy managed block or any unmanaged spelling fails inside this transaction
+# before the hosts-file replacement callback is reached.
+log "claiming unique local service mappings in $HOSTS_FILE"
+install_hosts || die "local service mappings are already owned; inspect $HOSTS_FILE and $RUN_LOCK_DIR"
+
 configure_ephemeral_range
 configure_tcp_backlogs
 
+# From this point cleanup owns every Docker mutation, including --fresh.
+STACK_OWNED=1
 if [[ "$FRESH" == 1 ]]; then
   log "wiping existing volumes (--fresh)"
   compose down -v --remove-orphans || true
 fi
 
-# Add the dedicated loopback address BEFORE starting docker (the published ports
-# bind to it) and patch /etc/hosts BEFORE the DBs are up, so the hostnames only
-# ever resolve to this dedicated IP -- if something connects early it gets
-# "connection refused", never a real database.
+# Add the dedicated loopback address before starting Docker; the already-owned
+# hostnames safely get connection refused until this alias and its listeners exist.
 log "adding loopback alias $LOCAL_HOST_IP"
 loopback_alias add || die "failed to add loopback alias $LOCAL_HOST_IP"
 ALIAS_ADDED=1
-
-log "updating $HOSTS_FILE"
-install_hosts
-HOSTS_INSTALLED=1
 
 log "starting postgres + redis on the urnetwork-local network"
 compose up -d
@@ -524,6 +581,19 @@ wait_healthy "$REDIS_CONTAINER" 60 || die "redis failed to start (see: ${DC[*]} 
 
 log "verifying $LOCAL_HOST_IP:$PG_PORT and $LOCAL_HOST_IP:$REDIS_PORT are reachable"
 verify_reachable || die "the DBs are healthy but $LOCAL_HOST_IP is not reachable on ports $PG_PORT/$REDIS_PORT (loopback alias / port publish problem)"
+
+log "verifying PostgreSQL access with the selected local resource"
+local_postgres_require_application_access "$PG_CONTAINER" "$PG_USER" "$PG_PASSWORD" "$PG_DB" ||
+  die "postgres does not satisfy the selected local test profile"
+
+# The lock exists throughout startup, but tests may proceed only after container
+# health, host-side TCP reachability, and application authentication have succeeded.
+# A rename in the lock directory makes the complete endpoint record visible all at once.
+log "publishing launcher-owned readiness for the test harness"
+local_run_attestation_publish \
+  "$RUN_LOCK_DIR" "$RUN_LOCK_OWNER" "$LOCAL_HOST_IP" \
+  "$PG_HOST" "$PG_PORT" "$REDIS_HOST" "$REDIS_PORT" ||
+  die "failed to publish local launcher readiness"
 
 cat <<INFO
 

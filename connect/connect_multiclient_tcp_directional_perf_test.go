@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,7 +116,7 @@ func testConnectMultiClientTcpDirectionalPerformance(t testing.TB) {
 	}()
 
 	// ---- device tun bridged to the multi client (same shape as mctcp) ---------
-	tun, err := connect.CreateTunWithDefaults(ctx)
+	tun, err := connect.CreateTun(ctx, newLocalPerformanceTcpTunSettings())
 	if err != nil {
 		panic(err)
 	}
@@ -132,7 +131,7 @@ func testConnectMultiClientTcpDirectionalPerformance(t testing.TB) {
 	specs := []*connect.ProviderSpec{
 		{ClientId: &providerClientIdConnect},
 	}
-	generator := connect.NewApiMultiClientGeneratorWithDefaults(
+	generator := connect.NewApiMultiClientGenerator(
 		ctx,
 		specs,
 		deviceStrategy,
@@ -144,6 +143,8 @@ func testConnectMultiClientTcpDirectionalPerformance(t testing.TB) {
 		"mctcpdir",
 		"0.0.0",
 		&deviceClientIdConnect,
+		newLocalPerformanceClientSettings,
+		connect.DefaultApiMultiClientGeneratorSettings(),
 	)
 
 	// received packets inject through the receive-dispatch batch: the
@@ -187,7 +188,7 @@ func testConnectMultiClientTcpDirectionalPerformance(t testing.TB) {
 
 	// runUpload writes the volume to the sink; goodput from the write side.
 	runUpload := func() (float64, bool) {
-		dialCtx, dialCancel := context.WithTimeout(ctx, 60*time.Second)
+		dialCtx, dialCancel := context.WithTimeout(ctx, mcTcpColdStartTimeout)
 		conn, err := tun.DialContext(dialCtx, "tcp", sinkAddr)
 		dialCancel()
 		if err != nil {
@@ -216,7 +217,7 @@ func testConnectMultiClientTcpDirectionalPerformance(t testing.TB) {
 
 	// runDownload reads the volume from the source; goodput from the read side.
 	runDownload := func() (float64, bool) {
-		dialCtx, dialCancel := context.WithTimeout(ctx, 60*time.Second)
+		dialCtx, dialCancel := context.WithTimeout(ctx, mcTcpColdStartTimeout)
 		conn, err := tun.DialContext(dialCtx, "tcp", sourceAddr)
 		dialCancel()
 		if err != nil {
@@ -274,14 +275,16 @@ func testConnectMultiClientTcpDirectionalPerformance(t testing.TB) {
 	profileDir := "profile"
 	os.MkdirAll(profileDir, 0755)
 	downloadCpuPath := filepath.Join(profileDir, "mctcpdir_download_cpu.pprof")
-	downloadCpuFile, _ := os.Create(downloadCpuPath)
-	downloadCpuActive := pprof.StartCPUProfile(downloadCpuFile) == nil
+	stopDownloadCpuProfile, downloadCpuProfileErr := startLocalPerformanceCpuProfile(downloadCpuPath)
+	if downloadCpuProfileErr != nil {
+		fmt.Printf("[mctcpdir]download cpu profile unavailable (%s)\n", downloadCpuProfileErr)
+	}
+	defer stopDownloadCpuProfile()
 
 	downloadGoodput := measure("download", runDownload)
 
-	if downloadCpuActive {
-		pprof.StopCPUProfile()
-		downloadCpuFile.Close()
+	stopDownloadCpuProfile()
+	if downloadCpuProfileErr == nil {
 		fmt.Printf("[mctcpdir]download cpu profile %s\n", downloadCpuPath)
 	}
 

@@ -28,23 +28,131 @@ func canceledCircleRetryRestoreMigrationIndex(t testing.TB) int {
 	return sqlMigrationIndex(t, "restore_canceled_circle_retries")
 }
 
-// Competition migrations were developed against an older main. They must
-// remain a contiguous suffix so every migration integrated from origin runs
-// first and retains its published version number.
-func TestCompetitionMigrationsFollowOriginMigrations(t *testing.T) {
+func accountPaymentContractRetentionMigrationIndex(t testing.TB) int {
+	return sqlMigrationIndex(t, "account_payment_contract_retention_queue")
+}
+
+func migrationIndex(t testing.TB, marker string) int {
+	t.Helper()
+	for i, migration := range migrations {
+		var sql string
+		switch typed := migration.(type) {
+		case *SqlMigration:
+			sql = typed.sql
+		case *OnlineSqlMigration:
+			sql = typed.sql
+		}
+		if strings.Contains(sql, marker) {
+			return i
+		}
+	}
+	t.Fatalf("migration containing %q not found", marker)
+	return -1
+}
+
+// The three structural families are deliberately contiguous and ordered. Do
+// not put a full-table ANALYZE in front of them: at statistics target 10,000,
+// production requested a three-million-block random sample and made less than
+// two percent progress in twenty minutes under the incident load. Once the
+// structural boundary exists, cap future samples without weakening the
+// one-million-change autoanalyze cadence.
+func TestTransferContractOpenPlanRepairMigrationOrder(t *testing.T) {
+	indexMarkers := []string{
+		"transfer_contract_unresolved_source_pair_create_time",
+		"transfer_contract_unresolved_destination_pair_create_time",
+		"transfer_contract_unresolved_payer_transfer_byte_count",
+	}
+	for index, marker := range indexMarkers {
+		migrationPosition := migrationIndex(t, marker)
+		if index > 0 && migrationPosition != migrationIndex(t, indexMarkers[index-1])+1 {
+			t.Errorf("%s migration index = %d; structural repair migrations must be contiguous and ordered", marker, migrationPosition)
+		}
+		if _, ok := migrations[migrationPosition].(*OnlineSqlMigration); !ok {
+			t.Errorf("%s migration is %T, want *OnlineSqlMigration", marker, migrations[migrationPosition])
+		}
+	}
+	for _, migration := range migrations {
+		if codeMigration, ok := migration.(*CodeMigration); ok && codeMigration.id == "20260908_analyze_transfer_contract_open_stats" {
+			t.Fatal("unbounded transfer_contract ANALYZE must not precede the structural repair")
+		}
+	}
+	statsPosition := migrationIndex(t, "ALTER COLUMN open SET STATISTICS 300")
+	lastIndexPosition := migrationIndex(t, indexMarkers[len(indexMarkers)-1])
+	if statsPosition != lastIndexPosition+1 {
+		t.Fatalf("bounded statistics migration index = %d, want %d immediately after structural indexes", statsPosition, lastIndexPosition+1)
+	}
+	statsMigration, ok := migrations[statsPosition].(*SqlMigration)
+	if !ok {
+		t.Fatalf("bounded statistics migration is %T, want *SqlMigration", migrations[statsPosition])
+	}
+	for _, marker := range []string{
+		"autovacuum_analyze_scale_factor = 0",
+		"autovacuum_analyze_threshold = 1000000",
+	} {
+		if !strings.Contains(statsMigration.sql, marker) {
+			t.Errorf("bounded statistics migration lacks %q", marker)
+		}
+	}
+}
+
+// Migration versions are an append-only production protocol. Versions
+// 588-590 were applied before the escrow/retention fixes were merged; moving
+// those new migrations ahead of the published competition sequence made a DB
+// recorded at 590 skip the new schema and try to create competition tables a
+// second time. Freeze every already-published index and require new work to
+// follow it. Future migrations may append after this map without changing it.
+func TestPublishedMigrationVersionsRemainStable(t *testing.T) {
+	published := []struct {
+		marker string
+		index  int
+	}{
+		{"CREATE TABLE competition_round", 587},
+		{"competition_append_only_guard", 588},
+		{"competition_workload_backfill_guard", 589},
+		{"competition_epoch_lifecycle_guard", 590},
+		{"competition_image_identity_backfill_guard", 591},
+		{"competition_candidate_review_gate", 592},
+		{"transfer_escrow_balance_contract", 593},
+		{"account_payment_contract_retention_queue", 594},
+		{"account_payment_contract_retention_pending", 595},
+		{"transfer_escrow_sweep_payment_contract", 596},
+	}
+	for _, migration := range published {
+		if index := migrationIndex(t, migration.marker); index != migration.index {
+			t.Errorf("migration %q index = %d (version %d), want index %d (version %d)",
+				migration.marker, index, index+1, migration.index, migration.index+1)
+		}
+	}
+}
+
+// The release-1.0 testnet durably published this exact numeric prefix. New
+// migrations append after it; moving a suffix to make room changes the SQL
+// named by every shifted migration_audit version.
+func TestPublishedMigrationPrefixIsImmutable(t *testing.T) {
 	markers := []string{
 		"CREATE TABLE competition_round",
 		"competition_append_only_guard",
 		"competition_workload_backfill_guard",
+		"competition_epoch_lifecycle_guard",
+		"competition_image_identity_backfill_guard",
+		"competition_candidate_review_gate",
 	}
-	firstCompetitionIndex := len(migrations) - len(markers)
-	if firstCompetitionIndex <= canceledCircleRetryRestoreMigrationIndex(t) {
-		t.Fatalf("competition migration suffix starts at %d before latest origin migration", firstCompetitionIndex)
+	firstCompetitionIndex := publishedMigrationPrefixCount - len(markers)
+	if len(migrations) <= publishedMigrationPrefixCount {
+		t.Fatalf("migration count = %d, want appended history after published prefix %d", len(migrations), publishedMigrationPrefixCount)
 	}
 	for i, marker := range markers {
 		if index := sqlMigrationIndex(t, marker); index != firstCompetitionIndex+i {
-			t.Fatalf("competition migration %q index = %d, want suffix index %d", marker, index, firstCompetitionIndex+i)
+			t.Fatalf("published competition migration %q index = %d, want immutable index %d", marker, index, firstCompetitionIndex+i)
 		}
+	}
+	identity, err := migrationPrefixIdentity(publishedMigrationPrefixCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expectedIdentity = "6b18ebd7cadd8413ef4c90385486c7516c272ed93105dfcfd7300228712a6aba"
+	if identity != expectedIdentity {
+		t.Fatalf("published migration prefix identity = %s, want %s", identity, expectedIdentity)
 	}
 }
 
@@ -330,6 +438,151 @@ func TestCanceledCircleRetryRestoreMigration(t *testing.T) {
 		}
 		if version := DbVersion(ctx); version != migrationIndex+1 {
 			t.Fatalf("DB version = %d, want %d", version, migrationIndex+1)
+		}
+	})
+}
+
+// Existing payments completed by the synchronous pre-deploy path normally
+// already have reap_time. Queue only the recent edge defensively so a deadline
+// inherited from the former straggler rule cannot shorten the seven-day
+// post-completion window; older history remains a one-time backfill concern.
+func TestAccountPaymentContractRetentionMigration(t *testing.T) {
+	(&TestEnv{ApplyDbMigrations: false}).Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		migrationIndex := accountPaymentContractRetentionMigrationIndex(t)
+		ApplyDbMigrationsUpTo(ctx, migrationIndex)
+
+		recentPaymentId := NewId()
+		oldPaymentId := NewId()
+		networkId := NewId()
+		paymentPlanId := NewId()
+		now := NowUtc()
+		MaintenanceTx(ctx, func(tx PgTx) {
+			for _, payment := range []struct {
+				id           Id
+				completeTime time.Time
+			}{
+				{id: recentPaymentId, completeTime: now.Add(-24 * time.Hour)},
+				{id: oldPaymentId, completeTime: now.Add(-8 * 24 * time.Hour)},
+			} {
+				RaisePgResult(tx.Exec(ctx, `
+					INSERT INTO account_payment (
+						payment_id,
+						payment_plan_id,
+						network_id,
+						payout_byte_count,
+						payout_nano_cents,
+						min_sweep_time,
+						create_time,
+						completed,
+						complete_time
+					)
+					VALUES ($1, $2, $3, 1, 1, $4, $4, true, $4)
+				`,
+					payment.id,
+					paymentPlanId,
+					networkId,
+					payment.completeTime,
+				))
+			}
+		})
+
+		ApplyDbMigrationsUpTo(ctx, migrationIndex+1)
+
+		states := map[Id]struct {
+			pending bool
+			cursor  *Id
+		}{}
+		MaintenanceDb(ctx, func(conn PgConn) {
+			result, err := conn.Query(ctx, `
+				SELECT payment_id, contract_retention_pending, contract_retention_cursor
+				FROM account_payment
+				WHERE payment_id IN ($1, $2)
+			`, recentPaymentId, oldPaymentId)
+			WithPgResult(result, err, func() {
+				for result.Next() {
+					var paymentId Id
+					var state struct {
+						pending bool
+						cursor  *Id
+					}
+					Raise(result.Scan(&paymentId, &state.pending, &state.cursor))
+					states[paymentId] = state
+				}
+			})
+		}, OptReadOnly())
+
+		if len(states) != 2 {
+			t.Fatalf("loaded %d payment retention states, want 2", len(states))
+		}
+		if state := states[recentPaymentId]; !state.pending || state.cursor != nil {
+			t.Fatalf("recent completed payment retention state = %+v, want pending with nil cursor", state)
+		}
+		if state := states[oldPaymentId]; state.pending || state.cursor != nil {
+			t.Fatalf("old completed payment retention state = %+v, want converged", state)
+		}
+		if version := DbVersion(ctx); version != migrationIndex+1 {
+			t.Fatalf("DB version = %d, want %d", version, migrationIndex+1)
+		}
+	})
+}
+
+// Net-escrow reconciliation now reads fresh bounded balance pages instead of
+// one fleet-wide snapshot. This index is what keeps each page from rescanning
+// the complete transfer_escrow history.
+func TestNetEscrowReconcileBalanceIndex(t *testing.T) {
+	DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		var indexDefinition string
+		MaintenanceDb(ctx, func(conn PgConn) {
+			result, err := conn.Query(ctx, `
+				SELECT indexdef
+				FROM pg_indexes
+				WHERE schemaname = current_schema()
+				  AND indexname = 'transfer_escrow_balance_contract'
+			`)
+			WithPgResult(result, err, func() {
+				if result.Next() {
+					Raise(result.Scan(&indexDefinition))
+				}
+			})
+		}, OptReadOnly())
+		if !strings.Contains(indexDefinition, "(balance_id, contract_id)") {
+			t.Fatalf("transfer_escrow reconciliation index = %q", indexDefinition)
+		}
+	})
+}
+
+// The bounded lateral query still overran on production because its complete
+// per-balance history ranges required heap fetches. The appended partial
+// covering index must contain only the necessary unsettled set while carrying
+// the aggregate payload; changing any of those three properties recreates the
+// billion-row history cost.
+func TestNetEscrowReconcileUnsettledCoveringIndex(t *testing.T) {
+	DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		var indexDefinition string
+		MaintenanceDb(ctx, func(conn PgConn) {
+			result, err := conn.Query(ctx, `
+				SELECT indexdef
+				FROM pg_indexes
+				WHERE schemaname = current_schema()
+				  AND indexname = 'transfer_escrow_unsettled_balance_contract'
+			`)
+			WithPgResult(result, err, func() {
+				if result.Next() {
+					Raise(result.Scan(&indexDefinition))
+				}
+			})
+		}, OptReadOnly())
+		for _, want := range []string{
+			"(balance_id, contract_id)",
+			"INCLUDE (balance_byte_count)",
+			"WHERE (settled = false)",
+		} {
+			if !strings.Contains(indexDefinition, want) {
+				t.Fatalf("unsettled net-escrow index %q missing %q", indexDefinition, want)
+			}
 		}
 	})
 }

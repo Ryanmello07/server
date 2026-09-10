@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -59,6 +60,27 @@ type CreateTransferTransactionResult struct {
 	State string `json:"state"`
 }
 
+// isCircleInvalidDestinationError identifies the definitive pre-chain Circle
+// rejection for an invalid destination. Only this exact 400 is safe to reset:
+// transport failures and rate limits can be ambiguous after submission and
+// must retain their idempotency key.
+func isCircleInvalidDestinationError(err error) bool {
+	var statusErr *server.HttpStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+
+	var response struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal([]byte(statusErr.ResponseBody), &response) != nil {
+		return false
+	}
+	message := strings.TrimSuffix(strings.TrimSpace(response.Message), ".")
+	return response.Code == 155219 || strings.EqualFold(message, "Invalid destination address")
+}
+
 func (c *CoreCircleApiClient) CreateTransferTransaction(
 	ctx context.Context,
 	idempotencyKey server.Id,
@@ -85,6 +107,9 @@ func (c *CoreCircleApiClient) CreateTransferTransaction(
 	}
 
 	uri := "https://api.circle.com/v1/w3s/developer/transactions/transfer"
+	if err := waitForCircleTransferAdmission(ctx); err != nil {
+		return nil, err
+	}
 
 	res, err := server.HttpPostRequireStatusOk(
 		ctx,

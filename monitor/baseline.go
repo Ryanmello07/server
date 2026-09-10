@@ -7,10 +7,11 @@
 // Missing or short history degrades gracefully — probes fall back to their
 // static bands until enough samples accrue. The store is safe for concurrent
 // use.
-package main
+package monitor
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,7 +63,20 @@ func newBaselineStore(dir string) (*baselineStore, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".metric") {
 			continue
 		}
-		name := strings.TrimSuffix(e.Name(), ".metric")
+		encodedName := strings.TrimSuffix(e.Name(), ".metric")
+		name := ""
+		if strings.HasPrefix(encodedName, "v2-") {
+			nameBytes, decodeErr := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encodedName, "v2-"))
+			if decodeErr == nil {
+				name = string(nameBytes)
+			}
+		}
+		if name == "" {
+			// Compatibility with the original flat-name format. Its slash to
+			// underscore mapping was lossy, but retaining the samples is more
+			// useful than silently discarding every pre-refactor baseline.
+			name = strings.ReplaceAll(encodedName, "_", "/")
+		}
 		self.metricSamples[name] = loadBaselineFile(filepath.Join(dir, e.Name()))
 		self.metricAppendCounts[name] = len(self.metricSamples[name])
 	}
@@ -94,8 +108,11 @@ func loadBaselineFile(path string) []baselineSample {
 }
 
 func (self *baselineStore) path(metric string) string {
-	// metric ids contain '/', keep filenames flat
-	return filepath.Join(self.dir, strings.ReplaceAll(metric, "/", "_")+".metric")
+	// Metric IDs contain slashes and arbitrary key-family shapes. A reversible
+	// encoding keeps filenames flat while allowing a fresh Signal.Run to load
+	// the exact same metric name.
+	name := "v2-" + base64.RawURLEncoding.EncodeToString([]byte(metric))
+	return filepath.Join(self.dir, name+".metric")
 }
 
 // record appends one sample for metric and persists it.
@@ -162,6 +179,48 @@ func (self *baselineStore) trailingMedian(metric string, window time.Duration, m
 	vs := self.trailingWindow(metric, window)
 	n = len(vs)
 	if n < minSamples {
+		return 0, n, false
+	}
+	sort.Float64s(vs)
+	if n%2 == 1 {
+		return vs[n/2], n, true
+	}
+	return (vs[n/2-1] + vs[n/2]) / 2, n, true
+}
+
+// trailingMedianSpanning adds a minimum wall-clock span to the sample-count
+// guard. A duplicated watcher or temporarily faster cadence can otherwise
+// satisfy minSamples with only a short anomalous interval and call that a
+// long-window baseline. Samples after now are ignored rather than allowing a
+// bad local clock entry to manufacture the required span.
+func (self *baselineStore) trailingMedianSpanning(
+	metric string,
+	window time.Duration,
+	minSamples int,
+	minSpan time.Duration,
+) (median float64, n int, ok bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-window)
+	vs := []float64{}
+	var earliest time.Time
+	var latest time.Time
+	for _, sample := range self.metricSamples[metric] {
+		if sample.at.Before(cutoff) || sample.at.After(now) {
+			continue
+		}
+		vs = append(vs, sample.v)
+		if earliest.IsZero() || sample.at.Before(earliest) {
+			earliest = sample.at
+		}
+		if latest.IsZero() || latest.Before(sample.at) {
+			latest = sample.at
+		}
+	}
+	n = len(vs)
+	if n < minSamples || earliest.IsZero() || latest.Sub(earliest) < minSpan {
 		return 0, n, false
 	}
 	sort.Float64s(vs)

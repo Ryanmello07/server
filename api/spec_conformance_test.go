@@ -35,7 +35,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/urnetwork/server/competition"
 	"github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/model"
 )
@@ -60,6 +59,7 @@ func rt(v any) reflect.Type { return reflect.TypeOf(v) }
 
 func registry() []specEndpoint {
 	return []specEndpoint{
+		{"GET", "/clock", nil, rt(model.ClockResult{})},
 		{"GET", "/stats/last-90", nil, rt(model.Stats{})},
 		{"GET", "/stats/providers", nil, rt(model.StatsProvidersResult{})},
 		{"POST", "/stats/providers-last-n", rt(model.StatsProvidersArgs{}), rt(model.StatsProvidersResult{})},
@@ -160,11 +160,18 @@ func registry() []specEndpoint {
 		{"POST", "/solana/payment-intent", rt(controller.SolanaPaymentIntentArgs{}), rt(controller.SolanaPaymentIntentResult{})},
 		{"POST", "/stripe/payment-intent", rt(controller.StripeCreatePaymentIntentArgs{}), rt(controller.StripeCreatePaymentIntentResult{})},
 		{"POST", "/stripe/customer-portal", rt(controller.StripeCreateCustomerPortalArgs{}), rt(controller.StripeCreateCustomerPortalResult{})},
+		{"POST", "/pay/data/checkout", rt(controller.PayDataCheckoutArgs{}), rt(controller.PayDataCheckoutResult{})},
+		{"POST", "/pay/data/network-lookup", rt(controller.PayDataNetworkLookupArgs{}), rt(controller.PayDataNetworkLookupResult{})},
 
 		{"GET", "/verify/keys", nil, rt(controller.GetVerifyKeysResult{})},
 		{"POST", "/sn/wallet", rt(controller.SnSetWalletArgs{}), rt(controller.SnSetWalletResult{})},
 		{"GET", "/sn/pool/claim", nil, rt(controller.SnPoolClaimResult{})},
 		{"GET", "/sn/epoch", nil, rt(model.StEpochSummary{})},
+		{"GET", "/sn/wallet", nil, rt(controller.SnGetWalletResult{})},
+		{"POST", "/sn/wallet/validate", rt(controller.SnValidateWalletArgs{}), rt(controller.SnValidateWalletResult{})},
+		{"GET", "/sn/head", nil, rt(controller.SnHeadResult{})},
+		{"POST", "/sn/head/binding", rt(controller.SnHeadBindingArgs{}), rt(controller.SnHeadBindingResult{})},
+		{"GET", "/account/epochs", nil, rt(controller.AccountEpochsResult{})},
 	}
 }
 
@@ -601,6 +608,13 @@ func TestSpecRoutesImplemented(t *testing.T) {
 			key := strings.ToUpper(method) + " " + normalizePath(path)
 			specKeys[key] = true
 			if !implKeys[key] {
+				// An operation the spec marks `x-status: planned` documents a
+				// route that a later change lands; it is logged, not failed,
+				// so the spec can lead the implementation by one deploy.
+				if asMap(asMap(methodsAny)[method])["x-status"] == "planned" {
+					t.Logf("spec endpoint %q is planned (x-status) and not yet in Routes()", key)
+					continue
+				}
 				missing = append(missing, key)
 			}
 		}
@@ -629,13 +643,16 @@ func TestSpecRoutesImplemented(t *testing.T) {
 
 func competitionRegistry() []specEndpoint {
 	return []specEndpoint{
-		{"GET", "/competition/healthz", nil, rt(competition.HealthResult{})},
-		{"GET", "/competition/readyz", nil, rt(competition.ReadinessResult{})},
-		{"GET", "/competition/info", nil, rt(competition.InfoResult{})},
-		{"POST", "/competition/generate-round", rt(competition.GenerateRoundArgs{}), rt(competition.RoundResult{})},
+		{"GET", "/competition/healthz", nil, rt(controller.HealthResult{})},
+		{"GET", "/competition/readyz", nil, rt(controller.ReadinessResult{})},
+		{"GET", "/competition/info", nil, rt(controller.InfoResult{})},
+		{"GET", "/competition/leaderboard", nil, rt(controller.SeasonLeaderboardResult{})},
+		{"POST", "/competition/generate-staging-round", nil, rt(controller.RoundResult{})},
+		{"POST", "/competition/close-staging-round", nil, rt(controller.RoundResult{})},
+		{"POST", "/competition/generate-round", rt(controller.GenerateRoundArgs{}), rt(controller.RoundResult{})},
 		{"GET", "/competition/round/{roundId}/providers.yml", nil, nil},
-		{"POST", "/competition/score", rt(competition.ScoreArgs{}), rt(competition.ScoreAcceptedResult{})},
-		{"GET", "/competition/score/{jobId}", nil, rt(competition.ScoreJobResult{})},
+		{"POST", "/competition/score", rt(controller.ScoreArgs{}), rt(controller.ScoreAcceptedResult{})},
+		{"GET", "/competition/score/{jobId}", nil, rt(controller.ScoreJobResult{})},
 	}
 }
 
@@ -685,6 +702,7 @@ func TestCompetitionSpecSecurity(t *testing.T) {
 	public := map[string]bool{
 		"GET /competition/healthz":                       true,
 		"GET /competition/info":                          true,
+		"GET /competition/leaderboard":                   true,
 		"GET /competition/round/{roundId}/providers.yml": true,
 	}
 	for path, methodsAny := range spec.paths {

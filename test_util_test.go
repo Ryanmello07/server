@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -18,12 +21,9 @@ import (
 	"github.com/urnetwork/connect"
 )
 
-// These tests exercise the real TestEnv.Run (including per-attempt environment
-// setup/teardown): a flaky failure on early attempts is retried and rescued,
-// while a failure that persists across every attempt still fails the test.
-//
-// ApplyDbMigrations is false (callbacks touch no schema) and RerunTimeout is
-// zero so reruns happen back-to-back.
+// These tests exercise the TestEnv retry loop with hermetic lifecycle
+// boundaries: a flaky failure on early attempts is retried and rescued, while
+// a failure that persists across every attempt still fails the test.
 
 func retryTestEnv(rerunCount int) *TestEnv {
 	return &TestEnv{
@@ -33,13 +33,659 @@ func retryTestEnv(rerunCount int) *TestEnv {
 	}
 }
 
+// Avoids provisioning PostgreSQL and Redis for tests concerned only with the
+// retry state machine.
+func runRetryTestEnv(t *testing.T, testEnv *TestEnv, callback func(testing.TB)) {
+	testEnv.runWithSetup(
+		t,
+		callback,
+		func() error {
+			return nil
+		},
+		func() func() {
+			return func() {}
+		},
+	)
+}
+
+// Strict release defaults never change an explicitly selected retry policy.
+func TestDefaultTestEnvReleaseFailFastConfiguration(t *testing.T) {
+	for _, value := range []string{"", "0", "1"} {
+		t.Setenv("WARP_TEST_ENV_FAIL_FAST", value)
+		testEnv := DefaultTestEnv()
+		wantReruns := 4
+		if value == "1" {
+			wantReruns = 0
+		}
+		if testEnv.RerunCount != wantReruns || !testEnv.ApplyDbMigrations || testEnv.Warmup || testEnv.RerunTimeout != 15*time.Second {
+			t.Fatalf("fail-fast setting %q changed default environment: %+v", value, testEnv)
+		}
+	}
+	var attempts atomic.Int32
+	runRetryTestEnv(t, retryTestEnv(1), func(tb testing.TB) {
+		if attempts.Add(1) == 1 {
+			tb.Error("explicit retry-policy fixture failure")
+		}
+	})
+	if attempts.Load() != 2 {
+		t.Fatalf("strict defaults changed explicit retry policy: attempts=%d", attempts.Load())
+	}
+}
+
+// A misspelled release setting must not silently restore hidden retries.
+func TestDefaultTestEnvReleaseFailFastRejectsMalformedSetting(t *testing.T) {
+	for _, value := range []string{"true", "false", " 1", "1 ", "2", "-1"} {
+		t.Setenv("WARP_TEST_ENV_FAIL_FAST", value)
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			DefaultTestEnv()
+		}()
+		if recovered != "WARP_TEST_ENV_FAIL_FAST must be 0 or 1" {
+			t.Fatalf("malformed fail-fast setting %q: panic=%v", value, recovered)
+		}
+	}
+}
+
+// A would-pass-on-retry assertion, fatal or panic must exit unsuccessfully on
+// its first attempt. Subprocesses keep those intended failures isolated.
+func TestDefaultTestEnvReleaseFailFastRejectsRecoveredFailure(t *testing.T) {
+	if mode := os.Getenv("URNETWORK_RELEASE_FAIL_FAST_CHILD"); mode != "" {
+		var attempts atomic.Int32
+		testEnv := DefaultTestEnv()
+		testEnv.RerunTimeout = 0
+		runRetryTestEnv(t, testEnv, func(tb testing.TB) {
+			attempt := attempts.Add(1)
+			fmt.Printf("release fail-fast attempt=%d\n", attempt)
+			if attempt != 1 {
+				return
+			}
+			switch mode {
+			case "assertion":
+				tb.Error("release fixture assertion failure")
+			case "fatal":
+				tb.Fatal("release fixture fatal failure")
+			case "panic":
+				panic("release fixture panic failure")
+			default:
+				panic("invalid release fail-fast child mode")
+			}
+		})
+		return
+	}
+	t.Setenv("WARP_TEST_ENV_FAIL_FAST", "1")
+	for _, mode := range []string{"assertion", "fatal", "panic"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDefaultTestEnvReleaseFailFastRejectsRecoveredFailure$", "-test.v")
+		cmd.Env = append(os.Environ(), "URNETWORK_RELEASE_FAIL_FAST_CHILD="+mode)
+		output, err := cmd.CombinedOutput()
+		contextErr := ctx.Err()
+		cancel()
+		var exitErr *exec.ExitError
+		if contextErr != nil || !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !strings.Contains(string(output), "release fail-fast attempt=1") || strings.Contains(string(output), "release fail-fast attempt=2") || !strings.Contains(string(output), "--- FAIL: TestDefaultTestEnvReleaseFailFastRejectsRecoveredFailure") {
+			t.Fatalf("%s did not fail exactly its first attempt: err=%v context=%v output=%s", mode, err, contextErr, output)
+		}
+	}
+}
+
+// A successful callback cannot certify a release when its teardown has been
+// abandoned. The teardown is held by an explicit barrier until Run returns.
+func TestDefaultTestEnvReleaseFailFastRejectsAbandonedTeardown(t *testing.T) {
+	if mode := os.Getenv("URNETWORK_RELEASE_TEARDOWN_CHILD"); mode != "" {
+		releaseTeardown := make(chan struct{})
+		teardownFinished := make(chan struct{})
+		defer func() {
+			close(releaseTeardown)
+			<-teardownFinished
+		}()
+		DefaultTestEnv().runWithSetup(t, func(testing.TB) {
+			fmt.Println("release teardown callback passed")
+		}, func() error { return nil }, func() func() {
+			return func() {
+				defer close(teardownFinished)
+				fmt.Println("release teardown entered blocking barrier")
+				<-releaseTeardown
+			}
+		})
+		return
+	}
+	for _, setting := range []string{"1", "0"} {
+		t.Setenv("WARP_TEST_ENV_FAIL_FAST", setting)
+		t.Setenv("WARP_TEST_TEARDOWN_BOUND_SECONDS", "1")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDefaultTestEnvReleaseFailFastRejectsAbandonedTeardown$", "-test.v")
+		cmd.Env = append(os.Environ(), "URNETWORK_RELEASE_TEARDOWN_CHILD=1")
+		output, err := cmd.CombinedOutput()
+		contextErr := ctx.Err()
+		cancel()
+		wire := string(output)
+		if contextErr != nil || !strings.Contains(wire, "release teardown callback passed") || !strings.Contains(wire, "release teardown entered blocking barrier") || !strings.Contains(wire, "abandoning teardown") {
+			t.Fatalf("teardown barrier was not reached and abandoned: setting=%s err=%v context=%v output=%s", setting, err, contextErr, wire)
+		}
+		if setting == "0" {
+			if err != nil {
+				t.Fatalf("release-only teardown policy changed development behavior: %v output=%s", err, wire)
+			}
+			continue
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !strings.Contains(wire, "--- FAIL: TestDefaultTestEnvReleaseFailFastRejectsAbandonedTeardown") {
+			t.Fatalf("strict release accepted an abandoned teardown: err=%v output=%s", err, wire)
+		}
+	}
+}
+
+// Exercise every wrapper exit boundary in a real child testing.T. A skipped
+// failure, unreturned attempt, invalid attempt count or post-attempt assertion
+// must not be converted into a successful package exit.
+func TestDefaultTestEnvReleaseFailFastRejectsFalseGreenExits(t *testing.T) {
+	if mode := os.Getenv("URNETWORK_RELEASE_FALSE_GREEN_CHILD"); mode != "" {
+		testEnv := DefaultTestEnv()
+		testEnv.RerunTimeout = 0
+		if mode == "negative-count" {
+			testEnv.RerunCount = -1
+		} else if mode == "overflow-count" {
+			testEnv.RerunCount = int(^uint(0) >> 1)
+		}
+		lateFailure := make(chan struct{})
+		lateFinished := make(chan struct{})
+		testEnv.runWithSetup(t, func(tb testing.TB) {
+			fmt.Println("release attempt callback entered")
+			switch mode {
+			case "failed-skip":
+				tb.Error("fixture failure before skip")
+				tb.Skip("later skip must not erase failure")
+			case "callback-goexit":
+				runtime.Goexit()
+			case "callback-nil-panic":
+				panic(nil)
+			case "cleanup-failure":
+				tb.Cleanup(func() { tb.Error("fixture cleanup failure") })
+			case "late-failure":
+				go func() {
+					defer close(lateFinished)
+					<-lateFailure
+					tb.Error("fixture post-attempt failure")
+				}()
+			case "clean-skip":
+				tb.Skip("intentional clean skip")
+			}
+		}, func() error {
+			fmt.Println("release attempt preflight entered")
+			return nil
+		}, func() func() {
+			if mode == "setup-goexit" {
+				runtime.Goexit()
+			}
+			return func() {
+				if mode == "teardown-goexit" {
+					runtime.Goexit()
+				}
+			}
+		})
+		if mode == "late-failure" {
+			close(lateFailure)
+			<-lateFinished
+		}
+		return
+	}
+	t.Setenv("WARP_TEST_ENV_FAIL_FAST", "1")
+	for _, testCase := range []struct {
+		mode        string
+		wantFailure bool
+		wantOutput  string
+	}{
+		{mode: "failed-skip", wantFailure: true, wantOutput: "fixture failure before skip"},
+		{mode: "negative-count", wantFailure: true, wantOutput: "invalid test rerun count"},
+		{mode: "overflow-count", wantFailure: true, wantOutput: "invalid test rerun count"},
+		{mode: "callback-goexit", wantFailure: true, wantOutput: "test attempt exited without returning"},
+		{mode: "callback-nil-panic", wantFailure: true, wantOutput: "test attempt exited without returning"},
+		{mode: "setup-goexit", wantFailure: true, wantOutput: "test attempt exited without returning"},
+		{mode: "teardown-goexit", wantFailure: true, wantOutput: "test environment teardown exited without returning"},
+		{mode: "cleanup-failure", wantFailure: true, wantOutput: "fixture cleanup failure"},
+		{mode: "late-failure", wantFailure: true, wantOutput: "fixture post-attempt failure"},
+		{mode: "clean-skip", wantOutput: "--- SKIP: TestDefaultTestEnvReleaseFailFastRejectsFalseGreenExits"},
+		{mode: "zero-reruns", wantOutput: "release attempt callback entered"},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDefaultTestEnvReleaseFailFastRejectsFalseGreenExits$", "-test.v")
+		cmd.Env = append(os.Environ(), "URNETWORK_RELEASE_FALSE_GREEN_CHILD="+testCase.mode)
+		if testCase.mode == "callback-nil-panic" {
+			cmd.Env = append(cmd.Env, "GODEBUG=panicnil=1")
+		}
+		output, err := cmd.CombinedOutput()
+		contextErr := ctx.Err()
+		cancel()
+		wire := string(output)
+		var exitErr *exec.ExitError
+		failed := errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+		if contextErr != nil || failed != testCase.wantFailure || err != nil && !failed || !strings.Contains(wire, testCase.wantOutput) {
+			t.Errorf("%s false-green boundary: wantFailure=%t err=%v context=%v output=%s", testCase.mode, testCase.wantFailure, err, contextErr, wire)
+		}
+		if (testCase.mode == "negative-count" || testCase.mode == "overflow-count") && strings.Contains(wire, "release attempt preflight entered") {
+			t.Errorf("%s performed preflight before rejecting invalid attempt count", testCase.mode)
+		}
+		if testCase.mode == "zero-reruns" && strings.Count(wire, "release attempt callback entered") != 1 {
+			t.Errorf("zero reruns did not execute exactly one attempt: %s", wire)
+		}
+	}
+}
+
+// Pins the lifecycle ordering that os.Exit would otherwise cut short.
+func TestRunTestMainTearsDownBeforeReturningStatus(t *testing.T) {
+	events := []string{}
+	status := runTestMain(
+		func() func() {
+			events = append(events, "setup")
+			return func() {
+				events = append(events, "teardown")
+			}
+		},
+		func() int {
+			events = append(events, "run")
+			return 23
+		},
+	)
+	connect.AssertEqual(t, status, 23)
+	connect.AssertEqual(t, events, []string{"setup", "run", "teardown"})
+}
+
+// Accepts only identifiers generated by TestEnv setup, so cleanup SQL never
+// interpolates a catalog name that merely shares the test_ prefix.
+func TestParseTestPgDbNameValidatesFullIdentifier(t *testing.T) {
+	millis, ok := parseTestPgDbName("test_123_00112233445566778899aabbccddeeff")
+	connect.AssertEqual(t, millis, int64(123))
+	connect.AssertEqual(t, ok, true)
+
+	invalidNames := []string{
+		"test_123_0011",
+		"test_not-a-time_00112233445566778899aabbccddeeff",
+		"test_123_00112233445566778899aabbccddeeff_extra",
+		"test_123_00112233445566778899aabbccddeezz",
+		"other_123_00112233445566778899aabbccddeeff",
+	}
+	for _, invalidName := range invalidNames {
+		_, ok := parseTestPgDbName(invalidName)
+		if ok {
+			t.Errorf("accepted invalid test database name %q", invalidName)
+		}
+	}
+}
+
+func TestPgResourcesRedirectMaintenancePoolAndRestore(t *testing.T) {
+	popBasePg := Vault.PushSimpleResource(DefaultPgVaultResourceName, []byte(`
+authority: "app.example:5432"
+user: "app"
+password: "app-secret"
+db: "app-db"
+`))
+	defer popBasePg()
+	popBaseMaintenance := Vault.PushSimpleResource(MaintenancePgVaultResourceName, []byte(`
+authority: "direct.example:5432"
+user: "maintenance"
+password: "maintenance-secret"
+db: "maintenance-db"
+`))
+	defer popBaseMaintenance()
+
+	app := Vault.RequireSimpleResource(DefaultPgVaultResourceName).Parse()
+	maintenance := Vault.RequireSimpleResource(MaintenancePgVaultResourceName).Parse()
+	popTest := pushTestPgResources(app, maintenance, "test_exact")
+
+	testApp := Vault.RequireSimpleResource(DefaultPgVaultResourceName)
+	testMaintenance := Vault.RequireSimpleResource(MaintenancePgVaultResourceName)
+	if got := testApp.RequireString("db"); got != "test_exact" {
+		t.Fatalf("test application database = %q, want test_exact", got)
+	}
+	if got := testMaintenance.RequireString("db"); got != "test_exact" {
+		t.Fatalf("test maintenance database = %q, want test_exact", got)
+	}
+	if got := testMaintenance.RequireString("authority"); got != "direct.example:5432" {
+		t.Fatalf("test maintenance authority = %q, want direct authority", got)
+	}
+	if got := testMaintenance.RequireString("user"); got != "maintenance" {
+		t.Fatalf("test maintenance user = %q, want maintenance credentials", got)
+	}
+
+	popTest()
+	if got := Vault.RequireSimpleResource(DefaultPgVaultResourceName).RequireString("db"); got != "app-db" {
+		t.Fatalf("restored application database = %q, want app-db", got)
+	}
+	if got := Vault.RequireSimpleResource(MaintenancePgVaultResourceName).RequireString("db"); got != "maintenance-db" {
+		t.Fatalf("restored maintenance database = %q, want maintenance-db", got)
+	}
+}
+
+// Installs complete in-memory resources so preflight behavior can be tested
+// without reading a developer's vault or opening network connections.
+func pushTestEnvironmentPreflightResources(t *testing.T) {
+	t.Helper()
+	t.Setenv("WARP_TEST_ENV_PORTABLE_ROOT", "")
+	t.Setenv("WARP_ENV", "local")
+	t.Setenv("WARP_VAULT_HOME", filepath.Join(t.TempDir(), "vault"))
+	t.Setenv("WARP_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("TEST_POSTGRES_HOST", "postgres.test")
+	t.Setenv("TEST_REDIS_HOST", "redis.test")
+	t.Setenv("BRINGYOUR_POSTGRES_HOSTNAME", "postgres.test")
+	t.Setenv("BRINGYOUR_REDIS_HOSTNAME", "redis.test")
+	popPg := Vault.PushSimpleResource(DefaultPgVaultResourceName, []byte(`
+authority: "{{ env:TEST_POSTGRES_HOST }}:5432"
+user: "test"
+password: "not-a-secret"
+db: "test"
+`))
+	popRedis := Vault.PushSimpleResource("redis.yml", []byte(`
+authority: "{{ env:TEST_REDIS_HOST }}:6379"
+password: ""
+db: 0
+cluster: false
+`))
+	popDbConfig := Config.PushSimpleResource(DefaultPgConfigResourceName, []byte(`
+min_connections: 1
+max_connections: 2
+`))
+	popRedisConfig := Config.PushSimpleResource("redis.yml", []byte(`
+min_connections: 1
+max_connections: 2
+`))
+	t.Cleanup(func() {
+		popRedisConfig()
+		popDbConfig()
+		popRedis()
+		popPg()
+	})
+}
+
+// An unset or non-local environment is a deterministic configuration error,
+// never a flaky test attempt.
+func TestTestEnvironmentNameRequiresLocal(t *testing.T) {
+	cases := []struct {
+		env      string
+		expected string
+	}{
+		{env: "", expected: "WARP_ENV must be set to local"},
+		{env: "main", expected: `WARP_ENV must be local, got "main"`},
+	}
+	for _, c := range cases {
+		t.Setenv("WARP_ENV", c.env)
+		err := validateTestEnvironmentName()
+		if err == nil || !strings.Contains(err.Error(), c.expected) {
+			t.Errorf("WARP_ENV=%q error = %v; want %q", c.env, err, c.expected)
+		}
+	}
+}
+
+// Every PostgreSQL/Redis vault and pool resource consumed during setup must be
+// named before any service probe or retry can begin.
+func TestTestEnvironmentPreflightReportsEachMissingResource(t *testing.T) {
+	t.Setenv("WARP_ENV", "local")
+	t.Setenv("WARP_VAULT_HOME", filepath.Join(t.TempDir(), "vault"))
+	t.Setenv("WARP_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	fixtures := []struct {
+		resolver *Resolver
+		name     string
+		content  []byte
+		expected string
+	}{
+		{
+			resolver: Vault,
+			name:     DefaultPgVaultResourceName,
+			content:  []byte("authority: postgres.test:5432\nuser: test\npassword: test\ndb: test\n"),
+			expected: "required vault resource pg.yml",
+		},
+		{
+			resolver: Vault,
+			name:     "redis.yml",
+			content:  []byte("authority: redis.test:6379\npassword: \"\"\ndb: 0\ncluster: false\n"),
+			expected: "required vault resource redis.yml",
+		},
+		{
+			resolver: Config,
+			name:     DefaultPgConfigResourceName,
+			content:  []byte("min_connections: 1\nmax_connections: 2\n"),
+			expected: "required config resource db.yml",
+		},
+		{
+			resolver: Config,
+			name:     "redis.yml",
+			content:  []byte("min_connections: 1\nmax_connections: 2\n"),
+			expected: "required config resource redis.yml",
+		},
+	}
+	for missingIndex, missingFixture := range fixtures {
+		pops := []func(){}
+		for fixtureIndex, fixture := range fixtures {
+			if fixtureIndex != missingIndex {
+				pops = append(pops, fixture.resolver.PushSimpleResource(fixture.name, fixture.content))
+			}
+		}
+		probeCalled := false
+		err := preflightTestEnvironment(func(context.Context, string, testEnvironmentConfiguration) error {
+			probeCalled = true
+			return nil
+		})
+		for i := len(pops) - 1; 0 <= i; i -= 1 {
+			pops[i]()
+		}
+		if err == nil || !strings.Contains(err.Error(), missingFixture.expected) {
+			t.Errorf("missing %s error = %v; want %q", missingFixture.name, err, missingFixture.expected)
+		}
+		if probeCalled {
+			t.Errorf("missing %s reached the service probe", missingFixture.name)
+		}
+	}
+}
+
+// A valid portable fixture expands environment-backed hostnames and probes
+// both services in deterministic order.
+func TestTestEnvironmentPreflightExpandsAndProbesPortableResources(t *testing.T) {
+	pushTestEnvironmentPreflightResources(t)
+	authorities := []string{}
+	err := preflightTestEnvironment(func(
+		ctx context.Context,
+		serviceName string,
+		configuration testEnvironmentConfiguration,
+	) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("service probe context has no deadline")
+		}
+		authorities = append(authorities, testEnvironmentServiceAuthority(serviceName, configuration))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connect.AssertEqual(t, authorities, []string{"postgres.test:5432", "redis.test:6379"})
+}
+
+// A missing environment value referenced by a fixture fails during resource
+// validation rather than entering network setup or the flaky retry loop.
+func TestTestEnvironmentPreflightReportsMissingFixtureEnvironment(t *testing.T) {
+	pushTestEnvironmentPreflightResources(t)
+	t.Setenv("TEST_POSTGRES_HOST", "")
+	probeCalled := false
+	err := preflightTestEnvironment(func(context.Context, string, testEnvironmentConfiguration) error {
+		probeCalled = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "Missing env var TEST_POSTGRES_HOST") {
+		t.Fatalf("preflight error = %v; want missing fixture environment", err)
+	}
+	if probeCalled {
+		t.Fatal("invalid fixture reached the service probe")
+	}
+}
+
+// An unavailable dependency is reported on its first bounded probe; Redis's
+// two-minute transient operation retry is reserved for an environment that was
+// reachable when the test started.
+func TestTestEnvironmentPreflightReportsUnavailableService(t *testing.T) {
+	pushTestEnvironmentPreflightResources(t)
+	redisUnavailableErr := errors.New("redis test endpoint refused the connection")
+	authorities := []string{}
+	err := preflightTestEnvironment(func(
+		ctx context.Context,
+		serviceName string,
+		configuration testEnvironmentConfiguration,
+	) error {
+		authority := testEnvironmentServiceAuthority(serviceName, configuration)
+		authorities = append(authorities, authority)
+		if authority == "redis.test:6379" {
+			return redisUnavailableErr
+		}
+		return nil
+	})
+	if !errors.Is(err, redisUnavailableErr) {
+		t.Fatalf("preflight error = %v; want Redis probe error", err)
+	}
+	connect.AssertEqual(t, authorities, []string{"postgres.test:5432", "redis.test:6379"})
+}
+
+// A hosts-file alias must not fall through to DNS when the native resolver is
+// unavailable. The injected dial fails deterministically if files-first lookup
+// does not answer localhost itself.
+func TestTestEnvironmentProbeResolverReadsHostsBeforeDns(t *testing.T) {
+	resolver := newTestEnvironmentProbeResolver()
+	if !resolver.PreferGo {
+		t.Fatal("test environment probe resolver does not prefer the Go resolver")
+	}
+	dnsDialed := false
+	resolver.Dial = func(context.Context, string, string) (net.Conn, error) {
+		dnsDialed = true
+		return nil, errors.New("unexpected DNS lookup")
+	}
+	addresses, err := resolver.LookupHost(context.Background(), "localhost")
+	if err != nil {
+		t.Fatalf("resolve hosts-file localhost: %v", err)
+	}
+	if dnsDialed {
+		t.Fatal("hosts-file localhost fell through to DNS")
+	}
+	if len(addresses) == 0 {
+		t.Fatal("hosts-file localhost resolved without an address")
+	}
+}
+
+// Both dependency clients must use the injected resolver path. Returning a
+// marker error at each boundary reproduces a resolver outage without timing or
+// host-network state.
+func TestTestEnvironmentServiceProbeUsesInjectedNetwork(t *testing.T) {
+	configuration := testEnvironmentConfiguration{
+		postgresAuthority: "postgres-resolver.test:5432",
+		postgresUser:      "test",
+		postgresPassword:  "not-a-secret",
+		postgresDatabase:  "test",
+		redisAuthority:    "redis-resolver.test:6379",
+	}
+	tests := []struct {
+		serviceName       string
+		expectedHost      string
+		expectedAuthority string
+	}{
+		{
+			serviceName:       "postgres",
+			expectedHost:      "postgres-resolver.test",
+			expectedAuthority: "",
+		},
+		{
+			serviceName:       "redis",
+			expectedHost:      "",
+			expectedAuthority: "redis-resolver.test:6379",
+		},
+	}
+	for _, test := range tests {
+		marker := "injected " + test.serviceName + " resolver outage"
+		lookupHosts := []string{}
+		dialAuthorities := []string{}
+		err := probeTestEnvironmentServiceWithNetwork(
+			context.Background(),
+			test.serviceName,
+			configuration,
+			func(ctx context.Context, host string) ([]string, error) {
+				lookupHosts = append(lookupHosts, host)
+				return nil, errors.New(marker)
+			},
+			func(ctx context.Context, network string, authority string) (net.Conn, error) {
+				dialAuthorities = append(dialAuthorities, authority)
+				return nil, errors.New(marker)
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), marker) {
+			t.Errorf("%s probe error = %v; want injected resolver error", test.serviceName, err)
+		}
+		if test.expectedHost == "" {
+			if len(lookupHosts) != 0 {
+				t.Errorf("%s probe unexpectedly used PostgreSQL lookup: %v", test.serviceName, lookupHosts)
+			}
+		} else {
+			connect.AssertEqual(t, lookupHosts, []string{test.expectedHost})
+		}
+		if test.expectedAuthority == "" {
+			if len(dialAuthorities) != 0 {
+				t.Errorf("%s probe unexpectedly reached dial: %v", test.serviceName, dialAuthorities)
+			}
+		} else {
+			if len(dialAuthorities) == 0 {
+				t.Errorf("%s probe did not use the injected dialer", test.serviceName)
+			}
+			for _, authority := range dialAuthorities {
+				if authority != test.expectedAuthority {
+					t.Errorf(
+						"%s dial authority = %q; want %q",
+						test.serviceName,
+						authority,
+						test.expectedAuthority,
+					)
+				}
+			}
+		}
+	}
+}
+
+// Redis-only integration tests diagnose their exact missing fixture without
+// depending on the PostgreSQL or pool configuration resources.
+func TestLoadTestRedisLeaseConfigurationReportsMissingFixture(t *testing.T) {
+	t.Setenv("WARP_ENV", "local")
+	t.Setenv("WARP_VAULT_HOME", filepath.Join(t.TempDir(), "vault"))
+	_, err := loadTestRedisLeaseConfiguration()
+	if err == nil || !strings.Contains(err.Error(), "required vault resource redis.yml") {
+		t.Fatalf("Redis fixture error = %v; want missing redis.yml", err)
+	}
+}
+
 // TestRunRetriesUntilPass checks every failure mode is retried: attempt 1
 // panics, 2 calls t.Fail, 3 fails an assertion (assert.Equal -> FailNow ->
 // runtime.Goexit), and 4 passes. Each failure is recorded only on the retryTB
 // wrapper, so the real *testing.T never fails and the test passes.
 func TestRunRetriesUntilPass(t *testing.T) {
+	if os.Getenv("URNETWORK_RERUN_SUCCESS_CHILD") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRunRetriesUntilPass$", "-test.count=1", "-test.v")
+		cmd.Env = append(os.Environ(), "URNETWORK_RERUN_SUCCESS_CHILD=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("retry child did not recover on its fourth attempt: %v\n%s", err, out)
+		}
+		output := string(out)
+		for _, signature := range []string{
+			"[flaky]test failed iteration[1/4] err = flaky panic on the first attempt",
+			"TestRunRetriesUntilPass.func1",
+			"[flaky]test failed iteration[2/4] (assertion failure, see test log)",
+			"1 does not equal 2",
+			"[flaky]test failed iteration[3/4] (assertion failure, see test log)",
+			"[flaky]test passed iteration[4/4]",
+			"--- PASS: TestRunRetriesUntilPass",
+		} {
+			if strings.Count(output, signature) != 1 {
+				t.Fatalf("retry child signature %q count = %d; want 1", signature, strings.Count(output, signature))
+			}
+		}
+		return
+	}
+
 	var attempts atomic.Int32
-	retryTestEnv(3).Run(t, func(tb testing.TB) {
+	var preflights atomic.Int32
+	testEnv := retryTestEnv(3)
+	testEnv.runWithSetup(t, func(tb testing.TB) {
 		switch attempts.Add(1) {
 		case 1:
 			panic("flaky panic on the first attempt")
@@ -49,9 +695,17 @@ func TestRunRetriesUntilPass(t *testing.T) {
 			connect.AssertEqual(tb, 1, 2)
 		}
 		// the fourth attempt falls through and passes
+	}, func() error {
+		preflights.Add(1)
+		return nil
+	}, func() func() {
+		return func() {}
 	})
 	if got := attempts.Load(); got != 4 {
 		t.Fatalf("expected 4 attempts before success, got %d", got)
+	}
+	if got := preflights.Load(); got != 1 {
+		t.Fatalf("preflight count = %d; want 1 outside the retry loop", got)
 	}
 }
 
@@ -62,7 +716,7 @@ func TestRunRetriesUntilPass(t *testing.T) {
 func TestRunFailsAfterExhaustion(t *testing.T) {
 	if os.Getenv("URNETWORK_RERUN_EXHAUSTION_CHILD") == "1" {
 		// Child process: always fails, so Run exhausts its reruns and fails.
-		retryTestEnv(1).Run(t, func(tb testing.TB) {
+		runRetryTestEnv(t, retryTestEnv(1), func(tb testing.TB) {
 			tb.Fatal("persistent failure")
 		})
 		return
@@ -74,7 +728,25 @@ func TestRunFailsAfterExhaustion(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected the child test to fail after exhausting reruns, but it passed:\n%s", out)
 	}
-	t.Logf("child test failed after exhausting reruns, as expected:\n%s", out)
+	output := string(out)
+	for _, expected := range []struct {
+		signature string
+		count     int
+	}{
+		{signature: "persistent failure", count: 2},
+		{signature: "[flaky]test failed iteration[1/2] (assertion failure, see test log)", count: 1},
+		{signature: "[flaky]test failed iteration[2/2] (assertion failure, see test log)", count: 1},
+		{signature: "--- FAIL: TestRunFailsAfterExhaustion", count: 1},
+	} {
+		if count := strings.Count(output, expected.signature); count != expected.count {
+			t.Fatalf(
+				"exhausted retry child signature %q count = %d; want %d",
+				expected.signature,
+				count,
+				expected.count,
+			)
+		}
+	}
 }
 
 // TestRunReportsPanicOriginAfterExhaustion checks that retry recovery retains
@@ -82,7 +754,7 @@ func TestRunFailsAfterExhaustion(t *testing.T) {
 // and hides the line that actually failed.
 func TestRunReportsPanicOriginAfterExhaustion(t *testing.T) {
 	if os.Getenv("URNETWORK_RERUN_PANIC_CHILD") == "1" {
-		retryTestEnv(0).Run(t, func(tb testing.TB) {
+		runRetryTestEnv(t, retryTestEnv(0), func(tb testing.TB) {
 			panic("persistent panic")
 		})
 		return
@@ -100,6 +772,9 @@ func TestRunReportsPanicOriginAfterExhaustion(t *testing.T) {
 	}
 	if !strings.Contains(output, "TestRunReportsPanicOriginAfterExhaustion.func1") {
 		t.Fatalf("expected callback origin in child output:\n%s", out)
+	}
+	if strings.Count(output, "[flaky]test failed iteration[1/1] err = persistent panic") != 1 {
+		t.Fatalf("expected one panic-attempt diagnostic in child output:\n%s", out)
 	}
 }
 
@@ -121,17 +796,81 @@ func TestRedisDbCandidatesHandleNegativeOffsets(t *testing.T) {
 	connect.AssertEqual(t, candidates, expected)
 }
 
+// An exhausted client-level dial sequence is still one transient setup error;
+// the bounded lease setup horizon must give it another operation attempt.
+func TestRedisLeaseConnectionOperationRetriesTransientFailure(t *testing.T) {
+	attemptCount := 0
+	err := retryTestRedisLeaseConnectionOperation(context.Background(), func(ctx context.Context) error {
+		attemptCount += 1
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("lease retry operation context has no deadline")
+		}
+		if attemptCount == 1 {
+			return &net.DNSError{
+				Err:       "i/o timeout",
+				Name:      "local-redis.bringyour.com",
+				IsTimeout: true,
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 2 {
+		t.Fatalf("operation attempts = %d; want 2", attemptCount)
+	}
+}
+
+// Authentication, protocol, and configuration errors are not made flaky by
+// retrying them as if they were transport failures.
+func TestRedisLeaseConnectionOperationRejectsPermanentFailure(t *testing.T) {
+	permanentErr := errors.New("redis lease configuration rejected")
+	attemptCount := 0
+	err := retryTestRedisLeaseConnectionOperation(context.Background(), func(context.Context) error {
+		attemptCount += 1
+		return permanentErr
+	})
+	if !errors.Is(err, permanentErr) {
+		t.Fatalf("operation error = %v; want %v", err, permanentErr)
+	}
+	if attemptCount != 1 {
+		t.Fatalf("operation attempts = %d; want 1", attemptCount)
+	}
+}
+
+// Caller cancellation remains stronger than the setup retry budget.
+func TestRedisLeaseConnectionOperationStopsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attemptCount := 0
+	err := retryTestRedisLeaseConnectionOperation(ctx, func(context.Context) error {
+		attemptCount += 1
+		return &net.DNSError{
+			Err:       "i/o timeout",
+			Name:      "local-redis.bringyour.com",
+			IsTimeout: true,
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("operation error = %v; want context cancellation", err)
+	}
+	if attemptCount != 0 {
+		t.Fatalf("operation attempts = %d; want 0", attemptCount)
+	}
+}
+
 func TestRedisDatabaseLeaseRenewsWhileOwnerIsActive(t *testing.T) {
+	authority, password, reservedDb := testRedisLeaseConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	redisResource := Vault.RequireSimpleResource("redis.yml")
 	token := strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	lease := acquireTestRedisDbLease(
 		ctx,
-		redisResource.RequireString("authority"),
-		redisResource.RequireString("password"),
-		redisResource.RequireInt("db"),
+		authority,
+		password,
+		reservedDb,
 		token,
 		0,
 		180*time.Millisecond,
@@ -155,13 +894,24 @@ func TestRedisDatabaseLeaseRenewsWhileOwnerIsActive(t *testing.T) {
 	}
 }
 
-// testRedisLeaseConfig reads the coordinator connection settings the same way
-// acquireTestRedisDbLease's callers do.
-func testRedisLeaseConfig() (authority string, password string, reservedDb int) {
-	redisResource := Vault.RequireSimpleResource("redis.yml")
-	return redisResource.RequireString("authority"),
-		redisResource.RequireString("password"),
-		redisResource.RequireInt("db")
+// Reads and probes only the Redis dependency needed by lease integration
+// tests, without imposing an unrelated PostgreSQL requirement.
+func testRedisLeaseConfig(t *testing.T) (authority string, password string, reservedDb int) {
+	t.Helper()
+	configuration, err := loadTestRedisLeaseConfiguration()
+	if err == nil {
+		err = preflightTestEnvironmentService(
+			"redis",
+			configuration,
+			probeTestEnvironmentService,
+		)
+	}
+	if err != nil {
+		t.Fatalf("redis integration test preflight: %v", err)
+	}
+	return configuration.redisAuthority,
+		configuration.redisPassword,
+		configuration.redisReservedDb
 }
 
 func testRedisLeaseToken() string {
@@ -173,10 +923,10 @@ func testRedisLeaseToken() string {
 // connection: go-redis then retries the script, and the retry must read the
 // released marker as success instead of misreporting the lease as not owned.
 func TestRedisDatabaseLeaseReleaseSurvivesRetriedRelease(t *testing.T) {
+	authority, password, reservedDb := testRedisLeaseConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	authority, password, reservedDb := testRedisLeaseConfig()
 	lease := acquireTestRedisDbLease(
 		ctx,
 		authority,
@@ -210,10 +960,10 @@ func TestRedisDatabaseLeaseReleaseSurvivesRetriedRelease(t *testing.T) {
 // retried SET NX reports not-acquired even though the key holds this process's
 // token, and acquisition must claim the lease instead of skipping the db.
 func TestRedisDatabaseLeaseAcquireClaimsOwnTokenAfterLostSetResponse(t *testing.T) {
+	authority, password, reservedDb := testRedisLeaseConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	authority, password, reservedDb := testRedisLeaseConfig()
 	token := testRedisLeaseToken()
 
 	client := redis.NewClient(&redis.Options{
@@ -269,10 +1019,10 @@ func TestRedisDatabaseLeaseAcquireClaimsOwnTokenAfterLostSetResponse(t *testing.
 // TestRedisDatabaseLeaseReleaseDetectsForeignOwner: a lease key rewritten by
 // another owner must fail release with the foreign-owner diagnostic.
 func TestRedisDatabaseLeaseReleaseDetectsForeignOwner(t *testing.T) {
+	authority, password, reservedDb := testRedisLeaseConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	authority, password, reservedDb := testRedisLeaseConfig()
 	lease := acquireTestRedisDbLease(
 		ctx,
 		authority,
@@ -313,10 +1063,10 @@ func TestRedisDatabaseLeaseReleaseDetectsForeignOwner(t *testing.T) {
 // entirely (flush, expiry) must still fail release with the not-owned
 // diagnostic.
 func TestRedisDatabaseLeaseReleaseDetectsMissingKey(t *testing.T) {
+	authority, password, reservedDb := testRedisLeaseConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	authority, password, reservedDb := testRedisLeaseConfig()
 	lease := acquireTestRedisDbLease(
 		ctx,
 		authority,
@@ -350,6 +1100,9 @@ func TestRedisDatabaseLeaseSeparatesProcesses(t *testing.T) {
 	)
 
 	if role := os.Getenv(roleEnv); role != "" {
+		if err := preflightTestEnvironment(probeTestEnvironmentService); err != nil {
+			t.Fatalf("local integration test preflight: %v", err)
+		}
 		teardown := (&TestEnv{ApplyDbMigrations: false}).setup()
 		defer teardown()
 
@@ -434,9 +1187,9 @@ func TestRedisDatabaseLeaseSeparatesProcesses(t *testing.T) {
 // ---- test listen port allocator ------------------------------------------
 //
 // Deterministic pins for the two allocator rules from certification failure
-// c12-1 (see the allocator doc in test_util.go). Each test occupies or
-// inspects real sockets, so the properties are asserted against actual OS
-// bind semantics, not a simulation.
+// c12-1 (see the allocator doc in test_util.go). The scope test asserts the
+// address passed to the OS and then occupies that exact address, avoiding
+// platform-specific rules for overlapping wildcard and specific binds.
 
 // TestReserveTestListenPortsStayBelowEphemeralRange: every allocated port
 // must sit below the OS ephemeral range (macOS: 49152+, Linux default:
@@ -462,57 +1215,51 @@ func TestReserveTestListenPortsStayBelowEphemeralRange(t *testing.T) {
 	}
 }
 
-// TestReserveTestListenPortsProbeWildcardScope: the probe must run on the
-// wildcard address the servers actually bind. The test occupies 0.0.0.0:P,
-// rewinds the allocator so P is the next candidate, and requires the
-// allocator to skip it. It also pins the OS semantics that make a loopback
-// probe insufficient: with SO_REUSEADDR (Go's listener default), binding
-// 127.0.0.1:P SUCCEEDS while 0.0.0.0:P is held — so a loopback probe would
-// have accepted P and the server's wildcard bind would then have failed
-// EADDRINUSE, exactly like c12-1.
+// The probe must use the wildcard address the servers actually bind and skip
+// candidates already occupied at that scope. TCP and UDP have separate bind
+// implementations, so both paths are pinned.
 func TestReserveTestListenPortsProbeWildcardScope(t *testing.T) {
-	// a port the allocator itself proved wildcard-free
-	ports, release, err := ReserveTestListenPorts("tcp")
-	if err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
-	occupiedPort := ports[0]
-	release()
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			// Start with a candidate the allocator proved wildcard-free.
+			ports, release, err := ReserveTestListenPorts(network)
+			if err != nil {
+				t.Fatalf("reserve: %v", err)
+			}
+			occupiedPort := ports[0]
+			release()
 
-	// occupy it on the wildcard, playing the part of the process's own
-	// outbound dial (or any other socket) landing on the number
-	occupier, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", occupiedPort))
-	if err != nil {
-		t.Fatalf("occupy wildcard %d: %v", occupiedPort, err)
-	}
-	defer occupier.Close()
+			expectedAddr := fmt.Sprintf("0.0.0.0:%d", occupiedPort)
+			if actualAddr := testListenPortAddress(occupiedPort); actualAddr != expectedAddr {
+				t.Fatalf("probe address = %q, want server wildcard %q", actualAddr, expectedAddr)
+			}
 
-	// the semantics pin: loopback bind succeeds while the wildcard is held,
-	// so probing loopback proves nothing about the server's wildcard bind
-	loopback, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", occupiedPort))
-	if err != nil {
-		t.Fatalf(
-			"loopback bind on wildcard-held port %d failed (%v): the OS no longer allows the specific-over-wildcard bind, so the loopback-probe hazard this test pins has changed shape — revisit the allocator doc",
-			occupiedPort, err,
-		)
-	}
-	loopback.Close()
+			var occupier io.Closer
+			switch network {
+			case "tcp":
+				occupier, err = net.Listen("tcp4", expectedAddr)
+			case "udp":
+				occupier, err = net.ListenPacket("udp4", expectedAddr)
+			}
+			if err != nil {
+				t.Fatalf("occupy wildcard port %d: %v", occupiedPort, err)
+			}
+			defer occupier.Close()
 
-	// rewind so the occupied port is the next candidate, then allocate: the
-	// wildcard probe must skip it
-	atomic.StoreInt64(&testListenPortNext, int64(occupiedPort))
-	if next := testNextListenPortCandidate(); next != occupiedPort {
-		t.Fatalf("rewind: next candidate = %d, want %d", next, occupiedPort)
-	}
-	ports, release, err = ReserveTestListenPorts("tcp")
-	if err != nil {
-		t.Fatalf("reserve with occupied candidate: %v", err)
-	}
-	defer release()
-	if ports[0] == occupiedPort {
-		t.Fatalf(
-			"allocator returned wildcard-occupied port %d: the probe is not checking the address the servers bind",
-			occupiedPort,
-		)
+			// Rewind so the occupied port is the next candidate. The matching
+			// wildcard probe must skip it.
+			atomic.StoreInt64(&testListenPortNext, int64(occupiedPort))
+			if next := testNextListenPortCandidate(); next != occupiedPort {
+				t.Fatalf("rewind: next candidate = %d, want %d", next, occupiedPort)
+			}
+			ports, release, err = ReserveTestListenPorts(network)
+			if err != nil {
+				t.Fatalf("reserve with occupied candidate: %v", err)
+			}
+			defer release()
+			if ports[0] == occupiedPort {
+				t.Fatalf("allocator returned wildcard-occupied port %d", occupiedPort)
+			}
+		})
 	}
 }

@@ -46,6 +46,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,17 +75,25 @@ const (
 	mcUdpDeliveryMinFraction = 0.01
 	// seq (8) + send nanos (8)
 	mcPayloadHeaderByteCount = 16
+	// the harness consumes packets directly from the multi-client callback,
+	// without a kernel IP stack to reassemble IPv4 fragments. Keep each UDP
+	// datagram at the product tunnel MTU so a callback is one complete packet.
+	mcUdpPayloadByteCount = connect.DefaultMtu - connect.Ipv4HeaderSizeWithoutExtensions - connect.UdpHeaderSize
 
 	// download blast volume and pacing. The pace is set above the expected
 	// stack ceiling so the path stays saturated; the kernel drops the excess
 	// at the nat ingress socket, and the delivered goodput measures the
 	// sustainable download rate of the full stack.
 	mcDownloadTotalByteCount   = 100 * 1024 * 1024
-	mcDownloadPayloadByteCount = 1400
+	mcDownloadPayloadByteCount = mcUdpPayloadByteCount
 	// pace in 64 KiB chunks with a 1ms sleep: ~62 MiB/s
 	mcDownloadPaceChunkByteCount = 64 * 1024
 
-	mcTcpStreamByteCount = 100 * 1024 * 1024
+	// A cold TCP dial includes provider discovery, generated-client setup, and
+	// contracts in both directions. The TUN's own dial timer must preserve this
+	// whole fixture budget instead of truncating it to the 30-second default.
+	mcTcpColdStartTimeout = 60 * time.Second
+	mcTcpStreamByteCount  = 100 * 1024 * 1024
 	// minimum acceptable max tcp goodput: a collapse detector, so it sits well
 	// below the honest -race capacity band (measured steady 0.61-0.71 MiB/s on
 	// an idle M1 Max, capacity-determined) rather than inside it — background
@@ -97,6 +106,131 @@ const (
 	// degrades one 3-run window does not get to fail the suite on its own.
 	mcPerfExtraRunCount = 2
 )
+
+// Keeps the in-process performance topology on loopback instead of gathering
+// every host interface or querying public STUN servers.
+func newLocalPerformanceClientSettings() *connect.ClientSettings {
+	clientSettings := connect.DefaultClientSettings()
+	clientSettings.WebRtcSettings.IceServerUrls = nil
+	clientSettings.WebRtcSettings.UseLoopbackOnlyIceInterfaces = true
+	return clientSettings
+}
+
+// Keeps the application socket's intrinsic deadline aligned with the full
+// multi-client cold-start budget used by the surrounding dial context.
+func newLocalPerformanceTcpTunSettings() *connect.TunSettings {
+	tunSettings := connect.DefaultTunSettings()
+	tunSettings.DialTimeout = mcTcpColdStartTimeout
+	return tunSettings
+}
+
+// Pins the fixture boundary that prevents host interface count and WAN state
+// from changing the cost of a same-process performance run.
+func TestLocalPerformanceClientSettingsConstrainIceToLoopback(t *testing.T) {
+	clientSettings := newLocalPerformanceClientSettings()
+	if iceServerUrls := clientSettings.WebRtcSettings.IceServerUrls; len(iceServerUrls) != 0 {
+		t.Errorf("local performance fixture has external ICE servers: %v", iceServerUrls)
+	}
+	if !clientSettings.WebRtcSettings.UseLoopbackOnlyIceInterfaces {
+		t.Error("local performance fixture can gather non-loopback ICE candidates")
+	}
+}
+
+// Pins the fixture boundary that prevents the TUN's shorter production dial
+// timer from ending a valid cold route formation before the caller's budget.
+func TestLocalPerformanceTcpTunPreservesColdStartDialBudget(t *testing.T) {
+	tunSettings := newLocalPerformanceTcpTunSettings()
+	if tunSettings.DialTimeout != mcTcpColdStartTimeout {
+		t.Errorf(
+			"local performance TUN dial timeout = %s, expected %s",
+			tunSettings.DialTimeout,
+			mcTcpColdStartTimeout,
+		)
+	}
+}
+
+// Starts an optional measurement profile while keeping file ownership local to
+// the fixture even when another package-level profile is already active.
+func startLocalPerformanceCpuProfile(path string) (func(), error) {
+	cpuProfileFile, err := os.Create(path)
+	if err != nil {
+		return func() {}, err
+	}
+	return startLocalPerformanceCpuProfileFile(
+		cpuProfileFile,
+		pprof.StartCPUProfile,
+		pprof.StopCPUProfile,
+	)
+}
+
+// Separates profiler admission from file ownership so both outcomes can be
+// proved without starting the process-global profiler in a unit test.
+func startLocalPerformanceCpuProfileFile(
+	cpuProfileFile io.WriteCloser,
+	startCpuProfile func(io.Writer) error,
+	stopCpuProfile func(),
+) (func(), error) {
+	if err := startCpuProfile(cpuProfileFile); err != nil {
+		cpuProfileFile.Close()
+		return func() {}, err
+	}
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			stopCpuProfile()
+			cpuProfileFile.Close()
+		})
+	}, nil
+}
+
+// A refused process-global profile still releases the file opened for it.
+func TestLocalPerformanceCpuProfileClosesFileWhenStartFails(t *testing.T) {
+	readFile, writeFile, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readFile.Close()
+
+	stopCpuProfile, startErr := startLocalPerformanceCpuProfileFile(
+		writeFile,
+		func(io.Writer) error { return fmt.Errorf("profile already active") },
+		func() { t.Error("refused profile was stopped") },
+	)
+	if startErr == nil {
+		t.Fatal("expected profile start failure")
+	}
+	stopCpuProfile()
+	if _, err := writeFile.Write([]byte{0}); err == nil {
+		t.Error("profile file remained open after start failure")
+	}
+}
+
+// An admitted profile stops once and releases its file when its owner ends it.
+func TestLocalPerformanceCpuProfileStopsAndClosesFile(t *testing.T) {
+	readFile, writeFile, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readFile.Close()
+
+	stopCount := 0
+	stopCpuProfile, startErr := startLocalPerformanceCpuProfileFile(
+		writeFile,
+		func(io.Writer) error { return nil },
+		func() { stopCount += 1 },
+	)
+	if startErr != nil {
+		t.Fatalf("start profile: %v", startErr)
+	}
+	stopCpuProfile()
+	stopCpuProfile()
+	if stopCount != 1 {
+		t.Errorf("profile stop count = %d, expected 1", stopCount)
+	}
+	if _, err := writeFile.Write([]byte{0}); err == nil {
+		t.Error("profile file remained open after stop")
+	}
+}
 
 func TestConnectMultiClientPerformance(t *testing.T) {
 	perfTestEnv().Run(t, func(t testing.TB) {
@@ -156,7 +290,7 @@ func testConnectMultiClientTcpPerformance(t testing.TB) {
 
 	// ---- device: tun bridged to the multi client -----------------------------
 
-	tun, err := connect.CreateTunWithDefaults(ctx)
+	tun, err := connect.CreateTun(ctx, newLocalPerformanceTcpTunSettings())
 	if err != nil {
 		panic(err)
 	}
@@ -171,7 +305,7 @@ func testConnectMultiClientTcpPerformance(t testing.TB) {
 	specs := []*connect.ProviderSpec{
 		{ClientId: &providerClientIdConnect},
 	}
-	generator := connect.NewApiMultiClientGeneratorWithDefaults(
+	generator := connect.NewApiMultiClientGenerator(
 		ctx,
 		specs,
 		deviceStrategy,
@@ -183,6 +317,8 @@ func testConnectMultiClientTcpPerformance(t testing.TB) {
 		"mctcp",
 		"0.0.0",
 		&deviceClientIdConnect,
+		newLocalPerformanceClientSettings,
+		connect.DefaultApiMultiClientGeneratorSettings(),
 	)
 
 	// received packets are injected synchronously: the inline tun.Write is
@@ -234,7 +370,7 @@ func testConnectMultiClientTcpPerformance(t testing.TB) {
 	// ---- phase 1: connect + first byte (cold start) --------------------------
 
 	startTime := time.Now()
-	dialCtx, dialCancel := context.WithTimeout(ctx, 60*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(ctx, mcTcpColdStartTimeout)
 	probeConn, err := tun.DialContext(dialCtx, "tcp", echoAddr)
 	dialCancel()
 	if err != nil {
@@ -274,8 +410,11 @@ func testConnectMultiClientTcpPerformance(t testing.TB) {
 	}
 
 	cpuProfilePath := filepath.Join(profileDir, "mctcp_stream_cpu.pprof")
-	cpuProfileFile, _ := os.Create(cpuProfilePath)
-	cpuProfileActive := pprof.StartCPUProfile(cpuProfileFile) == nil
+	stopCpuProfile, cpuProfileErr := startLocalPerformanceCpuProfile(cpuProfilePath)
+	if cpuProfileErr != nil {
+		fmt.Printf("[mctcp]cpu profile unavailable (%s)\n", cpuProfileErr)
+	}
+	defer stopCpuProfile()
 
 	// tcpStackStats prints the delta of the tun's gvisor TCP counters across a
 	// run, so a slow or stalled run is diagnosable from the log: retransmit/rto
@@ -413,10 +552,7 @@ func testConnectMultiClientTcpPerformance(t testing.TB) {
 		tcpStackStats(fmt.Sprintf("run %d", runs))
 	}
 
-	if cpuProfileActive {
-		pprof.StopCPUProfile()
-		cpuProfileFile.Close()
-	}
+	stopCpuProfile()
 	if writeProfile := pprof.Lookup("allocs"); writeProfile != nil {
 		if f, ferr := os.Create(filepath.Join(profileDir, "mctcp_stream_allocs.pprof")); ferr == nil {
 			writeProfile.WriteTo(f, 0)
@@ -617,7 +753,12 @@ func setupMcStack(ctx context.Context, label string) (*mcStack, func()) {
 	providerStrategy := connect.NewClientStrategy(ctx, providerStrategySettings)
 
 	providerOob := connect.NewApiOutOfBandControl(ctx, providerStrategy, providerByJwt, apiUrl)
-	providerClient := connect.NewClient(ctx, connect.Id(providerClientId), providerOob, connect.DefaultClientSettings())
+	providerClient := connect.NewClient(
+		ctx,
+		connect.Id(providerClientId),
+		providerOob,
+		newLocalPerformanceClientSettings(),
+	)
 
 	providerAuth := &connect.ClientAuth{
 		ByJwt:      providerByJwt,
@@ -782,7 +923,7 @@ func testConnectMultiClientPerformance(t testing.TB) {
 	specs := []*connect.ProviderSpec{
 		{ClientId: &providerClientIdConnect},
 	}
-	generator := connect.NewApiMultiClientGeneratorWithDefaults(
+	generator := connect.NewApiMultiClientGenerator(
 		ctx,
 		specs,
 		deviceStrategy,
@@ -794,6 +935,8 @@ func testConnectMultiClientPerformance(t testing.TB) {
 		"mcperf",
 		"0.0.0",
 		&deviceClientIdConnect,
+		newLocalPerformanceClientSettings,
+		connect.DefaultApiMultiClientGeneratorSettings(),
 	)
 
 	var echoCount int64
@@ -936,18 +1079,18 @@ func testConnectMultiClientPerformance(t testing.TB) {
 	// the blast is run several times and the run with the best delivery is
 	// taken, to ride out host scheduling noise on the build server.
 
-	payloadByteCount := 1400
+	payloadByteCount := mcUdpPayloadByteCount
 	sourcePorts := []int{41000, 41001, 41002, 41003}
 
 	// profile the single-client send/receive path across the throughput runs
 	profileDir := "profile"
 	os.MkdirAll(profileDir, 0755)
 	cpuProfilePath := filepath.Join(profileDir, "mcperf_tput_cpu.pprof")
-	cpuProfileFile, err := os.Create(cpuProfilePath)
-	if err != nil {
-		panic(err)
+	stopCpuProfile, cpuProfileErr := startLocalPerformanceCpuProfile(cpuProfilePath)
+	if cpuProfileErr != nil {
+		fmt.Printf("[mcperf]cpu profile unavailable (%s)\n", cpuProfileErr)
 	}
-	cpuProfileActive := pprof.StartCPUProfile(cpuProfileFile) == nil
+	defer stopCpuProfile()
 	runtime.SetBlockProfileRate(10 * 1000) // sample blocking >= 10us
 	runtime.SetMutexProfileFraction(5)
 
@@ -1057,10 +1200,7 @@ func testConnectMultiClientPerformance(t testing.TB) {
 		}
 	}
 
-	if cpuProfileActive {
-		pprof.StopCPUProfile()
-		cpuProfileFile.Close()
-	}
+	stopCpuProfile()
 	for _, name := range []string{"allocs", "mutex", "block"} {
 		if writeProfile := pprof.Lookup(name); writeProfile != nil {
 			if f, ferr := os.Create(filepath.Join(profileDir, fmt.Sprintf("mcperf_tput_%s.pprof", name))); ferr == nil {

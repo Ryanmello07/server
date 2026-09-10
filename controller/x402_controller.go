@@ -151,8 +151,8 @@ type X402PaymentRequired struct {
 	Accepts     []X402Accept `json:"accepts"`
 }
 
-// X402Sku is a thing an agent can buy, resolved from pro.yml (amount) + x402.yml
-// (price).
+// X402Sku is a thing an agent can buy, with availability from x402.yml and price and
+// amount from pro.yml.
 type X402Sku struct {
 	SkuId       string  `json:"sku_id"`
 	Description string  `json:"description"`
@@ -163,8 +163,8 @@ type X402Sku struct {
 	ByteCount model.ByteCount `json:"byte_count,omitempty"`
 }
 
-// X402Skus is everything purchasable over x402, with amounts from pro.yml so the
-// product spec stays in one place.
+// X402Skus is everything purchasable over x402, with prices and amounts from pro.yml
+// so the product spec stays in one place.
 func X402Skus() []*X402Sku {
 	return x402SkusForConfig(X402())
 }
@@ -727,6 +727,12 @@ func x402GrantProMonth(
 
 	granted := false
 	server.Tx(ctx, func(tx server.PgTx) {
+		granted = false
+		returnErr = nil
+		if err := model.LockPaymentNetworkInTx(tx, ctx, networkId); err != nil {
+			returnErr = err
+			return
+		}
 		if x402AlreadyGrantedForTransaction(ctx, tx, networkId, settleResponse.Transaction) {
 			// this settle tx already granted -- an agent retry, not a new purchase
 			glog.Infof(
@@ -761,7 +767,7 @@ func x402GrantProMonth(
 		if returnErr == nil {
 			granted = true
 		}
-	})
+	}, server.TxReadCommitted)
 
 	if returnErr != nil {
 		return
@@ -789,7 +795,13 @@ func x402GrantData(
 	startTime := server.NowUtc()
 	endTime := startTime.Add(model.Pro().DataCodeDuration)
 
+	var returnErr error
 	server.Tx(ctx, func(tx server.PgTx) {
+		returnErr = nil
+		if err := model.LockPaymentNetworkInTx(tx, ctx, networkId); err != nil {
+			returnErr = err
+			return
+		}
 		if x402AlreadyGrantedForTransaction(ctx, tx, networkId, settleResponse.Transaction) {
 			glog.Infof(
 				"[x402]tx %s already granted for network %s; ignoring retry\n",
@@ -807,9 +819,9 @@ func x402GrantData(
 			NetRevenue:            netRevenue,
 			PurchaseToken:         settleResponse.Transaction,
 		})
-	})
+	}, server.TxReadCommitted)
 
-	return nil
+	return returnErr
 }
 
 // x402SendReceipt emails a receipt for a settled purchase, through the normal

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/urnetwork/connect"
 
 	"github.com/urfoundation/sn/merkle"
@@ -22,11 +23,13 @@ import (
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
 	stconn "github.com/urnetwork/server/st"
+	"github.com/urnetwork/server/startifact"
 )
 
 func releaseStVaultFile() stVaultFile {
 	return stVaultFile{
 		TestnetEnabled: true, TestnetChainId: 945,
+		TestnetPublicRpcUrl: "https://test.chain.opentensor.ai",
 		TestnetGenesisHash:  "0x" + strings.Repeat("11", 32),
 		TestnetDeploymentId: "test-release", TestnetPolicyHash: "0x" + strings.Repeat("22", 32),
 		TestnetContractAddress: "0x0000000000000000000000000000000000000011",
@@ -50,25 +53,26 @@ func TestStConfigRejectsInvalidDepositTierSchedules(t *testing.T) {
 		name  string
 		tiers []StDepositTier
 	}{
-		{"missing zero baseline", []StDepositTier{{MinConvictionRao: 1, RateNumerator: 1, RateDenominator: 1}}},
-		{"duplicate threshold", []StDepositTier{{RateNumerator: 1, RateDenominator: 1}, {RateNumerator: 1, RateDenominator: 1}}},
-		{"zero numerator", []StDepositTier{{RateNumerator: 0, RateDenominator: 1}}},
-		{"zero denominator", []StDepositTier{{RateNumerator: 1, RateDenominator: 0}}},
-		{"rate increases", []StDepositTier{{RateNumerator: 1, RateDenominator: 2}, {MinConvictionRao: 1, RateNumerator: 2, RateDenominator: 3}}},
+		{name: "missing zero baseline", tiers: []StDepositTier{{MinConvictionRao: 1, RateNumerator: 1, RateDenominator: 1}}},
+		{name: "duplicate threshold", tiers: []StDepositTier{{RateNumerator: 1, RateDenominator: 1}, {RateNumerator: 1, RateDenominator: 1}}},
+		{name: "zero numerator", tiers: []StDepositTier{{RateNumerator: 0, RateDenominator: 1}}},
+		{name: "zero denominator", tiers: []StDepositTier{{RateNumerator: 1, RateDenominator: 0}}},
+		{name: "rate increases", tiers: []StDepositTier{{RateNumerator: 1, RateDenominator: 2}, {MinConvictionRao: 1, RateNumerator: 2, RateDenominator: 3}}},
 	}
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			f := releaseStVaultFile()
-			f.TestnetDepositTiers = test.tiers
-			if _, err := stConfigForProfile(stconn.ProfileTestnet, f, []string{"http://testnet"}); err == nil {
-				t.Fatal("invalid deposit tier schedule accepted")
-			}
-		})
+		f := releaseStVaultFile()
+		f.TestnetDepositTiers = test.tiers
+		if _, err := stConfigForProfile(stconn.ProfileTestnet, f, []string{"http://testnet"}); err == nil {
+			t.Fatalf("%s: invalid deposit tier schedule accepted", test.name)
+		}
 	}
 }
 
 func TestStConfigTestnetNamespaceIsStrict(t *testing.T) {
 	f := releaseStVaultFile()
+	f.WalletAllowUnsigned = true
+	f.PublicRpcUrl = "https://mainnet-rpc.example"
+	f.TestnetWalletAllowUnsigned = false
 	f.ChainId = 964
 	f.ContractAddress = "0x0000000000000000000000000000000000000099"
 	cfg, err := stConfigForProfile(stconn.ProfileTestnet, f, []string{"http://testnet"})
@@ -77,6 +81,18 @@ func TestStConfigTestnetNamespaceIsStrict(t *testing.T) {
 	}
 	if cfg.ChainId != 945 || cfg.ContractAddress != common.HexToAddress(f.TestnetContractAddress) {
 		t.Fatalf("testnet selected mainnet values: %+v", cfg)
+	}
+	if cfg.WalletAllowUnsigned || cfg.PublicRpcUrl != "https://test.chain.opentensor.ai" {
+		t.Fatalf("testnet selected global wallet/rpc values: unsigned=%t rpc=%q", cfg.WalletAllowUnsigned, cfg.PublicRpcUrl)
+	}
+	f.TestnetWalletAllowUnsigned = true
+	f.TestnetPublicRpcUrl = ""
+	cfg, err = stConfigForProfile(stconn.ProfileTestnet, f, []string{"http://testnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WalletAllowUnsigned || cfg.PublicRpcUrl != "" {
+		t.Fatalf("testnet missing public rpc fell back across profiles: unsigned=%t rpc=%q", cfg.WalletAllowUnsigned, cfg.PublicRpcUrl)
 	}
 	f.TestnetContractAddress = ""
 	if _, err := stConfigForProfile(stconn.ProfileTestnet, f, []string{"http://testnet"}); err == nil {
@@ -87,6 +103,10 @@ func TestStConfigTestnetNamespaceIsStrict(t *testing.T) {
 func TestStConfigMainnetNamespaceIsStrict(t *testing.T) {
 	f := releaseStVaultFile()
 	f.Enabled = true
+	f.WalletAllowUnsigned = true
+	f.PublicRpcUrl = "https://mainnet-rpc.example"
+	f.TestnetWalletAllowUnsigned = false
+	f.TestnetPublicRpcUrl = "https://test.chain.opentensor.ai"
 	f.ChainId = 964
 	f.GenesisHash = "0x" + strings.Repeat("55", 32)
 	f.DeploymentId = "main-release"
@@ -108,6 +128,19 @@ func TestStConfigMainnetNamespaceIsStrict(t *testing.T) {
 	}
 	if cfg.ChainId != 964 || cfg.ContractAddress != common.HexToAddress(f.ContractAddress) {
 		t.Fatalf("mainnet selected testnet values: %+v", cfg)
+	}
+	if !cfg.WalletAllowUnsigned || cfg.PublicRpcUrl != "https://mainnet-rpc.example" {
+		t.Fatalf("mainnet selected testnet wallet/rpc values: unsigned=%t rpc=%q", cfg.WalletAllowUnsigned, cfg.PublicRpcUrl)
+	}
+	f.WalletAllowUnsigned = false
+	f.PublicRpcUrl = ""
+	f.TestnetWalletAllowUnsigned = true
+	cfg, err = stConfigForProfile(stconn.ProfileMainnet, f, []string{"http://mainnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WalletAllowUnsigned || cfg.PublicRpcUrl != "" {
+		t.Fatalf("mainnet missing public rpc fell back across profiles: unsigned=%t rpc=%q", cfg.WalletAllowUnsigned, cfg.PublicRpcUrl)
 	}
 	f.LegacyContractAddress = f.ContractAddress
 	f.ContractAddress = ""
@@ -131,6 +164,80 @@ func TestStConfigRejectsRoleKeyReuseAndZeroDeploymentBoundary(t *testing.T) {
 	f.TestnetDeployBlock = 0
 	if _, err := stConfigForProfile(stconn.ProfileTestnet, f, []string{"http://testnet"}); err == nil {
 		t.Fatal("zero deployment block accepted")
+	}
+}
+
+// Exact chain/coordinator identity selects the logical operation. Human labels
+// do not, while a replacement contract or reset genesis always gets new keys.
+func TestStTransactionLogicalKeyUsesExactDeploymentIdentity(t *testing.T) {
+	cfg := &StConfig{
+		Profile: "testnet", DeploymentId: "reused-label", ChainId: 945,
+		ContractAddress: common.HexToAddress("0x1000000000000000000000000000000000000001"),
+	}
+	cfg.GenesisHash[0] = 1
+	key, err := stTransactionLogicalKey(cfg, "root:7:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed := *cfg
+	renamed.Profile, renamed.DeploymentId = "mainnet", "another-label"
+	if repeated, err := stTransactionLogicalKey(&renamed, "root:7:1"); err != nil || repeated != key {
+		t.Fatalf("metadata rename changed logical identity: %q %v", repeated, err)
+	}
+	replacement := *cfg
+	replacement.ContractAddress = common.HexToAddress("0x2000000000000000000000000000000000000002")
+	if other, err := stTransactionLogicalKey(&replacement, "root:7:1"); err != nil || other == key {
+		t.Fatalf("replacement coordinator reused logical identity: %q %v", other, err)
+	}
+	reset := *cfg
+	reset.GenesisHash[0] = 2
+	if other, err := stTransactionLogicalKey(&reset, "root:7:1"); err != nil || other == key {
+		t.Fatalf("reset genesis reused logical identity: %q %v", other, err)
+	}
+}
+
+// A stable epoch boundary, rather than a moving head offset, prevents retries
+// from changing calldata or being attributed to the following contract epoch.
+func TestStDepositDeadlinePinsIntendedEpoch(t *testing.T) {
+	deadline, err := stDepositDeadline(7, 1_000, 900)
+	if err != nil || deadline != 999 {
+		t.Fatalf("deadline = %d, %v; want 999", deadline, err)
+	}
+	if repeated, err := stDepositDeadline(7, 1_000, 998); err != nil || repeated != deadline {
+		t.Fatalf("later head changed deadline: %d, %v", repeated, err)
+	}
+	for _, headBlock := range []uint64{1_000, 1_001} {
+		if _, err := stDepositDeadline(7, 1_000, headBlock); err == nil {
+			t.Errorf("head %d accepted after intended epoch ended", headBlock)
+		}
+	}
+}
+
+// The public-RPC block window is inclusive and must remain bounded at both an
+// ordinary head and math.MaxUint64. This guards the rejected 2,000-block shape
+// and the adjacent overflow that would silently query from block zero.
+func TestStBoundedInclusiveRangeEnd(t *testing.T) {
+	cases := []struct {
+		name       string
+		fromBlock  uint64
+		headBlock  uint64
+		blockCount uint64
+		want       uint64
+		wantError  bool
+	}{
+		{name: "single", fromBlock: 100, headBlock: 100, blockCount: 1000, want: 100},
+		{name: "exact thousand", fromBlock: 100, headBlock: 1099, blockCount: 1000, want: 1099},
+		{name: "bounded thousand", fromBlock: 100, headBlock: 1100, blockCount: 1000, want: 1099},
+		{name: "near maximum short", fromBlock: math.MaxUint64 - 10, headBlock: math.MaxUint64, blockCount: 1000, want: math.MaxUint64},
+		{name: "near maximum bounded", fromBlock: math.MaxUint64 - 1000, headBlock: math.MaxUint64, blockCount: 1000, want: math.MaxUint64 - 1},
+		{name: "zero size", fromBlock: 100, headBlock: 100, blockCount: 0, wantError: true},
+		{name: "reverse", fromBlock: 101, headBlock: 100, blockCount: 1000, wantError: true},
+	}
+	for _, c := range cases {
+		got, err := stBoundedInclusiveRangeEnd(c.fromBlock, c.headBlock, c.blockCount)
+		if (err != nil) != c.wantError || (!c.wantError && got != c.want) {
+			t.Errorf("%s end=%d error=%v, want end=%d error=%t", c.name, got, err, c.want, c.wantError)
+		}
 	}
 }
 
@@ -393,6 +500,51 @@ func TestStDepositRateForConvictionUsesPreEpochTierExactly(t *testing.T) {
 	}
 	if _, _, err := stDepositRateForConviction([]StDepositTier{{MinConvictionRao: 1, RateNumerator: 1, RateDenominator: 1}}, big.NewInt(0)); err == nil {
 		t.Fatal("tier schedule without zero baseline accepted")
+	}
+}
+
+func TestStDepositArtifactUsagePinsSignerIdentityAndFinalizedBoundaries(t *testing.T) {
+	cfg, err := stConfigForProfile(stconn.ProfileTestnet, releaseStVaultFile(), []string{"https://evm.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startHash, endHash := [32]byte{1}, [32]byte{2}
+	artifact, err := startifact.Build(startifact.BuildInput{
+		DeploymentID: cfg.DeploymentId, GenesisHash: "0x" + strings.Repeat("11", 32),
+		PolicyHash: "0x" + strings.Repeat("22", 32), ChainID: cfg.ChainId, Netuid: uint16(cfg.Netuid),
+		Coordinator: cfg.ContractAddress, SettlementVault: cfg.SettlementVault,
+		Epoch: 4, NoID: cfg.NoId,
+		Start:                startifact.Boundary{Number: 100, Hash: common.BytesToHash(startHash[:]).Hex()},
+		End:                  startifact.Boundary{Number: 200, Hash: common.BytesToHash(endHash[:]).Hex()},
+		OperatorSnapshotHash: "sha256:" + strings.Repeat("10", 32),
+		FleetSnapshotHash:    "sha256:" + strings.Repeat("20", 32),
+		Providers:            []startifact.ProviderInput{{ClientID: [16]byte{1}, Coldkey: [32]byte{1}, UsageBytes: 1234, Assignments: 8, Confirmations: 8, Eligible: true}},
+		ReliabilityAMin:      8, CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := startifact.Sign(artifact, cfg.ArtifactKey); err != nil {
+		t.Fatal(err)
+	}
+	record := &model.StPayoutArtifact{Epoch: 4, NoId: cfg.NoId, ContentHash: artifact.ContentHash, PayoutRoot: artifact.PayoutRoot}
+	usage, err := stDepositArtifactUsage(artifact, record, cfg, 4, 100, startHash, 200, endHash)
+	if err != nil || usage != 1234 {
+		t.Fatalf("artifact usage = %d, %v", usage, err)
+	}
+	if _, err := stDepositArtifactUsage(artifact, record, cfg, 4, 100, [32]byte{9}, 200, endHash); err == nil {
+		t.Fatal("orphaned start boundary was accepted")
+	}
+	otherKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := startifact.Sign(artifact, otherKey); err != nil {
+		t.Fatal(err)
+	}
+	record.ContentHash = artifact.ContentHash
+	if _, err := stDepositArtifactUsage(artifact, record, cfg, 4, 100, startHash, 200, endHash); err == nil {
+		t.Fatal("unexpected artifact signer was accepted")
 	}
 }
 

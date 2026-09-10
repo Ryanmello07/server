@@ -1,0 +1,301 @@
+{
+  "uid": "urnetwork-competition",
+  "title": "urnetwork / sim-latency competition",
+  "tags": ["urnetwork", "competition"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "15s",
+  "time": {"from": "now-24h", "to": "now"},
+  "links": [
+    {"title": "MinIO", "url": "/d/urnetwork-minio", "keepTime": true, "includeVars": false},
+    {"title": "Service logs", "url": "/d/urnetwork-service-logs", "keepTime": true, "includeVars": true}
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "env", "label": "env", "type": "query",
+        "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+        "query": "label_values(urnetwork_competition_configured, env)",
+        "refresh": 2, "sort": 1
+      },
+      {
+        "name": "host", "label": "host", "type": "query",
+        "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+        "query": "label_values(urnetwork_competition_configured{env=\"$env\"}, host)",
+        "refresh": 2, "sort": 1, "multi": true, "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "current round epoch",
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_current_epoch{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "artifact object lock",
+      "description": "Alert immediately while this is 0. Production score commits fail closed without retained MinIO.",
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "min(urnetwork_competition_artifact_archive_ready{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "durable worker lease heartbeat age",
+      "description": "Database lease health. Page when above 60 seconds for five minutes, or -1 while a competition is open/grading. A drained epoch in honesty review intentionally has no worker.",
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 40}, {"color": "red", "value": 60}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "min(urnetwork_competition_worker_heartbeat_age_seconds{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "queued",
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_jobs{env=\"$env\",host=~\"$host\",state=\"queued\"})", "instant": true}]
+    },
+    {
+      "id": 5, "type": "stat", "title": "running",
+      "description": "Alert for a stalled queue when queued > 0 and running = 0 for five minutes during grading.",
+      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0, "max": 1}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_jobs{env=\"$env\",host=~\"$host\",state=\"running\"})", "instant": true}]
+    },
+    {
+      "id": 6, "type": "stat", "title": "metric refresh errors (1h)",
+      "description": "Page on any increase; queue/heartbeat gauges are stale when this is nonzero.",
+      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "sum(increase(urnetwork_competition_metric_refresh_errors_total{env=\"$env\",host=~\"$host\"}[1h]))", "instant": true}]
+    },
+    {
+      "id": 7, "type": "state-timeline", "title": "epoch phase",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 5},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "options": {},
+      "targets": [{"refId": "A", "expr": "max by (phase) (urnetwork_competition_round_phase{env=\"$env\",host=~\"$host\"})", "legendFormat": "{{phase}}"}]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "durable jobs by state",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 5},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "max by (state) (urnetwork_competition_jobs{env=\"$env\",host=~\"$host\"})", "legendFormat": "{{state}}"}]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "evaluation outcomes",
+      "description": "Page when infrastructure_failed or rebaseline_mismatch increases; investigate retries before the attempt cap.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (outcome) (increase(urnetwork_competition_evaluations_total{env=\"$env\",host=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{outcome}}"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "evaluation duration p50 / p95",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(urnetwork_competition_evaluation_seconds_bucket{env=\"$env\",host=~\"$host\"}[$__rate_interval])))", "legendFormat": "p50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(urnetwork_competition_evaluation_seconds_bucket{env=\"$env\",host=~\"$host\"}[$__rate_interval])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "oldest job age",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "max by (state) (urnetwork_competition_oldest_job_age_seconds{env=\"$env\",host=~\"$host\",state=~\"queued|running\"})", "legendFormat": "{{state}}"}]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "retained artifact volume",
+      "description": "Pair this with the MinIO capacity dashboard. Warn below 25% free; page below 10% free or on any artifact failure.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(urnetwork_competition_artifact_bytes_total{env=\"$env\",host=~\"$host\"}[$__rate_interval]))", "legendFormat": "retained bytes"},
+        {"refId": "B", "expr": "sum(increase(urnetwork_competition_artifact_failures_total{env=\"$env\",host=~\"$host\"}[$__rate_interval]))", "legendFormat": "failures"}
+      ]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "submission and epoch events",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sum by (outcome) (increase(urnetwork_competition_submissions_total{env=\"$env\",host=~\"$host\"}[$__rate_interval]))", "legendFormat": "submission {{outcome}}"},
+        {"refId": "B", "expr": "sum by (event) (increase(urnetwork_competition_round_events_total{env=\"$env\",host=~\"$host\"}[$__rate_interval]))", "legendFormat": "epoch {{event}}"}
+      ]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "retained objects and configured processes",
+      "description": "Object count excludes the enclosing manifest. Configured should remain one for every API/worker process in the selected environment.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(urnetwork_competition_artifact_objects_total{env=\"$env\",host=~\"$host\"}[$__rate_interval]))", "legendFormat": "retained objects"},
+        {"refId": "B", "expr": "sum(urnetwork_competition_configured{env=\"$env\",host=~\"$host\"})", "legendFormat": "configured processes"}
+      ]
+    },
+    {
+      "id": 15, "type": "stat", "title": "runner heartbeat age",
+      "description": "The sim-latency runner emits a process heartbeat every 15 seconds. Orange means no heartbeat has been heard for more than 30 seconds; red means more than 60 seconds. This is expected after the drained epoch enters honesty review.",
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 60}]}}, "overrides": []},
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "time() - max(urnetwork_competition_runner_heartbeat_timestamp_seconds{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 16, "type": "stat", "title": "submission queue",
+      "description": "Submissions waiting in the durable FIFO. The count is authoritative PostgreSQL state; Redis is a rebuildable FIFO dispatch index.",
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_submission_queue_size{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 17, "type": "stat", "title": "current evaluation elapsed",
+      "description": "Wall time consumed by the current submission. Every submission has a hard three-hour evaluation budget.",
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "max": 10800, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 9000}, {"color": "red", "value": 10800}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_current_evaluation_elapsed_seconds{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 18, "type": "stat", "title": "estimated FIFO drain time",
+      "description": "Estimated current remaining time plus queued submissions, using the recent completed-evaluation p75 and the three-hour limit before enough history exists.",
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_submission_backlog_estimated_seconds{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 19, "type": "stat", "title": "significant submission found",
+      "description": "One after any completed submission in the current epoch passes the recorded statistical-significance test. Results remain internal until epoch finalization.",
+      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_significant_submission_found{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 20, "type": "stat", "title": "evaluation duration estimate",
+      "description": "Recent completed-evaluation p75 used by the drain-time estimate; falls back to the three-hour evaluation limit when no history exists.",
+      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_evaluation_duration_estimate_seconds{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    },
+    {
+      "id": 21, "type": "stat", "title": "current submission",
+      "description": "Internal identity of the one submission currently being evaluated. No series means the runner is idle.",
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 41},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0, "max": 1}, "overrides": []},
+      "options": {"colorMode": "background", "textMode": "name", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max by (job_id, round_id, patch_sha256, attempt) (urnetwork_competition_current_evaluation_info{env=\"$env\",host=~\"$host\"})", "legendFormat": "job {{job_id}} · attempt {{attempt}} · patch {{patch_sha256}}", "instant": true}]
+    },
+    {
+      "id": 22, "type": "bargauge", "title": "live TTFB p50 by replicate",
+      "description": "Internal live reveal after each completed replicate. Green is baseline, blue is a provisional statistically significant improvement, red is a significant regression, and gray is not significant at one-sided p≤0.05. The final sealed composite score remains authoritative.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 46},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {
+        "defaults": {"unit": "ms", "min": 0, "color": {"mode": "fixed", "fixedColor": "#8f8f8f"}},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*\\[baseline\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#199e70"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[improved\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#3987e5"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[regressed\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e02f44"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[not_testable\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e0a52f"}}]}
+        ]
+      },
+      "options": {"displayMode": "basic", "orientation": "vertical", "showUnfilled": true, "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max by (job_id, role, replicate, significance) (urnetwork_competition_live_evaluation_metric_value{env=\"$env\",host=~\"$host\",metric=\"ttfb_p50_ms\"}) and on(job_id) max by (job_id) (urnetwork_competition_current_evaluation_info{env=\"$env\",host=~\"$host\"})", "legendFormat": "{{role}} r{{replicate}} [{{significance}}]", "instant": true}]
+    },
+    {
+      "id": 23, "type": "bargauge", "title": "live TTFB p95 by replicate",
+      "description": "Internal live reveal after each completed replicate. Green is baseline, blue is a provisional statistically significant improvement, red is a significant regression, and gray is not significant at one-sided p≤0.05. The final sealed composite score remains authoritative.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 46},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {
+        "defaults": {"unit": "ms", "min": 0, "color": {"mode": "fixed", "fixedColor": "#8f8f8f"}},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*\\[baseline\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#199e70"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[improved\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#3987e5"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[regressed\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e02f44"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[not_testable\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e0a52f"}}]}
+        ]
+      },
+      "options": {"displayMode": "basic", "orientation": "vertical", "showUnfilled": true, "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max by (job_id, role, replicate, significance) (urnetwork_competition_live_evaluation_metric_value{env=\"$env\",host=~\"$host\",metric=\"ttfb_p95_ms\"}) and on(job_id) max by (job_id) (urnetwork_competition_current_evaluation_info{env=\"$env\",host=~\"$host\"})", "legendFormat": "{{role}} r{{replicate}} [{{significance}}]", "instant": true}]
+    },
+    {
+      "id": 24, "type": "bargauge", "title": "live throughput p50 by replicate",
+      "description": "Internal live reveal after each completed replicate. Green is baseline, blue is a provisional statistically significant improvement, red is a significant regression, and gray is not significant at one-sided p≤0.05. The final sealed composite score remains authoritative.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {
+        "defaults": {"unit": "Bps", "min": 0, "color": {"mode": "fixed", "fixedColor": "#8f8f8f"}},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*\\[baseline\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#199e70"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[improved\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#3987e5"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[regressed\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e02f44"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[not_testable\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e0a52f"}}]}
+        ]
+      },
+      "options": {"displayMode": "basic", "orientation": "vertical", "showUnfilled": true, "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max by (job_id, role, replicate, significance) (urnetwork_competition_live_evaluation_metric_value{env=\"$env\",host=~\"$host\",metric=\"throughput_p50_bytes_per_s\"}) and on(job_id) max by (job_id) (urnetwork_competition_current_evaluation_info{env=\"$env\",host=~\"$host\"})", "legendFormat": "{{role}} r{{replicate}} [{{significance}}]", "instant": true}]
+    },
+    {
+      "id": 25, "type": "bargauge", "title": "live throughput p95 by replicate",
+      "description": "Internal live reveal after each completed replicate. Green is baseline, blue is a provisional statistically significant improvement, red is a significant regression, and gray is not significant at one-sided p≤0.05. The final sealed composite score remains authoritative.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {
+        "defaults": {"unit": "Bps", "min": 0, "color": {"mode": "fixed", "fixedColor": "#8f8f8f"}},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*\\[baseline\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#199e70"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[improved\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#3987e5"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[regressed\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e02f44"}}]},
+          {"matcher": {"id": "byRegexp", "options": ".*\\[not_testable\\].*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#e0a52f"}}]}
+        ]
+      },
+      "options": {"displayMode": "basic", "orientation": "vertical", "showUnfilled": true, "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max by (job_id, role, replicate, significance) (urnetwork_competition_live_evaluation_metric_value{env=\"$env\",host=~\"$host\",metric=\"throughput_p95_bytes_per_s\"}) and on(job_id) max by (job_id) (urnetwork_competition_current_evaluation_info{env=\"$env\",host=~\"$host\"})", "legendFormat": "{{role}} r{{replicate}} [{{significance}}]", "instant": true}]
+    },
+    {
+      "id": 26, "type": "stat", "title": "current era",
+      "description": "Zero is production or pre-round idle; one is the independently numbered fee-free staging era.",
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 62},
+      "datasource": {"type": "prometheus", "uid": "warp-mimir"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none", "min": 0, "max": 1,
+          "mappings": [{"type": "value", "options": {"0": {"text": "production"}, "1": {"text": "staging"}}}]
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "expr": "max(urnetwork_competition_current_round_staging{env=\"$env\",host=~\"$host\"})", "instant": true}]
+    }
+  ]
+}

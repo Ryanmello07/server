@@ -226,9 +226,50 @@ func AlwaysFail(
 	return nil, errors.New("always fails")
 }
 
+func TestErrorRescheduleDelayDispersesCappedWave(t *testing.T) {
+	base := 2 * time.Second
+	cap := time.Hour
+
+	// Unsaturated retries retain the legacy nominal + [0, base) jitter.
+	if got := errorRescheduleDelay(base, cap, 0, rescheduleBackoffMaxExponent, 0); got != 2*time.Second {
+		t.Fatalf("first retry with zero jitter = %s, want 2s", got)
+	}
+	if got := errorRescheduleDelay(base, cap, 3, rescheduleBackoffMaxExponent, 0.5); got != 17*time.Second {
+		t.Fatalf("unsaturated retry midpoint = %s, want 17s", got)
+	}
+	// A special low exponent (deploy drain/version skew) never accidentally
+	// inherits the saturated proportional jitter from a high stored count.
+	if got := errorRescheduleDelay(base, cap, 30, 0, 0.5); got != 3*time.Second {
+		t.Fatalf("clamped retry = %s, want 3s", got)
+	}
+
+	// Synthetic 824-row outage cohort: deterministic quantiles cover every
+	// minute from 30 through 89 after reaching the one-hour nominal cap, with
+	// no minute retaining more than 14 rows. The old two-second jitter put all
+	// 824 rows in one or two adjacent seconds forever.
+	minuteCounts := map[int]int{}
+	for i := 0; i < 824; i++ {
+		unit := (float64(i) + 0.5) / 824
+		delay := errorRescheduleDelay(base, cap, 30, rescheduleBackoffMaxExponent, unit)
+		minuteCounts[int(delay/time.Minute)]++
+	}
+	if len(minuteCounts) != 60 {
+		t.Fatalf("capped cohort covered %d minute buckets, want 60: %v", len(minuteCounts), minuteCounts)
+	}
+	for minute := 30; minute < 90; minute++ {
+		if count := minuteCounts[minute]; count < 13 || 14 < count {
+			t.Fatalf("minute %d has %d retries, want 13 or 14", minute, count)
+		}
+	}
+	if midpoint := errorRescheduleDelay(base, cap, 30, rescheduleBackoffMaxExponent, 0.5); midpoint != cap+base/2 {
+		t.Fatalf("capped retry midpoint = %s, want %s", midpoint, cap+base/2)
+	}
+}
+
 // A task that errors repeatedly must back off exponentially:
-// run_at - now ~= jitter[0, RescheduleTimeout) + RescheduleTimeout * 2^errorCount,
-// capped at RescheduleBackoffMaxTimeout. Without the backoff a wedged task
+// run_at - now ~= jitter[0, RescheduleTimeout) + RescheduleTimeout * 2^errorCount
+// until the nominal cap. Saturated retries use proportional 30–90 minute
+// jitter with a one-hour mean. Without the backoff a wedged task
 // (e.g. an external 429 rate limit) retried every ~RescheduleTimeout forever;
 // in prod 8k such payment tasks churned pending_task to ~94% dead tuples and
 // made the poll query 39% of all db exec time.
@@ -327,7 +368,8 @@ func TestTaskRescheduleErrorBackoff(t *testing.T) {
 			connect.AssertEqual(t, delay <= maxDelay, true)
 		}
 
-		// a high error count converges to the cap instead of growing unbounded
+		// A high error count converges to proportional jitter around the
+		// nominal cap instead of growing unbounded or preserving one retry wave.
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(
 				ctx,
@@ -343,8 +385,10 @@ func TestTaskRescheduleErrorBackoff(t *testing.T) {
 		errorCount, runAt := readState()
 		connect.AssertEqual(t, errorCount, 31)
 		delay := runAt.Sub(evalStart)
-		connect.AssertEqual(t, RescheduleBackoffMaxTimeout <= delay, true)
-		connect.AssertEqual(t, delay <= RescheduleBackoffMaxTimeout+RescheduleTimeout+10*time.Second, true)
+		minDelay := RescheduleBackoffMaxTimeout/2 + RescheduleTimeout/2
+		maxDelay := 3*RescheduleBackoffMaxTimeout/2 + RescheduleTimeout/2 + 10*time.Second
+		connect.AssertEqual(t, minDelay <= delay, true)
+		connect.AssertEqual(t, delay <= maxDelay, true)
 	})
 }
 
@@ -466,6 +510,112 @@ func TestTaskLeaseIsBoundedAndExtendedByKeepalive(t *testing.T) {
 		case <-evalDone:
 		case <-time.After(10 * time.Second):
 			t.Fatal("eval did not finish")
+		}
+	})
+}
+
+// A timestamp heartbeat uses the ordinary pooled DB path, which raises query
+// errors as panics. If that pool stalls while the direct advisory-lock session
+// is healthy, the timestamp may expire but a second worker still cannot own the
+// task. The live task must therefore continue instead of losing its guard and
+// restarting from the beginning on another worker.
+func TestTaskTimestampLeaseRefreshPanicDoesNotCancelLiveOwner(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		leaseWorkStarted = make(chan struct{}, 1)
+		leaseWorkRelease = make(chan struct{})
+		var releaseOnce sync.Once
+		releaseWork := func() {
+			releaseOnce.Do(func() {
+				close(leaseWorkRelease)
+			})
+		}
+		defer releaseWork()
+
+		ctx := context.Background()
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+		defer clientSession.Cancel()
+
+		taskId := ScheduleTask(
+			LeaseWork,
+			&LeaseWorkArgs{},
+			clientSession,
+			RunAt(server.NowUtc().Add(-time.Minute)),
+			MaxTime(time.Hour),
+		)
+
+		taskWorker := NewTaskWorkerWithDefaults(ctx)
+		taskWorker.AddTargets(NewTaskTarget(LeaseWork))
+		heartbeatTick := make(chan time.Time, 1)
+		refreshAttempted := make(chan bool, 1)
+		taskWorker.heartbeatAfter = func(time.Duration) <-chan time.Time {
+			return heartbeatTick
+		}
+		refreshFailure := errors.New("synthetic pooled lease refresh timeout")
+		taskWorker.refreshTaskTimestampLeases = func(
+			ctx context.Context,
+			tasks map[server.Id]*Task,
+		) {
+			_, containsTask := tasks[taskId]
+			refreshAttempted <- containsTask
+			panic(refreshFailure)
+		}
+
+		type evalResult struct {
+			finishedTaskIds        []server.Id
+			rescheduledTaskIds     []server.Id
+			postRescheduledTaskIds []server.Id
+			err                    error
+		}
+		evalDone := make(chan evalResult, 1)
+		go func() {
+			finishedTaskIds, rescheduledTaskIds, postRescheduledTaskIds, err := taskWorker.EvalTasks(1)
+			evalDone <- evalResult{
+				finishedTaskIds:        finishedTaskIds,
+				rescheduledTaskIds:     rescheduledTaskIds,
+				postRescheduledTaskIds: postRescheduledTaskIds,
+				err:                    err,
+			}
+		}()
+
+		select {
+		case <-leaseWorkStarted:
+		case <-time.After(10 * time.Second):
+			t.Fatal("lease work never started")
+		}
+
+		heartbeatTick <- time.Now()
+		select {
+		case containsTask := <-refreshAttempted:
+			if !containsTask {
+				t.Fatalf("timestamp refresh did not receive claimed task %s", taskId)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timestamp refresh was not attempted")
+		}
+
+		select {
+		case result := <-evalDone:
+			t.Fatalf("pooled timestamp refresh panic terminated live evaluation: %+v", result)
+		default:
+		}
+
+		releaseWork()
+		select {
+		case result := <-evalDone:
+			if result.err != nil {
+				t.Fatalf("EvalTasks after timestamp refresh panic: %v", result.err)
+			}
+			if len(result.finishedTaskIds) != 1 || result.finishedTaskIds[0] != taskId {
+				t.Fatalf("finished tasks = %v, want only %s", result.finishedTaskIds, taskId)
+			}
+			if len(result.rescheduledTaskIds) != 0 {
+				t.Fatalf("rescheduled tasks = %v, want none", result.rescheduledTaskIds)
+			}
+			if len(result.postRescheduledTaskIds) != 0 {
+				t.Fatalf("post-rescheduled tasks = %v, want none", result.postRescheduledTaskIds)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("live task did not finish after timestamp refresh failure")
 		}
 	})
 }

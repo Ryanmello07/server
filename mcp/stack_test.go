@@ -434,13 +434,13 @@ func setupFetchTestStackWithOptions(t testing.TB, options *fetchTestStackOptions
 
 	// ---- the test network space pointing the sdk at the local servers --------
 	connectSettings := connect.DefaultConnectSettings()
-	connectSettings.DisableIpv6 = true
 	networkSpace := sdk.Testing_NewNetworkSpaceWithUrls(
 		ctx,
 		apiUrl,
 		platformUrl,
 		connectSettings,
 	)
+	t.Cleanup(networkSpace.Close)
 
 	// ---- a local provider ----------------------------------------------------
 	providerNetworkId := server.NewId()
@@ -588,7 +588,7 @@ func setupFetchTestStackWithOptions(t testing.TB, options *fetchTestStackOptions
 	proxyDeviceManager := proxy.NewProxyDeviceManager(ctx, pdmSettings)
 	go func() {
 		<-ctx.Done()
-		proxyDeviceManager.Close()
+		_ = proxyDeviceManager.CloseAndWait(context.Background())
 	}()
 
 	releaseTestPorts()

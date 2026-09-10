@@ -11,8 +11,11 @@ package controller
 //     the webhooks use (the stripe_invoice ledger, the
 //     apple_subscription_transaction ledger, the Play overlap re-check under
 //     the purchase-token advisory lock, the Solana intent one-shot). The
-//     reconciler has NO write path of its own, so a reconcile credit racing a
-//     late webhook for the same event produces exactly one credit.
+//     Reconcile credits have no separate write path, so a reconcile credit
+//     racing a late webhook for the same event produces exactly one credit.
+//   - store affirmatively confirms an exact, already-credited renewal whose
+//     Pro metadata is missing -> add one idempotent, zero-byte/zero-revenue Pro
+//     marker for that renewal window after rechecking its live local owner.
 //   - store says the entitlement is ALREADY over (refunded, revoked, expired
 //     and the end-of-period task missed it) -> end it at now. The cancelled ≠
 //     expired rule: a cancel-at-period-end with time remaining is paid-through
@@ -69,30 +72,90 @@ const paymentReconcileSolanaFinalityGrace = 1 * time.Hour
 // skipped with a skipped_store audit row. Replaceable only by hermetic tests
 // (the S5 Play seam pattern); production never mutates these.
 
-var stripeReconcileHasCredentials = func() bool {
-	_, err := server.Vault.SimpleResource("stripe.yml")
-	return err == nil
+// simpleResourceNonblankString requires the selected YAML value to be an
+// actual string scalar. Typed YAML decoding deliberately coerces numeric
+// scalars into strings, which is unsafe for credential-presence checks.
+func simpleResourceNonblankString(resource *server.SimpleResource, path ...string) bool {
+	object, err := resource.ParseE()
+	if err != nil {
+		return false
+	}
+	var value any = object
+	for _, component := range path {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		value, ok = object[component]
+		if !ok {
+			return false
+		}
+	}
+	stringValue, ok := value.(string)
+	return ok && strings.TrimSpace(stringValue) != ""
 }
+
+func stripeReconcileCredentialsPresent() bool {
+	resource, err := server.Vault.SimpleResource("stripe.yml")
+	if err != nil {
+		return false
+	}
+	return simpleResourceNonblankString(resource, "api", "token")
+}
+
+var stripeReconcileHasCredentials = stripeReconcileCredentialsPresent
 
 var appleReconcileHasCredentials = func() bool {
 	return appleReconcileCredentialsFunc() != nil
 }
 
-var playReconcileHasCredentials = func() bool {
-	if _, err := server.Vault.SimpleResource("google.yml"); err != nil {
+func playReconcileCredentialsPresent() bool {
+	resource, err := server.Vault.SimpleResource("google.yml")
+	if err != nil {
 		return false
 	}
-	// the sku catalog the credit path prices from
-	if _, err := server.Config.SimpleResource("play.yml"); err != nil {
+	if !simpleResourceNonblankString(resource, "webhook", "package_name") ||
+		!simpleResourceNonblankString(resource, "oauth", "client_id") ||
+		!simpleResourceNonblankString(resource, "oauth", "client_secret") ||
+		!simpleResourceNonblankString(resource, "oauth", "refresh_token") {
 		return false
 	}
-	return true
+	var credentials struct {
+		Webhook struct {
+			PackageName string `yaml:"package_name"`
+		} `yaml:"webhook"`
+		OAuth struct {
+			ClientId     string `yaml:"client_id"`
+			ClientSecret string `yaml:"client_secret"`
+			RefreshToken string `yaml:"refresh_token"`
+		} `yaml:"oauth"`
+	}
+	if err := resource.UnmarshalYamlE(&credentials); err != nil ||
+		strings.TrimSpace(credentials.Webhook.PackageName) == "" ||
+		strings.TrimSpace(credentials.OAuth.ClientId) == "" ||
+		strings.TrimSpace(credentials.OAuth.ClientSecret) == "" ||
+		strings.TrimSpace(credentials.OAuth.RefreshToken) == "" {
+		return false
+	}
+	resource, err = server.Config.SimpleResource("play.yml")
+	if err != nil {
+		return false
+	}
+	var skus Skus
+	return resource.UnmarshalYamlE(&skus) == nil && 0 < len(skus.Skus)
 }
 
-var solanaReconcileHasCredentials = func() bool {
-	_, err := server.Vault.SimpleResource("helius.yml")
-	return err == nil
+var playReconcileHasCredentials = playReconcileCredentialsPresent
+
+func solanaReconcileCredentialsPresent() bool {
+	resource, err := server.Vault.SimpleResource("helius.yml")
+	if err != nil {
+		return false
+	}
+	return simpleResourceNonblankString(resource, "helius", "api_key")
 }
+
+var solanaReconcileHasCredentials = solanaReconcileCredentialsPresent
 
 // ----- apple App Store Server API client -----
 
@@ -109,9 +172,15 @@ type appleServerApiCredentials struct {
 	ProductIds []string
 }
 
-var appleReconcileCredentialsFunc = func() *appleServerApiCredentials {
+func appleReconcileCredentialsFromVault() *appleServerApiCredentials {
 	resource, err := server.Vault.SimpleResource("apple.yml")
 	if err != nil {
+		return nil
+	}
+	if !simpleResourceNonblankString(resource, "app_store_server_api_key_id") ||
+		!simpleResourceNonblankString(resource, "issuer_id") ||
+		!simpleResourceNonblankString(resource, "private_key") ||
+		!simpleResourceNonblankString(resource, "app_store_notifications", "bundle_id") {
 		return nil
 	}
 	var config struct {
@@ -123,9 +192,9 @@ var appleReconcileCredentialsFunc = func() *appleServerApiCredentials {
 			ProductIds []string `yaml:"product_ids"`
 		} `yaml:"app_store_notifications"`
 	}
-	resource.UnmarshalYaml(&config)
-	if config.KeyId == "" || config.IssuerId == "" || config.PrivateKey == "" ||
-		config.AppStoreNotifications == nil || config.AppStoreNotifications.BundleId == "" {
+	if err := resource.UnmarshalYamlE(&config); err != nil ||
+		strings.TrimSpace(config.KeyId) == "" || strings.TrimSpace(config.IssuerId) == "" || strings.TrimSpace(config.PrivateKey) == "" ||
+		config.AppStoreNotifications == nil || strings.TrimSpace(config.AppStoreNotifications.BundleId) == "" {
 		return nil
 	}
 	return &appleServerApiCredentials{
@@ -136,6 +205,8 @@ var appleReconcileCredentialsFunc = func() *appleServerApiCredentials {
 		ProductIds: config.AppStoreNotifications.ProductIds,
 	}
 }
+
+var appleReconcileCredentialsFunc = appleReconcileCredentialsFromVault
 
 // replaceable by tests standing up a fake App Store Server API
 var appleAppStoreServerApiBaseUrl = "https://api.storekit.itunes.apple.com"
@@ -195,6 +266,9 @@ type appleLastTransaction struct {
 	Status                int    `json:"status"`
 	OriginalTransactionId string `json:"originalTransactionId"`
 	SignedTransactionInfo string `json:"signedTransactionInfo"`
+	// the renewal info JWS: autoRenewStatus (the customer's auto-renew switch),
+	// autoRenewProductId, expirationIntent. Read by the subscription details.
+	SignedRenewalInfo string `json:"signedRenewalInfo"`
 }
 
 func (self *appleLastTransaction) entitled() bool {
@@ -243,9 +317,22 @@ func stripeSubscriptionOver(status string) bool {
 	return false
 }
 
+// stripeSubscriptionEntitled names the states where Stripe affirmatively says
+// the current subscription period is entitled. past_due remains conservative:
+// it may still be collecting, but it is not an authoritative active/granted
+// verdict from which to reconstruct missing entitlement metadata.
+func stripeSubscriptionEntitled(status string) bool {
+	switch status {
+	case "active", "trialing":
+		return true
+	}
+	return false
+}
+
 type stripeReconcileInvoiceExpanded struct {
 	Id           string                       `json:"id"`
 	Status       string                       `json:"status"`
+	Lines        *StripeLineItems             `json:"lines"`
 	Subscription *stripeReconcileSubscription `json:"subscription"`
 }
 
@@ -267,6 +354,7 @@ type solanaSignatureStatusesResponse struct {
 	Result struct {
 		Value []*struct {
 			Slot               int64   `json:"slot"`
+			Err                any     `json:"err"`
 			ConfirmationStatus *string `json:"confirmationStatus"`
 		} `json:"value"`
 	} `json:"result"`
@@ -280,10 +368,11 @@ type solanaSignatureStatusesResponse struct {
 type PaymentReconcileRunOptions struct {
 	// DryRun audits without repairing: every store API READ happens for real,
 	// but every write is suppressed -- no credit, no ended entitlement, no
-	// unfulfilled-record clearing, and no watermark advance (a dry run must
-	// not eat the incremental window a later real run needs). Each suppressed
-	// repair is recorded as a would_credit / would_end audit event with the
-	// same evidence and details the real repair would carry, tagged dry_run.
+	// Pro-metadata repair, unfulfilled-record clearing, and no watermark
+	// advance (a dry run must not eat the incremental window a later real run
+	// needs). Each suppressed repair is recorded as a would_credit / would_end /
+	// would_repair_entitlement audit event with the same evidence and details
+	// the real repair would carry, tagged dry_run.
 	DryRun bool
 	// Stores limits the pass to the named stores
 	// (model.SubscriptionMarketStripe | Apple | Google | Solana); empty runs
@@ -292,15 +381,16 @@ type PaymentReconcileRunOptions struct {
 	Stores []string
 }
 
-// PaymentReconcileStoreResult is one store's tally for the run. In a dry run
-// Credited/Ended count the would_credit/would_end events.
+// PaymentReconcileStoreResult is one store's tally for the run. In a dry run,
+// the action counts describe the corresponding would_* events.
 type PaymentReconcileStoreResult struct {
-	Examined        int  `json:"examined"`
-	Credited        int  `json:"credited"`
-	Ended           int  `json:"ended"`
-	Errors          int  `json:"errors"`
-	Skipped         bool `json:"skipped,omitempty"`
-	BudgetExhausted bool `json:"budget_exhausted,omitempty"`
+	Examined             int  `json:"examined"`
+	Credited             int  `json:"credited"`
+	Ended                int  `json:"ended"`
+	EntitlementsRepaired int  `json:"entitlements_repaired"`
+	Errors               int  `json:"errors"`
+	Skipped              bool `json:"skipped,omitempty"`
+	BudgetExhausted      bool `json:"budget_exhausted,omitempty"`
 	// stripe only: how many invoice.paid credits since the last watermark
 	// resolved their network by the LEGACY customer-email fallback (S11) --
 	// surfaced, never repaired, until the fallback can be retired
@@ -310,12 +400,13 @@ type PaymentReconcileStoreResult struct {
 type PaymentReconcileRunResult struct {
 	RunId  server.Id `json:"run_id"`
 	DryRun bool      `json:"dry_run,omitempty"`
-	// in a dry run Credited/Ended count the would_credit/would_end events
-	Credited      int                                     `json:"credited"`
-	Ended         int                                     `json:"ended"`
-	Errors        int                                     `json:"errors"`
-	SkippedStores []string                                `json:"skipped_stores,omitempty"`
-	StoreResults  map[string]*PaymentReconcileStoreResult `json:"store_results,omitempty"`
+	// In a dry run, the action counts describe the corresponding would_* events.
+	Credited             int                                     `json:"credited"`
+	Ended                int                                     `json:"ended"`
+	EntitlementsRepaired int                                     `json:"entitlements_repaired"`
+	Errors               int                                     `json:"errors"`
+	SkippedStores        []string                                `json:"skipped_stores,omitempty"`
+	StoreResults         map[string]*PaymentReconcileStoreResult `json:"store_results,omitempty"`
 	// the S11 email_fallback audit rows behind StoreResults' EmailFallbacks
 	// counts, so the CLI can print each one as a line
 	EmailFallbackEvents []*model.PaymentReconciliationEvent `json:"email_fallback_events,omitempty"`
@@ -330,10 +421,11 @@ type paymentReconcileRun struct {
 	// remaining store API budget for the store currently reconciling
 	budget int
 
-	credited int
-	ended    int
-	errors   int
-	skipped  []string
+	credited             int
+	ended                int
+	entitlementsRepaired int
+	errors               int
+	skipped              []string
 	// per-store detail folded into the heartbeat row
 	storeDetails map[string]map[string]any
 	// per-store tallies for the run result (the CLI summary)
@@ -356,6 +448,9 @@ func (self *paymentReconcileRun) record(
 	case model.PaymentReconcileActionEnded, model.PaymentReconcileActionWouldEnd:
 		self.ended += 1
 		self.storeResult(store).Ended += 1
+	case model.PaymentReconcileActionEntitlementRepaired, model.PaymentReconcileActionWouldRepairEntitlement:
+		self.entitlementsRepaired += 1
+		self.storeResult(store).EntitlementsRepaired += 1
 	case model.PaymentReconcileActionError:
 		self.errors += 1
 		self.storeResult(store).Errors += 1
@@ -407,6 +502,39 @@ func (self *paymentReconcileRun) creditAction() string {
 		return model.PaymentReconcileActionWouldCredit
 	}
 	return model.PaymentReconcileActionCredited
+}
+
+func (self *paymentReconcileRun) repairEntitlement(
+	store string,
+	renewal *model.ReconcileSubscriptionRenewal,
+	evidence string,
+	details map[string]any,
+) {
+	repaired, err := model.RepairReconciledProEntitlement(
+		self.clientSession.Ctx,
+		store,
+		renewal,
+		self.now,
+		self.dryRun,
+	)
+	if err != nil {
+		self.record(
+			store,
+			model.PaymentReconcileActionError,
+			&renewal.NetworkId,
+			evidence,
+			map[string]any{"error": err.Error(), "leg": "entitlement_repair"},
+		)
+		return
+	}
+	if !repaired {
+		return
+	}
+	action := model.PaymentReconcileActionEntitlementRepaired
+	if self.dryRun {
+		action = model.PaymentReconcileActionWouldRepairEntitlement
+	}
+	self.record(store, action, &renewal.NetworkId, evidence, details)
 }
 
 // end applies the "store says it is already over" repair -- or, in a dry run,
@@ -645,9 +773,10 @@ func runPaymentReconciliation(
 	// every run leaves a heartbeat -- a run that repaired nothing writes ONLY
 	// this row, and a missing heartbeat is how an operator sees the task died
 	heartbeatDetails := map[string]any{
-		"credited": run.credited,
-		"ended":    run.ended,
-		"errors":   run.errors,
+		"credited":              run.credited,
+		"ended":                 run.ended,
+		"entitlements_repaired": run.entitlementsRepaired,
+		"errors":                run.errors,
 	}
 	if run.dryRun {
 		heartbeatDetails["dry_run"] = true
@@ -667,14 +796,15 @@ func runPaymentReconciliation(
 	)
 
 	return &PaymentReconcileRunResult{
-		RunId:               run.runId,
-		DryRun:              run.dryRun,
-		Credited:            run.credited,
-		Ended:               run.ended,
-		Errors:              run.errors,
-		SkippedStores:       run.skipped,
-		StoreResults:        run.storeResults,
-		EmailFallbackEvents: run.emailFallbackEvents,
+		RunId:                run.runId,
+		DryRun:               run.dryRun,
+		Credited:             run.credited,
+		Ended:                run.ended,
+		EntitlementsRepaired: run.entitlementsRepaired,
+		Errors:               run.errors,
+		SkippedStores:        run.skipped,
+		StoreResults:         run.storeResults,
+		EmailFallbackEvents:  run.emailFallbackEvents,
 	}
 }
 
@@ -894,10 +1024,58 @@ func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 				fullInvoice.Subscription.Id,
 				map[string]any{"subscription_status": fullInvoice.Subscription.Status},
 			)
+		} else if stripeSubscriptionEntitled(fullInvoice.Subscription.Status) &&
+			stripeRenewalMatchesInvoice(ctx, renewal, fullInvoice) {
+			run.repairEntitlement(
+				store,
+				renewal,
+				fullInvoice.Subscription.Id,
+				map[string]any{"subscription_status": fullInvoice.Subscription.Status},
+			)
 		}
 	}
 
 	return true, nil
+}
+
+func stripeRenewalMatchesInvoice(
+	ctx context.Context,
+	renewal *model.ReconcileSubscriptionRenewal,
+	invoice *stripeReconcileInvoiceExpanded,
+) bool {
+	if invoice == nil || invoice.Subscription == nil || invoice.Id != renewal.TransactionId {
+		return false
+	}
+	ledgerNetworkId, credited := model.GetStripeInvoiceNetworkId(ctx, renewal.TransactionId)
+	if !credited || ledgerNetworkId != renewal.NetworkId {
+		return false
+	}
+	metadataNetwork := invoice.Subscription.Metadata["network_id"]
+	if metadataNetwork != "" {
+		metadataNetworkId, err := server.ParseId(metadataNetwork)
+		if err != nil || metadataNetworkId != renewal.NetworkId {
+			return false
+		}
+	} else {
+		// Legacy subscriptions predate immutable provider metadata. The exact
+		// stripe_invoice ledger remains the committed credit owner.
+	}
+	if invoice.Lines == nil {
+		return false
+	}
+	for _, line := range invoice.Lines.Data {
+		if line == nil || line.Type != "subscription" || line.Period == nil {
+			continue
+		}
+		if line.Subscription != nil && *line.Subscription != invoice.Subscription.Id {
+			continue
+		}
+		if renewal.StartTime.Equal(time.Unix(line.Period.Start, 0)) &&
+			renewal.EndTime.Equal(time.Unix(line.Period.End, 0).Add(SubscriptionGracePeriod)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ----- apple -----
@@ -999,8 +1177,35 @@ func reconcileApple(run *paymentReconcileRun, since time.Time) (bool, error) {
 				)
 				continue
 			}
-			transactionId, _ := appleControllerStringClaim(claims, "transactionId")
-			if transactionId == "" || model.IsAppleTransactionCredited(ctx, transactionId) {
+			transaction, err := validateAppleTransaction(
+				AppleNotificationDecodedPayload{
+					SignedDate:      run.now.UnixMilli(),
+					TransactionInfo: claims,
+				},
+				creds.ProductIds,
+				true,
+			)
+			if err != nil {
+				run.record(
+					store,
+					model.PaymentReconcileActionError,
+					&renewal.NetworkId,
+					renewal.TransactionId,
+					map[string]any{"error": err.Error(), "leg": "validate"},
+				)
+				continue
+			}
+			transactionId := transaction.transactionId
+			ledgerNetworkId, transactionCredited := model.GetAppleTransactionNetworkId(ctx, transactionId)
+			if transactionCredited {
+				if ledgerNetworkId == renewal.NetworkId && appleRenewalMatchesTransaction(renewal, transaction) {
+					run.repairEntitlement(
+						store,
+						renewal,
+						transactionId,
+						map[string]any{"status": entitledTransaction.Status},
+					)
+				}
 				continue
 			}
 			credited, networkId, err := appleReconcileCreditTransaction(ctx, claims, creds.ProductIds, run.dryRun)
@@ -1022,6 +1227,16 @@ func reconcileApple(run *paymentReconcileRun, since time.Time) (bool, error) {
 					transactionId,
 					map[string]any{"status": entitledTransaction.Status},
 				)
+			} else if appleRenewalMatchesTransaction(renewal, transaction) {
+				// A concurrent notification may have inserted the transaction
+				// ledger after the fast check. Its normal credit creates Pro; if it
+				// did not, the same exact-window repair remains idempotent.
+				run.repairEntitlement(
+					store,
+					renewal,
+					transactionId,
+					map[string]any{"status": entitledTransaction.Status},
+				)
 			}
 			continue
 		}
@@ -1038,6 +1253,16 @@ func reconcileApple(run *paymentReconcileRun, since time.Time) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func appleRenewalMatchesTransaction(
+	renewal *model.ReconcileSubscriptionRenewal,
+	transaction *validatedAppleTransaction,
+) bool {
+	return renewal.NetworkId == transaction.networkId &&
+		renewal.TransactionId == transaction.transactionId &&
+		renewal.StartTime.Equal(transaction.purchaseTime) &&
+		renewal.EndTime.Equal(transaction.expiresTime.Add(SubscriptionGracePeriod))
 }
 
 // appleReconcileCreditTransaction validates the store-reported transaction
@@ -1073,7 +1298,7 @@ func appleReconcileCreditTransaction(
 			return
 		}
 		credited = appleCreditSubscriptionTransactionInTx(tx, ctx, server.NewId(), transaction)
-	})
+	}, server.TxReadCommitted)
 	if returnErr != nil {
 		return false, networkId, returnErr
 	}
@@ -1177,6 +1402,22 @@ func reconcilePlay(run *paymentReconcileRun, since time.Time) (bool, error) {
 		}
 
 		if sub.SubscriptionState == "SUBSCRIPTION_STATE_ACTIVE" {
+			repairMatches, matchErr := playRenewalMatchesSubscription(
+				run.clientSession,
+				renewal,
+				sub,
+				maxExpiryTime,
+			)
+			if matchErr != nil {
+				run.record(
+					store,
+					model.PaymentReconcileActionError,
+					&renewal.NetworkId,
+					purchaseToken,
+					map[string]any{"error": matchErr.Error(), "leg": "validate"},
+				)
+				continue
+			}
 			if run.dryRun {
 				// the renewal path's overlap gate, read-only: an existing
 				// balance overlapping this expiry means the real run would
@@ -1188,6 +1429,13 @@ func reconcilePlay(run *paymentReconcileRun, since time.Time) (bool, error) {
 						&renewal.NetworkId,
 						purchaseToken,
 						map[string]any{"expiry_time": maxExpiryTime.UTC().Format(time.RFC3339)},
+					)
+				} else if repairMatches {
+					run.repairEntitlement(
+						store,
+						renewal,
+						purchaseToken,
+						map[string]any{"subscription_state": sub.SubscriptionState},
 					)
 				}
 				continue
@@ -1225,11 +1473,44 @@ func reconcilePlay(run *paymentReconcileRun, since time.Time) (bool, error) {
 					purchaseToken,
 					map[string]any{"expiry_time": result.ExpiryTime.UTC().Format(time.RFC3339)},
 				)
+			} else if repairMatches {
+				run.repairEntitlement(
+					store,
+					renewal,
+					purchaseToken,
+					map[string]any{"subscription_state": sub.SubscriptionState},
+				)
 			}
 		}
 	}
 
 	return true, nil
+}
+
+func playRenewalMatchesSubscription(
+	clientSession *session.ClientSession,
+	renewal *model.ReconcileSubscriptionRenewal,
+	subscription *PlaySubscription,
+	maxExpiryTime time.Time,
+) (bool, error) {
+	startTime, err := subscription.ParseStartTime()
+	if err != nil {
+		return false, err
+	}
+	if len(subscription.LineItems) == 0 {
+		return false, nil
+	}
+	sku, ok := playSkusFunc()[subscription.LineItems[0].ProductId]
+	if !ok || !sku.Supporter {
+		return false, nil
+	}
+	linkedNetworkId, validLink := playLinkedNetworkId(clientSession, subscription)
+	if !validLink || linkedNetworkId == nil {
+		return false, nil
+	}
+	return *linkedNetworkId == renewal.NetworkId &&
+		renewal.StartTime.Equal(startTime) &&
+		renewal.EndTime.Equal(maxExpiryTime.Add(SubscriptionGracePeriod)), nil
 }
 
 // ----- solana -----
@@ -1344,8 +1625,8 @@ func reconcileSolana(run *paymentReconcileRun, since time.Time) (bool, error) {
 		if renewal.TransactionId == "" {
 			continue
 		}
-		signature, ok := model.GetSolanaPaymentIntentSignature(ctx, renewal.TransactionId)
-		if !ok {
+		intentNetworkId, signature, ok := model.GetSolanaPaymentIntentCompletion(ctx, renewal.TransactionId)
+		if !ok || intentNetworkId != renewal.NetworkId {
 			continue
 		}
 		run.examine(store)
@@ -1386,11 +1667,21 @@ func reconcileSolana(run *paymentReconcileRun, since time.Time) (bool, error) {
 		}
 
 		for i, status := range statuses.Result.Value {
+			target := targets[start+i]
 			if status != nil {
-				// the payment is on-chain -- all is well
+				// The exact credited payment is present in authoritative chain
+				// history. Only a successful confirmed/finalized execution is a
+				// positive payment verdict from which to reconstruct metadata.
+				if solanaStatusConfirmsPayment(status.Err, status.ConfirmationStatus) {
+					run.repairEntitlement(
+						store,
+						target.renewal,
+						target.signature,
+						map[string]any{"confirmation_status": status.ConfirmationStatus},
+					)
+				}
 				continue
 			}
-			target := targets[start+i]
 			run.end(
 				store,
 				target.renewal.NetworkId,
@@ -1404,4 +1695,11 @@ func reconcileSolana(run *paymentReconcileRun, since time.Time) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func solanaStatusConfirmsPayment(statusErr any, confirmationStatus *string) bool {
+	if statusErr != nil || confirmationStatus == nil {
+		return false
+	}
+	return *confirmationStatus == "confirmed" || *confirmationStatus == "finalized"
 }

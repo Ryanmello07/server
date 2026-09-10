@@ -3,11 +3,11 @@ package model
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/urnetwork/glog"
 	"github.com/urnetwork/server"
-	"sync"
 )
 
 // A deployment-wide budget on the bytes active bandwidth probing is allowed
@@ -40,20 +40,22 @@ const MaxProviderBandwidthLookaheadBuckets = 24
 
 // activeBandwidthProbesPerBucket is the per-hour reservation budget. It is
 // CAPACITY, and capacity is a property of the deployment rather than of this
-// code, so it is configurable: beta runs on a 4-core box with a 40-provider
-// fleet, mainnet has ~100k providers and must measure its own limits and set
-// its own number. That is different from a behavioural knob like the sampling
-// rate, which stays one value everywhere so both deployments exercise the same
-// path.
+// code, so it is configurable: a small deployment runs a 40-provider fleet on a
+// 4-core box, a production one carries ~100k providers, and each has to measure
+// its own limits and set its own number. That is different from a behavioural
+// knob like the sampling rate, which stays one value everywhere so every
+// deployment exercises the same path.
 //
 // The default below is deliberately the conservative one, so an environment
 // with no config file cannot accidentally spend more than a small deployment
-// can afford. It is NOT beta's value: beta sets 80 in
-// beta-vault/config/provider_bandwidth.yml, derived below. The compiled
-// default of 40 covers 20 providers per hour (two reservations each), which is
-// the point -- an unconfigured deployment gets a floor, not a fleet sweep.
+// can afford. It is not a recommendation: a deployment sets probes_per_bucket
+// in provider_bandwidth.yml to whatever its own measurements justify. The
+// compiled default of 40 covers 20 providers per hour (two reservations each),
+// which is the point -- an unconfigured deployment gets a floor, not a fleet
+// sweep.
 //
-// HOW TO DERIVE IT, using the measurements taken on beta 2026-07-31:
+// HOW TO DERIVE IT, worked through with the measurements taken on a 4-core,
+// 40-provider deployment on 2026-07-31:
 //
 //	Each provider costs TWO reservations, not one -- the operator target and
 //	the cdn target are measured separately and never averaged.
@@ -66,16 +68,16 @@ const MaxProviderBandwidthLookaheadBuckets = 24
 //	  cdn:      640 MiB in only (cloudflare serves it, we only relay)
 //	  total:    1.9 GiB per sweep, of which 1.25 GiB is reserved budget
 //
-//	Measured beta headroom under the SINGLE-STREAM load that preceded this
+//	Measured headroom there under the SINGLE-STREAM load that preceded this
 //	(one third the bytes, one eighth the simultaneous transfers):
 //	  uplink    240-324 MB/s down, 28-120 MB/s up -> the sweep used 0.17%
 //	  cpu       connect 5.4% idle -> 50% peak of ONE core, on a 4-core box
 //	  memory    available flat at ~2.3 GB; connect RSS +25 MiB across the pass
 //
-//	So on beta NO hardware resource binds; the budget is what binds, and the
-//	right value is set by coverage rather than by capacity: 2 reservations x
-//	40 providers = 80 is exactly one full sweep of the current fleet in one
-//	hour.
+//	So on that deployment NO hardware resource binds; the budget is what
+//	binds, and the right value is set by coverage rather than by capacity:
+//	2 reservations x 40 providers = 80 is exactly one full sweep of that fleet
+//	in one hour, and that is what it configures.
 //
 //	80, not the 100 this carried when a reservation was 5 MiB. That 100 bought
 //	headroom to grow to 50 providers; a reservation now costs 3.2x more, so
@@ -87,7 +89,7 @@ const MaxProviderBandwidthLookaheadBuckets = 24
 //
 //	Bytes are not the only dimension. Simultaneous transfers served by the api
 //	are (the prober's stream count) x (its -concurrency), which a byte budget
-//	does not bound at all: 8 x 2 = 16 at beta's deployed -concurrency=2. That
+//	does not bound at all: 8 x 2 = 16 at a deployed -concurrency=2. That
 //	is bounded on the prober side, where both numbers live.
 //
 // Revisit against real data; this is tuned, not structural.

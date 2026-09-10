@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	// "math"
 	mathrand "math/rand"
 	"slices"
@@ -31,19 +32,471 @@ import (
 	"github.com/urnetwork/server/stats"
 )
 
+const (
+	// One UpdateClientScores export contains thousands of cross-slot SETs for
+	// each caller location. Sending all of them through one ClusterClient
+	// pipeline from each of 48 workers can fill a node socket until the 15s
+	// write deadline; generating a complete operation list before batching also
+	// retained tens of GiB across those workers. Produce and flush one bounded
+	// batch at a time; completed chunks are not replayed when a later chunk
+	// needs a transient retry.
+	clientScoreExportBatchSize   = 512
+	clientScoreExportBatchBytes  = 8 << 20
+	clientScoreExportMaxAttempts = 3
+
+	// A caller-target alias is intentionally tiny. "1" selects the shared
+	// zero-caller baseline and "0" selects the caller-specific override. A
+	// missing alias means the cache was written by a legacy process and must
+	// continue to select the caller-specific payload.
+	clientScoreAliasBaselineValue = "1"
+	clientScoreAliasCallerValue   = "0"
+	clientScoreAliasReadyKey      = "client_score_alias_v1_ready"
+	// The score writer only visits targets present in its current SQL result.
+	// Persist the last complete target set so a location that loses its final
+	// eligible provider receives an explicit empty payload instead of leaving
+	// its prior providers selectable for the cache TTL.
+	clientScoreTargetManifestKey = "client_score_target_manifest_v1"
+	// Published only after a complete score export whose SQL excludes derived
+	// window clients and inactive top-level clients. Monitoring uses this
+	// durable boundary to distinguish harmless raw candidate rows from caches
+	// written by the legacy unfiltered query.
+	clientScoreProviderEligibilityReadyKey   = "client_score_provider_eligibility_v1_ready"
+	clientScoreProviderEligibilityReadyValue = "1"
+)
+
+type clientScoreRedisSet struct {
+	key   string
+	value []byte
+}
+
+type clientScoreTargetManifestDocument struct {
+	LocationIds      []string `json:"location_ids"`
+	LocationGroupIds []string `json:"location_group_ids"`
+}
+
+type clientScoreTargetManifest struct {
+	locationIds      map[server.Id]bool
+	locationGroupIds map[server.Id]bool
+}
+
+// clientScoreTargetKeys builds the payload and alias key families for one
+// target location or location group. The caller location stays in each hash
+// tag to preserve cluster distribution; aliases let equivalent callers share
+// the zero-caller payload instead of duplicating it.
+type clientScoreTargetKeys struct {
+	counts func(server.Id) string
+	filter func(server.Id) string
+	sample func(server.Id, int) string
+	alias  func(server.Id) string
+}
+
+type clientScoreTargetEncode func(map[server.Id]*ClientScore) (
+	countsBytes []byte,
+	filterBytes []byte,
+	counts []int,
+	encodeSample func(int) []byte,
+)
+
+type clientScoreExportBatchExec func([]clientScoreRedisSet) error
+type clientScoreExportRetryWait func(context.Context, int) error
+type clientScoreExportProduce func(func(clientScoreRedisSet) error) error
+
+func clientScoreNetworkIds(clientScores map[server.Id]*ClientScore) map[server.Id]bool {
+	networkIds := make(map[server.Id]bool)
+	for _, clientScore := range clientScores {
+		networkIds[clientScore.NetworkId] = true
+	}
+	return networkIds
+}
+
+func networkSetsIntersect(a, b map[server.Id]bool) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	for networkId := range a {
+		if b[networkId] {
+			return true
+		}
+	}
+	return false
+}
+
+func filterClientScoresByNetwork(
+	clientScores map[server.Id]*ClientScore,
+	excludedNetworkIds map[server.Id]bool,
+) map[server.Id]*ClientScore {
+	activeClientScores := make(map[server.Id]*ClientScore, len(clientScores))
+	for clientId, clientScore := range clientScores {
+		if !excludedNetworkIds[clientScore.NetworkId] {
+			activeClientScores[clientId] = clientScore
+		}
+	}
+	return activeClientScores
+}
+
+// emitClientScoreTargetFanout stores one complete zero-caller baseline for a
+// target. Callers whose blocked-network set leaves the target unchanged get a
+// one-byte baseline alias; callers that really remove a provider get a complete
+// override and a caller alias. A missing alias remains the legacy-reader
+// sentinel, so a rolling deployment can read cache entries from either writer.
+//
+// The first alias-aware export can additionally refresh the legacy duplicate
+// payloads for unchanged callers. Once that complete export publishes the
+// schema-ready marker, later exports omit those duplicates and let their normal
+// TTL reclaim the memory without a production delete.
+//
+// This changes storage sharing, not score contents. loadClientScores already
+// randomizes the sample-key order and FindProviders2 performs a final weighted
+// selection, so equivalent callers do not require independently shuffled gob
+// payloads.
+func emitClientScoreTargetFanout(
+	clientLocationIds []server.Id,
+	clientScores map[server.Id]*ClientScore,
+	excludeLocationNetworkIds map[server.Id]map[server.Id]bool,
+	keys clientScoreTargetKeys,
+	encode clientScoreTargetEncode,
+	writeLegacyUnchanged bool,
+	emit func(clientScoreRedisSet) error,
+) error {
+	targetNetworkIds := clientScoreNetworkIds(clientScores)
+	unchangedClientLocationIds := make([]server.Id, 0, len(clientLocationIds))
+	changedClientLocationIds := make([]server.Id, 0)
+	for _, clientLocationId := range clientLocationIds {
+		if clientLocationId == (server.Id{}) {
+			continue
+		}
+		if networkSetsIntersect(targetNetworkIds, excludeLocationNetworkIds[clientLocationId]) {
+			changedClientLocationIds = append(changedClientLocationIds, clientLocationId)
+		} else {
+			unchangedClientLocationIds = append(unchangedClientLocationIds, clientLocationId)
+		}
+	}
+
+	emitPayload := func(
+		callerIds []server.Id,
+		countsBytes []byte,
+		filterBytes []byte,
+		counts []int,
+		encodeSample func(int) []byte,
+	) error {
+		for _, callerId := range callerIds {
+			for _, set := range []clientScoreRedisSet{
+				{key: keys.counts(callerId), value: countsBytes},
+				{key: keys.filter(callerId), value: filterBytes},
+			} {
+				if err := emit(set); err != nil {
+					return err
+				}
+			}
+		}
+		for sampleIndex := range counts {
+			// Encode before the caller loop: every equivalent caller gets the
+			// same immutable payload under its own key.
+			value := encodeSample(sampleIndex)
+			for _, callerId := range callerIds {
+				if err := emit(clientScoreRedisSet{
+					key:   keys.sample(callerId, sampleIndex),
+					value: value,
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// The zero caller is the canonical baseline even when the caller list does
+	// not explicitly contain it. During the one-time compatibility pass, the
+	// same immutable bytes also refresh every legacy unchanged-caller key.
+	countsBytes, filterBytes, counts, encodeSample := encode(clientScores)
+	baselineAndLegacyCallers := []server.Id{{}}
+	if writeLegacyUnchanged {
+		baselineAndLegacyCallers = append(baselineAndLegacyCallers, unchangedClientLocationIds...)
+	}
+	if err := emitPayload(baselineAndLegacyCallers, countsBytes, filterBytes, counts, encodeSample); err != nil {
+		return err
+	}
+	for _, clientLocationId := range unchangedClientLocationIds {
+		if err := emit(clientScoreRedisSet{
+			key:   keys.alias(clientLocationId),
+			value: []byte(clientScoreAliasBaselineValue),
+		}); err != nil {
+			return err
+		}
+	}
+	for _, clientLocationId := range changedClientLocationIds {
+		activeClientScores := filterClientScoresByNetwork(
+			clientScores,
+			excludeLocationNetworkIds[clientLocationId],
+		)
+		countsBytes, filterBytes, counts, encodeSample := encode(activeClientScores)
+		if err := emitPayload(
+			[]server.Id{clientLocationId},
+			countsBytes,
+			filterBytes,
+			counts,
+			encodeSample,
+		); err != nil {
+			return err
+		}
+		if err := emit(clientScoreRedisSet{
+			key:   keys.alias(clientLocationId),
+			value: []byte(clientScoreAliasCallerValue),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// selectClientScorePayload resolves one alias-aware read. Missing/unknown
+// aliases deliberately preserve the legacy caller-key behavior. If a baseline
+// alias races a missing/evicted baseline value, the caller payload is the safe
+// fallback because it preserves exclusions.
+func selectClientScorePayload(
+	clientLocationId server.Id,
+	aliasBytes []byte,
+	callerBytes []byte,
+	baselineBytes []byte,
+) (effectiveClientLocationId server.Id, payload []byte) {
+	if clientLocationId != (server.Id{}) &&
+		string(aliasBytes) == clientScoreAliasBaselineValue &&
+		0 < len(baselineBytes) {
+		return server.Id{}, baselineBytes
+	}
+	return clientLocationId, callerBytes
+}
+
+func clientScoreCommandBytes(cmd *redis.StringCmd) []byte {
+	if cmd == nil {
+		return nil
+	}
+	value, _ := cmd.Bytes()
+	return value
+}
+
+func transientClientScoreExportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Pool exhaustion is local backpressure. Retrying it in-place adds more
+	// demand to the same saturated pool, matching server.Redis's fail-fast
+	// rule for this class.
+	if strings.Contains(err.Error(), "redis: connection pool timeout") {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	message := err.Error()
+	for _, marker := range []string{
+		"i/o timeout",
+		"connection reset by peer",
+		"cannot assign requested address",
+		"redis: client is closed",
+		"CLUSTERDOWN",
+		"LOADING",
+		"READONLY",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// runClientScoreExportStream is the deterministic bounded-working-set and
+// retry core. Produce cannot get past either the command-count or payload-byte
+// budget ahead of execBatch: a full batch is synchronously written and cleared
+// before emit returns. SET is idempotent and every value carries the same ttl, so retrying
+// exactly the failed chunk is safe; successful earlier chunks are deliberately
+// not replayed. retryWait is injected so tests never depend on wall-clock
+// sleeps.
+func runClientScoreExportStream(
+	ctx context.Context,
+	batchSize int,
+	maxBatchBytes int,
+	maxAttempts int,
+	produce clientScoreExportProduce,
+	execBatch clientScoreExportBatchExec,
+	retryWait clientScoreExportRetryWait,
+) error {
+	if batchSize <= 0 || maxBatchBytes <= 0 || maxAttempts <= 0 || produce == nil || execBatch == nil || retryWait == nil {
+		return fmt.Errorf("client score export requires positive batch size, byte budget, and attempts")
+	}
+	batch := make([]clientScoreRedisSet, 0, batchSize)
+	batchBytes := 0
+	batchIndex := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		batchIndex++
+		var err error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			err = execBatch(batch)
+			if err == nil {
+				break
+			}
+			if !transientClientScoreExportError(err) || attempt == maxAttempts {
+				return fmt.Errorf("client score export batch %d attempt %d/%d: %w", batchIndex, attempt, maxAttempts, err)
+			}
+			if waitErr := retryWait(ctx, attempt); waitErr != nil {
+				return waitErr
+			}
+		}
+		// Release every encoded payload before produce resumes. Re-slicing alone
+		// leaves the old []byte references in the backing array and lets a short
+		// tail retain almost a full prior batch until the worker exits.
+		clear(batch)
+		batch = batch[:0]
+		batchBytes = 0
+		return nil
+	}
+	emit := func(set clientScoreRedisSet) error {
+		setBytes := len(set.key) + len(set.value)
+		// Count and bytes are independent guards. Encoded samples vary with
+		// provider population, so a 512-command batch alone is not a bounded
+		// working set. Flush before adding a value that would cross the byte
+		// budget. One individually oversized value is unavoidable, but is sent
+		// alone immediately instead of being combined with other payloads.
+		if 0 < len(batch) && (maxBatchBytes-batchBytes < setBytes) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		batch = append(batch, set)
+		batchBytes += setBytes
+		if len(batch) == batchSize || maxBatchBytes <= batchBytes {
+			return flush()
+		}
+		return nil
+	}
+	if err := produce(emit); err != nil {
+		return err
+	}
+	return flush()
+}
+
+// runClientScoreExportBatches retains the slice-based seam for focused retry
+// tests and small callers. Production uses the streaming producer below, so a
+// whole caller-location export is never materialized at once.
+func runClientScoreExportBatches(
+	ctx context.Context,
+	sets []clientScoreRedisSet,
+	batchSize int,
+	maxBatchBytes int,
+	maxAttempts int,
+	execBatch clientScoreExportBatchExec,
+	retryWait clientScoreExportRetryWait,
+) error {
+	return runClientScoreExportStream(
+		ctx,
+		batchSize,
+		maxBatchBytes,
+		maxAttempts,
+		func(emit func(clientScoreRedisSet) error) error {
+			for _, set := range sets {
+				if err := emit(set); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		execBatch,
+		retryWait,
+	)
+}
+
+func writeClientScoreRedisStream(ctx context.Context, r server.RedisClient, ttl time.Duration, produce clientScoreExportProduce) error {
+	return runClientScoreExportStream(
+		ctx,
+		clientScoreExportBatchSize,
+		clientScoreExportBatchBytes,
+		clientScoreExportMaxAttempts,
+		produce,
+		func(batch []clientScoreRedisSet) error {
+			pipe := r.Pipeline()
+			for _, set := range batch {
+				pipe.Set(ctx, set.key, set.value, ttl)
+			}
+			_, err := pipe.Exec(ctx)
+			return err
+		},
+		func(ctx context.Context, failedAttempt int) error {
+			timer := time.NewTimer(time.Duration(failedAttempt) * 250 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
+	)
+}
+
+func clientScoreAliasReady(ctx context.Context) (ready bool, returnErr error) {
+	server.Redis(ctx, func(r server.RedisClient) {
+		value, err := r.Get(ctx, clientScoreAliasReadyKey).Result()
+		if err == redis.Nil {
+			return
+		}
+		if err != nil {
+			returnErr = err
+			return
+		}
+		ready = value == clientScoreAliasBaselineValue
+	})
+	return
+}
+
+func markClientScoreAliasReady(ctx context.Context) (returnErr error) {
+	server.Redis(ctx, func(r server.RedisClient) {
+		returnErr = r.Set(ctx, clientScoreAliasReadyKey, clientScoreAliasBaselineValue, 0).Err()
+	})
+	return
+}
+
+func clientScoreProviderEligibilityReady(ctx context.Context) (ready bool, returnErr error) {
+	server.Redis(ctx, func(r server.RedisClient) {
+		value, err := r.Get(ctx, clientScoreProviderEligibilityReadyKey).Result()
+		if err == redis.Nil {
+			return
+		}
+		if err != nil {
+			returnErr = err
+			return
+		}
+		ready = value == clientScoreProviderEligibilityReadyValue
+	})
+	return
+}
+
+func markClientScoreProviderEligibilityReady(ctx context.Context) (returnErr error) {
+	server.Redis(ctx, func(r server.RedisClient) {
+		returnErr = r.Set(ctx, clientScoreProviderEligibilityReadyKey, clientScoreProviderEligibilityReadyValue, 0).Err()
+	})
+	return
+}
+
 func init() {
 	resetCountryCodeLocationIds()
 	server.OnReset(func() {
 		resetCountryCodeLocationIds()
 	})
-	server.OnWarmup(func() {
+	server.OnWarmup(server.WarmupTargetCountryLocations, func() {
 		countryCodeLocationIds()
 	})
 
 	server.OnReset(func() {
 		resetLocationDirectory()
 	})
-	server.OnWarmup(func() {
+	server.OnWarmup(server.WarmupTargetLocationDirectory, func() {
 		loadLocationDirectory()
 	})
 }
@@ -1913,9 +2366,10 @@ const minEgressHealthOKDenominator = 10
 
 const providerConfigResourceName = "provider.yml"
 
-// providerEgressTestEnabled controls whether egress-test evidence is an
-// eligibility requirement. The probe pipeline can still run while this is
-// false; its results simply do not gate provider discovery or public counts.
+// providerEgressTestEnabled controls whether broad egress health and observed-
+// country evidence are eligibility requirements. The probe pipeline can still
+// run while this is false. A current explicit blackhole verdict remains an
+// eligibility requirement independently of this rollout switch.
 //
 // Defaulting to false is deliberate. A deployment can introduce the server
 // side of the probe pipeline before any prober has populated its tables. In
@@ -1945,8 +2399,12 @@ func providerEgressTestEnabledFromResource(resource *server.SimpleResource, err 
 // was not, so a location could survive the gate and still advertise providers
 // that no probe had ever reached.
 //
-// Both maps are loaded once per pass. These loops run over the entire provider
-// population, so a per-provider query here is one round trip per provider.
+// Current hard-failure evidence is always loaded: an explicit blackhole verdict
+// or an unauthenticated TLS identity is conclusive per-provider evidence, not a
+// dependency on broad fleet probe coverage. Health and observed-country
+// evidence are loaded only when the broad egress qualification gate is enabled.
+// These loops run over the entire provider population, so a per-provider query
+// here is one round trip per provider.
 type providerCountFilter struct {
 	healthCounts map[server.Id]ProviderEgressHealthCounts
 	countryCodes map[server.Id]string
@@ -1955,14 +2413,30 @@ type providerCountFilter struct {
 	// both a passing check and no check at all. See
 	// GetAllProviderBlackholedClientIds for why it fails in that direction.
 	blackholed map[server.Id]bool
+	// tlsAuthenticationFailed is positive integrity-failure evidence. It is
+	// loaded and enforced even while broad percentage/location qualification is
+	// disabled, just like a current explicit blackhole verdict.
+	tlsAuthenticationFailed map[server.Id]bool
 }
 
-func newProviderCountFilter(ctx context.Context) providerCountFilter {
-	return providerCountFilter{
-		healthCounts: GetAllProviderEgressHealthCounts(ctx),
-		countryCodes: GetAllProviderEgressCountryCodes(ctx),
-		blackholed:   GetAllProviderBlackholedClientIds(ctx),
+func newProviderCountFilter(ctx context.Context, loadEgressEvidence bool) providerCountFilter {
+	f := providerCountFilter{
+		blackholed:              GetAllProviderBlackholedClientIds(ctx),
+		tlsAuthenticationFailed: GetAllProviderEgressTLSAuthenticationFailedClientIds(ctx),
 	}
+	if loadEgressEvidence {
+		f.healthCounts = GetAllProviderEgressHealthCounts(ctx)
+		f.countryCodes = GetAllProviderEgressCountryCodes(ctx)
+	}
+	return f
+}
+
+func (f providerCountFilter) isBlackholed(clientId server.Id) bool {
+	return f.blackholed[clientId]
+}
+
+func (f providerCountFilter) hasHardEgressFailure(clientId server.Id) bool {
+	return f.isBlackholed(clientId) || f.tlsAuthenticationFailed[clientId]
 }
 
 // passesHealth reports whether a probe has MEASURED this provider healthy.
@@ -1973,14 +2447,12 @@ func newProviderCountFilter(ctx context.Context) providerCountFilter {
 // Compared exactly as 10*ok >= 9*total rather than through a float, so the 90%
 // boundary cannot drift with rounding.
 func (f providerCountFilter) passesHealth(clientId server.Id) bool {
-	// The hourly blackhole check overrides a passing health measurement, and
-	// only ever in the removing direction. The two run on very different
-	// cadences -- health sweeps the fleet over hours to days, the blackhole
-	// check over an hour -- so a provider that went dark since its last health
-	// measurement is caught here rather than at the next health sweep. A
-	// provider is only in this set when a CURRENT check says nothing got
-	// through; see GetAllProviderBlackholedClientIds.
-	if f.blackholed[clientId] {
+	// Hard failures override a passing percentage. The hourly blackhole check
+	// catches a provider that went dark after its last health sweep; the TLS bit
+	// catches a provider for which one authenticated destination failed even if
+	// enough unrelated destinations passed to clear 90%. Neither is a ranking
+	// input: both only remove unsafe/unusable supply.
+	if f.hasHardEgressFailure(clientId) {
 		return false
 	}
 
@@ -1992,6 +2464,17 @@ func (f providerCountFilter) passesHealth(clientId server.Id) bool {
 		return false
 	}
 	return minEgressHealthOKDenominator*counts.OKCount >= minEgressHealthOKNumerator*counts.Total
+}
+
+// passesEligibility always honors hard per-provider failures, then optionally
+// applies the broader health qualification. This distinction lets a rollout
+// leave broad egress testing disabled without publishing a provider that a
+// current fast check proved dark or a health check proved TLS-intercepting.
+func (f providerCountFilter) passesEligibility(clientId server.Id, requireEgressEvidence bool) bool {
+	if f.hasHardEgressFailure(clientId) {
+		return false
+	}
+	return !requireEgressEvidence || f.passesHealth(clientId)
 }
 
 // countsTowardCountry reports whether this provider counts as supply for
@@ -2017,9 +2500,9 @@ func (f providerCountFilter) countsTowardCountry(clientId server.Id, countryCode
 	return observed == strings.ToLower(countryCode)
 }
 
-// shouldSkipCountGate reports whether the count gate should be skipped
-// entirely for this pass, falling back to the pre-gate behavior (connected +
-// valid + Public key only) instead of fail-closed per provider.
+// shouldSkipCountGate reports whether broad health/location qualification
+// should be skipped for this pass, falling back to connected + valid + Public
+// key supply after still excluding current blackholes.
 //
 // Both maps are checked, not just healthCounts, because they are fed by two
 // INDEPENDENT pipelines that can stall separately: health arrives over the
@@ -2076,8 +2559,9 @@ func shouldRecountUngated(gated bool, providerRows int, countedLocations int) bo
 }
 
 // providerCountRow is one connected + valid + Public provider row from the
-// count query, held in memory so the pass can be counted twice (gated, then
-// ungated if the gated pass came out empty) without issuing a second query.
+// count query, held in memory so the pass can be counted twice (with broad
+// qualification, then without it if the first pass came out empty) without
+// issuing a second query. Both passes exclude current blackholes.
 type providerCountRow struct {
 	clientId          server.Id
 	cityLocationId    server.Id
@@ -2098,14 +2582,12 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 
 	initialClientLocations := &InitialClientLocations{}
 
-	// one bulk load per pass, outside the tx: this loop runs over the whole
-	// provider population. Do not query the probe tables when their result is
-	// not an eligibility requirement.
+	// One bulk load per pass, outside the tx: this loop runs over the whole
+	// provider population. Current blackhole and TLS-authentication verdicts are
+	// always eligibility evidence. The broader health and observed-country
+	// tables are queried only when their gate is enabled.
 	egressTestEnabled := providerEgressTestEnabled()
-	countFilter := providerCountFilter{}
-	if egressTestEnabled {
-		countFilter = newProviderCountFilter(ctx)
-	}
+	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
 
 	// An empty health OR countryCodes map means one of the two probe
 	// pipelines has told us nothing yet -- stalled job, truncated table, cold
@@ -2129,9 +2611,9 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 	skipCountGate := !egressTestEnabled || countFilter.shouldSkipCountGate()
 	if skipCountGate {
 		if egressTestEnabled {
-			glog.Infof("[nclm]egress health or location records are empty; skipping the provider count gate for this pass\n")
+			glog.Infof("[nclm]egress health or location records are empty; skipping broad provider count qualification for this pass; hard egress exclusions remain enabled\n")
 		} else {
-			glog.Infof("[nclm]provider egress test is disabled; skipping the provider count gate for this pass\n")
+			glog.Infof("[nclm]provider egress test is disabled; skipping broad provider count qualification for this pass; hard egress exclusions remain enabled\n")
 		}
 	}
 
@@ -2152,6 +2634,9 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 	        	country_location.country_code
 
 	        FROM network_client_location_reliability
+
+	        INNER JOIN network_client ON
+	            network_client.client_id = network_client_location_reliability.client_id
 
 	        -- fix(beta): this was an INNER JOIN upstream, which requires a
 	        -- client to already have a row in client_connection_reliability_score
@@ -2174,6 +2659,8 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 	        	country_location.location_id = network_client_location_reliability.country_location_id
 
 	        WHERE
+	            network_client.active = true AND
+	            network_client.source_client_id IS NULL AND
 	        	network_client_location_reliability.connected = true AND
 	        	network_client_location_reliability.valid = true AND
 	        	-- this is the number shown to everyone, so count only providers
@@ -2230,6 +2717,14 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 		countProviderRows := func(gated bool) map[server.Id]int {
 			locationClientCounts := map[server.Id]int{}
 			for _, row := range providerCountRows {
+				// A current blackhole or TLS-authentication verdict is conclusive
+				// per-provider evidence and is never part of the fleet-wide
+				// health/location fallback. Otherwise that fallback would
+				// immediately resurrect the exact unsafe provider.
+				if countFilter.hasHardEgressFailure(row.clientId) {
+					continue
+				}
+
 				// This is the number every app shows when a user picks a
 				// location, so count only providers a probe has MEASURED
 				// healthy and OBSERVED egressing from the country they claim.
@@ -2286,7 +2781,7 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 		// be collapsed.
 		if shouldRecountUngated(gated, len(providerCountRows), len(locationClientCounts)) {
 			glog.Infof(
-				"[nclm]the count gate emptied all %d connected provider rows fleet-wide; recounting ungated for this pass\n",
+				"[nclm]broad count qualification emptied all %d connected provider rows fleet-wide; recounting without health/location qualification; hard egress exclusions remain enabled\n",
 				len(providerCountRows),
 			)
 			locationClientCounts = countProviderRows(false)
@@ -2608,21 +3103,35 @@ func loadLocationStables(
 	locationStables = map[server.Id]bool{}
 
 	server.Redis(ctx, func(r server.RedisClient) {
-		locationFilterCmds := map[server.Id]*redis.StringCmd{}
+		type filterRead struct {
+			alias    *redis.StringCmd
+			caller   *redis.StringCmd
+			baseline *redis.StringCmd
+		}
+		locationFilterCmds := map[server.Id]filterRead{}
 
 		// plain pipeline instead of tx: independent gets across cluster slots
 		pipe := r.Pipeline()
 		for _, locationId := range locationIds {
-			locationFilterCmds[locationId] = pipe.Get(
-				ctx,
-				clientScoreLocationFilterKey(forceMinimum, rankMode, locationId, clientLocationId),
-			)
+			read := filterRead{
+				caller: pipe.Get(ctx, clientScoreLocationFilterKey(forceMinimum, rankMode, locationId, clientLocationId)),
+			}
+			if clientLocationId != (server.Id{}) {
+				read.alias = pipe.Get(ctx, clientScoreLocationAliasKey(forceMinimum, rankMode, locationId, clientLocationId))
+				read.baseline = pipe.Get(ctx, clientScoreLocationFilterKey(forceMinimum, rankMode, locationId, server.Id{}))
+			}
+			locationFilterCmds[locationId] = read
 		}
 		// note ignore the error for GET since it will include missing key
 		pipe.Exec(ctx)
 
-		for locationId, filterCmd := range locationFilterCmds {
-			filterBytes, _ := filterCmd.Bytes()
+		for locationId, read := range locationFilterCmds {
+			_, filterBytes := selectClientScorePayload(
+				clientLocationId,
+				clientScoreCommandBytes(read.alias),
+				clientScoreCommandBytes(read.caller),
+				clientScoreCommandBytes(read.baseline),
+			)
 			if len(filterBytes) == 0 {
 				// there are no providers
 				continue
@@ -2944,6 +3453,8 @@ type FindProvidersProvider struct {
 	HasEstimatedBytesPerSecond bool              `json:"has_estimated_bytes_per_second"`
 	Tier                       int               `json:"tier"`
 	IntermediaryIds            []server.Id       `json:"intermediary_ids"`
+	NetworkOnly                bool              `json:"network_only,omitempty"`
+	ReputationFailedNames      string            `json:"reputation_failed_names,omitempty"`
 	Location                   *ProviderLocation `json:"location,omitempty"`
 }
 
@@ -2985,6 +3496,13 @@ type ClientScore struct {
 	// the pre-existing behaviour -- or every provider would be treated as
 	// network-only until the cache turned over.
 	NetworkOnly bool
+	// ReputationFailedNames is the current external-probe domain/vendor
+	// rejection set. It is intentionally separate from health scoring: a
+	// hosted exit can carry traffic correctly while a particular publisher
+	// refuses its egress IP. Like the location ids below, this is set only on
+	// the top-level score so each lookback does not duplicate the string in
+	// every gob cache blob.
+	ReputationFailedNames string
 
 	// set only on the top-level score, never on the `LookbackClientScores`
 	// copies: each score is gob-serialized into thousands of cache key
@@ -3041,6 +3559,24 @@ func clientScoreLocationGroupCountsKey(forceMinimum bool, rankMode RankMode, loc
 	return fmt.Sprintf("{cs_%d_%c_%s_%s}c_g", fm, rm, callerLocationId, locationGroupId)
 }
 
+func clientScoreLocationAliasKey(forceMinimum bool, rankMode RankMode, locationId server.Id, callerLocationId server.Id) string {
+	fm := 0
+	if forceMinimum {
+		fm = 1
+	}
+	rm, _ := utf8.DecodeRuneInString(rankMode)
+	return fmt.Sprintf("{cs_%d_%c_%s_%s}a_l", fm, rm, callerLocationId, locationId)
+}
+
+func clientScoreLocationGroupAliasKey(forceMinimum bool, rankMode RankMode, locationGroupId server.Id, callerLocationId server.Id) string {
+	fm := 0
+	if forceMinimum {
+		fm = 1
+	}
+	rm, _ := utf8.DecodeRuneInString(rankMode)
+	return fmt.Sprintf("{cs_%d_%c_%s_%s}a_g", fm, rm, callerLocationId, locationGroupId)
+}
+
 func clientScoreLocationFilterKey(forceMinimum bool, rankMode RankMode, locationId server.Id, callerLocationId server.Id) string {
 	fm := 0
 	if forceMinimum {
@@ -3078,14 +3614,21 @@ func clientScoreLocationGroupSampleKey(forceMinimum bool, rankMode RankMode, loc
 }
 
 func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (returnErr error) {
-	addClientScore := func(lookbackClientScore *ClientScore, m map[server.Id]*ClientScore) *ClientScore {
+	aliasesReady, err := clientScoreAliasReady(ctx)
+	if err != nil {
+		return fmt.Errorf("read client score alias migration state: %w", err)
+	}
+	writeLegacyUnchanged := !aliasesReady
+
+	addClientScore := func(lookbackClientScore *ClientScore, reputationFailedNames string, m map[server.Id]*ClientScore) *ClientScore {
 		clientScore, ok := m[lookbackClientScore.ClientId]
 		if !ok {
 			clientScore = &ClientScore{
-				ClientId:             lookbackClientScore.ClientId,
-				NetworkId:            lookbackClientScore.NetworkId,
-				NetworkOnly:          lookbackClientScore.NetworkOnly,
-				LookbackClientScores: map[int]*ClientScore{},
+				ClientId:              lookbackClientScore.ClientId,
+				NetworkId:             lookbackClientScore.NetworkId,
+				NetworkOnly:           lookbackClientScore.NetworkOnly,
+				ReputationFailedNames: reputationFailedNames,
+				LookbackClientScores:  map[int]*ClientScore{},
 			}
 			m[lookbackClientScore.ClientId] = clientScore
 		}
@@ -3174,7 +3717,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		}
 	}
 
-	loadClientScore := func(result server.PgResult) (lookbackClientScore *ClientScore, cityLocationXId *server.Id, regionLocationXId *server.Id, countryLocationXId *server.Id) {
+	loadClientScore := func(result server.PgResult) (lookbackClientScore *ClientScore, cityLocationXId *server.Id, regionLocationXId *server.Id, countryLocationXId *server.Id, reputationFailedNames string) {
 		var clientId server.Id
 		var networkId server.Id
 		var netTypeScore int
@@ -3203,6 +3746,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			&reliabilityWeight,
 			&independentReliabilityWeight,
 			&publiclyUsable,
+			&reputationFailedNames,
 		))
 		lookbackClientScore = &ClientScore{
 			ClientId:                     clientId,
@@ -3265,9 +3809,13 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	            	WHERE
 	            		provide_key.client_id = network_client_location_reliability.client_id AND
 	            		provide_key.provide_mode = $1
-	            )
+	            ),
+	            COALESCE(provider_egress_health.reputation_failed_names, '')
 
 	        FROM network_client_location_reliability
+
+	        INNER JOIN network_client ON
+	            network_client.client_id = network_client_location_reliability.client_id
 
 	        -- fix(beta): same class of issue as UpdateClientLocations above --
 	        -- an INNER JOIN here requires a reliability score to already exist
@@ -3278,7 +3826,12 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	        -- weight, lookback 0) rather than excluding it outright.
 	        LEFT JOIN client_connection_reliability_score ON
 	        	client_connection_reliability_score.client_id = network_client_location_reliability.client_id
+	        LEFT JOIN provider_egress_health ON
+	                provider_egress_health.client_id = network_client_location_reliability.client_id AND
+	                provider_egress_health.measured_at >= $3
 	        WHERE
+	            network_client.active = true AND
+	            network_client.source_client_id IS NULL AND
 	        	network_client_location_reliability.connected = true AND
 	        	network_client_location_reliability.valid = true AND
 	        	-- the candidate pool, unlike the public count in
@@ -3312,10 +3865,11 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	        `,
 			ProvideModePublic,
 			ProvideModeNetwork,
+			server.NowUtc().Add(-ProviderEgressHealthMaxAge).UTC(),
 		)
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
-				lookbackClientScore, cityLocationId, regionLocationId, countryLocationId := loadClientScore(result)
+				lookbackClientScore, cityLocationId, regionLocationId, countryLocationId, reputationFailedNames := loadClientScore(result)
 
 				// top-level only; the lookback copies stay nil (see `ClientScore`)
 				setLocationIds := func(clientScore *ClientScore) {
@@ -3341,7 +3895,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 						clientScores = map[server.Id]*ClientScore{}
 						locationClientScores[locationId] = clientScores
 					}
-					setLocationIds(addClientScore(lookbackClientScore, clientScores))
+					setLocationIds(addClientScore(lookbackClientScore, reputationFailedNames, clientScores))
 				}
 			}
 		})
@@ -3370,16 +3924,23 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	                	WHERE
 	                		provide_key.client_id = network_client_location_reliability.client_id AND
 	                		provide_key.provide_mode = $1
-	                )
+	                ),
+	                COALESCE(provider_egress_health.reputation_failed_names, '')
 
 	            FROM network_client_location_reliability
+
+	            INNER JOIN network_client ON
+	                network_client.client_id = network_client_location_reliability.client_id
 
 	            -- fix(beta): same class of issue as UpdateClientLocations/the query
             -- above this one -- treats an unscored client as neutral rather
             -- than excluding it, since the reliability-scoring pipeline may
             -- never populate at this env's small/cold-start scale
-            LEFT JOIN client_connection_reliability_score ON
+	            LEFT JOIN client_connection_reliability_score ON
 	        		client_connection_reliability_score.client_id = network_client_location_reliability.client_id
+	            LEFT JOIN provider_egress_health ON
+	                    provider_egress_health.client_id = network_client_location_reliability.client_id AND
+	                    provider_egress_health.measured_at >= $3
 
 	            LEFT JOIN location_group_member location_group_member_city ON
 	                location_group_member_city.location_id = network_client_location_reliability.city_location_id
@@ -3391,6 +3952,8 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	                location_group_member_country.location_id = network_client_location_reliability.country_location_id
 
 	            WHERE
+	                network_client.active = true AND
+	                network_client.source_client_id IS NULL AND
 	            	network_client_location_reliability.connected = true AND
 	            	network_client_location_reliability.valid = true AND
 	            	-- same rule as the per-location query above: Public or
@@ -3409,10 +3972,11 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	        `,
 			ProvideModePublic,
 			ProvideModeNetwork,
+			server.NowUtc().Add(-ProviderEgressHealthMaxAge).UTC(),
 		)
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
-				lookbackClientScore, cityLocationGroupId, regionLocationGroupId, countryLocationGroupId := loadClientScore(result)
+				lookbackClientScore, cityLocationGroupId, regionLocationGroupId, countryLocationGroupId, reputationFailedNames := loadClientScore(result)
 
 				// once per distinct group id. The three location columns can
 				// be the same id (a country-only client), in which case all
@@ -3427,7 +3991,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 						clientScores = map[server.Id]*ClientScore{}
 						locationGroupClientScores[locationGroupId] = clientScores
 					}
-					addClientScore(lookbackClientScore, clientScores)
+					addClientScore(lookbackClientScore, reputationFailedNames, clientScores)
 				}
 			}
 		})
@@ -3453,30 +4017,11 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	// invalid however tolerant the rule is). 0.95 allows three such blocks an
 	// hour. Repeated reconnects still fail it: they are real user impact, and
 	// `client_reliability_valid` only forgives ONE per block.
-	// TEMPORARY (beta): lowered from 0.95/0.7/0.6 while the fleet recovers from
-	// the 24h-token expiry.
-	//
-	// Every provider was issued a credential that died after a day, so the fleet
-	// spent days disconnecting and reconnecting. The hour threshold forgives
-	// three bad blocks in sixty and, as its own comment says, repeated
-	// reconnects still fail it -- so the churn drove the whole fleet under the
-	// gate and /network/provider-locations went to zero. Confirmed by
-	// elimination: a provider with health 128/131 measured 6.7h ago and a
-	// passing blackhole check was still excluded, and find-providers2 returns 0
-	// gated against 50 ungated.
-	//
-	// The token lifetime is back to 30 days, but reliability is a trailing
-	// measurement: nothing but elapsed uptime can lift these weights again. This
-	// buys the fleet that time instead of advertising nothing meanwhile.
-	//
-	// RAISE THIS BACK to 0.95/0.7/0.6 once the fleet has strung together clean
-	// hours. Left in place it admits providers with genuinely poor reliability,
-	// which is the very thing the gate exists to keep out of the market.
 	if NormalNetworkConditions() {
 		minFilter.minIndependentReliabilityWeights = map[int]float64{
-			1: float64(0.5),
-			2: float64(0.4),
-			3: float64(0.3),
+			1: float64(0.95),
+			2: float64(0.7),
+			3: float64(0.6),
 		}
 	} else {
 		// some abormal conditions, loosen the stats as they reset
@@ -3514,14 +4059,13 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	// provider can never be re-measured and is stuck out permanently.
 	// Shared with UpdateClientLocations so the gated membership and the
 	// advertised count can never disagree about what "healthy" means.
-	// UpdateClientScores uses passesHealth ONLY: its candidate pool is not
-	// country-scoped, so the observed-country check does not apply here.
+	// UpdateClientScores uses health but not observed country: its candidate
+	// pool is not country-scoped. Current blackholes and TLS-authentication
+	// failures apply regardless of the broad egress-test rollout switch.
 	egressTestEnabled := providerEgressTestEnabled()
-	countFilter := providerCountFilter{}
-	if egressTestEnabled {
-		countFilter = newProviderCountFilter(ctx)
-	} else {
-		glog.Infof("[nclm]provider egress test is disabled; skipping the provider score gate for this pass\n")
+	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
+	if !egressTestEnabled {
+		glog.Infof("[nclm]provider egress test is disabled; skipping broad provider score qualification for this pass; hard egress exclusions remain enabled\n")
 	}
 
 	// migration: set each client score to the lowest lookback index index
@@ -3544,15 +4088,15 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		clientScore.ScaledWeights = map[string]float32{}
 		clientScore.PassesMinimums = map[string]bool{}
 
-		// measured egress health does not vary by rank mode, so it is evaluated
+		// Provider eligibility does not vary by rank mode, so it is evaluated
 		// once per client and seeds every mode's minimum. It is a gate and
 		// nothing else: it can only take a provider out of the pool, and the
 		// scaled-weight arithmetic below is untouched, so every provider that
 		// still qualifies keeps exactly the weight and ordering it has today.
-		passesHealth := !egressTestEnabled || countFilter.passesHealth(clientScore.ClientId)
+		passesEligibility := countFilter.passesEligibility(clientScore.ClientId, egressTestEnabled)
 
 		for _, rankMode := range slices.Collect(maps.Keys(clientScore.Scores)) {
-			passesMinimum := passesHealth
+			passesMinimum := passesEligibility
 			// all lookback thresholds must pass
 			for lookbackIndex, lookbackClientScore := range clientScore.LookbackClientScores {
 				if lookbackClientScore.IndependentReliabilityWeight < minFilter.minIndependentReliabilityWeights[lookbackIndex] {
@@ -3588,11 +4132,9 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 
 	exportClientScores := func(forceMinimum bool, rankMode RankMode, s map[server.Id]*ClientScore) (
 		countsBytes []byte,
-		samplesBytes [][]byte,
 		filterBytes []byte,
 		counts []int,
-		samples [][]*ClientScore,
-		filter *ClientFilter,
+		encodeSample func(int) []byte,
 	) {
 		clientScores := []*ClientScore{}
 		publicCount := 0
@@ -3615,7 +4157,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		// UpdateClientLocations it counts only providers a stranger can reach:
 		// a location whose only supply is network-only is not stable, and with
 		// zero public providers it reports no providers at all.
-		filter = &ClientFilter{
+		filter := &ClientFilter{
 			Count:                publicCount,
 			NetReliabilityWeight: publicNetReliabilityWeight,
 		}
@@ -3627,24 +4169,26 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		n := (len(clientScores) + ClientScoreSampleCount - 1) / ClientScoreSampleCount
 
 		counts = make([]int, n)
-		samples = make([][]*ClientScore, n)
-		samplesBytes = make([][]byte, n)
-
+		clientsPerSample := 0
 		if 0 < n {
-			c := (len(clientScores) + n - 1) / n
+			clientsPerSample = (len(clientScores) + n - 1) / n
 			for i := range n {
-				i0 := i * c
-				i1 := min((i+1)*c, len(clientScores))
-				sample := clientScores[i0:i1]
-
-				counts[i] = len(sample)
-				samples[i] = sample
-
-				b := bytes.NewBuffer(nil)
-				e := gob.NewEncoder(b)
-				e.Encode(sample)
-				samplesBytes[i] = b.Bytes()
+				i0 := i * clientsPerSample
+				i1 := min((i+1)*clientsPerSample, len(clientScores))
+				counts[i] = i1 - i0
 			}
+		}
+		// Encode on demand so 48 parallel caller-location exporters retain at
+		// most one sample each, rather than every encoded sample for their
+		// current provider location. The returned bytes move directly into the
+		// 512-item/8MiB streaming writer and are cleared after the synchronous Exec.
+		encodeSample = func(i int) []byte {
+			i0 := i * clientsPerSample
+			i1 := min((i+1)*clientsPerSample, len(clientScores))
+			b := bytes.NewBuffer(nil)
+			e := gob.NewEncoder(b)
+			e.Encode(clientScores[i0:i1])
+			return b.Bytes()
 		}
 
 		b := bytes.NewBuffer(nil)
@@ -3690,75 +4234,126 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		})
 	})
 
-	filterActive := func(clientScores map[server.Id]*ClientScore, clientLocationId server.Id) map[server.Id]*ClientScore {
-		excludeNetworkIds := excludeLocationNetworkIds[clientLocationId]
-		if len(excludeNetworkIds) == 0 {
-			return clientScores
-		}
-		activeClientScores := map[server.Id]*ClientScore{}
-		for clientId, clientScore := range clientScores {
-			if !excludeNetworkIds[clientScore.NetworkId] {
-				activeClientScores[clientId] = clientScore
-			}
-		}
-		return activeClientScores
-	}
-
 	clientLocationIds := []server.Id{
 		// no client location match
 		server.Id{},
 	}
 	clientLocationIds = append(clientLocationIds, slices.Collect(maps.Values(countryCodeLocationIds()))...)
 
-	m := (len(clientLocationIds) + parallel - 1) / parallel
-	allBlockClientLocationIds := [][]server.Id{}
-	for i := 0; i < len(clientLocationIds); i += m {
-		allBlockClientLocationIds = append(allBlockClientLocationIds, clientLocationIds[i:min(len(clientLocationIds), i+m)])
+	type clientScoreTarget struct {
+		id            server.Id
+		locationGroup bool
+		clientScores  map[server.Id]*ClientScore
+	}
+	targets := make([]clientScoreTarget, 0, len(locationClientScores)+len(locationGroupClientScores))
+	for locationId, clientScores := range locationClientScores {
+		targets = append(targets, clientScoreTarget{id: locationId, clientScores: clientScores})
+	}
+	for locationGroupId, clientScores := range locationGroupClientScores {
+		targets = append(targets, clientScoreTarget{
+			id:            locationGroupId,
+			locationGroup: true,
+			clientScores:  clientScores,
+		})
 	}
 
 	var wg sync.WaitGroup
 	var exportCount atomic.Uint32
-	returnErrs := make(chan error, parallel)
+	workerLimit := max(1, parallel)
+	returnErrs := make(chan error, workerLimit)
+	targetExportTotal := 2 * len(performanceTargets) * len(targets)
+	targetBlockSize := 0
+	if len(targets) != 0 {
+		targetBlockSize = (len(targets) + workerLimit - 1) / workerLimit
+	}
 
-	for i := 0; i < len(clientLocationIds); i += m {
-		blockClientLocationIds := clientLocationIds[i:min(len(clientLocationIds), i+m)]
+	for i := 0; i < len(targets); i += targetBlockSize {
+		blockTargets := targets[i:min(len(targets), i+targetBlockSize)]
 
 		wg.Add(1)
-		go connect.HandleError(func() {
+		go func() {
 			defer wg.Done()
-
-			server.Redis(ctx, func(r server.RedisClient) {
-				for _, forceMinimum := range []bool{false, true} {
-					for rankMode, _ := range performanceTargets {
-						for _, clientLocationId := range blockClientLocationIds {
-							// plain pipeline instead of tx: the sets are independent and the
-							// keys hash to different cluster slots, which multi/exec cannot span
-							pipe := r.Pipeline()
-
-							exportIndex := exportCount.Add(1)
-							glog.Infof("[nclm]export client location[%d/%d] %s\n", exportIndex, 2*len(performanceTargets)*len(clientLocationIds), clientLocationId)
-							for locationId, clientScores := range locationClientScores {
-								activeClientScores := filterActive(clientScores, clientLocationId)
-								countsBytes, samplesBytes, filterBytes, counts, _, _ := exportClientScores(forceMinimum, rankMode, activeClientScores)
-								pipe.Set(ctx, clientScoreLocationCountsKey(forceMinimum, rankMode, locationId, clientLocationId), countsBytes, ttl)
-								pipe.Set(ctx, clientScoreLocationFilterKey(forceMinimum, rankMode, locationId, clientLocationId), filterBytes, ttl)
-								for i, sampleBytes := range samplesBytes {
-									pipe.Set(ctx, clientScoreLocationSampleKey(forceMinimum, rankMode, locationId, clientLocationId, i), sampleBytes, ttl)
+			connect.HandleError(func() {
+				server.Redis(ctx, func(r server.RedisClient) {
+					for _, forceMinimum := range []bool{false, true} {
+						for rankMode, _ := range performanceTargets {
+							// The sets are independent and hash to different cluster slots, so
+							// multi/exec cannot span them. Encode directly into the bounded
+							// writer. Partitioning by target, rather than caller, lets one gob
+							// payload fan out to every caller whose blocked-network set leaves
+							// that target unchanged.
+							err := writeClientScoreRedisStream(ctx, r, ttl, func(emit func(clientScoreRedisSet) error) error {
+								for _, target := range blockTargets {
+									exportIndex := exportCount.Add(1)
+									kind := "location"
+									keys := clientScoreTargetKeys{}
+									if target.locationGroup {
+										kind = "location_group"
+										keys = clientScoreTargetKeys{
+											counts: func(callerId server.Id) string {
+												return clientScoreLocationGroupCountsKey(forceMinimum, rankMode, target.id, callerId)
+											},
+											filter: func(callerId server.Id) string {
+												return clientScoreLocationGroupFilterKey(forceMinimum, rankMode, target.id, callerId)
+											},
+											sample: func(callerId server.Id, sampleIndex int) string {
+												return clientScoreLocationGroupSampleKey(forceMinimum, rankMode, target.id, callerId, sampleIndex)
+											},
+											alias: func(callerId server.Id) string {
+												return clientScoreLocationGroupAliasKey(forceMinimum, rankMode, target.id, callerId)
+											},
+										}
+									} else {
+										keys = clientScoreTargetKeys{
+											counts: func(callerId server.Id) string {
+												return clientScoreLocationCountsKey(forceMinimum, rankMode, target.id, callerId)
+											},
+											filter: func(callerId server.Id) string {
+												return clientScoreLocationFilterKey(forceMinimum, rankMode, target.id, callerId)
+											},
+											sample: func(callerId server.Id, sampleIndex int) string {
+												return clientScoreLocationSampleKey(forceMinimum, rankMode, target.id, callerId, sampleIndex)
+											},
+											alias: func(callerId server.Id) string {
+												return clientScoreLocationAliasKey(forceMinimum, rankMode, target.id, callerId)
+											},
+										}
+									}
+									// Target-oriented export has thousands more progress units than
+									// the old caller-oriented loop. Keep production progress useful
+									// without turning the root CPU fix into a log-volume regression.
+									if exportIndex == 1 || exportIndex%100 == 0 || int(exportIndex) == targetExportTotal {
+										glog.Infof(
+											"[nclm]export client score target[%d/%d] %s=%s callers=%d\n",
+											exportIndex,
+											targetExportTotal,
+											kind,
+											target.id,
+											len(clientLocationIds),
+										)
+									}
+									if err := emitClientScoreTargetFanout(
+										clientLocationIds,
+										target.clientScores,
+										excludeLocationNetworkIds,
+										keys,
+										func(clientScores map[server.Id]*ClientScore) ([]byte, []byte, []int, func(int) []byte) {
+											return exportClientScores(forceMinimum, rankMode, clientScores)
+										},
+										writeLegacyUnchanged,
+										emit,
+									); err != nil {
+										return err
+									}
+									glog.V(2).Infof(
+										"[nclm]updated client score target %s=%s for %d callers\n",
+										kind,
+										target.id,
+										len(clientLocationIds),
+									)
 								}
-								glog.V(2).Infof("[nclm]update client scores location samples(%s)[%d] = %v\n", locationId, len(counts), counts)
-							}
-							for locationGroupId, clientScores := range locationGroupClientScores {
-								activeClientScores := filterActive(clientScores, clientLocationId)
-								countsBytes, samplesBytes, filterBytes, counts, _, _ := exportClientScores(forceMinimum, rankMode, activeClientScores)
-								pipe.Set(ctx, clientScoreLocationGroupCountsKey(forceMinimum, rankMode, locationGroupId, clientLocationId), countsBytes, ttl)
-								pipe.Set(ctx, clientScoreLocationGroupFilterKey(forceMinimum, rankMode, locationGroupId, clientLocationId), filterBytes, ttl)
-								for i, sampleBytes := range samplesBytes {
-									pipe.Set(ctx, clientScoreLocationGroupSampleKey(forceMinimum, rankMode, locationGroupId, clientLocationId, i), sampleBytes, ttl)
-								}
-								glog.V(2).Infof("[nclm]update client scores location group samples(%s)[%d] = %v\n", locationGroupId, len(counts), counts)
-							}
-
-							_, err := pipe.Exec(ctx)
+								return nil
+							})
 							if err != nil {
 								select {
 								case <-ctx.Done():
@@ -3769,14 +4364,17 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 							}
 						}
 					}
+				})
+			}, func(err error) {
+				// A recovered worker panic must prevent publication of the alias
+				// migration marker. Keep wg.Done outside HandleError so the error
+				// reaches this bounded channel before the waiter can close it.
+				select {
+				case <-ctx.Done():
+				case returnErrs <- fmt.Errorf("client score export worker panic: %w", err):
 				}
 			})
-			// the deferred wg.Done above covers both return and panic (the
-			// closure's defers run before HandleError's recover), so wg.Done
-			// must not also be a rescue handler — the pair double-counted on
-			// the panic path and crashed the process with a negative
-			// WaitGroup counter inside the recovery (2026-08-02).
-		})
+		}()
 	}
 
 	wg.Wait()
@@ -3797,6 +4395,16 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	}()
 
 	if returnErr == nil {
+		if writeLegacyUnchanged {
+			if err := markClientScoreAliasReady(ctx); err != nil {
+				return fmt.Errorf("publish client score alias migration state: %w", err)
+			}
+			glog.Infof("[nclm]client score alias schema ready; legacy duplicate payloads will expire naturally\n")
+		}
+		if err := markClientScoreProviderEligibilityReady(ctx); err != nil {
+			return fmt.Errorf("publish client score provider eligibility state: %w", err)
+		}
+		glog.Infof("[nclm]client score provider eligibility ready; derived and inactive clients excluded\n")
 		glog.Infof(
 			"[nclm]update %d client locations x %d location scores, %d location group scores\n",
 			len(clientLocationIds),
@@ -3820,26 +4428,48 @@ func loadClientScores(
 	n int,
 ) (clientScores map[server.Id]*ClientScore, returnErr error) {
 	server.Redis(ctx, func(r server.RedisClient) {
-		locationCounts := map[server.Id]*redis.StringCmd{}
-		locationGroupCounts := map[server.Id]*redis.StringCmd{}
+		type countsRead struct {
+			alias    *redis.StringCmd
+			caller   *redis.StringCmd
+			baseline *redis.StringCmd
+		}
+		locationCounts := map[server.Id]countsRead{}
+		locationGroupCounts := map[server.Id]countsRead{}
 
 		// plain pipeline instead of tx: independent gets across cluster slots
 		pipe := r.Pipeline()
 		for locationId, _ := range locationIds {
-			v := pipe.Get(ctx, clientScoreLocationCountsKey(forceMinimum, rankMode, locationId, clientLocationId))
-			locationCounts[locationId] = v
+			read := countsRead{
+				caller: pipe.Get(ctx, clientScoreLocationCountsKey(forceMinimum, rankMode, locationId, clientLocationId)),
+			}
+			if clientLocationId != (server.Id{}) {
+				read.alias = pipe.Get(ctx, clientScoreLocationAliasKey(forceMinimum, rankMode, locationId, clientLocationId))
+				read.baseline = pipe.Get(ctx, clientScoreLocationCountsKey(forceMinimum, rankMode, locationId, server.Id{}))
+			}
+			locationCounts[locationId] = read
 		}
 		for locationGroupId, _ := range locationGroupIds {
-			v := pipe.Get(ctx, clientScoreLocationGroupCountsKey(forceMinimum, rankMode, locationGroupId, clientLocationId))
-			locationGroupCounts[locationGroupId] = v
+			read := countsRead{
+				caller: pipe.Get(ctx, clientScoreLocationGroupCountsKey(forceMinimum, rankMode, locationGroupId, clientLocationId)),
+			}
+			if clientLocationId != (server.Id{}) {
+				read.alias = pipe.Get(ctx, clientScoreLocationGroupAliasKey(forceMinimum, rankMode, locationGroupId, clientLocationId))
+				read.baseline = pipe.Get(ctx, clientScoreLocationGroupCountsKey(forceMinimum, rankMode, locationGroupId, server.Id{}))
+			}
+			locationGroupCounts[locationGroupId] = read
 		}
 		// note ignore the error for GET since it will include missing key
 		pipe.Exec(ctx)
 
 		sampleKeyCounts := map[string]int{}
 
-		for locationId, countsCmd := range locationCounts {
-			countsBytes, _ := countsCmd.Bytes()
+		for locationId, read := range locationCounts {
+			effectiveClientLocationId, countsBytes := selectClientScorePayload(
+				clientLocationId,
+				clientScoreCommandBytes(read.alias),
+				clientScoreCommandBytes(read.caller),
+				clientScoreCommandBytes(read.baseline),
+			)
 			if len(countsBytes) == 0 {
 				continue
 			}
@@ -3851,11 +4481,16 @@ func loadClientScores(
 				return
 			}
 			for i, count := range counts {
-				sampleKeyCounts[clientScoreLocationSampleKey(forceMinimum, rankMode, locationId, clientLocationId, i)] = count
+				sampleKeyCounts[clientScoreLocationSampleKey(forceMinimum, rankMode, locationId, effectiveClientLocationId, i)] = count
 			}
 		}
-		for locationGroupId, countsCmd := range locationGroupCounts {
-			countsBytes, _ := countsCmd.Bytes()
+		for locationGroupId, read := range locationGroupCounts {
+			effectiveClientLocationId, countsBytes := selectClientScorePayload(
+				clientLocationId,
+				clientScoreCommandBytes(read.alias),
+				clientScoreCommandBytes(read.caller),
+				clientScoreCommandBytes(read.baseline),
+			)
 			if len(countsBytes) == 0 {
 				continue
 			}
@@ -3867,7 +4502,7 @@ func loadClientScores(
 				return
 			}
 			for i, count := range counts {
-				sampleKeyCounts[clientScoreLocationGroupSampleKey(forceMinimum, rankMode, locationGroupId, clientLocationId, i)] = count
+				sampleKeyCounts[clientScoreLocationGroupSampleKey(forceMinimum, rankMode, locationGroupId, effectiveClientLocationId, i)] = count
 			}
 		}
 
@@ -3970,6 +4605,25 @@ func resolveProviderLocation(
 		}
 	}
 	return location
+}
+
+// findProvidersProviderFromClientScore is the cache-to-wire boundary. Keep
+// discovery metadata assembled in one pure helper so reputation and
+// same-network eligibility cannot be silently dropped by one response path.
+func findProvidersProviderFromClientScore(
+	clientScore *ClientScore,
+	rankMode RankMode,
+	directory map[server.Id]*locationDirectoryEntry,
+) *FindProvidersProvider {
+	return &FindProvidersProvider{
+		ClientId:                   clientScore.ClientId,
+		Tier:                       clientScore.Tiers[rankMode],
+		EstimatedBytesPerSecond:    clientScore.MaxBytesPerSecond,
+		HasEstimatedBytesPerSecond: clientScore.HasSpeedTest,
+		NetworkOnly:                clientScore.NetworkOnly,
+		ReputationFailedNames:      clientScore.ReputationFailedNames,
+		Location:                   resolveProviderLocation(directory, clientScore),
+	}
 }
 
 func FindProviders2(
@@ -4148,14 +4802,7 @@ func FindProviders2(
 		// output in order of `clientIds`
 		for _, clientId := range clientIds {
 			clientScore := clientScores[clientId]
-			provider := &FindProvidersProvider{
-				ClientId:                   clientId,
-				Tier:                       clientScore.Tiers[rankMode],
-				EstimatedBytesPerSecond:    clientScore.MaxBytesPerSecond,
-				HasEstimatedBytesPerSecond: clientScore.HasSpeedTest,
-				Location:                   resolveProviderLocation(directory, clientScore),
-			}
-			providers = append(providers, provider)
+			providers = append(providers, findProvidersProviderFromClientScore(clientScore, rankMode, directory))
 		}
 
 		// export one anonymized stats sample tracing this call's pool and

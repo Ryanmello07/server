@@ -218,7 +218,7 @@
     },
     {
       "type": "timeseries",
-      "title": "\u00a74 contract failures / min by cause + companion (lossless)",
+      "title": "\u00a74 contract failures + origin/destination details / min (lossless)",
       "datasource": {
         "type": "prometheus",
         "uid": "warp-mimir"
@@ -264,9 +264,27 @@
           "expr": "sum by (cause, companion) (rate(urnetwork_connect_contract_failures_total{env=\"$env\",instance!=\"\"}[$__rate_interval])) * 60",
           "refId": "F",
           "legendFormat": "{{cause}} companion={{companion}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum by (request_companion, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_missing_origin_details_total{env=\"$env\",instance!=\"\"}[$__rate_interval])) * 60",
+          "refId": "G",
+          "legendFormat": "missing origin request_companion={{request_companion}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum by (request_companion, sender_role, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_inactive_destination_details_total{env=\"$env\",instance!=\"\"}[$__rate_interval])) * 60",
+          "refId": "H",
+          "legendFormat": "inactive destination request_companion={{request_companion}} sender_role={{sender_role}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}"
         }
       ],
-      "description": "urnetwork_connect_contract_failures_total \u2014 the lossless counter behind the sampled contract-error log exemplars. missing_companion_origin climbing while everything else is healthy = stale provider selection serving zombies (playbook 5.9; post-churn variant 5.9.7). insufficient_balance step-change = netEscrow drift re-emerging (\u00a74). Empty until the instrumented api build deploys."
+      "description": "urnetwork_connect_contract_failures_total is the lossless counter behind the sampled contract-error log exemplars. Missing-origin detail partitions only missing_companion_origin; inactive-destination detail partitions only inactive_destination. Both retain bounded original request bit, resolution path, relationship, and endpoint lifecycle without client identifiers. Inactive-destination detail additionally retains sender_role=client|server|absent|unknown: the reported sequence lane, not an application, device, provider, or artifact identity. request_companion is not an endpoint-role label. Details are breakdowns of the aggregate, not additional failures to add to it. Absent or incomplete detail is not zero and cannot establish attribution; reconcile fresh complete detail to its aggregate as specified in SIGNALS sections 2.17 and 2.18. An insufficient_balance step-change can indicate netEscrow drift re-emerging (\u00a74). Empty until the instrumented api build deploys."
     },
     {
       "type": "timeseries",
@@ -1038,8 +1056,27 @@
           "expr": "sum(urnetwork_proxy_wg_peers{env=\"$env\"})",
           "refId": "U",
           "legendFormat": "wg peers"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(max_over_time(urnetwork_proxy_wg_receive_routine_failures{env=\"$env\"}[$__rate_interval]))",
+          "refId": "V",
+          "legendFormat": "wg receiver failures"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "max by (host, block) (urnetwork_proxy_lifecycle_join_enabled{env=\"$env\"})",
+          "refId": "W",
+          "legendFormat": "lifecycle join {{host}} {{block}}"
         }
-      ]
+      ],
+      "description": "Live proxy devices, prewarmed capacity, registered WireGuard peers, unexpected WireGuard socket-reader exits, and the lifecycle-join capability reported by each host/build. Receiver failures are retained over the rate window so a sampled failure remains visible while the owning process recovers; any nonzero value requires correlating the process restart and peer recovery. Lifecycle join must be 1 on every running proxy series before testing the joined close path."
     },
     {
       "type": "table",
@@ -2256,8 +2293,8 @@
     },
     {
       "type": "timeseries",
-      "title": "contract + task terminal outcomes / s",
-      "description": "Expired contracts force-closed by resolution, plus RunPost tasks whose finished-task row had already been reaped. The orphaned task outcome is a safe no-op, but any sustained rate merits retention/scheduling investigation.",
+      "title": "contract + task exceptional outcomes / s",
+      "description": "Expired contracts force-closed by resolution, RunPost tasks whose finished-task row had already been reaped, and timestamp-heartbeat writes that failed while advisory ownership remained healthy. Any sustained task rate merits database-pool and retention/scheduling investigation.",
       "datasource": {
         "type": "prometheus",
         "uid": "warp-mimir"
@@ -2314,6 +2351,15 @@
           "expr": "sum(rate(urnetwork_task_run_post_orphaned_total{env=\"$env\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "orphaned RunPost"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_task_timestamp_lease_refresh_errors_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "timestamp heartbeat failure"
         }
       ]
     },
@@ -2681,13 +2727,631 @@
     },
     {
       "type": "row",
-      "title": "coverage notes",
+      "title": "proxy device resources and return-path pressure",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 141
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "proxy DeviceLocal memory and carrier bytes",
+      "description": "Fleet totals for the per-device steady-state memory target, tracked live use, private platform-carrier budget and use, and H1 bytes waiting for carrier admission. Tracked use excludes allocator/runtime and bounded NAT endpoint memory. Sustained pending H1 bytes with used carrier bytes at budget indicates carrier starvation rather than provider reachability.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 142
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_device_memory_target_bytes{env=\"$env\"})",
+          "refId": "A",
+          "legendFormat": "device target"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_device_memory_tracked_used_bytes{env=\"$env\"})",
+          "refId": "B",
+          "legendFormat": "device tracked used"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_platform_transport_budget_bytes{env=\"$env\"})",
+          "refId": "C",
+          "legendFormat": "carrier budget"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_platform_transport_used_bytes{env=\"$env\"})",
+          "refId": "D",
+          "legendFormat": "carrier used"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_platform_transports_pending_h1_bytes{env=\"$env\"})",
+          "refId": "E",
+          "legendFormat": "pending H1"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "proxy platform-carrier admission",
+      "description": "Fleet carrier slots: private per-device limits, acquired carriers, and H1 reservations waiting for admission. The limit should scale with live hosted devices; a flat limit while device count grows indicates a stale shared-budget build. Sustained pending H1 at the limit is the direct carrier-starvation signature.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 142
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_platform_transports_max{env=\"$env\"})",
+          "refId": "A",
+          "legendFormat": "limit"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_platform_transports_used{env=\"$env\"})",
+          "refId": "B",
+          "legendFormat": "used"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(urnetwork_proxy_platform_transports_pending_h1{env=\"$env\"})",
+          "refId": "C",
+          "legendFormat": "pending H1"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "proxy WireGuard queue pressure / s",
+      "description": "Returned WireGuard packets that waited for the fixed receive queue, inbound encrypted packets refused at one peer's full bounded queue, and packets refused at the device-global decryption queue. Return backpressure is lossless bounded flow control; peer-queue drops rely on WireGuard retransmission and must remain isolated from unrelated peers, while decryption-queue drops indicate shared CPU saturation. Correlate any sustained rate with wait duration, kernel socket queues, CPU, and process lifecycle.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 150
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_wireguard_return_backpressure_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "packets waiting / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_wg_inbound_peer_queue_drop_packets{env=\"$env\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "peer queue drops / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_wg_inbound_decryption_queue_drop_packets{env=\"$env\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "decryption queue drops / s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "proxy WireGuard return backpressure duration",
+      "description": "Fleet histogram of time spent waiting for bounded WireGuard receive-queue capacity. Quantiles are computed after merging histogram buckets across instances; the mean uses the merged sum and count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 150
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(urnetwork_proxy_wireguard_return_backpressure_seconds_bucket{env=\"$env\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(urnetwork_proxy_wireguard_return_backpressure_seconds_bucket{env=\"$env\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_wireguard_return_backpressure_seconds_sum{env=\"$env\"}[$__rate_interval])) / sum(rate(urnetwork_proxy_wireguard_return_backpressure_seconds_count{env=\"$env\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "mean"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "external admission and proxy lock-cache pressure",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 158
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Circle transfer admission / s",
+      "description": "Fleet rates for Circle Wallets API transfer submissions admitted by the shared rolling-window gate, deferred because its window was full, or failed closed before an external request. Deferrals may exceed admissions because one submission can wait through several full windows.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 159
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_circle_transfer_admissions_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "admissions / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_circle_transfer_deferrals_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "deferrals / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_circle_transfer_admission_errors_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "fail-closed / s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Circle transfer admission wait",
+      "description": "Fleet histogram of time spent waiting for Circle transfer admission. Quantiles merge buckets across taskworkers; the mean merges the histogram sum and count. A nonzero fail-closed rate with no wait sample means admission failed before an external transfer was attempted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 159
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(urnetwork_circle_transfer_admission_wait_seconds_bucket{env=\"$env\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(urnetwork_circle_transfer_admission_wait_seconds_bucket{env=\"$env\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_circle_transfer_admission_wait_seconds_sum{env=\"$env\"}[$__rate_interval])) / sum(rate(urnetwork_circle_transfer_admission_wait_seconds_count{env=\"$env\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "mean"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "proxy lock-cache occupancy",
+      "description": "Caller IP-lock cache entries and hard capacity for each Proxy process. A process pinned at capacity while evictions rise is bounded high-cardinality churn; a flat capacity mismatch identifies a stale build or configuration boundary.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 167
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "max by (host, block, instance) (urnetwork_proxy_lock_cache_entries{env=\"$env\"})",
+          "refId": "A",
+          "legendFormat": "entries {{host}} / {{block}} / {{instance}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "max by (host, block, instance) (urnetwork_proxy_lock_cache_capacity{env=\"$env\"})",
+          "refId": "B",
+          "legendFormat": "capacity {{host}} / {{block}} / {{instance}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "proxy lock-cache activity / s",
+      "description": "Fleet lookup and removal rates for the bounded caller IP-lock cache. Misses require configuration loading, expirations are ordinary TTL turnover, and evictions identify pressure at the hard LRU capacity. Correlate a rising miss ratio or evictions with occupancy before changing either capacity or TTL.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "warp-mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 167
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_lock_cache_hits_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "hits / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_lock_cache_misses_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "misses / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_lock_cache_expirations_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "expirations / s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "warp-mimir"
+          },
+          "expr": "sum(rate(urnetwork_proxy_lock_cache_evictions_total{env=\"$env\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "evictions / s"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "coverage notes",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 175
       }
     },
     {
@@ -2698,7 +3362,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 142
+        "y": 176
       },
       "options": {
         "mode": "markdown",

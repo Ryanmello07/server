@@ -23,12 +23,17 @@ import (
 // (the browser form) and the `Authorization: Bearer` header (the non-browser
 // form) reach the same resolution.
 func TestDeviceRpcHandlerAuth(t *testing.T) {
+	if testing.Short() {
+		return
+	}
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		pdm := NewProxyDeviceManager(ctx, DefaultProxyDeviceManagerSettings())
-		defer pdm.Close()
+		defer func() {
+			_ = pdm.CloseAndWait(context.Background())
+		}()
 
 		handler := NewDeviceRpcHandler(pdm, DefaultProxySettings())
 		ts := httptest.NewServer(router.NewRouter(ctx, []*router.Route{

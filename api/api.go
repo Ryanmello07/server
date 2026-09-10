@@ -2,6 +2,7 @@ package api
 
 import (
 	"github.com/urnetwork/server/api/handlers"
+	"github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/oauth"
 	"github.com/urnetwork/server/router"
 )
@@ -17,18 +18,28 @@ import (
 // service; the routes themselves are path-matched, so they answer on either
 // host. The issuer published in the discovery documents is what clients use.
 func Routes() []*router.Route {
+	return routesWithReservedAttemptUpload(nil)
+}
+
+// Only the API lifecycle supplies this authenticated cache; the route never
+// starts a background owner or dials a provider on an upload request.
+func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUpload) []*router.Route {
 	routes := []*router.Route{
 		router.NewRoute("GET", "/privacy.txt", router.Txt),
 		router.NewRoute("GET", "/terms.txt", router.Txt),
 		router.NewRoute("GET", "/vdp.txt", router.Txt),
 		router.NewRoute("GET", "/status", router.WarpStatus),
+		router.NewRoute("GET", "/clock", handlers.Clock),
 		// The sim-latency competition is a separate, fail-closed security
 		// domain served by this API process. Its health and published policy
 		// are public; round control and scoring use role-scoped opaque tokens.
 		router.NewRoute("GET", "/competition/healthz", handlers.CompetitionHealth),
 		router.NewRoute("GET", "/competition/readyz", handlers.CompetitionReady),
 		router.NewRoute("GET", "/competition/info", handlers.CompetitionInfo),
+		router.NewRoute("GET", "/competition/leaderboard", handlers.CompetitionLeaderboard),
 		router.NewRoute("GET", "/competition/round/([^/]+)/providers.yml", handlers.CompetitionGetRoundWorkload),
+		router.NewRoute("POST", "/competition/generate-staging-round", handlers.CompetitionGenerateStagingRound),
+		router.NewRoute("POST", "/competition/close-staging-round", handlers.CompetitionCloseStagingRound),
 		router.NewRoute("POST", "/competition/generate-round", handlers.CompetitionGenerateRound),
 		router.NewRoute("POST", "/competition/score", handlers.CompetitionSubmitScore),
 		router.NewRoute("GET", "/competition/score/([^/]+)", handlers.CompetitionGetScore),
@@ -49,6 +60,8 @@ func Routes() []*router.Route {
 		router.NewRoute("GET", "/stats/providers-overview-last-90", handlers.StatsProvidersOverviewLast90),
 		router.NewRoute("POST", "/stats/provider-last-90", handlers.StatsProviderLast90),
 		router.NewRoute("POST", "/stats/leaderboard", handlers.GetLeaderboard),
+		// all-time points leaderboard: reads a snapshot table (no live aggregate)
+		router.NewRoute("POST", "/stats/points-leaderboard", handlers.GetPointsLeaderboard),
 		router.NewRoute("POST", "/auth/login", handlers.AuthLogin),
 		router.NewRoute("POST", "/auth/wallet-nonce", handlers.AuthWalletNonce),
 		router.NewRoute("POST", "/auth/login-with-password", handlers.AuthLoginWithPassword),
@@ -63,6 +76,9 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/auth/network-delete", handlers.RemoveNetwork),
 		router.NewRoute("POST", "/auth/code-create", handlers.AuthCodeCreate),
 		router.NewRoute("POST", "/auth/code-login", handlers.AuthCodeLogin),
+		router.NewRoute("POST", "/auth/apple/callback", handlers.AuthAppleOAuthCallback),
+		router.NewRoute("GET", "/auth/apple/callback", handlers.AuthAppleOAuthCallback),
+		router.NewRoute("GET", "/auth/google/callback", handlers.AuthGoogleOAuthCallback),
 		router.NewRoute("POST", "/auth/add-auth", handlers.AuthAdd),
 		router.NewRoute("POST", "/auth/remove-auth", handlers.AuthRemove),
 		router.NewRoute("POST", "/auth/regenerate-seedphrase", handlers.AuthRegenerateSeedphrase),
@@ -79,7 +95,7 @@ func Routes() []*router.Route {
 		// the prober fetching the network client jwt that the bootstrap task
 		// minted for it. This is what makes the credential arrive without a
 		// human -- until it existed the task stored a jwt nothing ever read, and
-		// an operator still had to hand-carry one into the prober's env. Returns
+		// an operator still had to hand-carry one into the prober's environment.
 		// Returns the jwt and the client id it names, and nothing else -- but do
 		// NOT read that narrowness as containment. The jwt itself carries
 		// network_id, user_id and network_name as readable claims, and holding
@@ -114,6 +130,7 @@ func Routes() []*router.Route {
 		// forward -- see model.ProviderClientVerdictQuorumMet.
 		router.NewRoute("POST", "/network/provider-verdict", handlers.ProviderClientVerdictSubmit),
 		router.NewRoute("GET", "/network/clients", handlers.NetworkClients),
+		router.NewRoute("GET", "/network/proxies", handlers.NetworkProxies),
 		router.NewRoute("GET", "/network/peers", handlers.NetworkPeers),
 		router.NewRoute("GET", "/network/provider-locations", handlers.NetworkGetProviderLocations),
 		router.NewRoute("POST", "/network/find-provider-locations", handlers.NetworkFindProviderLocations),
@@ -121,6 +138,8 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/network/user/update", handlers.UpdateNetworkName),
 		router.NewRoute("GET", "/network/ranking", handlers.GetLeaderboardNetworkRanking),
 		router.NewRoute("POST", "/network/ranking-visibility", handlers.SetNetworkLeaderboardPublic),
+		router.NewRoute("POST", "/network/points-ranking-visibility", handlers.SetNetworkPointsLeaderboardPublic),
+		router.NewRoute("POST", "/network/emoji", handlers.SetNetworkEmojiTag),
 
 		// block locations
 		router.NewRoute("POST", "/network/block-location", handlers.NetworkBlockLocation),
@@ -142,11 +161,34 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/stripe/payment-intent", handlers.CreateStripePaymentIntent),
 		router.NewRoute("POST", "/stripe/customer-portal", handlers.StripeCreateCustomerPortal),
 		router.NewRoute("POST", "/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession),
+		router.NewRoute("POST", "/pay/data/checkout", handlers.PayDataCheckout),
+		router.NewRoute("POST", "/pay/data/network-lookup", handlers.PayDataNetworkLookup),
+		router.NewRoute("POST", "/pay/data/solana-intent", handlers.PayDataSolanaIntent),
+		router.NewRoute("POST", "/pay/data/solana-status", handlers.PayDataSolanaStatus),
 		router.NewRoute("GET", "/wallet/balance", handlers.WalletBalance),
 		router.NewRoute("POST", "/wallet/validate-address", handlers.WalletValidateAddress),
 		router.NewRoute("POST", "/wallet/circle-init", handlers.WalletCircleInit),
 		router.NewRoute("POST", "/wallet/circle-transfer-out", handlers.WalletCircleTransferOut),
 		router.NewRoute("GET", "/subscription/balance", handlers.SubscriptionBalance),
+		// onboarding program (mmm/onboarding/PLAN.md): the welcome offer, the
+		// closed client event schema, the campaign token endpoints and the
+		// inline Stripe payment sheet
+		router.NewRoute("POST", "/onboarding/offer/issue", handlers.OnboardingOfferIssue),
+		router.NewRoute("POST", "/onboarding/click", handlers.OnboardingClick),
+		router.NewRoute("GET", "/onboarding/feedback/([^/]+)", handlers.OnboardingFeedbackToken),
+		router.NewRoute("POST", "/client/events", handlers.ClientEventsSend),
+		// the onboarding results side (PLAN.md "OPTIMIZATION LOOP"): the
+		// nightly aggregate and the registry, behind the vault admin bearers
+		router.NewRoute("GET", "/admin/onboarding/results", handlers.AdminOnboardingResults),
+		router.NewRoute("GET", "/admin/onboarding/experiments", handlers.AdminOnboardingExperiments),
+		router.NewRoute("POST", "/subscription/stripe/payment-sheet", handlers.StripePaymentSheet),
+		router.NewRoute("GET", "/subscription/stripe/prices", handlers.StripePrices),
+		// the "Manage subscription" screen: every store billing the network with
+		// its paid-through date and auto-renew state; cancel/resume act on
+		// Stripe, the other stores are cancelled on the store itself
+		router.NewRoute("GET", "/subscription/details", handlers.SubscriptionDetails),
+		router.NewRoute("POST", "/subscription/cancel", handlers.SubscriptionCancel),
+		router.NewRoute("POST", "/subscription/resume", handlers.SubscriptionResume),
 		router.NewRoute("POST", "/subscription/check-balance-code", handlers.SubscriptionCheckBalanceCode),
 		router.NewRoute("POST", "/subscription/redeem-balance-code", handlers.SubscriptionRedeemBalanceCode),
 		router.NewRoute("POST", "/subscription/create-payment-id", handlers.SubscriptionCreatePaymentId),
@@ -175,6 +217,8 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/device/set-name", handlers.DeviceSetName), router.NewRoute("POST", "/connect/control", handlers.ConnectControl),
 		// Unauthenticated public-key lookup; see handlers.GetClientKey.
 		router.NewRoute("GET", "/key/([^/]+)", handlers.GetClientKey),
+		router.NewRoute("POST", "/sn/client-key/observation", handlers.SnClientKeyObservation),
+		router.NewRoute("POST", "/sn/client-key/observations", handlers.SnClientKeyObservations),
 		// routing verification (sn/VALIDATOR.md); auth is the protocol's own
 		// Ed25519 signatures, not a JWT — see handlers.Verify
 		router.NewRoute("POST", "/verify", handlers.Verify),
@@ -183,9 +227,15 @@ func Routes() []*router.Route {
 		router.NewRoute("GET", "/verify/proofs", handlers.GetVerifyProofs),
 		// subnet control plane (sn/PLAN.md §5, D-13)
 		router.NewRoute("POST", "/sn/wallet", handlers.SnSetWallet),
+		router.NewRoute("GET", "/sn/wallet", handlers.SnGetWallet),
+		router.NewRoute("POST", "/sn/wallet/validate", handlers.SnValidateWallet),
+		router.NewRoute("GET", "/sn/head", handlers.SnHead),
+		router.NewRoute("POST", "/sn/head/binding", handlers.SnHeadBinding),
 		router.NewRoute("GET", "/sn/pool/claim", handlers.SnPoolClaim),
 		router.NewRoute("GET", "/sn/epoch", handlers.SnEpoch),
 		router.NewRoute("GET", "/sn/artifact", handlers.SnArtifact),
+		router.NewRoute("GET", "/sn/attempt-artifact", handlers.SnAttemptArtifact),
+		router.NewRoute("POST", "/sn/attempt-artifact", handlers.SnUploadAttemptArtifactWithReserved(reserved)),
 		router.NewRoute("GET", "/sn/artifacts", handlers.SnArtifactHistory),
 		router.NewRoute("GET", "/sn/evidence", handlers.SnEvidence),
 		router.NewRoute("POST", "/sn/evidence", handlers.SnEvidence),
@@ -209,6 +259,7 @@ func Routes() []*router.Route {
 		router.NewRoute("POST", "/account/change-name", handlers.ChangeNetworkName),
 		router.NewRoute("POST", "/account/claim-name", handlers.ClaimNetworkName),
 		router.NewRoute("GET", "/account/points", handlers.GetAccountPoints),
+		router.NewRoute("GET", "/account/epochs", handlers.GetAccountEpochs),
 		router.NewRoute("GET", "/account/balance-codes", handlers.GetNetworkRedeemedBalanceCodes),
 		router.NewRoute("POST", "/referral-code/validate", handlers.ValidateReferralCode),
 		router.NewRoute("GET", "/transfer/stats", handlers.TransferStats),

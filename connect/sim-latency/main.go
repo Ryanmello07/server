@@ -21,6 +21,22 @@ package main
 //   score-baseline
 //             validate trusted same-round baseline artifacts and write the
 //             signed-manifest payload consumed by score
+//   score     validate and score a complete candidate artifact bundle
+//   source-check
+//             verify one frozen source epoch against the measured repositories
+//   source-record
+//             verify and print one epoch from the remote competition branches
+//   staging-source-check
+//             verify immutable staging branches alias frozen baseline source
+//   epoch-review
+//             enumerate, reject, or approve ranked significant candidates
+//   promote   publish a significant winner or no-winner source transition
+//   launch-preflight
+//             prove frozen source, image, API, MinIO, Grafana, and heartbeat
+//   handoff-manifest
+//             authenticate the launch evidence awaiting Apex signatures
+//   credentials
+//             generate, rotate, and revoke competition credentials
 //   reset     clear cross-run reliability state so runs are independent
 
 import (
@@ -34,6 +50,7 @@ import (
 	"github.com/docopt/docopt-go"
 
 	"github.com/urnetwork/server"
+	"github.com/urnetwork/server/controller"
 )
 
 func main() {
@@ -47,14 +64,28 @@ func main() {
 
 Usage:
   sim-latency init [--out=<path>] [--count=<n>] [--clients=<n>] [--rate=<m>] [--seed=<s>] [--quality-window=<n>]
-  sim-latency run [--providers=<path>] [--site-home=<dir>] [--ramp=<d>] [--prewarm=<d>] [--settle=<d>] [--client-warmup-timeout=<d>] [--duration=<d>] [--request-timeout=<d>] [--fleet-shards=<n>] [--site-listen=<addr>] [--hosts=<n>] [--api-port=<p>] [--pipeline-interval=<d>] [--test-timeout=<d>] [--announce-timeout=<d>] [--no-impair] [--reset] [--meta=<path>] [--evaluation-id=<id>] [--official] [--expected-revision=<sha>] [--resource-report=<path>] [--accounting-report=<path>] [--accounting-source=<path>] [--final-marker=<path>]
-  sim-latency fleet --providers=<path> --shard=<i/n> --api-url=<url> --ws-urls=<urls> [--ramp=<d>] [--evaluation-id=<id>] [--accounting-command-fd=<n>] [--accounting-response-fd=<n>]
+  sim-latency run --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] [--providers=<path>] [--site-home=<dir>] [--ramp=<d>] [--prewarm=<d>] [--settle=<d>] [--client-warmup-timeout=<d>] [--duration=<d>] [--request-timeout=<d>] [--fleet-shards=<n>] [--site-listen=<addr>] [--hosts=<n>] [--api-port=<p>] [--pipeline-interval=<d>] [--test-timeout=<d>] [--announce-timeout=<d>] [--no-impair] [--reset] [--meta=<path>] [--evaluation-id=<id>] [--official] [--expected-revision=<sha>] [--resource-report=<path>] [--accounting-report=<path>] [--accounting-source=<path>] [--final-marker=<path>]
+  sim-latency fleet --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] --providers=<path> --shard=<i/n> --api-url=<url> --ws-urls=<urls> [--ramp=<d>] [--evaluation-id=<id>] [--accounting-command-fd=<n>] [--accounting-response-fd=<n>]
   sim-latency analyze --run=<path> [--window=<w>] [--out=<path>] [--json]
-  sim-latency baseline --runs=<paths> [--alpha=<a>] [--out=<path>]
-  sim-latency baseline [--replicates=<n>] [--out-dir=<dir>] [--alpha=<a>] [--out=<path>] [--providers=<path>] [--site-home=<dir>] [--ramp=<d>] [--prewarm=<d>] [--settle=<d>] [--client-warmup-timeout=<d>] [--duration=<d>] [--request-timeout=<d>] [--fleet-shards=<n>] [--site-listen=<addr>] [--hosts=<n>] [--api-port=<p>] [--pipeline-interval=<d>] [--test-timeout=<d>] [--announce-timeout=<d>] [--no-impair]
+  sim-latency baseline --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] --runs=<paths> [--alpha=<a>] [--out=<path>]
+  sim-latency baseline --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] [--replicates=<n>] [--out-dir=<dir>] [--alpha=<a>] [--out=<path>] [--providers=<path>] [--site-home=<dir>] [--ramp=<d>] [--prewarm=<d>] [--settle=<d>] [--client-warmup-timeout=<d>] [--duration=<d>] [--request-timeout=<d>] [--fleet-shards=<n>] [--site-listen=<addr>] [--hosts=<n>] [--api-port=<p>] [--pipeline-interval=<d>] [--test-timeout=<d>] [--announce-timeout=<d>] [--no-impair]
   sim-latency compare --a=<paths> --b=<paths> [--baseline=<path>] [--p=<a>] [--window=<w>] [--json]
   sim-latency score-baseline --run=<paths> --stderr=<paths> --accounting=<paths> --samples=<paths> --resource-report=<paths> --marker=<paths> --round-id=<id> --takeover-margin=<m> [--out=<path>]
   sim-latency score --run=<paths> --stderr=<paths> --baseline=<path> --accounting=<paths> --samples=<paths> --resource-report=<paths> --marker=<paths> [--out=<path>]
+  sim-latency source-check --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] [--json]
+  sim-latency source-record --epoch=<n> [--source-config=<path>] [--repos-root=<dir>]
+  sim-latency staging-source-check --epoch=0 [--source-config=<path>] [--repos-root=<dir>]
+  sim-latency epoch-review --epoch=<n> next [--out-dir=<dir>]
+  sim-latency epoch-review --epoch=<n> export-winner --job-id=<id> [--out-dir=<dir>]
+  sim-latency epoch-review --epoch=<n> reject --job-id=<id> --reviewer=<id> --reason=<text> --evidence=<path> [--out-dir=<dir>]
+  sim-latency epoch-review --epoch=<n> approve --job-id=<id> --reviewer=<id> --reason=<text> --evidence=<path>
+  sim-latency promote --epoch=<n> (--winner=<dir> --winner-job-id=<id> | --no-winner) [--message=<text>] [--source-config=<path>] [--repos-root=<dir>] [--dry-run]
+  sim-latency launch-preflight --epoch=<n> --evaluator-image=<digest> --operator-token-file=<path> --grafana-url=<url> --grafana-token-file=<path> --metrics-url=<url> --metrics-token-file=<path> [--api-url=<url>] [--openapi=<path>] [--artifact-capacity-bytes=<n>] [--source-config=<path>] [--repos-root=<dir>] [--out=<path>]
+  sim-latency handoff-manifest --epoch=<n> --evaluator-image=<digest> --openapi=<path> --baseline-manifest=<path> --preflight=<path> [--staging-evidence=<paths>] [--source-config=<path>] [--repos-root=<dir>] [--out=<path>]
+  sim-latency credentials generate --vault=<path> --delivery=<path> --submitter-name=<name> --operator-name=<name>
+  sim-latency credentials rotate-token --vault=<path> --delivery=<path> --role=<role> --name=<name>
+  sim-latency credentials rotate-seed --vault=<path> --confirm-no-unrevealed-rounds
+  sim-latency credentials revoke --vault=<path> --name=<name>
   sim-latency reset
   sim-latency -h | --help
   sim-latency --version
@@ -62,6 +93,36 @@ Usage:
 Options:
   -h --help              Show this screen.
   --version              Show version.
+  --epoch=<n>            Source epoch: 0 is baseline; 1..6 follow finalized epoch transitions.
+  --source-config=<path> Epoch ledger path [default: discovered config/main/sim-latency.yml].
+  --repos-root=<dir>     Parent of all repositories in the frozen evaluator source graph [default: discovered workspace].
+  --winner=<dir>         Winner directory containing score.json and one or more patch files.
+  --winner-job-id=<id>   Published winning competition job id recorded in the next epoch.
+  --job-id=<id>          Exact candidate job id currently presented for honesty review.
+  --reviewer=<id>        Stable operator or agent-harness reviewer identity.
+  --reason=<text>        Concise honesty-review finding recorded append-only.
+  --evidence=<path>      JSON honesty-review report; its SHA-256 is recorded with the decision.
+  --no-winner            Carry the prior repository commits forward after an epoch with no significant winner.
+  --message=<text>       Promotion commit message suffix.
+  --dry-run              Validate and stage a promotion without pushing or updating local branches.
+  --evaluator-image=<digest>  Immutable sha256 evaluator image identity.
+  --operator-token-file=<path>  Private file containing the competition operator bearer token.
+  --grafana-url=<url>     Main Grafana origin used by launch preflight.
+  --grafana-token-file=<path>  Private file containing a Grafana service-account token.
+  --metrics-url=<url>     Main Prometheus-compatible Mimir query origin.
+  --metrics-token-file=<path>  Private file containing a Mimir query token.
+  --openapi=<path>        Competition OpenAPI source file.
+  --artifact-capacity-bytes=<n>  Approved MinIO allocation [default: 1099511627776].
+  --baseline-manifest=<path>  Versioned baseline evidence manifest.
+  --preflight=<path>      Passing launch-preflight JSON evidence.
+  --staging-evidence=<paths>  Comma-separated Apex staging evidence files.
+  --vault=<path>          Private competition vault YAML to create or update atomically.
+  --delivery=<path>       New private JSON file receiving raw generated bearer tokens.
+  --submitter-name=<name> Stable name for the initial submitter credential.
+  --operator-name=<name>  Stable name for the initial operator credential.
+  --name=<name>           Stable name of the token to create or revoke.
+  --role=<role>           Token role: submitter or operator.
+  --confirm-no-unrevealed-rounds  Confirm seed rotation cannot invalidate an unrevealed round.
   --out=<path>           Output path for the selected file-producing command.
   --count=<n>            Number of providers [default: 100000].
   --clients=<n>          Client identity pool size [default: 4000].
@@ -148,6 +209,26 @@ Options:
 		runScoreBaseline(opts)
 	case optBool(opts, "score"):
 		runScore(opts)
+	case optBool(opts, "source-check"):
+		runSourceCheck(opts)
+	case optBool(opts, "source-record"):
+		runSourceRecord(opts)
+	case optBool(opts, "staging-source-check"):
+		runStagingSourceCheck(opts)
+	case optBool(opts, "epoch-review"):
+		requireMainEnvironment("epoch-review")
+		runEpochReview(opts)
+	case optBool(opts, "promote"):
+		requireMainEnvironment("promote")
+		runPromote(opts)
+	case optBool(opts, "launch-preflight"):
+		requireMainEnvironment("launch-preflight")
+		runLaunchPreflight(opts)
+	case optBool(opts, "handoff-manifest"):
+		runHandoffManifest(opts)
+	case optBool(opts, "credentials"):
+		requireMainEnvironment("credentials")
+		runCredentials(opts)
 	case optBool(opts, "reset"):
 		requireLocalEnvironment("reset")
 		runReset()
@@ -181,12 +262,13 @@ func runInit(opts docopt.Opts) {
 }
 
 func generatedConfig(seed int64, count int, clients int, rate float64, qualityWindow int) (*Config, error) {
-	config := defaultConfig(seed, count, clients, rate)
-	config.Clients.QualityWindowSize = qualityWindow
-	// validate requires the sampled fleet to be present. Generate it first, then
-	// validate the complete artifact that will actually be written.
-	if err := generateFleet(config); err != nil {
-		return nil, fmt.Errorf("generate fleet: %w", err)
+	configBytes, err := controller.GenerateSimLatencyWorkload(seed, count, clients, rate, qualityWindow)
+	if err != nil {
+		return nil, fmt.Errorf("generate workload: %w", err)
+	}
+	config, err := decodeConfig(configBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode generated workload: %w", err)
 	}
 	if err := config.validate(); err != nil {
 		return nil, err
@@ -195,6 +277,10 @@ func generatedConfig(seed int64, count int, clients int, rate float64, qualityWi
 }
 
 func runRun(opts docopt.Opts) {
+	epochNumber, sourceConfig, repositoriesRoot, err := checkConfiguredSource(opts)
+	if err != nil {
+		fatalf("source epoch preflight: %s", err)
+	}
 	providers, _ := opts.String("--providers")
 	siteHome, _ := opts.String("--site-home")
 	absSiteHome := mustAbs(siteHome)
@@ -213,6 +299,9 @@ func runRun(opts docopt.Opts) {
 	servicesConfig.AnnounceTimeout = optDuration(opts, "--announce-timeout", servicesConfig.AnnounceTimeout)
 
 	options := &RunOptions{
+		Epoch:               epochNumber,
+		SourceConfig:        sourceConfig,
+		RepositoriesRoot:    repositoriesRoot,
 		ConfigPath:          providers,
 		SiteHome:            absSiteHome,
 		Ramp:                optDuration(opts, "--ramp", 1*time.Minute),
@@ -240,6 +329,9 @@ func runRun(opts docopt.Opts) {
 }
 
 func runFleet(opts docopt.Opts) {
+	if _, _, _, err := checkConfiguredSource(opts); err != nil {
+		fatalf("source epoch preflight: %s", err)
+	}
 	providers, _ := opts.String("--providers")
 	shard, _ := opts.String("--shard")
 	apiUrl, _ := opts.String("--api-url")
@@ -326,11 +418,25 @@ func validateEnvironment(command string, env string) error {
 				env,
 			)
 		}
+	case "epoch-review", "promote", "launch-preflight", "credentials":
+		if env != "main" {
+			return fmt.Errorf(
+				"sim-latency %s is main-only: refusing WARP_ENV=%q",
+				command,
+				env,
+			)
+		}
 	}
 	return nil
 }
 
 func requireLocalEnvironment(command string) {
+	if err := validateEnvironment(command, server.RequireEnv()); err != nil {
+		fatalf("%s", err)
+	}
+}
+
+func requireMainEnvironment(command string) {
 	if err := validateEnvironment(command, server.RequireEnv()); err != nil {
 		fatalf("%s", err)
 	}

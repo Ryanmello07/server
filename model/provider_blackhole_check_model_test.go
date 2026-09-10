@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func TestBlackholedProviderFailsTheHealthGate(t *testing.T) {
 			ClientId: healthy, CheckedAt: now.Add(-time.Minute), OK: true,
 		})
 
-		f := newProviderCountFilter(ctx)
+		f := newProviderCountFilter(ctx, true)
 
 		if !f.passesHealth(healthy) {
 			t.Errorf("a provider measured healthy and checked ok must pass the gate")
@@ -75,7 +76,7 @@ func TestStaleBlackholeCheckDoesNotExclude(t *testing.T) {
 			OK:        false, Failure: "all_destinations_failed",
 		})
 
-		if !newProviderCountFilter(ctx).passesHealth(clientId) {
+		if !newProviderCountFilter(ctx, true).passesHealth(clientId) {
 			t.Errorf("a failing check older than %s must not keep excluding the provider: "+
 				"a stalled sweep would otherwise drain the list", ProviderBlackholeCheckMaxAge)
 		}
@@ -165,6 +166,43 @@ func TestGetProviderBlackholeCheckDue(t *testing.T) {
 		// gets back into the list -- so ordering is by age alone
 		if 0 < len(due) && due[0] != never {
 			t.Errorf("due[0] = %s, want the never-checked provider %s first", due[0], never)
+		}
+	})
+}
+
+// A materialized connected row can outlive the client state that made it
+// eligible. The blackhole sweep must spend its bounded slots only on active
+// top-level providers, never derivative return-traffic identities or inactive
+// clients that still retain a Public key.
+func TestGetProviderBlackholeCheckDueExcludesDerivedAndInactiveClients(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkId := server.NewId()
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		sourceClientId := testingCreateProviderClient(ctx, networkId, nil, true)
+		activeClientId := testingCreateProviderClient(ctx, networkId, nil, true)
+		derivedClientId := testingCreateProviderClient(ctx, networkId, &sourceClientId, true)
+		inactiveClientId := testingCreateProviderClient(ctx, networkId, nil, false)
+		for _, clientId := range []server.Id{activeClientId, derivedClientId, inactiveClientId} {
+			testingInsertProviderLocationReliability(ctx, clientId, networkId, city)
+		}
+
+		due := GetProviderBlackholeCheckDue(ctx, server.NowUtc(), 100, 0, 1)
+		if !slices.Contains(due, activeClientId) {
+			t.Errorf("due = %v, missing active top-level provider %s", due, activeClientId)
+		}
+		for _, clientId := range []server.Id{derivedClientId, inactiveClientId} {
+			if slices.Contains(due, clientId) {
+				t.Errorf("due = %v, contains derived or inactive provider %s", due, clientId)
+			}
 		}
 	})
 }

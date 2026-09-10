@@ -34,8 +34,53 @@ var wgPeersGauge = prometheus.NewGauge(
 	},
 )
 
+var wgInboundPeerQueueDropPacketsGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "proxy",
+		Name:      "wg_inbound_peer_queue_drop_packets",
+		Help:      "WireGuard ingress packets refused because one peer's queue was full or its lifecycle was transitioning",
+	},
+)
+
+var wgReceiveRoutineFailuresGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "proxy",
+		Name:      "wg_receive_routine_failures",
+		Help:      "Unexpected WireGuard socket receive-routine failures in this process",
+	},
+)
+
+var wgInboundDecryptionQueueDropPacketsGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "proxy",
+		Name:      "wg_inbound_decryption_queue_drop_packets",
+		Help:      "WireGuard ingress packets refused because the device-global decryption queue was full",
+	},
+)
+
+// This artifact capability is intentionally identity-free. The monitor joins
+// it to the exact process identity and treats absence as unknown: a canceled
+// manager is not fully retired until its admitted constructors, device
+// workers, shared NetworkSpace, and SDK-owned child lifetimes have joined.
+var lifecycleJoinEnabledGauge = prometheus.NewGaugeFunc(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "proxy",
+		Name:      "lifecycle_join_enabled",
+		Help:      "Whether Proxy manager and SDK-owned device lifetimes are synchronously joined during external shutdown",
+	},
+	func() float64 { return 1 },
+)
+
 func init() {
 	prometheus.MustRegister(wgPeersGauge)
+	prometheus.MustRegister(wgInboundPeerQueueDropPacketsGauge)
+	prometheus.MustRegister(wgInboundDecryptionQueueDropPacketsGauge)
+	prometheus.MustRegister(wgReceiveRoutineFailuresGauge)
+	prometheus.MustRegister(lifecycleJoinEnabledGauge)
 }
 
 const InternalSocksPort = 8080
@@ -45,6 +90,10 @@ const InternalApiPort = 8083
 const InternalWgPort = 8084
 
 func DefaultProxySettings() *ProxySettings {
+	// HttpProxy interprets ProxyConnectTimeout as retry pacing, not as a total
+	// timeout. Follow its prompt production default so a transient hosted-device
+	// dial failure can recover inside an ordinary client request deadline.
+	httpProxySettings := proxy.DefaultHttpProxySettings()
 	return &ProxySettings{
 		SocksPort:                InternalSocksPort,
 		HttpPort:                 InternalHttpPort,
@@ -54,7 +103,7 @@ func DefaultProxySettings() *ProxySettings {
 		ProxyWriteTimeout:        15 * time.Second,
 		ProxyIdleTimeout:         5 * time.Minute,
 		ProxyTlsHandshakeTimeout: 30 * time.Second,
-		ProxyConnectTimeout:      30 * time.Minute,
+		ProxyConnectTimeout:      httpProxySettings.ProxyConnectTimeout,
 		NotificationTimeout:      5 * time.Second,
 		WarmupTimeout:            30 * time.Minute,
 		MaxRequestBytes:          32 * model.Kib,
@@ -143,10 +192,11 @@ type ProxySettings struct {
 	// them and initiates handshakes from the server side, so wg clients
 	// re-establish in ~1 RTT after the deploy's conntrack flush instead of
 	// waiting out their own dead-session timers. The export doubles as the
-	// old instance's drain-complete beacon: the replacement sequences its
-	// device pre-warm after the export (or the poll budget), so the reused
-	// persisted window identities never run live in both containers during
-	// the drain grace (REVIEW2-UPDATE1 §4.4).
+	// old instance's drain-complete beacon: the replacement holds identity
+	// restoration across every early open path, then releases it and runs
+	// device pre-warm after the export (or the poll budget). Reused identities
+	// therefore never run live in both containers during the drain grace
+	// (REVIEW2-UPDATE1 §4.4).
 	EnableWgHandoff bool
 	// WgHandoffActivityWindow filters the export to peers with a recent
 	// handshake — the ones plausibly still there to answer an initiation.
@@ -391,7 +441,7 @@ func (self *httpServer) newHttpProxy() *proxy.HttpProxy {
 		return authHeaderProxyId(authHeader)
 	}
 
-	connectDial := func(r *http.Request, network string, addr string) (net.Conn, error) {
+	connectDial := func(ctx context.Context, r *http.Request, network string, addr string) (net.Conn, error) {
 		proxyId, err := authProxyId(r)
 		if err != nil {
 			return nil, err
@@ -419,7 +469,7 @@ func (self *httpServer) newHttpProxy() *proxy.HttpProxy {
 			return nil, err
 		}
 
-		return pd.DialContext(r.Context(), network, addr)
+		return pd.DialContext(ctx, network, addr)
 	}
 
 	httpSettings := proxy.DefaultHttpProxySettings()
@@ -432,7 +482,7 @@ func (self *httpServer) newHttpProxy() *proxy.HttpProxy {
 	httpProxy := proxy.NewHttpProxy(httpSettings)
 	// httpProxy.Logger = self
 	httpProxy.GetTlsConfigForClient = self.transportTls.GetTlsConfigForClient
-	httpProxy.ConnectDialWithRequest = connectDial
+	httpProxy.ConnectDialContextWithRequest = connectDial
 	return httpProxy
 }
 
@@ -569,6 +619,7 @@ func NewWgServer(
 		wgProxy:            wgProxy,
 	}
 
+	go s.runRuntimeMetrics()
 	go server.HandleError(s.run, cancel)
 
 	return s
@@ -580,8 +631,38 @@ func (self *wgServer) run() {
 	listenIpv4, listenIpv6, listenPort := server.RequireListenIpPort(self.settings.WgPort)
 
 	err := self.wgProxy.ListenAndServe(listenIpv4, listenIpv6, listenPort)
+	runtimeStats := self.wgProxy.RuntimeStats()
+	updateWgRuntimeMetrics(runtimeStats)
+	if 0 < runtimeStats.ReceiveRoutineFailureCount {
+		glog.Errorf(
+			"[wg]device stopped after %d socket receive-routine failure(s); peer_queue_drop_packets=%d decryption_queue_drop_packets=%d\n",
+			runtimeStats.ReceiveRoutineFailureCount,
+			runtimeStats.InboundPeerQueueDropPacketCount,
+			runtimeStats.InboundDecryptionQueueDropPacketCount,
+		)
+	}
 	if err != nil {
 		panic(err)
+	}
+}
+
+// updateWgRuntimeMetrics publishes one identity-free device generation.
+func updateWgRuntimeMetrics(stats proxy.WgRuntimeStats) {
+	wgInboundPeerQueueDropPacketsGauge.Set(float64(stats.InboundPeerQueueDropPacketCount))
+	wgInboundDecryptionQueueDropPacketsGauge.Set(float64(stats.InboundDecryptionQueueDropPacketCount))
+	wgReceiveRoutineFailuresGauge.Set(float64(stats.ReceiveRoutineFailureCount))
+}
+
+// runRuntimeMetrics keeps datagram refusals visible while the device remains
+// live; a fatal receiver exit also takes one final sample in run.
+func (self *wgServer) runRuntimeMetrics() {
+	for {
+		updateWgRuntimeMetrics(self.wgProxy.RuntimeStats())
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 
@@ -592,6 +673,30 @@ type wgClientCounts struct {
 	invalidAuthToken  int
 	// dropped because the network's plan does not include WireGuard
 	notEntitled int
+}
+
+type wgProxyDeviceOpener interface {
+	OpenProxyDevice(server.Id) (*ProxyDevice, error)
+}
+
+// wgTunFactory retains only the immutable proxy id and manager. The full
+// model.ProxyClient includes every URL, auth token, and WireGuard config
+// string; capturing that object in one durable peer closure kept all of those
+// startup JSON allocations reachable for the peer's lifetime even though Tun
+// activation needs only ProxyId.
+func wgTunFactory(opener wgProxyDeviceOpener, proxyID server.Id) func() (tun proxy.WgTun, err error) {
+	return func() (tun proxy.WgTun, err error) {
+		if r := server.HandleError(func() {
+			tun, err = opener.OpenProxyDevice(proxyID)
+		}); r != nil {
+			if rErr, ok := r.(error); ok {
+				err = rErr
+			} else {
+				err = fmt.Errorf("open proxy device: %v", r)
+			}
+		}
+		return
+	}
 }
 
 // validWgClients converts proxy clients to wg clients, dropping clients that
@@ -643,18 +748,7 @@ func (self *wgServer) validWgClients(proxyClients []*model.ProxyClient) (map[net
 		// panics. Model calls raise on a canceled ctx (e.g. instance shutdown
 		// with in-flight client packets), so convert panics to an error - the
 		// device drops the packet instead of crashing the process.
-		tun := func() (tun proxy.WgTun, err error) {
-			if r := server.HandleError(func() {
-				tun, err = self.proxyDeviceManager.OpenProxyDevice(proxyClient.ProxyId)
-			}); r != nil {
-				if rErr, ok := r.(error); ok {
-					err = rErr
-				} else {
-					err = fmt.Errorf("open proxy device: %v", r)
-				}
-			}
-			return
-		}
+		tun := wgTunFactory(self.proxyDeviceManager, proxyClient.ProxyId)
 		client := &proxy.WgClient{
 			PublicKey:  proxyClient.WgConfig.ClientPublicKey,
 			ClientIpv4: proxyClient.WgConfig.ClientIpv4,
@@ -688,16 +782,27 @@ func (self *wgServer) logClientCounts(op string, applied int, removed int, count
 	)
 }
 
-// logAppliedClients logs one line per client whose wg peer config was just
-// applied to the device, keyed by client ipv4. This is the authoritative signal
-// that a peer is installed: if a client cannot connect and its ipv4 never
-// appears here, the problem is upstream (not delivered/validated/installed); if
-// it does appear, the peer exists and the problem is the transport (e.g. UDP
-// DNAT/SNAT to the wg port) or the handshake.
-func (self *wgServer) logAppliedClients(op string, applied map[netip.Addr]*proxy.WgClient) {
-	for addr, client := range applied {
-		glog.Infof("[wg]%s peer installed client_ipv4=%s public_key=%s\n", op, addr, client.PublicKey)
+// logAppliedClientDetails retains the per-client diagnostic at V(1) without
+// making a full peer-table synchronization emit tens of thousands of default
+// info lines. The terminal logClientCounts summary and wgPeersGauge remain the
+// default authoritative fleet signals; an operator can temporarily enable V(1)
+// when one client's installation path needs exact attribution.
+func logAppliedClientDetails(
+	op string,
+	applied map[netip.Addr]*proxy.WgClient,
+	enabled bool,
+	logf func(format string, args ...any),
+) {
+	if !enabled {
+		return
 	}
+	for addr, client := range applied {
+		logf("[wg]%s peer installed client_ipv4=%s public_key=%s\n", op, addr, client.PublicKey)
+	}
+}
+
+func (self *wgServer) logAppliedClients(op string, applied map[netip.Addr]*proxy.WgClient) {
+	logAppliedClientDetails(op, applied, bool(glog.V(1)), glog.Infof)
 }
 
 func (self *wgServer) AddProxyClients(proxyClients ...*model.ProxyClient) error {

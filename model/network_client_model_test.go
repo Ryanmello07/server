@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"testing"
@@ -16,6 +17,128 @@ import (
 	"github.com/urnetwork/server/session"
 	"github.com/urnetwork/server/task"
 )
+
+func TestNetworkClientLifecycleClassesAreBounded(t *testing.T) {
+	active := true
+	inactive := false
+	sourceClientId := server.NewId()
+	for _, test := range []struct {
+		name   string
+		active *bool
+		source *server.Id
+		want   NetworkClientLifecycle
+	}{
+		{name: "missing", want: NetworkClientLifecycleMissing},
+		{name: "active top", active: &active, want: NetworkClientLifecycleActiveTop},
+		{name: "inactive top", active: &inactive, want: NetworkClientLifecycleInactiveTop},
+		{name: "active derived", active: &active, source: &sourceClientId, want: NetworkClientLifecycleActiveDerived},
+		{name: "inactive derived", active: &inactive, source: &sourceClientId, want: NetworkClientLifecycleInactiveDerived},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := networkClientLifecycle(test.active, test.source); got != test.want {
+				t.Fatalf("networkClientLifecycle() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkA := server.NewId()
+		networkB := server.NewId()
+		activeTop := server.NewId()
+		activeDerived := server.NewId()
+		inactiveTop := server.NewId()
+		inactiveDerived := server.NewId()
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+				INSERT INTO network_client (
+					client_id, network_id, active, source_client_id
+				) VALUES
+					($1, $2, true, NULL),
+					($3, $2, true, $1),
+					($4, $5, false, NULL),
+					($6, $5, false, $1)
+				`,
+				activeTop,
+				networkA,
+				activeDerived,
+				inactiveTop,
+				networkB,
+				inactiveDerived,
+			))
+		})
+
+		for _, test := range []struct {
+			name        string
+			source      server.Id
+			destination server.Id
+			want        ProvideRelationshipDetails
+		}{
+			{
+				name:        "same network derived destination",
+				source:      activeTop,
+				destination: activeDerived,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModeNetwork,
+					SourceLifecycle:      NetworkClientLifecycleActiveTop,
+					DestinationLifecycle: NetworkClientLifecycleActiveDerived,
+				},
+			},
+			{
+				name:        "cross network inactive destination",
+				source:      activeTop,
+				destination: inactiveDerived,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModePublic,
+					SourceLifecycle:      NetworkClientLifecycleActiveTop,
+					DestinationLifecycle: NetworkClientLifecycleInactiveDerived,
+				},
+			},
+			{
+				name:        "inactive source and top destination",
+				source:      inactiveDerived,
+				destination: inactiveTop,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModeNetwork,
+					SourceLifecycle:      NetworkClientLifecycleInactiveDerived,
+					DestinationLifecycle: NetworkClientLifecycleInactiveTop,
+				},
+			},
+			{
+				name:        "missing destination",
+				source:      activeTop,
+				destination: server.NewId(),
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModePublic,
+					SourceLifecycle:      NetworkClientLifecycleActiveTop,
+					DestinationLifecycle: NetworkClientLifecycleMissing,
+				},
+			},
+			{
+				name:        "self",
+				source:      activeTop,
+				destination: activeTop,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModeNetwork,
+					SourceLifecycle:      NetworkClientLifecycleActiveTop,
+					DestinationLifecycle: NetworkClientLifecycleActiveTop,
+				},
+			},
+		} {
+			if got := GetProvideRelationshipDetails(ctx, test.source, test.destination); got != test.want {
+				t.Fatalf("%s: GetProvideRelationshipDetails() = %+v, want %+v", test.name, got, test.want)
+			}
+			if got := GetProvideRelationship(ctx, test.source, test.destination); got != test.want.Mode {
+				t.Fatalf("%s: GetProvideRelationship() = %d, want %d", test.name, got, test.want.Mode)
+			}
+		}
+	})
+}
 
 func TestNetworkClientHandlerLifecycle(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
@@ -98,6 +221,49 @@ func TestNetworkClientHandlerLifecycleIPV6(t *testing.T) {
 
 		err = HeartbeatNetworkClientHandler(ctx, handlerId)
 		connect.AssertNotEqual(t, err, nil)
+	})
+}
+
+// An open connection whose ephemeral handler row is already gone must be
+// repaired even though it cannot appear in the expired-handler query.
+func TestCloseExpiredNetworkClientHandlersClosesOrphanedConnections(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		orphanHandlerId := CreateNetworkClientHandler(ctx)
+		orphanConnectionId, _, _, _, err := ConnectNetworkClient(
+			ctx,
+			server.NewId(),
+			"10.0.0.1:20000",
+			orphanHandlerId,
+		)
+		connect.AssertEqual(t, err, nil)
+
+		liveHandlerId := CreateNetworkClientHandler(ctx)
+		liveConnectionId, _, _, _, err := ConnectNetworkClient(
+			ctx,
+			server.NewId(),
+			"10.0.0.2:20000",
+			liveHandlerId,
+		)
+		connect.AssertEqual(t, err, nil)
+
+		// Simulate the durable failure found on main: the handler was removed,
+		// but its connection row remained connected. The control handler stays
+		// newer than the cutoff so the repair cannot pass by closing everything.
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`DELETE FROM network_client_handler WHERE handler_id = $1`,
+				orphanHandlerId,
+			))
+		})
+
+		CloseExpiredNetworkClientHandlers(ctx, server.NowUtc().Add(-time.Hour))
+
+		connect.AssertEqual(t, GetNetworkClientConnectionStatus(ctx, orphanConnectionId).Connected, false)
+		connect.AssertEqual(t, GetNetworkClientConnectionStatus(ctx, liveConnectionId).Connected, true)
+		connect.AssertEqual(t, HeartbeatNetworkClientHandler(ctx, liveHandlerId), nil)
 	})
 }
 
@@ -2071,10 +2237,12 @@ func TestFindActiveClientNetwork(t *testing.T) {
 		connect.AssertEqual(t, err, nil)
 		_, err = FindActiveClientNetwork(ctx, clientId)
 		connect.AssertNotEqual(t, err, nil)
+		connect.AssertEqual(t, errors.Is(err, ErrActiveClientNotFound), true)
 
 		// deleted client
 		_, err = FindActiveClientNetwork(ctx, server.NewId())
 		connect.AssertNotEqual(t, err, nil)
+		connect.AssertEqual(t, errors.Is(err, ErrActiveClientNotFound), true)
 	})
 }
 
@@ -2368,5 +2536,75 @@ func TestRemoveDisconnectedChildReapBumpsConnected(t *testing.T) {
 		RemoveDisconnectedNetworkClients(ctx, minConnectionTime, minClientTime, minTopLevelAuthTime)
 		exists, _ = clientAuthTime(connectedChildId)
 		connect.AssertEqual(t, exists, true)
+	})
+}
+
+// The device list holds only top-level devices: a child client (one with a
+// source client) and a hosted proxy device (a client with a
+// proxy_device_config row) are left out, and the proxy device is what the
+// proxies list returns instead. Nothing here depends on provide mode.
+func TestNetworkClientsListTopLevelDevicesOnly(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		userId := server.NewId()
+
+		Testing_CreateNetwork(ctx, networkId, "test", userId)
+		userSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
+			NetworkId: networkId,
+			UserId:    userId,
+		})
+
+		// a plain device
+		deviceResult, err := AuthNetworkClient(
+			&AuthNetworkClientArgs{
+				Description: "phone",
+				DeviceSpec:  "test spec",
+			},
+			userSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, deviceResult.Error, nil)
+		deviceClientId := *deviceResult.ClientId
+
+		// a child of that device
+		childResult, err := AuthNetworkClient(
+			&AuthNetworkClientArgs{
+				SourceClientId: &deviceClientId,
+				Description:    "child",
+				DeviceSpec:     "test spec",
+			},
+			userSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, childResult.Error, nil)
+
+		// a hosted proxy device: a client that carries a proxy device config
+		proxyResult, err := AuthNetworkClient(
+			&AuthNetworkClientArgs{
+				Description: "resident proxy",
+				DeviceSpec:  "resident proxy",
+			},
+			userSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, proxyResult.Error, nil)
+		proxyClientId := *proxyResult.ClientId
+		proxyDeviceConfig := &ProxyDeviceConfig{}
+		proxyDeviceConfig.ClientId = proxyClientId
+		err = CreateProxyDeviceConfig(ctx, proxyDeviceConfig)
+		connect.AssertEqual(t, err, nil)
+
+		clientsResult, err := GetNetworkClients(userSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, 1, len(clientsResult.Clients))
+		connect.AssertEqual(t, deviceClientId, clientsResult.Clients[0].ClientId)
+		connect.AssertEqual(t, true, clientsResult.Clients[0].ProxyClient == nil)
+
+		proxiesResult, err := GetNetworkProxies(userSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, 1, len(proxiesResult.Clients))
+		connect.AssertEqual(t, proxyClientId, proxiesResult.Clients[0].ClientId)
 	})
 }

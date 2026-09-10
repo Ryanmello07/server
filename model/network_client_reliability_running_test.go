@@ -24,7 +24,8 @@ func testingConnectClientWithLocation(
 	location *Location,
 ) [32]byte {
 	Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
-	connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(ctx, clientId, clientAddress, server.NewId())
+	handlerId := CreateNetworkClientHandler(ctx)
+	connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(ctx, clientId, clientAddress, handlerId)
 	connect.AssertEqual(t, err, nil)
 	err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
 	connect.AssertEqual(t, err, nil)
@@ -88,6 +89,24 @@ func testingReadRunningWindow(ctx context.Context, lookbackIndex int) (w reliabi
 	return
 }
 
+func testingReadRunningWindowWriteToken(ctx context.Context, lookbackIndex int) (token string) {
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			`SELECT COALESCE(degraded_classification_write_token::text, '')
+			 FROM client_reliability_running_window
+			 WHERE lookback_index = $1`,
+			lookbackIndex,
+		)
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				server.Raise(result.Scan(&token))
+			}
+		})
+	})
+	return
+}
+
 func testingAssertScoreEq(t testing.TB, label string, a ReliabilityScore, b ReliabilityScore) {
 	const eps = 1e-9
 	closeEq := func(x float64, y float64) bool {
@@ -128,6 +147,238 @@ func testingAssertScoresEquivalent(
 	}
 }
 
+func TestReliabilityRunningRecomputeCadence(t *testing.T) {
+	if got, want := time.Duration(ReliabilityRunningRecomputeBlocks)*ReliabilityBlockDuration, 4*time.Hour; got != want {
+		t.Fatalf("recompute cadence = %s, want %s", got, want)
+	}
+	if got, want := reliabilityRunningMaintenanceDeferralAfter, 5*time.Minute; got != want {
+		t.Fatalf("maintenance deferral floor = %s, want %s", got, want)
+	}
+
+	base := reliabilityRunningWindow{
+		exists:                                  true,
+		minBlockNumber:                          1000,
+		maxBlockNumber:                          2000,
+		lastRecomputeBlock:                      2000,
+		degradedClassificationVersion:           reliabilityDegradedClassificationVersion,
+		degradedClassificationWriteTokenPresent: true,
+		degradedClassificationGuardPresent:      true,
+	}
+	legacyClassification := base
+	legacyClassification.degradedClassificationVersion = 0
+	missingWriterToken := base
+	missingWriterToken.degradedClassificationWriteTokenPresent = false
+	missingWriterGuard := base
+	missingWriterGuard.degradedClassificationGuardPresent = false
+	tests := []struct {
+		name                    string
+		prev                    reliabilityRunningWindow
+		newMin                  int64
+		newMax                  int64
+		periodicReanchorAllowed bool
+		recompute               bool
+		deferred                bool
+	}{
+		{name: "missing state ignores maintenance", prev: reliabilityRunningWindow{}, newMin: 1001, newMax: 2001, recompute: true},
+		{name: "classification upgrade ignores maintenance", prev: legacyClassification, newMin: 1001, newMax: 2001, recompute: true},
+		{name: "missing writer token ignores maintenance", prev: missingWriterToken, newMin: 1001, newMax: 2001, recompute: true},
+		{name: "missing writer guard ignores maintenance", prev: missingWriterGuard, newMin: 1001, newMax: 2001, recompute: true},
+		{name: "one cycle rolls", prev: base, newMin: 1030, newMax: 2030, periodicReanchorAllowed: true},
+		{name: "just below cadence rolls", prev: base, newMin: 1000 + ReliabilityRunningRecomputeBlocks - 1, newMax: 2000 + ReliabilityRunningRecomputeBlocks - 1, periodicReanchorAllowed: true},
+		{name: "cadence boundary reanchors when quiet", prev: base, newMin: 1000 + ReliabilityRunningRecomputeBlocks, newMax: 2000 + ReliabilityRunningRecomputeBlocks, periodicReanchorAllowed: true, recompute: true},
+		{name: "cadence boundary defers during maintenance", prev: base, newMin: 1000 + ReliabilityRunningRecomputeBlocks, newMax: 2000 + ReliabilityRunningRecomputeBlocks, deferred: true},
+		{name: "backward max ignores maintenance", prev: base, newMin: 999, newMax: 1999, recompute: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recompute, deferred := reliabilityRunningNeedsRecompute(
+				test.prev,
+				test.newMin,
+				test.newMax,
+				test.periodicReanchorAllowed,
+			)
+			if recompute != test.recompute || deferred != test.deferred {
+				t.Fatalf(
+					"decision = (recompute=%t deferred=%t), want (recompute=%t deferred=%t)",
+					recompute,
+					deferred,
+					test.recompute,
+					test.deferred,
+				)
+			}
+		})
+	}
+}
+
+// A new CREATE INDEX CONCURRENTLY can finish its table scan before an optional
+// reliability re-anchor that starts moments later. The re-anchor then owns an
+// older snapshot and prevents index validation until its full-window scan ends.
+func TestReliabilityRunningReanchorDefersForNewConcurrentIndex(t *testing.T) {
+	if reliabilityRunningReanchorAllowedForMaintenance(false, true) {
+		t.Fatal("new concurrent index build allowed an optional reliability re-anchor")
+	}
+}
+
+// Small routine vacuums should not suppress the periodic correction. The live
+// catalog query classifies only vacuums older than the established-work floor.
+func TestReliabilityRunningReanchorAllowsBriefVacuum(t *testing.T) {
+	if !reliabilityRunningReanchorAllowedForMaintenance(false, false) {
+		t.Fatal("brief vacuum suppressed an optional reliability re-anchor")
+	}
+	if reliabilityRunningReanchorAllowedForMaintenance(true, false) {
+		t.Fatal("established vacuum allowed an optional reliability re-anchor")
+	}
+}
+
+// A current writer can finish one lookback while older Taskworkers are still
+// eligible to claim the next recurring task. The old UPSERT does not mention
+// either migration column. Prove the database guard resets version 1 even when
+// that legacy write repeats identical bounds, then prove the decision forces a
+// re-anchor and a current writer can publish a fresh token/version again.
+func TestReliabilityRunningVersionGuardDetectsLegacyWriter(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		const lookbackIndex = 2
+		const minBlock = int64(1000)
+		const maxBlock = int64(1721)
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			writeReliabilityRunningWindow(
+				ctx,
+				tx,
+				lookbackIndex,
+				minBlock,
+				maxBlock,
+				maxBlock,
+			)
+		})
+		current := testingReadRunningWindow(ctx, lookbackIndex)
+		currentToken := testingReadRunningWindowWriteToken(ctx, lookbackIndex)
+		if current.degradedClassificationVersion != reliabilityDegradedClassificationVersion ||
+			!current.degradedClassificationWriteTokenPresent ||
+			!current.degradedClassificationGuardPresent ||
+			currentToken == "" {
+			t.Fatalf("current writer did not publish guarded version: window=%+v token_present=%t", current, currentToken != "")
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			// This is the exact pre-migration column list and conflict update. The
+			// identical bounds are intentional: value comparison cannot detect it.
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`INSERT INTO client_reliability_running_window (
+					lookback_index, min_block_number, max_block_number, last_recompute_block
+				 ) VALUES ($1, $2, $3, $4)
+				 ON CONFLICT (lookback_index) DO UPDATE SET
+					min_block_number = EXCLUDED.min_block_number,
+					max_block_number = EXCLUDED.max_block_number,
+					last_recompute_block = EXCLUDED.last_recompute_block`,
+				lookbackIndex,
+				minBlock,
+				maxBlock,
+				maxBlock,
+			))
+		})
+		legacy := testingReadRunningWindow(ctx, lookbackIndex)
+		legacyToken := testingReadRunningWindowWriteToken(ctx, lookbackIndex)
+		if legacy.degradedClassificationVersion != 0 {
+			t.Fatalf("legacy write retained trusted classification version: %+v", legacy)
+		}
+		if !legacy.degradedClassificationWriteTokenPresent || !legacy.degradedClassificationGuardPresent {
+			t.Fatalf("legacy write removed guard evidence instead of revoking version: %+v", legacy)
+		}
+		if legacyToken != currentToken {
+			t.Fatalf("legacy write unexpectedly rotated token: before=%q after=%q", currentToken, legacyToken)
+		}
+		recompute, deferred := reliabilityRunningNeedsRecompute(
+			legacy,
+			minBlock,
+			maxBlock,
+			false,
+		)
+		if !recompute || deferred {
+			t.Fatalf("legacy marker decision=(recompute=%t deferred=%t), want (true false)", recompute, deferred)
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			writeReliabilityRunningWindow(
+				ctx,
+				tx,
+				lookbackIndex,
+				minBlock,
+				maxBlock,
+				maxBlock,
+			)
+		})
+		recovered := testingReadRunningWindow(ctx, lookbackIndex)
+		recoveredToken := testingReadRunningWindowWriteToken(ctx, lookbackIndex)
+		if recovered.degradedClassificationVersion != reliabilityDegradedClassificationVersion ||
+			!recovered.degradedClassificationWriteTokenPresent ||
+			!recovered.degradedClassificationGuardPresent ||
+			recoveredToken == "" || recoveredToken == currentToken {
+			t.Fatalf(
+				"current rewrite did not restore guarded generation: window=%+v token_present=%t token_rotated=%t",
+				recovered,
+				recoveredToken != "",
+				recoveredToken != currentToken,
+			)
+		}
+	})
+}
+
+// A task timeout used to roll back every lookback because all four running
+// aggregates shared one transaction. Inject a failure immediately after the
+// first per-lookback commit and prove that marker remains durable, then resume
+// the same operation and finish the next lookback.
+func TestClientReliabilityRunningCheckpointSurvivesLaterFailure(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		maxTime := server.NowUtc()
+		lookbacks := reliabilityRunningLookbacks()[:2]
+		sentinel := "synthetic failure after committed lookback"
+		panicked := false
+
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					panicked = true
+					if recovered != sentinel {
+						t.Fatalf("unexpected panic: %v", recovered)
+					}
+				}
+			}()
+			updateClientReliabilityRunningCheckpointed(
+				ctx,
+				maxTime,
+				lookbacks,
+				func(lb reliabilityRunningLookback) {
+					if lb.lookbackIndex == lookbacks[0].lookbackIndex {
+						panic(sentinel)
+					}
+				},
+			)
+		}()
+		if !panicked {
+			t.Fatal("synthetic later-step failure did not fire")
+		}
+
+		first := testingReadRunningWindow(ctx, lookbacks[0].lookbackIndex)
+		second := testingReadRunningWindow(ctx, lookbacks[1].lookbackIndex)
+		if !first.exists {
+			t.Fatal("first lookback checkpoint rolled back after later failure")
+		}
+		if second.exists {
+			t.Fatalf("second lookback unexpectedly ran before injected failure: %+v", second)
+		}
+
+		updateClientReliabilityRunningCheckpointed(ctx, maxTime, lookbacks, nil)
+		second = testingReadRunningWindow(ctx, lookbacks[1].lookbackIndex)
+		if !second.exists {
+			t.Fatal("retry did not resume and commit the remaining lookback")
+		}
+	})
+}
+
 // TestClientReliabilityRunningRollingEquivalence is the correctness proof for the
 // rolling incremental reliability-score maintenance: driving the running sums
 // forward block-by-block (the ROLLING path) produces the exact same client
@@ -140,10 +391,9 @@ func TestClientReliabilityRunningRollingEquivalence(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// prod defaults to recompute-every-cycle (the INCLUDE index made the
-		// full recompute ~10s, so no drift can accumulate); force a long
-		// rolling horizon here so this test still exercises and proves the
-		// rolling add/subtract path
+		// Pin the production four-hour rolling horizon so this test continues to
+		// exercise the add/subtract path even if unrelated tests adjust the
+		// package variable.
 		defer func(prev int64) { ReliabilityRunningRecomputeBlocks = prev }(ReliabilityRunningRecomputeBlocks)
 		ReliabilityRunningRecomputeBlocks = int64(4 * time.Hour / ReliabilityBlockDuration)
 
@@ -296,5 +546,121 @@ func TestClientReliabilityRunningRollingEquivalence(t *testing.T) {
 		if math.Abs(b1.ReliabilityScore-b1.IndependentReliabilityScore) > eps {
 			t.Fatalf("clientB1 is alone on its ip so reliability should equal independent: %+v", b1)
 		}
+	})
+}
+
+// A fleet-wide step down can make a moving 12-hour median flip hours after the
+// event. The old classifier then put previously omitted blocks back into the
+// denominator without putting them back into the materialized running sum.
+// This compact 61-block fixture reproduces that boundary: 41 healthy blocks
+// followed by 31 low blocks, with the score first anchored after 20 low blocks
+// and then rolled across the median flip. Rolling and a fresh re-anchor must
+// both retain a perfect provider weight because the one client reported in
+// every non-excused block.
+func TestReliabilityRunningKeepsDegradedClassificationAcrossMedianFlip(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		defer func(previous int64) { ReliabilityRunningRecomputeBlocks = previous }(ReliabilityRunningRecomputeBlocks)
+		ReliabilityRunningRecomputeBlocks = int64(4 * time.Hour / ReliabilityBlockDuration)
+
+		location := &Location{
+			LocationType: LocationTypeCity,
+			City:         "median_flip_city",
+			Region:       "median_flip_region",
+			Country:      "Median Flip Country",
+			CountryCode:  "mf",
+		}
+		CreateLocation(ctx, location)
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		clientAddressHash := testingConnectClientWithLocation(
+			ctx,
+			t,
+			networkId,
+			clientId,
+			"10.44.0.1:20001",
+			location,
+		)
+
+		stats := &ClientReliabilityStats{
+			ConnectionEstablishedCount: 1,
+			ProvideEnabledCount:        1,
+			ReceiveMessageCount:        1,
+		}
+		startTime := server.NowUtc().UTC().Truncate(ReliabilityBlockDuration).Add(-24 * time.Hour)
+		blockTime := func(i int) time.Time {
+			return startTime.Add(time.Duration(i) * ReliabilityBlockDuration)
+		}
+
+		const blockCount = 72
+		for i := 0; i < blockCount; i++ {
+			AddClientReliabilityStats(
+				ctx,
+				networkId,
+				clientId,
+				clientAddressHash,
+				blockTime(i),
+				stats,
+			)
+		}
+		UpdateClientLocationReliabilities(ctx, startTime, blockTime(blockCount))
+
+		startBlock := reliabilityBlockNumber(startTime)
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.BatchInTx(ctx, tx, func(batch server.PgBatch) {
+				for i := 0; i < blockCount; i++ {
+					validClientCount := int64(1000)
+					if 41 <= i {
+						validClientCount = 300
+					}
+					batch.Queue(
+						`INSERT INTO client_reliability_block (block_number, client_count, valid_client_count)
+						 VALUES ($1, $2, $3)`,
+						startBlock+int64(i),
+						1200,
+						validClientCount,
+					)
+				}
+			})
+		})
+
+		// [0,61): 41 high blocks and 20 locally degraded blocks.
+		UpdateClientReliabilityScores(ctx, blockTime(60), false)
+		initial := testingSnapshotClientScores(ctx)[fmt.Sprintf("1:%s", clientId)]
+		if math.Abs(initial.IndependentReliabilityWeight-1) > 1e-9 {
+			t.Fatalf("initial anchored weight = %v, want 1: %+v", initial.IndependentReliabilityWeight, initial)
+		}
+
+		// [11,72): 30 high blocks, 30 blocks that retain their degraded
+		// classification, and one low block after the trailing median adapts.
+		UpdateClientReliabilityScores(ctx, blockTime(71), false)
+		rolling := testingSnapshotClientScores(ctx)[fmt.Sprintf("1:%s", clientId)]
+		if math.Abs(rolling.IndependentReliabilityWeight-1) > 1e-9 {
+			t.Fatalf("rolling weight crossed the median flip = %v, want 1: %+v", rolling.IndependentReliabilityWeight, rolling)
+		}
+
+		window := testingReadRunningWindow(ctx, 1)
+		if window.degradedClassificationVersion != reliabilityDegradedClassificationVersion {
+			t.Fatalf("classification version = %d, want %d", window.degradedClassificationVersion, reliabilityDegradedClassificationVersion)
+		}
+		if !(window.lastRecomputeBlock < window.maxBlockNumber) {
+			t.Fatalf("fixture did not exercise rolling state: %+v", window)
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE client_reliability_running_window
+				 SET last_recompute_block = last_recompute_block - $1
+				 WHERE lookback_index = 1`,
+				ReliabilityRunningRecomputeBlocks+1000,
+			))
+		})
+		UpdateClientReliabilityScores(ctx, blockTime(71), false)
+		recomputed := testingSnapshotClientScores(ctx)[fmt.Sprintf("1:%s", clientId)]
+		testingAssertScoreEq(t, "median-flip rolling/recompute", rolling, recomputed)
 	})
 }

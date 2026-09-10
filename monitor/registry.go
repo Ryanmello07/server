@@ -1,0 +1,331 @@
+package monitor
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// Monitor owns a configured, ordered set of registered signals.
+type Monitor struct {
+	settings SignalSettings
+	signals  []Signal
+}
+
+// New constructs a monitor with every named probe registered in one explicit
+// slice. Adding SIGNALS.md §X.Y (`short-key`) therefore means adding
+// signal_short_key.go, signal_short_key_test.go, and its constructor here.
+func New(settings SignalSettings) *Monitor {
+	return &Monitor{
+		settings: settings.withDefaults().withRuntime(),
+		signals:  NewSignals(),
+	}
+}
+
+// NewMonitor is the descriptive alias for New.
+func NewMonitor(settings SignalSettings) *Monitor { return New(settings) }
+
+// NewWithSignals constructs a monitor with an explicit signal set. It is
+// useful for focused embedding and synthetic integration tests; production
+// normally uses New and the complete catalog registry.
+func NewWithSignals(settings SignalSettings, signals ...Signal) *Monitor {
+	return &Monitor{
+		settings: settings.withDefaults().withRuntime(),
+		signals:  append([]Signal(nil), signals...),
+	}
+}
+
+// NewSignals returns fresh stateful signal instances in catalog order.
+func NewSignals() []Signal {
+	return []Signal{
+		NewContractRateSignal(),
+		NewTaskCanariesSignal(),
+		NewNetEscrowSignal(),
+		NewPostgresStateSignal(),
+		NewPgCapacitySignal(),
+		NewPoolRetentionSignal(),
+		NewRedisClusterSignal(),
+		NewRedisRatesSignal(),
+		NewLogErrorsSignal(),
+		NewActiveQueriesSignal(),
+		NewWaitEventsSignal(),
+		NewReindexDebrisSignal(),
+		NewPlannerFlipsSignal(),
+		NewVacuumHealthSignal(),
+		NewTaskHealthSignal(),
+		NewOpenContractsSignal(),
+		NewCloseDurationSignal(),
+		NewRebootCollisionSignal(),
+		NewConnectionRateSignal(),
+		NewSelectionFreshnessSignal(),
+		NewSelectionPopulationSignal(),
+		NewRetentionFanoutSignal(),
+		NewPgBouncerStallsSignal(),
+		NewWorkerMemorySignal(),
+		NewWorkerChurnSignal(),
+		NewCircleAdmissionSignal(),
+		NewReliabilityDriftSignal(),
+		NewConnectionOrphansSignal(),
+		NewMissingOriginSignal(),
+		NewStaleDestinationSignal(),
+		NewEgressCoverageSignal(),
+		NewStaleContractsSignal(),
+		NewPaymentReconciliationSignal(),
+		NewPaymentFailuresSignal(),
+		NewEgressOutcomesSignal(),
+		NewRedisMemorySignal(),
+		NewRedisBuffersSignal(),
+		NewKeyFamiliesSignal(),
+		NewTTLLeaksSignal(),
+		NewRedisBytesSignal(),
+		NewRedisNonexpiringSignal(),
+		NewRedisProcessSignal(),
+		NewRedisConnectionsSignal(),
+		NewRedisTopologySignal(),
+		NewReliabilityPipelineSignal(),
+		NewCredentialsSignal(),
+		NewSourceAttributionSignal(),
+		NewMigrationsSignal(),
+		NewReliabilityIndexSignal(),
+		NewRolloutGuardSignal(),
+		NewContainerRuntimeSignal(),
+		NewJournalBufferSignal(),
+		NewProvenanceSignal(),
+		NewReleaseBuilderSignal(),
+		NewRedisKeyEventsSignal(),
+		NewStuckLeasesSignal(),
+		NewTaskConvergenceSignal(),
+		NewProxyPathSignal(),
+		NewProxyMemorySignal(),
+		NewProxyPoolSignal(),
+		NewProxyRuntimeSignal(),
+		NewProxyCacheSignal(),
+		NewKeyPublicationSignal(),
+		NewSubtensorSignal(),
+		NewSubtensorConvergenceSignal(),
+		NewPointsReadinessSignal(),
+		NewEdgeIPv6Signal(),
+		NewTLSExpirySignal(),
+		NewGrafanaDatasourcesSignal(),
+		NewGrafanaIngressSignal(),
+		NewGrafanaNodeSignal(),
+		NewMimirIndexSignal(),
+		NewLogShipperSignal(),
+		NewLokiTailersSignal(),
+		NewMimirContinuitySignal(),
+		NewMimirAdmissionSignal(),
+		NewMimirShutdownSignal(),
+		NewBackupArchivesSignal(),
+		NewAssociationFilesSignal(),
+		NewEmailAssetsSignal(),
+		NewPlayCrashesSignal(),
+		NewAppleCrashesSignal(),
+		NewVPNSessionsSignal(),
+	}
+}
+
+// IncludeSignals returns only the registered signals named by short key,
+// SIGNALS.md number, or probe ID. At least one identifier is required, and
+// every identifier must resolve to exactly one signal. This fail-closed
+// contract prevents an empty, misspelled, or ambiguous focused invocation
+// from silently expanding to the complete production registry.
+func IncludeSignals(signals []Signal, identifiers ...string) ([]Signal, error) {
+	if len(identifiers) == 0 {
+		return nil, fmt.Errorf("monitor: at least one included signal is required")
+	}
+
+	requested := make([]string, 0, len(identifiers))
+	matches := make(map[string]int, len(identifiers))
+	for _, identifier := range identifiers {
+		if _, duplicate := matches[identifier]; duplicate {
+			continue
+		}
+		requested = append(requested, identifier)
+		matches[identifier] = 0
+	}
+
+	selected := make([]Signal, 0, len(signals))
+	for _, signal := range signals {
+		matched := false
+		for _, identifier := range requested {
+			if identifier == signal.Key() || identifier == signal.Number() || identifier == signal.ID() {
+				matches[identifier]++
+				matched = true
+			}
+		}
+		if matched {
+			selected = append(selected, signal)
+		}
+	}
+	for _, identifier := range requested {
+		switch matches[identifier] {
+		case 0:
+			return nil, fmt.Errorf("monitor: included signal %q is not registered", identifier)
+		case 1:
+		default:
+			return nil, fmt.Errorf("monitor: included signal %q matches multiple registered signals", identifier)
+		}
+	}
+	return selected, nil
+}
+
+// ExcludeSignals returns the registered signals except those named by short
+// key, SIGNALS.md number, or probe ID. Unknown names fail closed so a typo
+// cannot silently re-enable a signal an operator intended to pause.
+func ExcludeSignals(signals []Signal, identifiers ...string) ([]Signal, error) {
+	requested := map[string]bool{}
+	for _, identifier := range identifiers {
+		requested[identifier] = false
+	}
+	selected := make([]Signal, 0, len(signals))
+	for _, signal := range signals {
+		excluded := false
+		for identifier := range requested {
+			if identifier == signal.Key() || identifier == signal.Number() || identifier == signal.ID() {
+				requested[identifier] = true
+				excluded = true
+			}
+		}
+		if !excluded {
+			selected = append(selected, signal)
+		}
+	}
+	for identifier, found := range requested {
+		if !found {
+			return nil, fmt.Errorf("monitor: excluded signal %q is not registered", identifier)
+		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("monitor: every registered signal was excluded")
+	}
+	return selected, nil
+}
+
+// Signals returns a copy of the registered slice.
+func (m *Monitor) Signals() []Signal {
+	return append([]Signal(nil), m.signals...)
+}
+
+// Run executes all registered signals and returns every active alert. A probe
+// execution failure also becomes a structured visibility alert while the
+// joined error lets callers choose a non-zero exit status.
+func (m *Monitor) Run(ctx context.Context) (Alerts, error) {
+	alerts := Alerts{}
+	errs := []error{}
+	for _, signal := range m.signals {
+		signalAlerts, err := signal.Run(ctx, m.settings)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("signal %s: %w", signal.Number(), err))
+			alerts = append(alerts, visibilityAlert(m.settings, signal, err))
+			continue
+		}
+		alerts = append(alerts, signalAlerts...)
+	}
+	sort.SliceStable(alerts, func(i, j int) bool {
+		return alerts[i].Identity() < alerts[j].Identity()
+	})
+	return alerts, errors.Join(errs...)
+}
+
+func visibilityAlert(settings SignalSettings, signal Signal, err error) Alert {
+	var providerFailure interface{ monitorVisibilityClass() string }
+	if errors.As(err, &providerFailure) {
+		return providerFailureAlert(settings, signal, err, providerFailure.monitorVisibilityClass())
+	}
+	errorText := redactTaskErrorIdentifiers(err.Error())
+	if target, ok := sshAdmissionResetTarget(err); ok {
+		return Alert{
+			SignalNumber: signal.Number(),
+			SignalKey:    signal.Key(),
+			SignalID:     "monitor/visibility",
+			SignalName:   signal.Name(),
+			Severity:     SeverityWarn,
+			Class:        "ssh-admission-reset",
+			Target:       target,
+			Environment:  settings.Environment,
+			ObservedAt:   settings.Now(),
+			Sustain:      2,
+			Symptom:      fmt.Sprintf("SSH admission to %s was reset while running signal %s (%s)", target, signal.Number(), signal.ID()),
+			Mechanism:    "The SSH connection closed during key exchange, before the remote observation command could run. On this fleet the same signature occurred when slow public pre-auth clients occupied OpenSSH's global MaxStartups pool and concurrent monitor probes supplied the trip connection. An sshd reload/restart or a network reset can look similar; the host journal is the discriminator.",
+			Baseline:     "Every monitor SSH command authenticates without an sshd MaxStartups throttle, key-exchange reset, or connection close.",
+			Observed:     errorText,
+			Context:      fmt.Sprintf("failed_signal=%s failed_probe=%s; this is observation-path failure, not evidence that the probed database or service rejected the command", signal.Key(), signal.ID()),
+			Action:       "On the target, read the ssh/sshd journal across this timestamp and inspect the listener's current startup count plus [accepted]/[net] children. If it reports beginning MaxStartups/past MaxStartups, keep the monitor's shared per-host command cap and deploy the shared xops SSH pre-auth hardening; restrict public SSH where operational access permits. Do not blame PostgreSQL or merely raise MaxStartups. If the journal instead shows an sshd lifecycle or host network event, repair that event.",
+			Verify:       "The target journal records no new MaxStartups throttle or key-exchange drop through monitor startup and at least two recurring cadences, and the failed signal returns a concrete observation.",
+			Playbook:     "SIGNALS.md monitor SSH-admission note and MONITOR.md §4",
+		}
+	}
+	return Alert{
+		SignalNumber: signal.Number(),
+		SignalKey:    signal.Key(),
+		SignalID:     "monitor/visibility",
+		SignalName:   signal.Name(),
+		Severity:     SeverityWarn,
+		Class:        "cannot-observe",
+		Target:       signal.ID(),
+		Environment:  settings.Environment,
+		ObservedAt:   settings.Now(),
+		Sustain:      2,
+		Symptom:      fmt.Sprintf("Signal %s (%s) could not run: %s", signal.Number(), signal.ID(), errorText),
+		Mechanism:    "The monitor could not reach or parse a source of truth, so the associated production condition is currently unknown.",
+		Baseline:     "Every registered signal completes within its command timeout.",
+		Observed:     errorText,
+		Action:       "Restore access to the signal source, then rerun the failed signal; also check whether the unreachable target is itself the incident.",
+		Verify:       "The signal completes and reports either no alert or a concrete target alert.",
+		Playbook:     "SIGNALS.md §1.4 and MONITOR.md §3.6",
+	}
+}
+
+func providerFailureAlert(settings SignalSettings, signal Signal, err error, class string) Alert {
+	errorText := providerErrorText(err)
+	symptom := fmt.Sprintf("Signal %s (%s) lost provider visibility: %s", signal.Number(), signal.ID(), errorText)
+	mechanism := "The external reporting provider could not complete a bounded API request, so the associated crash condition is unknown rather than healthy."
+	action := "Check provider availability, rate limits, and the request contract; preserve the last committed cursor and rerun without bypassing validation."
+	verify := "The provider API completes every page and the signal returns either explicit current data or a concrete crash alert."
+	switch class {
+	case providerAuthenticationClass:
+		symptom = fmt.Sprintf("Signal %s (%s) could not authenticate to its reporting provider: %s", signal.Number(), signal.ID(), errorText)
+		mechanism = "The reporting credential could not obtain or use its short-lived token, so no crash response is authoritative. A 401/403 can mean a revoked key, clock error, disabled API, wrong app access, or insufficient read-only role."
+		action = "Validate the dedicated Vault resource, local clock, provider API enablement, and least-privilege app role. Rotate a revoked key through Vault; do not paste tokens into logs or disable the probe."
+		verify = "A fresh OAuth/JWT token authenticates, the configured app is readable, and the next signal run reaches an explicit provider freshness/data boundary."
+	case providerDataClass:
+		symptom = fmt.Sprintf("Signal %s (%s) rejected invalid provider report data: %s", signal.Number(), signal.ID(), errorText)
+		mechanism = "The provider response violated its bounded schema, pagination, size, checksum, compression, or app-identity contract. Advancing the cursor would lose or double-count crash evidence."
+		action = "Compare the response shape with the current provider contract and status page. Fix the parser only after a sanitized fixture reproduces a legitimate schema change; otherwise retry after the provider repairs the data."
+		verify = "Every response page and segment validates, the cursor advances exactly once, and the deterministic malformed-data fixture still fails closed."
+	}
+	return Alert{
+		SignalNumber: signal.Number(), SignalKey: signal.Key(), SignalID: "monitor/visibility", SignalName: signal.Name(),
+		Severity: SeverityWarn, Class: class, Target: signal.ID(), Environment: settings.Environment,
+		ObservedAt: settings.Now(), Sustain: 1,
+		Symptom: symptom, Mechanism: mechanism,
+		Baseline: "The configured external provider authenticates and publishes a complete, bounded, schema-valid observation on every signal cadence.",
+		Observed: errorText, Action: action, Verify: verify,
+		Playbook: "SIGNALS.md §" + signal.Number(),
+	}
+}
+
+// sshAdmissionResetTarget recognizes the client-side OpenSSH text emitted
+// when a connection dies before authentication. It intentionally does not
+// assert MaxStartups from this text alone; visibilityAlert directs the
+// operator to the authoritative sshd journal for that discriminator.
+func sshAdmissionResetTarget(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	message := err.Error()
+	keyExchangeReset := strings.Contains(message, "kex_exchange_identification")
+	port22Close := strings.Contains(message, "port 22") &&
+		(strings.Contains(message, "Connection reset by") || strings.Contains(message, "Connection closed by"))
+	if !keyExchangeReset && !port22Close {
+		return "", false
+	}
+	target, _, found := strings.Cut(message, ":")
+	target = strings.TrimSpace(target)
+	if !found || target == "" || strings.ContainsAny(target, " \t\r\n") {
+		target = "ssh-target"
+	}
+	return target, true
+}

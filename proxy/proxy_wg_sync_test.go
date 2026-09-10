@@ -43,6 +43,9 @@ func newTestProxyClient(t testing.TB, clientIpv4 netip.Addr) *model.ProxyClient 
 }
 
 func TestWgServerSyncProxyClients(t *testing.T) {
+	if testing.Short() {
+		return
+	}
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		setProxyTestEnv()
 
@@ -50,7 +53,9 @@ func TestWgServerSyncProxyClients(t *testing.T) {
 		defer cancel()
 
 		proxyDeviceManager := NewProxyDeviceManagerWithDefaults(ctx)
-		defer proxyDeviceManager.Close()
+		defer func() {
+			_ = proxyDeviceManager.CloseAndWait(context.Background())
+		}()
 
 		wgCtx, wgCancel := context.WithCancel(ctx)
 		defer wgCancel()

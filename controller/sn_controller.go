@@ -15,9 +15,7 @@ package controller
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
 	"net/http"
 	"strings"
@@ -27,6 +25,7 @@ import (
 	"github.com/urfoundation/sn/merkle"
 	"github.com/urfoundation/sn/ss58"
 
+	"github.com/urnetwork/glog"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/session"
@@ -40,6 +39,14 @@ type SnSetWalletArgs struct {
 	// the caller's network. Release 1.0 settlement uses this provider-level
 	// history, while the network wallet remains available for old epochs.
 	ClientId *server.Id `json:"client_id,omitempty"`
+	// Signature is the coldkey's sr25519 signature (hex) over Message, and
+	// Message is the exact single-use challenge text issued by
+	// `POST /auth/wallet-challenge` for blockchain TAO (the ur.io wallet
+	// bridge signs it with purpose "connect"). Both are required unless the
+	// deployment keeps the CLI compatibility gate open (the selected st.yml
+	// wallet_allow_unsigned policy).
+	Signature string `json:"signature,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 type SnSetWalletError struct {
@@ -59,14 +66,44 @@ func SnSetWallet(
 	setWallet *SnSetWalletArgs,
 	clientSession *session.ClientSession,
 ) (*SnSetWalletResult, error) {
-	coldkeyPubkey, err := ss58.DecodeWithPrefix(setWallet.ColdkeySs58, ss58.BittensorPrefix)
-	if err != nil {
-		return &SnSetWalletResult{
-			Error: &SnSetWalletError{
-				Message: fmt.Sprintf("Invalid ss58 coldkey: %s", err),
-			},
-		}, nil
+	fail := func(message string) (*SnSetWalletResult, error) {
+		return &SnSetWalletResult{Error: &SnSetWalletError{Message: message}}, nil
 	}
+	coldkeySs58 := strings.TrimSpace(setWallet.ColdkeySs58)
+	coldkeyPubkey, err := ss58.DecodeWithPrefix(coldkeySs58, ss58.BittensorPrefix)
+	if err != nil {
+		return fail(fmt.Sprintf("Invalid ss58 coldkey: %s", err))
+	}
+	if SnWalletBanned(coldkeyPubkey) {
+		return fail("This wallet address cannot be used.")
+	}
+	// proof of key possession: the coldkey signs the single-use login
+	// challenge, so a pasted address alone can never redirect a payout and
+	// a captured signature cannot be replayed
+	if strings.TrimSpace(setWallet.Signature) == "" || setWallet.Message == "" {
+		if !snUnsignedWalletSetAllowed() {
+			return fail("A coldkey signature over the wallet challenge is required.")
+		}
+		glog.Infof("[sn]unsigned wallet set for network %s (selected wallet_allow_unsigned policy)\n", clientSession.ByJwt.NetworkId)
+	} else {
+		use, useErr := model.UseWalletAuthChallenge(&model.UseWalletAuthChallengeArgs{
+			Blockchain: model.TAO.String(),
+			PublicKey:  coldkeySs58,
+			Message:    setWallet.Message,
+			Signature:  setWallet.Signature,
+		}, clientSession.Ctx)
+		if useErr != nil {
+			return nil, useErr
+		}
+		if !use.Valid {
+			message := "Invalid wallet signature."
+			if use.Error != nil {
+				message = use.Error.Message
+			}
+			return fail(message)
+		}
+	}
+	setWallet.ColdkeySs58 = coldkeySs58
 
 	clientId := setWallet.ClientId
 	if clientId == nil {
@@ -131,11 +168,16 @@ func SnPoolClaim(
 	clientSession *session.ClientSession,
 ) (*SnPoolClaimResult, error) {
 	ctx := clientSession.Ctx
+	cfg := stConfig()
+	if cfg == nil || cfg.DeploymentKey() == "" {
+		return &SnPoolClaimResult{Error: &SnPoolClaimError{Message: "No claimable epoch."}}, nil
+	}
+	deploymentKey := cfg.DeploymentKey()
 	var stEpoch *model.StEpoch
 	if poolClaim.Epoch != nil {
-		stEpoch = model.GetStEpoch(ctx, *poolClaim.Epoch)
+		stEpoch = model.GetStEpoch(ctx, deploymentKey, *poolClaim.Epoch)
 	} else {
-		stEpoch = model.GetLatestFinalizedStEpoch(ctx)
+		stEpoch = model.GetLatestFinalizedStEpoch(ctx, deploymentKey)
 	}
 	if stEpoch == nil {
 		return &SnPoolClaimResult{
@@ -161,9 +203,7 @@ func SnPoolClaim(
 
 	var leaf *model.StPayoutLeaf
 	var artifactRecord *model.StPayoutArtifact
-	if cfg := stConfig(); cfg != nil {
-		artifactRecord = model.GetStPayoutArtifact(ctx, stEpoch.Epoch, cfg.NoId)
-	}
+	artifactRecord = model.GetStPayoutArtifact(ctx, deploymentKey, stEpoch.Epoch, cfg.NoId)
 	// Provider identity, payout ownership, and head exclusion are all frozen in
 	// the immutable epoch artifact. Never apply the caller's current wallet to
 	// an old epoch after a rotation.
@@ -172,25 +212,16 @@ func SnPoolClaim(
 		if !available {
 			return nil, fmt.Errorf("payout artifact store unavailable")
 		}
-		reader, readErr := store.Get(ctx, artifactRecord.ContentKey)
+		artifact, _, readErr := startifact.Read(ctx, store, artifactRecord.ContentHash)
 		if readErr != nil {
-			return nil, readErr
-		}
-		bytes, readErr := io.ReadAll(io.LimitReader(reader, 32<<20))
-		reader.Close()
-		if readErr != nil {
-			return nil, readErr
-		}
-		var artifact startifact.Artifact
-		if json.Unmarshal(bytes, &artifact) != nil || startifact.Verify(&artifact) != nil || !strings.EqualFold(artifact.ContentHash, artifactRecord.ContentHash) {
-			return nil, fmt.Errorf("payout artifact integrity failure")
+			return nil, fmt.Errorf("payout artifact integrity failure: %w", readErr)
 		}
 		clientId := stId16(*clientSession.ByJwt.ClientId)
 		for _, provider := range artifact.Providers {
 			if provider.ClientID != clientId {
 				continue
 			}
-			for _, candidate := range model.GetStPayoutLeaves(ctx, stEpoch.Epoch, artifact.NoID) {
+			for _, candidate := range model.GetStPayoutLeaves(ctx, deploymentKey, stEpoch.Epoch, artifact.NoID) {
 				if candidate.Coldkey == provider.Coldkey {
 					leaf = candidate
 					break
@@ -202,8 +233,8 @@ func SnPoolClaim(
 	// Backward-compatible lookup for a network-scoped JWT/legacy epoch.
 	if leaf == nil {
 		if wallet := model.GetStWallet(ctx, clientSession.ByJwt.NetworkId); wallet != nil {
-			if noId, ok := getStPayoutNoIdForColdkey(ctx, stEpoch.Epoch, wallet.ColdkeyPubkey); ok {
-				leaf = model.GetStPayoutLeafForColdkey(ctx, stEpoch.Epoch, noId, wallet.ColdkeyPubkey)
+			if noId, ok := getStPayoutNoIdForColdkey(ctx, deploymentKey, stEpoch.Epoch, wallet.ColdkeyPubkey); ok {
+				leaf = model.GetStPayoutLeafForColdkey(ctx, deploymentKey, stEpoch.Epoch, noId, wallet.ColdkeyPubkey)
 			}
 		}
 	}
@@ -217,7 +248,7 @@ func SnPoolClaim(
 	}
 	coldkey, noId := leaf.Coldkey, leaf.NoId
 
-	leaves := model.GetStPayoutLeaves(ctx, stEpoch.Epoch, noId)
+	leaves := model.GetStPayoutLeaves(ctx, deploymentKey, stEpoch.Epoch, noId)
 	root, proof, err := snPoolClaimProof(leaves, coldkey, leaf.ShareBps)
 	if err != nil {
 		// a proof that does not self-verify is a server bug; never hand it out
@@ -237,14 +268,14 @@ func SnPoolClaim(
 		result.ArtifactHash = artifactRecord.ContentHash
 		result.ArtifactUri = "/sn/artifact?hash=" + artifactRecord.ContentHash
 	}
-	if cfg := stConfig(); cfg != nil && cfg.SettlementVault != (common.Address{}) {
+	if cfg.SettlementVault != (common.Address{}) {
 		result.ContractAddress = cfg.SettlementVault.Hex()
 		result.SettlementVaultAddress = cfg.SettlementVault.Hex()
 		result.ChainId = cfg.ChainId
 	}
 	// contract coordinates ride along from the hot epoch mirror; on a cache
 	// miss they are zero and the claimant falls back to its own config
-	if summary := model.GetStEpochSummaryCache(ctx); summary != nil {
+	if summary := model.GetStEpochSummaryCache(ctx, deploymentKey); summary != nil {
 		if result.ContractAddress == "" {
 			result.ContractAddress = summary.ContractAddress
 			result.ChainId = summary.ChainId
@@ -258,7 +289,7 @@ func SnPoolClaim(
 // noId, and the claim route does not take one. With the single-NO bootstrap
 // (PLAN.md §10) a coldkey has at most one pool leaf; should multiple
 // operators ever pool the same coldkey, the lowest noId is served.
-func getStPayoutNoIdForColdkey(ctx context.Context, epoch uint64, coldkey [32]byte) (uint64, bool) {
+func getStPayoutNoIdForColdkey(ctx context.Context, deploymentKey model.StDeploymentKey, epoch uint64, coldkey [32]byte) (uint64, bool) {
 	var noId uint64
 	var found bool
 	server.Db(ctx, func(conn server.PgConn) {
@@ -267,10 +298,11 @@ func getStPayoutNoIdForColdkey(ctx context.Context, epoch uint64, coldkey [32]by
 			`
                 SELECT no_id
                 FROM st_payout_leaf
-                WHERE epoch = $1 AND coldkey = $2
+				WHERE deployment_key = $1 AND epoch = $2 AND coldkey = $3
                 ORDER BY no_id ASC
                 LIMIT 1
             `,
+			string(deploymentKey),
 			int64(epoch),
 			coldkey[:],
 		)
@@ -347,19 +379,24 @@ func snProofBytes(proof [][32]byte) [][]byte {
 // callers can tell "not synced yet" apart from a real epoch-0 mirror.
 func SnEpoch(clientSession *session.ClientSession) (*model.StEpochSummary, error) {
 	ctx := clientSession.Ctx
+	cfg := stConfig()
+	if cfg == nil || cfg.DeploymentKey() == "" {
+		return nil, fmt.Errorf("%d Subnet epoch state is not synced yet.", http.StatusServiceUnavailable)
+	}
+	deploymentKey := cfg.DeploymentKey()
 
-	if summary := model.GetStEpochSummaryCache(ctx); summary != nil {
+	if summary := model.GetStEpochSummaryCache(ctx, deploymentKey); summary != nil {
 		return summary, nil
 	}
 
-	if stEpoch := model.GetLatestStEpoch(ctx); stEpoch != nil {
-		return &model.StEpochSummary{
+	if stEpoch := model.GetLatestStEpoch(ctx, deploymentKey); stEpoch != nil {
+		return snEpochSummaryWithChainSettings(cfg, &model.StEpochSummary{
 			Epoch:               stEpoch.Epoch,
 			StartBlock:          stEpoch.StartBlock,
 			CommitDeadlineBlock: stEpoch.CommitDeadlineBlock,
 			TrailsDeadlineBlock: stEpoch.TrailsDeadlineBlock,
 			FinalizeBlock:       stEpoch.FinalizeBlock,
-		}, nil
+		}), nil
 	}
 
 	return nil, fmt.Errorf("%d Subnet epoch state is not synced yet.", http.StatusServiceUnavailable)

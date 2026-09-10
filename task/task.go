@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	mathrand "math/rand"
 	"reflect"
 	"regexp"
@@ -63,8 +64,23 @@ var orphanedRunPostCounter = prometheus.NewCounter(
 	},
 )
 
+// taskTimestampLeaseRefreshErrorCounter counts timestamp-heartbeat writes that
+// failed while the direct PostgreSQL session still proved advisory ownership.
+// The advisory lock is the duplicate-execution guard; this timestamp is only
+// the bounded crash-recovery hint, so a pooled write stall must stay visible
+// without canceling live work and releasing its ownership session.
+var taskTimestampLeaseRefreshErrorCounter = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Namespace: "urnetwork",
+		Subsystem: "task",
+		Name:      "timestamp_lease_refresh_errors_total",
+		Help:      "Task timestamp lease refreshes that failed while advisory ownership remained healthy",
+	},
+)
+
 func init() {
 	prometheus.MustRegister(orphanedRunPostCounter)
+	prometheus.MustRegister(taskTimestampLeaseRefreshErrorCounter)
 }
 
 // the task system captures work that needs to be done to advance the platform
@@ -160,12 +176,14 @@ func (self *taskClaimGuard) release() {
 // the reschedule time is uniformly chosen on [0, t] so the expected mean will be t/2
 var RescheduleTimeout = 2 * BlockSizeSeconds * time.Second
 
-// cap for the exponential error-reschedule backoff. A task that keeps erroring
-// retries at RescheduleTimeout * 2^reschedule_error_count (plus the uniform
-// jitter above), capped here. Without backoff a wedged task (e.g. an external
-// 429 rate limit) retried every ~2s forever; 8k such payment tasks churned
-// pending_task to ~94% dead tuples and made the poll query 39% of all db exec
-// time. The count resets when the task completes (the pending row is deleted).
+// nominal cap for the exponential error-reschedule backoff. A task that keeps
+// erroring retries at RescheduleTimeout * 2^reschedule_error_count, capped
+// here. Saturated retries are jittered from half to one-and-a-half times this
+// value, preserving the one-hour mean while dispersing a cohort over an hour.
+// Without backoff a wedged task (e.g. an external 429 rate limit) retried every
+// ~2s forever; 8k such payment tasks churned pending_task to ~94% dead tuples
+// and made the poll query 39% of all db exec time. The count resets when the
+// task completes (the pending row is deleted).
 var RescheduleBackoffMaxTimeout = 1 * time.Hour
 
 // clamp for the backoff exponent in the reschedule write (bounds power())
@@ -179,6 +197,41 @@ const rescheduleBackoffMaxExponent = 24
 // load, and a PERMANENTLY missing target stays loudly visible in
 // has_reschedule_error instead of hiding behind an hour-long backoff.
 const targetNotFoundBackoffMaxExponent = 3
+
+// errorRescheduleDelay keeps the legacy short-retry behavior until the
+// exponential backoff reaches its cap. At the cap, a two-second jitter is too
+// small: tasks created by one outage retain the same wave forever and can rate
+// limit their shared dependency once an hour. Proportional jitter spreads that
+// wave over [cap/2, 3*cap/2), while its mean remains cap (plus the legacy
+// half-base jitter). randomUnit is explicit so the distribution contract has
+// deterministic synthetic tests; production passes math/rand.Float64().
+func errorRescheduleDelay(
+	base time.Duration,
+	cap time.Duration,
+	errorCount int,
+	maxExponent int,
+	randomUnit float64,
+) time.Duration {
+	if base <= 0 || cap <= 0 {
+		return 0
+	}
+	if errorCount < 0 {
+		errorCount = 0
+	}
+	if maxExponent < 0 {
+		maxExponent = 0
+	}
+	exponent := min(errorCount, maxExponent)
+	nominal := time.Duration(math.Min(
+		float64(cap),
+		float64(base)*math.Pow(2, float64(exponent)),
+	))
+	randomUnit = max(0, min(randomUnit, math.Nextafter(1, 0)))
+	if nominal < cap {
+		return nominal + time.Duration(randomUnit*float64(base))
+	}
+	return nominal/2 + time.Duration(randomUnit*float64(nominal)) + base/2
+}
 
 // ErrTargetNotFound tags a claimed task whose function has no registered
 // target in this worker (deploy version skew, or a missing registration).
@@ -524,7 +577,8 @@ func GetTasks(ctx context.Context, taskIds ...server.Id) map[server.Id]*Task {
 		        pending_task.run_max_time_seconds,
 		        pending_task.claim_time,
 		        pending_task.release_time,
-		        pending_task.reschedule_error
+		        pending_task.reschedule_error,
+		        pending_task.reschedule_error_count
 		    FROM pending_task
 		`
 
@@ -583,6 +637,7 @@ func GetTasks(ctx context.Context, taskIds ...server.Id) map[server.Id]*Task {
 					&task.ClaimTime,
 					&task.ReleaseTime,
 					&rescheduleError,
+					&task.RescheduleErrorCount,
 				))
 				if byJwtJson != nil {
 					task.ClientByJwtJson = *byJwtJson
@@ -935,20 +990,21 @@ func RemoveFinishedTasks(ctx context.Context, minTime time.Time, postErrorMinTim
 }
 
 type Task struct {
-	TaskId            server.Id
-	FunctionName      string
-	ArgsJson          string
-	ClientAddress     string
-	ClientAddressHash []byte
-	ClientAddressPort int
-	ClientByJwtJson   string
-	RunAt             time.Time
-	RunOnceKey        string
-	RunPriority       int
-	RunMaxTimeSeconds int
-	ClaimTime         time.Time
-	ReleaseTime       time.Time
-	RescheduleError   string
+	TaskId               server.Id
+	FunctionName         string
+	ArgsJson             string
+	ClientAddress        string
+	ClientAddressHash    []byte
+	ClientAddressPort    int
+	ClientByJwtJson      string
+	RunAt                time.Time
+	RunOnceKey           string
+	RunPriority          int
+	RunMaxTimeSeconds    int
+	ClaimTime            time.Time
+	ReleaseTime          time.Time
+	RescheduleError      string
+	RescheduleErrorCount int
 }
 
 func (self *Task) ClientSession(ctx context.Context) (*session.ClientSession, error) {
@@ -1304,6 +1360,12 @@ type TaskWorker struct {
 	targets     map[string]Target
 	settings    *TaskWorkerSettings
 
+	// These production-boundary functions are fields so tests can trigger a
+	// heartbeat and a pooled refresh panic with explicit barriers. Every worker
+	// constructed through NewTaskWorker receives the real clock and DB write.
+	heartbeatAfter             func(time.Duration) <-chan time.Time
+	refreshTaskTimestampLeases func(context.Context, map[server.Id]*Task)
+
 	stateLock sync.Mutex
 	draining  bool
 
@@ -1321,14 +1383,16 @@ func NewTaskWorker(ctx context.Context, settings *TaskWorkerSettings) *TaskWorke
 	drainCtx, drainCancel := context.WithCancel(cancelCtx)
 
 	taskWorker := &TaskWorker{
-		ctx:         cancelCtx,
-		cancel:      cancel,
-		runCtx:      runCtx,
-		runCancel:   runCancel,
-		drainCtx:    drainCtx,
-		drainCancel: drainCancel,
-		targets:     map[string]Target{},
-		settings:    settings,
+		ctx:                        cancelCtx,
+		cancel:                     cancel,
+		runCtx:                     runCtx,
+		runCancel:                  runCancel,
+		drainCtx:                   drainCtx,
+		drainCancel:                drainCancel,
+		targets:                    map[string]Target{},
+		settings:                   settings,
+		heartbeatAfter:             time.After,
+		refreshTaskTimestampLeases: refreshTaskTimestampLeases,
 	}
 
 	taskWorker.AddTargets(
@@ -1774,6 +1838,62 @@ func (self *TaskWorker) takeTasks(n int) (
 	return claimedTasks, claimGuard, nil
 }
 
+// refreshTaskTimestampLeases writes the short crash-recovery timestamps through
+// the ordinary pooled DB path. server.Tx raises DB errors, so callers must keep
+// this operation behind tryRefreshTaskTimestampLeases's narrow recovery
+// boundary. The direct taskClaimGuard session remains the ownership authority.
+func refreshTaskTimestampLeases(
+	ctx context.Context,
+	tasks map[server.Id]*Task,
+) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.BatchInTx(ctx, tx, func(batch server.PgBatch) {
+			claimTime := server.NowUtc()
+			releaseTime := claimTime.Add(TaskLeaseTimeout)
+
+			for _, task := range tasks {
+				// GREATEST prevents a backwards clock adjustment from
+				// shortening an existing lease. Under a normal clock every
+				// heartbeat advances the bounded recovery deadline.
+				batch.Queue(
+					`
+						UPDATE pending_task
+						SET
+							claim_time = $2,
+							release_time = GREATEST(release_time, $3)
+						WHERE task_id = $1
+					`,
+					task.TaskId,
+					claimTime,
+					releaseTime,
+				)
+			}
+		})
+	})
+}
+
+// tryRefreshTaskTimestampLeases converts only the pooled timestamp-refresh
+// operation's panic contract into an error. Losing that recovery hint is
+// observable but nonfatal while claimGuard.ping has just proved the direct
+// advisory-lock session healthy.
+func tryRefreshTaskTimestampLeases(
+	ctx context.Context,
+	tasks map[server.Id]*Task,
+	refresh func(context.Context, map[server.Id]*Task),
+) (returnErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if err, ok := recovered.(error); ok {
+				returnErr = fmt.Errorf("refresh task timestamp leases: %w", err)
+			} else {
+				returnErr = fmt.Errorf("refresh task timestamp leases: %v", recovered)
+			}
+		}
+	}()
+	refresh(ctx, tasks)
+	return nil
+}
+
 // return taskIds of the finished tasks, rescheduled tasks
 func (self *TaskWorker) EvalTasks(n int) (
 	finishedTaskIds []server.Id,
@@ -1931,7 +2051,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 					rescheduledTasks[r.task.TaskId] = r.err
 				}
 
-			case <-time.After(ReleaseTimeout / 3):
+			case <-self.heartbeatAfter(ReleaseTimeout / 3):
 				elapsedSeconds := float32(time.Now().Sub(startTime)/time.Millisecond) / 1000
 				if 10 <= elapsedSeconds {
 					for _, task := range tasks {
@@ -1954,32 +2074,21 @@ func (self *TaskWorker) EvalTasks(n int) (
 				)
 				// Keep the direct session carrying the advisory ownership lock
 				// active and fail this evaluation if that ownership session is lost.
-				server.Raise(claimGuard.ping(heartbeatCtx))
-				server.Tx(heartbeatCtx, func(tx server.PgTx) {
-					server.BatchInTx(heartbeatCtx, tx, func(batch server.PgBatch) {
-						claimTime := server.NowUtc()
-						releaseTime := claimTime.Add(TaskLeaseTimeout)
-
-						for _, task := range tasks {
-							// GREATEST prevents a backwards clock adjustment from
-							// shortening an existing lease. Under a normal clock every
-							// heartbeat advances the bounded recovery deadline.
-							batch.Queue(
-								`
-									UPDATE pending_task
-									SET
-										claim_time = $2,
-										release_time = GREATEST(release_time, $3)
-									WHERE task_id = $1
-								`,
-								task.TaskId,
-								claimTime,
-								releaseTime,
-							)
-						}
-					})
-				})
-				heartbeatCancel()
+				func() {
+					defer heartbeatCancel()
+					server.Raise(claimGuard.ping(heartbeatCtx))
+					if err := tryRefreshTaskTimestampLeases(
+						heartbeatCtx,
+						tasks,
+						self.refreshTaskTimestampLeases,
+					); err != nil {
+						taskTimestampLeaseRefreshErrorCounter.Inc()
+						glog.Infof(
+							"[taskworker]timestamp lease refresh failed while advisory ownership remained healthy: %v\n",
+							err,
+						)
+					}
+				}()
 			}
 		}
 	}()
@@ -2067,14 +2176,12 @@ func (self *TaskWorker) EvalTasks(n int) (
 
 			for taskId, err := range rescheduledTasks {
 				now := server.NowUtc()
-				rescheduleTime := now.Add(time.Second * time.Duration(mathrand.Intn(int(RescheduleTimeout/time.Second))))
-				// exponential backoff on consecutive errors: the jittered base
-				// above plus RescheduleTimeout * 2^errorCount, capped at
-				// RescheduleBackoffMaxTimeout. The first error retries near the
-				// old fast cadence (transient blips stay fast); a wedged task
-				// (external rate limit, hard failure) converges to the cap
-				// instead of hammering pending_task and its dependency every
-				// ~2s. The exponent is clamped in SQL to keep power() bounded.
+				// Exponential backoff is computed in Go so saturated retries can
+				// receive proportional jitter. The first error retains the old
+				// fast cadence (transient blips stay fast); a wedged cohort
+				// converges to a one-hour mean while spreading retries across a
+				// full hour instead of preserving an outage wave. The exponent
+				// remains clamped to keep power() bounded.
 				//
 				// Two error classes adjust the backoff:
 				// - drained (operator-caused): no error-count advance and a
@@ -2091,16 +2198,20 @@ func (self *TaskWorker) EvalTasks(n int) (
 				} else if errors.Is(err, ErrTargetNotFound) {
 					backoffMaxExponent = targetNotFoundBackoffMaxExponent
 				}
+				rescheduleTime := now.Add(errorRescheduleDelay(
+					RescheduleTimeout,
+					RescheduleBackoffMaxTimeout,
+					tasks[taskId].RescheduleErrorCount,
+					backoffMaxExponent,
+					mathrand.Float64(),
+				))
 				batch.Queue(
 					`
 						UPDATE pending_task
 						SET
 							reschedule_error = $2,
-							reschedule_error_count = pending_task.reschedule_error_count + $7,
-							run_at = $3::timestamp + make_interval(secs => LEAST(
-								$5::double precision * power(2::double precision, LEAST(pending_task.reschedule_error_count, $8)::double precision),
-								$6::double precision
-							)),
+							reschedule_error_count = pending_task.reschedule_error_count + $5,
+							run_at = $3,
 							release_time = $4
 						WHERE task_id = $1
 					`,
@@ -2108,10 +2219,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 					err.Error(),
 					rescheduleTime,
 					now,
-					float64(RescheduleTimeout/time.Second),
-					float64(RescheduleBackoffMaxTimeout/time.Second),
 					errorCountDelta,
-					backoffMaxExponent,
 				)
 			}
 		})

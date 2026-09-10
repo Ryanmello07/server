@@ -539,6 +539,38 @@ func TestPerfvarSingleRegion1000msP2pLegacyCorrectness(t *testing.T) {
 	})
 }
 
+// A focused developer gate reproduces the maximum-RTT native P2P lifecycle
+// without paying for the preceding exchange routes.
+func TestPerfvarSingleRegion1000msP2pFastCorrectness(t *testing.T) {
+	if testing.Short() {
+		return
+	}
+	testEnvironment := &server.TestEnv{ApplyDbMigrations: true, RerunCount: 0}
+	testEnvironment.Run(t, func(t testing.TB) {
+		profiles := initialNetworkProfiles(2026081100)
+		profile := profiles["single-region-1000ms-rtt"]
+		providerProfile := profiles["clean-lan"]
+		providerProfile.SourceNote = "synthetic provider colocated with server/connect"
+		fixture, err := newPerfvarCorrectnessFixture(
+			t,
+			fullTunRouteP2pFast,
+			profile,
+			profile,
+			providerProfile,
+			defaultTunResourceProfile(),
+			10*time.Minute,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, measureErr := fixture.measureExactTCP(64 * 1024)
+		fixture.close()
+		if measureErr != nil {
+			t.Fatal(measureErr)
+		}
+	})
+}
+
 // Fresh construction matches the performance runner's one-route-per-scenario
 // isolation and prevents an earlier protocol from satisfying carrier checks.
 func measurePerfvarFreshApplicationWorkload(
@@ -710,7 +742,7 @@ func testPerfvarApplicationWorkloads(
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("latency under load: %w", err)
+		return fmt.Errorf("latency under load result=%+v: %w", loaded.Result, err)
 	}
 	if loaded.Result.UsefulByteCount != loadedByteCount ||
 		loaded.Result.ContentHash != deterministicPayloadHash(loadedByteCount) ||
@@ -729,7 +761,11 @@ func testPerfvarApplicationWorkloads(
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("download latency under load: %w", err)
+		return fmt.Errorf(
+			"download latency under load result=%+v: %w",
+			loadedDownload.Result,
+			err,
+		)
 	}
 	if loadedDownload.Result.UsefulByteCount != loadedByteCount ||
 		loadedDownload.Result.ContentHash != deterministicPayloadHash(loadedByteCount) ||

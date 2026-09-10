@@ -3,35 +3,49 @@ package handlers
 import (
 	"net/http"
 
-	"github.com/urnetwork/server/competition"
+	"github.com/urnetwork/server/controller"
 )
 
 // Competition endpoints use their own opaque, role-scoped bearer boundary;
 // they intentionally do not pass through the consumer JWT wrappers.
 func CompetitionHealth(w http.ResponseWriter, r *http.Request) {
-	competition.HealthHandler(w, r)
+	controller.HealthHandler(w, r)
 }
 
 func CompetitionReady(w http.ResponseWriter, r *http.Request) {
-	competition.ReadyHandler(w, r)
+	controller.ReadyHandler(w, r)
 }
 
 func CompetitionInfo(w http.ResponseWriter, r *http.Request) {
-	competition.InfoHandler(w, r)
+	controller.InfoHandler(w, r)
+}
+
+func CompetitionLeaderboard(w http.ResponseWriter, r *http.Request) {
+	controller.LeaderboardHandler(w, r)
 }
 
 func CompetitionGetRoundWorkload(w http.ResponseWriter, r *http.Request) {
-	competition.GetRoundWorkloadHandler(w, r)
+	controller.GetRoundWorkloadHandler(w, r)
 }
 
 func CompetitionGenerateRound(w http.ResponseWriter, r *http.Request) {
-	competition.GenerateRoundHandler(w, r)
+	controller.GenerateRoundHandler(w, r)
+}
+
+// CompetitionGenerateStagingRound advances the pre-production staging era.
+func CompetitionGenerateStagingRound(w http.ResponseWriter, r *http.Request) {
+	controller.GenerateStagingRoundHandler(w, r)
+}
+
+// CompetitionCloseStagingRound closes admission while preserving its FIFO.
+func CompetitionCloseStagingRound(w http.ResponseWriter, r *http.Request) {
+	controller.CloseStagingRoundHandler(w, r)
 }
 
 func CompetitionSubmitScore(w http.ResponseWriter, r *http.Request) {
-	competition.SubmitScoreHandler(w, r)
+	controller.SubmitScoreHandler(w, r)
 }
 
 func CompetitionGetScore(w http.ResponseWriter, r *http.Request) {
-	competition.GetScoreHandler(w, r)
+	controller.GetScoreHandler(w, r)
 }

@@ -143,6 +143,13 @@ func sendPaymentsWithPlanner(clientSession *session.ClientSession, planner payme
 	// and payments held from earlier plans (e.g. waiting on a valid wallet)
 	SchedulePendingPayments(clientSession)
 
+	// committed plans applied account points: re-rank the points leaderboard
+	if 0 < len(plans) {
+		server.Tx(clientSession.Ctx, func(tx server.PgTx) {
+			TriggerRebuildPointsLeaderboardInTx(clientSession, tx)
+		})
+	}
+
 	// The loop can return already-committed plans together with an error from a
 	// later slice. Those durable payments were scheduled above; return the error
 	// so the payout task still retries the remaining frontier.
@@ -384,32 +391,8 @@ func advancePayment(
 				return
 			}
 			complete = true
-
-			userAuth, err := model.GetUserAuth(clientSession.Ctx, payment.NetworkId)
-			if err != nil {
-				returnErr = fmt.Errorf("[%s]Payment auth error = %s", payment.PaymentId, err)
-				return
-			}
-
-			awsMessageSender := GetAWSMessageSender()
-			// TODO handler error
-
-			explorerBasePath := getExplorerTxPath(tx.Blockchain)
-
-			networkReferralCode := model.GetNetworkReferralCode(clientSession.Ctx, payment.NetworkId)
-
-			if networkReferralCode != nil {
-				awsMessageSender.SendAccountMessageTemplate(userAuth, &SendPaymentTemplate{
-					PaymentId:          payment.PaymentId,
-					ExplorerBasePath:   *explorerBasePath,
-					TxHash:             tx.TxHash,
-					ReferralCode:       networkReferralCode.ReferralCode,
-					Blockchain:         tx.Blockchain,
-					DestinationAddress: tx.DestinationAddress,
-					AmountUsd:          tx.AmountInUSD,
-					PaymentCreatedAt:   payment.CreateTime,
-				})
-			}
+			// no per-payment email: earnings are reported once per finalized
+			// epoch by the epoch earnings email (controller/epoch_earnings_email.go)
 
 			return
 
@@ -509,6 +492,16 @@ func advancePayment(
 		)
 		if err != nil {
 			auditAccountPayment(clientSession, payment.PaymentId, err)
+			if isCircleInvalidDestinationError(err) {
+				// Circle rejected the destination before creating a transfer, so
+				// this is the one submit error for which it is safe to release the
+				// pinned attempt. On the next retry UpdatePaymentWallet can select a
+				// corrected payout wallet. Ambiguous failures retain the key.
+				if resetErr := model.RemovePaymentRecord(clientSession.Ctx, payment.PaymentId); resetErr != nil {
+					returnErr = fmt.Errorf("[%s]Payment create transaction error = %s; invalid destination reset error = %s", payment.PaymentId, err, resetErr)
+					return
+				}
+			}
 			returnErr = fmt.Errorf("[%s]Payment create transaction error = %s", payment.PaymentId, err)
 			return
 		}
@@ -616,21 +609,6 @@ func ConvertFeeToUSDC(ctx context.Context, currencyTicker string, fee float64) (
 	feeUsdc := fee * rate
 
 	return feeUsdc, nil
-}
-
-func getExplorerTxPath(network string) *string {
-	network = strings.ToUpper(network)
-
-	switch network {
-	case "SOL", "SOLANA":
-		explorerPath := "https://explorer.solana.com/tx"
-		return &explorerPath
-	case "MATIC", "POLY", "POLYGON":
-		explorerPath := "https://polygonscan.com/tx"
-		return &explorerPath
-	}
-
-	return nil
 }
 
 func formatBlockchain(network string) (string, error) {

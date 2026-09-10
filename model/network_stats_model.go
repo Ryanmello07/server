@@ -104,8 +104,8 @@ type ProviderCountryCount struct {
 	CityCount int64
 }
 
-// CountProvidersByCountry returns the connected, valid, Public provider
-// count per country — the same population and predicate as
+// CountProvidersByCountry returns the active top-level, connected, valid,
+// Public provider count per country — the same population and predicate as
 // CountProviderCountries and the public providers map
 // (GetProvidersMap), grouped by country code — with the distinct region
 // and city counts of that population. Region and city location ids are
@@ -116,11 +116,22 @@ type ProviderCountryCount struct {
 // consumer that keeps per-country state must treat absence as zero. The
 // result is ordered by country code.
 func CountProvidersByCountry(ctx context.Context) []ProviderCountryCount {
-	counts := []ProviderCountryCount{}
+	var counts []ProviderCountryCount
 	server.ReplicaDb(ctx, func(conn server.PgConn) {
-		result, err := conn.Query(
-			ctx,
-			`
+		counts = countProvidersByCountry(ctx, conn)
+	})
+	return counts
+}
+
+// countProvidersByCountry is the connection-scoped form used when a caller
+// already holds a replica connection (notably ComputeStats). Keeping the live
+// public summaries on that same connection avoids opening a nested pool
+// checkout during the hourly historical export.
+func countProvidersByCountry(ctx context.Context, conn server.PgConn) []ProviderCountryCount {
+	counts := []ProviderCountryCount{}
+	result, err := conn.Query(
+		ctx,
+		`
                 SELECT
                     location.country_code,
                     MIN(location.location_name),
@@ -128,9 +139,13 @@ func CountProvidersByCountry(ctx context.Context) []ProviderCountryCount {
                     COUNT(DISTINCT network_client_location_reliability.region_location_id),
                     COUNT(DISTINCT network_client_location_reliability.city_location_id)
                 FROM network_client_location_reliability
+                INNER JOIN network_client ON
+                    network_client.client_id = network_client_location_reliability.client_id
                 INNER JOIN location ON
                     location.location_id = network_client_location_reliability.country_location_id
                 WHERE
+                    network_client.active = true AND
+                    network_client.source_client_id IS NULL AND
                     network_client_location_reliability.connected = true AND
                     network_client_location_reliability.valid = true AND
                     EXISTS (
@@ -142,22 +157,21 @@ func CountProvidersByCountry(ctx context.Context) []ProviderCountryCount {
                 GROUP BY location.country_code
                 ORDER BY location.country_code
             `,
-			ProvideModePublic,
-		)
-		server.WithPgResult(result, err, func() {
-			for result.Next() {
-				var count ProviderCountryCount
-				server.Raise(result.Scan(
-					&count.CountryCode,
-					&count.Country,
-					&count.Count,
-					&count.RegionCount,
-					&count.CityCount,
-				))
-				count.CountryCode = strings.ToUpper(strings.TrimSpace(count.CountryCode))
-				counts = append(counts, count)
-			}
-		})
+		ProvideModePublic,
+	)
+	server.WithPgResult(result, err, func() {
+		for result.Next() {
+			var count ProviderCountryCount
+			server.Raise(result.Scan(
+				&count.CountryCode,
+				&count.Country,
+				&count.Count,
+				&count.RegionCount,
+				&count.CityCount,
+			))
+			count.CountryCode = strings.ToUpper(strings.TrimSpace(count.CountryCode))
+			counts = append(counts, count)
+		}
 	})
 	return counts
 }

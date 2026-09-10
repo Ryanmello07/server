@@ -21,14 +21,14 @@ package model
 //	{vstat_<clientId>}p<t>  per-period stats hash: assignments, confirmations,
 //	                        log-spaced latency buckets lb_<i> (§7)
 //	verify_stat_clients     set of clientIds with stats pending rollup
-//	verify_seed_ip_<hash>   seed rate counter per source ip (INCR+EXPIRE, §9)
-//	verify_seed_vpk_<vpk>   seed rate counter per vpk (INCR+EXPIRE, §9)
+//	verify_seed_ip_<hash>_<window> seed fixed-window counter per source ip (§9)
+//	verify_seed_vpk_<vpk>_<window> seed fixed-window counter per vpk (§9)
 //	verify_trails_<vpk>     active trail count per vpk (concurrent-trail cap, §9)
 //
 // The egress index is fed by exactly one bijection-gated feeder
-// (`FeedVerifyEgress`) with two call sites: observed connection source ips
-// (connect/transport_announce.go) and proxy-allocated egresses
-// (CreateProxyClient + the periodic `RefreshVerifyProxyEgress`). The §8.2
+// (`FeedVerifyEgress`) with two sources: observed connection source ips
+// (connect/transport_announce.go) and proxy-allocated egresses (the API
+// controller's post-allocation feed + periodic `RefreshVerifyProxyEgress`). The §8.2
 // invariant — one provider ⇄ one egress ip — is enforced at write time (an ip
 // observed backing a second client becomes ambiguous and resolves to nothing)
 // and re-checked at read time (`ResolveVerifyEgress` requires the forward and
@@ -816,24 +816,37 @@ func IncrVerifySeedRates(
 	vpk []byte,
 	settings *VerifySettings,
 ) (ipCount int64, vpkCount int64) {
-	ipHash, err := server.ClientIpHash(clientIp)
+	rateLimitClient, err := server.NewRateLimitClientIp(clientIp)
 	server.Raise(err)
-	server.Redis(ctx, func(r server.RedisClient) {
-		incrWindow := func(key string) int64 {
-			var countCmd *redis.IntCmd
-			_, err := r.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				countCmd = pipe.Incr(ctx, key)
-				pipe.Expire(ctx, key, settings.SeedRateWindow)
-				return nil
-			})
-			server.Raise(err)
-			count, err := countCmd.Result()
-			server.Raise(err)
-			return count
-		}
-		ipCount = incrWindow(verifySeedIpRateKey(ipHash))
-		vpkCount = incrWindow(verifySeedVpkRateKey(vpk))
-	})
+	return incrVerifySeedRatesForClient(
+		ctx,
+		rateLimitClient.IpHash(),
+		rateLimitClient.Excluded(),
+		vpk,
+		settings,
+	)
+}
+
+func incrVerifySeedRatesForClient(
+	ctx context.Context,
+	ipHash [32]byte,
+	ipExcluded bool,
+	vpk []byte,
+	settings *VerifySettings,
+) (ipCount int64, vpkCount int64) {
+	if !ipExcluded {
+		client := server.NewStoredRateLimitClient(ipHash)
+		var err error
+		ipCount, err = server.IncrementIpRateLimit(
+			ctx,
+			client,
+			verifySeedIpRateKey(ipHash),
+			settings.SeedRateWindow,
+		)
+		server.Raise(err)
+	}
+	vpkCount, err := server.IncrementRateLimitWindow(ctx, verifySeedVpkRateKey(vpk), settings.SeedRateWindow)
+	server.Raise(err)
 	return
 }
 
@@ -849,20 +862,34 @@ func IncrVerifyExtendRate(
 	clientIp string,
 	settings *VerifySettings,
 ) (ipCount int64) {
-	ipHash, err := server.ClientIpHash(clientIp)
+	rateLimitClient, err := server.NewRateLimitClientIp(clientIp)
 	server.Raise(err)
-	server.Redis(ctx, func(r server.RedisClient) {
-		var countCmd *redis.IntCmd
-		_, err := r.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			countCmd = pipe.Incr(ctx, verifyExtendIpRateKey(ipHash))
-			pipe.Expire(ctx, verifyExtendIpRateKey(ipHash), settings.SeedRateWindow)
-			return nil
-		})
-		server.Raise(err)
-		ipCount, err = countCmd.Result()
-		server.Raise(err)
-	})
-	return
+	return incrVerifyExtendRateForClient(
+		ctx,
+		rateLimitClient.IpHash(),
+		rateLimitClient.Excluded(),
+		settings,
+	)
+}
+
+func incrVerifyExtendRateForClient(
+	ctx context.Context,
+	ipHash [32]byte,
+	ipExcluded bool,
+	settings *VerifySettings,
+) (ipCount int64) {
+	if ipExcluded {
+		return 0
+	}
+	client := server.NewStoredRateLimitClient(ipHash)
+	ipCount, err := server.IncrementIpRateLimit(
+		ctx,
+		client,
+		verifyExtendIpRateKey(ipHash),
+		settings.SeedRateWindow,
+	)
+	server.Raise(err)
+	return ipCount
 }
 
 // IncrVerifyActiveTrails counts a new active trail against the vpk's

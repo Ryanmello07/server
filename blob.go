@@ -16,12 +16,16 @@ package server
 // ansible are unaffected; only the Go surface is abstracted.
 
 import (
+	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +33,9 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
+	"github.com/minio/minio-go/v7/pkg/replication"
 
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/glog"
 )
 
@@ -41,14 +47,51 @@ import (
 // explicit prefix.
 const DefaultBlobPrefix = "blob"
 
-// blobPartialSuffix marks an in-progress local write (renamed into place on
-// completion), so a List never returns a half-written object.
+// blobPartialSuffix reserves local staging and coordination files. Public
+// writes cannot select it, and listings never expose these private owners.
 const blobPartialSuffix = ".partial"
 
 // BlobObject is a stored object's key and size, as returned by List.
 type BlobObject struct {
 	Key  string
 	Size int64
+}
+
+// Immutable retention proof returned for a write that the backend protects
+// through the requested absolute date. Production MinIO writes use compliance
+// object lock and name the exact retained object version. The local backend is
+// only a development substitute and reports mode LOCAL.
+type BlobRetention struct {
+	Key         string
+	Size        int64
+	VersionId   string
+	Mode        string
+	RetainUntil time.Time
+}
+
+// BlobUsage is a bounded namespace capacity proof. CapacityBytes is an
+// operator allocation for the configured prefix, not an estimate of the whole
+// MinIO cluster; cluster free-space alerts remain sourced from MinIO metrics.
+type BlobUsage struct {
+	Authority     string  `json:"authority"`
+	Bucket        string  `json:"bucket"`
+	Prefix        string  `json:"prefix"`
+	ObjectCount   int     `json:"object_count"`
+	UsedBytes     int64   `json:"used_bytes"`
+	CapacityBytes int64   `json:"capacity_bytes"`
+	FreeBytes     int64   `json:"free_bytes"`
+	UsedPercent   float64 `json:"used_percent"`
+}
+
+// BlobProtection is the non-secret production proof for one immutable
+// evidence bucket. ReplicationTargets contains only configured destination
+// bucket identities; credentials and endpoint secrets are never included.
+type BlobProtection struct {
+	Authority          string   `json:"authority"`
+	Bucket             string   `json:"bucket"`
+	ObjectLock         string   `json:"object_lock"`
+	Versioning         bool     `json:"versioning"`
+	ReplicationTargets []string `json:"replication_targets"`
 }
 
 // BlobLifecycleRule expires (deletes) objects whose key starts with KeyPrefix
@@ -67,6 +110,19 @@ const localReapInterval = 1 * time.Hour
 // cap; this bounds the successful-copy destination as well.
 const DefaultLocalBlobMaxBytes int64 = 8 * 1024 * 1024 * 1024
 
+// MaximumBlobListPageObjects bounds every paged backend allocation and remote
+// listing request. Callers needing an unbounded administrative scan use List.
+const MaximumBlobListPageObjects = 4096
+
+// A local public listing fails closed before an attacker-controlled tree can
+// turn one request into unbounded filesystem work. Production uses MinIO's
+// cursor; the local backend is intentionally capped for test/dev safety.
+const maximumLocalBlobListScanEntries = 64 * 1024
+
+// Shared identity lets tests and callers distinguish a fail-closed work bound
+// from cancellation or an underlying filesystem error.
+var errLocalBlobListScanLimitExceeded = errors.New("local blob list scan limit exceeded")
+
 // BlobStore is object storage keyed by string, safe for concurrent use. Keys
 // are full object keys; callers compose any namespace under Prefix. Retention
 // is the backing store's job (a MinIO ILM lifecycle rule; the local backend
@@ -75,6 +131,10 @@ const DefaultLocalBlobMaxBytes int64 = 8 * 1024 * 1024 * 1024
 type BlobStore interface {
 	// Put uploads the file at localPath to key with the given content type.
 	Put(ctx context.Context, key string, localPath string, contentType string) error
+	// PutIfAbsent atomically uploads only when key does not exist. created is
+	// false only when another writer already owns the key; implementations must
+	// not emulate this with a separate existence check and Put.
+	PutIfAbsent(ctx context.Context, key string, localPath string, contentType string) (created bool, err error)
 	// Get opens key for reading; the caller closes the returned reader.
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	// List returns every object whose key starts with keyPrefix.
@@ -91,6 +151,89 @@ type BlobStore interface {
 	Prefix() string
 	// Authority is the backing endpoint (for logging).
 	Authority() string
+}
+
+// PagedBlobStore is the optional bounded-list capability used by public APIs.
+// Keeping it separate preserves BlobStore compatibility for private/test
+// implementations; a public handler fails closed when the capability is absent.
+type PagedBlobStore interface {
+	// ListPage returns keys in global lexical order, strictly after startAfter,
+	// and retains at most limit+1 candidates while discovering whether more exist.
+	ListPage(ctx context.Context, keyPrefix string, startAfter string, limit int) (objects []BlobObject, more bool, err error)
+}
+
+// RetainedBlobStore is the optional immutable-evidence capability. Keeping it
+// separate from BlobStore lets ordinary streams use simple object storage,
+// while callers handling dispute evidence can fail closed unless the backend
+// proves versioning and compliance retention.
+type RetainedBlobStore interface {
+	BlobStore
+	// PutRetained uploads one immutable object version and proves that the
+	// backend will reject deletion through retainUntil. Production MinIO uses
+	// compliance mode; the local implementation exists for deterministic tests.
+	PutRetained(ctx context.Context, key string, localPath string, contentType string, retainUntil time.Time) (*BlobRetention, error)
+	// GetVersion opens the exact immutable version returned by PutRetained.
+	// An empty version id selects the current object for local/test stores.
+	GetVersion(ctx context.Context, key string, versionId string) (io.ReadCloser, error)
+	// CheckRetention verifies that immutable retained writes are available. It
+	// performs no mutation and is suitable for readiness checks.
+	CheckRetention(ctx context.Context) error
+}
+
+// ProtectedBlobStore is the production evidence capability required at
+// launch: immutable WORM storage plus at least one enabled, server-validated
+// replication destination.
+type ProtectedBlobStore interface {
+	RetainedBlobStore
+	CheckProtection(ctx context.Context) (*BlobProtection, error)
+}
+
+// MeasureBlobUsage authenticates the current object sizes under one store
+// prefix against an operator-approved allocation. It is intentionally a
+// launch/preflight operation rather than a hot readiness probe because a full
+// recursive MinIO listing can be expensive.
+func MeasureBlobUsage(ctx context.Context, store BlobStore, capacityBytes int64) (*BlobUsage, error) {
+	if store == nil {
+		return nil, errors.New("blob store is required")
+	}
+	return MeasureBlobUsageAtPrefix(ctx, store, store.Prefix(), capacityBytes)
+}
+
+// MeasureBlobUsageAtPrefix scopes the allocation proof to one subsystem
+// namespace while retaining the store's bucket and authority identity.
+func MeasureBlobUsageAtPrefix(ctx context.Context, store BlobStore, keyPrefix string, capacityBytes int64) (*BlobUsage, error) {
+	if store == nil || capacityBytes <= 0 {
+		return nil, errors.New("blob capacity allocation must be positive")
+	}
+	keyPrefix = strings.TrimSpace(keyPrefix)
+	if keyPrefix == "" || !strings.HasPrefix(keyPrefix, store.Prefix()) {
+		return nil, errors.New("blob usage prefix is outside the configured namespace")
+	}
+	objects, err := store.List(ctx, keyPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var usedBytes int64
+	for _, object := range objects {
+		if object.Size < 0 || math.MaxInt64-usedBytes < object.Size {
+			return nil, errors.New("blob usage size is invalid")
+		}
+		usedBytes += object.Size
+	}
+	freeBytes := capacityBytes - usedBytes
+	if freeBytes < 0 {
+		freeBytes = 0
+	}
+	return &BlobUsage{
+		Authority:     store.Authority(),
+		Bucket:        store.Bucket(),
+		Prefix:        keyPrefix,
+		ObjectCount:   len(objects),
+		UsedBytes:     usedBytes,
+		CapacityBytes: capacityBytes,
+		FreeBytes:     freeBytes,
+		UsedPercent:   100 * float64(usedBytes) / float64(capacityBytes),
+	}, nil
 }
 
 // BlobStoreConfig is the backing MinIO configuration (or local-backend
@@ -248,12 +391,73 @@ func (self *minioBlobStore) Put(ctx context.Context, key string, localPath strin
 	return err
 }
 
+// PutIfAbsent uses one non-multipart conditional request so the condition is
+// evaluated when the object is committed, not during a separate lookup.
+func (self *minioBlobStore) PutIfAbsent(ctx context.Context, key string, localPath string, contentType string) (bool, error) {
+	options := minio.PutObjectOptions{
+		ContentType:      contentType,
+		DisableMultipart: true,
+	}
+	options.SetMatchETagExcept("*")
+	_, err := self.client.FPutObject(ctx, self.bucket, key, localPath, options)
+	if err == nil {
+		return true, nil
+	}
+	if isMinioPreconditionConflict(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// Only the exact conditional-create rejection proves another object won.
+func isMinioPreconditionConflict(err error) bool {
+	response := minio.ToErrorResponse(err)
+	return response.StatusCode == http.StatusPreconditionFailed && response.Code == minio.PreconditionFailed
+}
+
+func (self *minioBlobStore) PutRetained(
+	ctx context.Context,
+	key string,
+	localPath string,
+	contentType string,
+	retainUntil time.Time,
+) (*BlobRetention, error) {
+	retainUntil = retainUntil.UTC()
+	if !NowUtc().Before(retainUntil) {
+		return nil, errors.New("blob retention must end in the future")
+	}
+	upload, err := self.client.FPutObject(ctx, self.bucket, key, localPath, minio.PutObjectOptions{
+		ContentType:     contentType,
+		Mode:            minio.Compliance,
+		RetainUntilDate: retainUntil,
+	})
+	if err != nil {
+		return nil, err
+	}
+	mode, retainedUntil, err := self.client.GetObjectRetention(ctx, self.bucket, key, upload.VersionID)
+	if err != nil {
+		return nil, err
+	}
+	if mode == nil || *mode != minio.Compliance || retainedUntil == nil ||
+		retainedUntil.Before(retainUntil.Add(-time.Second)) {
+		return nil, errors.New("minio did not prove compliance retention")
+	}
+	return &BlobRetention{
+		Key: key, Size: upload.Size, VersionId: upload.VersionID,
+		Mode: minio.Compliance.String(), RetainUntil: retainedUntil.UTC(),
+	}, nil
+}
+
 func (self *minioBlobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	object, err := self.client.GetObject(ctx, self.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
 	return object, nil
+}
+
+func (self *minioBlobStore) GetVersion(ctx context.Context, key string, versionId string) (io.ReadCloser, error) {
+	return self.client.GetObject(ctx, self.bucket, key, minio.GetObjectOptions{VersionID: versionId})
 }
 
 func (self *minioBlobStore) List(ctx context.Context, keyPrefix string) ([]BlobObject, error) {
@@ -268,6 +472,60 @@ func (self *minioBlobStore) List(ctx context.Context, keyPrefix string) ([]BlobO
 		objects = append(objects, BlobObject{Key: object.Key, Size: object.Size})
 	}
 	return objects, nil
+}
+
+// ListPage uses a separately cancelable MinIO iterator so discovery stops as
+// soon as one object beyond the requested page proves that another page exists.
+func (self *minioBlobStore) ListPage(ctx context.Context, keyPrefix string, startAfter string, limit int) ([]BlobObject, bool, error) {
+	if limit <= 0 || MaximumBlobListPageObjects < limit {
+		return nil, false, fmt.Errorf("blob list page limit must be between 1 and %d", MaximumBlobListPageObjects)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	listCtx, listCancel := context.WithCancel(ctx)
+	defer listCancel()
+	objects := make([]BlobObject, 0, limit)
+	more := false
+	objectCh := self.client.ListObjects(listCtx, self.bucket, minio.ListObjectsOptions{
+		Prefix:     keyPrefix,
+		Recursive:  true,
+		MaxKeys:    min(limit+1, 1000),
+		StartAfter: startAfter,
+	})
+	for object := range objectCh {
+		if object.Err != nil {
+			if more && errors.Is(object.Err, context.Canceled) {
+				continue
+			}
+			return nil, false, object.Err
+		}
+		if len(objects) == limit {
+			more = true
+			listCancel()
+			continue
+		}
+		objects = append(objects, BlobObject{Key: object.Key, Size: object.Size})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	return objects, more, nil
+}
+
+// blobObjectMaxHeap retains the lexically largest selected candidate at its
+// root so a streaming local scan can keep only the smallest requested keys.
+type blobObjectMaxHeap []BlobObject
+
+func (self blobObjectMaxHeap) Len() int           { return len(self) }
+func (self blobObjectMaxHeap) Less(i, j int) bool { return self[j].Key < self[i].Key }
+func (self blobObjectMaxHeap) Swap(i, j int)      { self[i], self[j] = self[j], self[i] }
+func (self *blobObjectMaxHeap) Push(value any)    { *self = append(*self, value.(BlobObject)) }
+func (self *blobObjectMaxHeap) Pop() any {
+	old := *self
+	last := old[len(old)-1]
+	*self = old[:len(old)-1]
+	return last
 }
 
 // resolveBlobAuthority resolves the configured authority to a dialable
@@ -358,6 +616,85 @@ func (self *minioBlobStore) SetLifecycle(ctx context.Context, rules []BlobLifecy
 	return self.client.SetBucketLifecycle(ctx, self.bucket, config)
 }
 
+func (self *minioBlobStore) checkRetentionConfiguration(ctx context.Context) error {
+	exists, err := self.client.BucketExists(ctx, self.bucket)
+	if err != nil {
+		return fmt.Errorf("check minio blob bucket existence: %w", err)
+	}
+	if !exists {
+		return errors.New("minio blob bucket does not exist")
+	}
+	objectLock, _, _, _, err := self.client.GetObjectLockConfig(ctx, self.bucket)
+	if err != nil {
+		return fmt.Errorf("read minio blob bucket object-lock configuration: %w", err)
+	}
+	if objectLock != "Enabled" {
+		return errors.New("minio blob bucket does not have object lock enabled")
+	}
+	versioning, err := self.client.GetBucketVersioning(ctx, self.bucket)
+	if err != nil {
+		return fmt.Errorf("read minio blob bucket versioning configuration: %w", err)
+	}
+	if !versioning.Enabled() {
+		return errors.New("minio blob bucket does not have versioning enabled")
+	}
+	return nil
+}
+
+// enabledReplicationTargets validates and normalizes the enabled backup
+// destinations without depending on a live MinIO server.
+func enabledReplicationTargets(config replication.Config) ([]string, error) {
+	targetSet := map[string]bool{}
+	for _, rule := range config.Rules {
+		if rule.Status != replication.Enabled {
+			continue
+		}
+		target := strings.TrimSpace(rule.Destination.Bucket)
+		if target == "" {
+			return nil, errors.New("minio replication has an enabled rule without a destination bucket")
+		}
+		targetSet[target] = true
+	}
+	if len(targetSet) == 0 {
+		return nil, errors.New("minio blob bucket does not have an enabled replication destination")
+	}
+	targets := make([]string, 0, len(targetSet))
+	for target := range targetSet {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+	return targets, nil
+}
+
+func (self *minioBlobStore) CheckProtection(ctx context.Context) (*BlobProtection, error) {
+	if err := self.checkRetentionConfiguration(ctx); err != nil {
+		return nil, err
+	}
+	config, err := self.client.GetBucketReplication(ctx, self.bucket)
+	if err != nil {
+		return nil, fmt.Errorf("read minio blob bucket replication configuration: %w", err)
+	}
+	targets, err := enabledReplicationTargets(config)
+	if err != nil {
+		return nil, err
+	}
+	if err := self.client.CheckBucketReplication(ctx, self.bucket); err != nil {
+		return nil, fmt.Errorf("minio replication validation: %w", err)
+	}
+	return &BlobProtection{
+		Authority:          self.authority,
+		Bucket:             self.bucket,
+		ObjectLock:         "COMPLIANCE",
+		Versioning:         true,
+		ReplicationTargets: targets,
+	}, nil
+}
+
+func (self *minioBlobStore) CheckRetention(ctx context.Context) error {
+	_, err := self.CheckProtection(ctx)
+	return err
+}
+
 // mergeOwnedLifecycleRules replaces existing rules by exact ID match with the
 // owned set and preserves every other rule — ops-set rules and, in a shared
 // bucket, another env's code-owned rules (their deterministic IDs differ).
@@ -411,10 +748,14 @@ type localBlobStore struct {
 	prefix   string
 	maxBytes int64
 
-	putMu    sync.Mutex
-	reapMu   sync.Mutex
-	rules    []BlobLifecycleRule
-	reapOnce sync.Once
+	reapMu                         sync.Mutex
+	rules                          []BlobLifecycleRule
+	reapOnce                       sync.Once
+	beforeCreateCommitForTest      func()
+	afterListScanEntryForTest      func()
+	afterUsageScanEntryForTest     func(string)
+	beforeCapacityLockForTest      func()
+	afterCapacityContentionForTest func()
 }
 
 func (self *localBlobStore) pathFor(key string) string {
@@ -422,87 +763,234 @@ func (self *localBlobStore) pathFor(key string) string {
 }
 
 func (self *localBlobStore) Put(ctx context.Context, key string, localPath string, contentType string) error {
+	_, err := self.putFile(ctx, key, localPath, false)
+	return err
+}
+
+// PutIfAbsent stages each attempt separately and hard-links it into place.
+// Link is an atomic no-replace operation even between independent processes.
+func (self *localBlobStore) PutIfAbsent(ctx context.Context, key string, localPath string, contentType string) (bool, error) {
+	return self.putFile(ctx, key, localPath, true)
+}
+
+// putFile preserves ordinary Put replacement while sharing capacity and
+// partial-file handling with the atomic create path.
+func (self *localBlobStore) putFile(ctx context.Context, key string, localPath string, ifAbsent bool) (created bool, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			created = false
+		}
+	}()
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
-	dst := self.pathFor(key)
-	tmp := dst + blobPartialSuffix
+	if _, err := localBlobWritePath(self.root, key); err != nil {
+		return false, err
+	}
 	srcInfo, err := os.Stat(localPath)
 	if err != nil {
-		return err
+		return false, err
 	}
-
-	// Serialize capacity checks with writes and reaping. Otherwise concurrent
-	// uploads can each observe the same free space and collectively exceed the
-	// bound.
-	self.putMu.Lock()
-	defer self.putMu.Unlock()
-
-	usage, err := self.usageBytes()
+	if !srcInfo.Mode().IsRegular() {
+		return false, errors.New("local blob source must be a regular file")
+	}
+	if batch, ok := ctx.Value(localBlobWriteBatchKey{}).(*LocalBlobWriteBatch); ok {
+		return batch.putFile(ctx, self, key, localPath, srcInfo, ifAbsent)
+	}
+	owner, err := self.lockCapacity(ctx)
 	if err != nil {
-		return err
+		return false, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, owner.Close()) }()
+	return self.putFileAtCapacity(ctx, key, localPath, srcInfo, ifAbsent, owner, nil)
+}
+
+// The caller owns the physical root lock through the complete copy and commit.
+// A finite batch supplies its accounted usage; ordinary writes scan afresh.
+func (self *localBlobStore) putFileAtCapacity(ctx context.Context, key, localPath string, srcInfo os.FileInfo, ifAbsent bool, owner *localBlobCapacityOwner, batchUsage *int64) (created bool, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			created = false
+		}
+	}()
+	if err := errors.Join(ctx.Err(), owner.check()); err != nil {
+		return false, err
+	}
+	dst, err := localBlobWritePath(owner.root, key)
+	if err != nil {
+		return false, err
+	}
+	if ifAbsent {
+		if _, err := os.Lstat(dst); err == nil {
+			return false, nil
+		} else if !os.IsNotExist(err) {
+			return false, err
+		}
+	}
+	var usage int64
+	if batchUsage == nil {
+		usage, err = self.usageBytesAtRootWithContext(ctx, owner.root)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		usage = *batchUsage
 	}
 	var replacedBytes int64
-	if info, err := os.Stat(dst); err == nil {
-		replacedBytes = info.Size()
-	} else if !os.IsNotExist(err) {
-		return err
+	if !ifAbsent {
+		if info, err := os.Lstat(dst); err == nil {
+			replacedBytes = info.Size()
+		} else if !os.IsNotExist(err) {
+			return false, err
+		}
 	}
-	if info, err := os.Stat(tmp); err == nil {
-		replacedBytes += info.Size()
-	} else if !os.IsNotExist(err) {
-		return err
+	available, err := localBlobAvailableBytes(usage, replacedBytes, srcInfo.Size(), self.maxBytes)
+	if err != nil {
+		return false, err
 	}
-	if self.maxBytes < usage-replacedBytes+srcInfo.Size() {
-		return fmt.Errorf(
-			"local blob capacity exceeded: usage=%d replacement=%d incoming=%d max=%d",
-			usage,
-			replacedBytes,
-			srcInfo.Size(),
-			self.maxBytes,
-		)
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+		return false, err
 	}
 	src, err := os.Open(localPath)
 	if err != nil {
-		return err
+		return false, err
 	}
-	defer src.Close()
-	// write to a temp file then rename, so a List never sees a partial object
-	out, err := os.Create(tmp)
+	defer func() { resultErr = errors.Join(resultErr, src.Close()) }()
+	openedSource, err := src.Stat()
+	if err != nil || !openedSource.Mode().IsRegular() || !os.SameFile(srcInfo, openedSource) {
+		return false, errors.Join(errors.New("local blob source identity changed before copy"), err)
+	}
+	if _, err := localBlobAvailableBytes(usage, replacedBytes, openedSource.Size(), self.maxBytes); err != nil {
+		return false, err
+	}
+	out, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+"-*"+blobPartialSuffix)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if _, err := io.Copy(out, src); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
+	tmp := out.Name()
+	defer func() {
+		if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}()
+	// Count the actual copied bytes, not an earlier source Stat. One extra
+	// private byte detects growth without overflowing the finite read bound.
+	copyLimit := available
+	if copyLimit < math.MaxInt64 {
+		copyLimit++
 	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
+	written, copyErr := io.Copy(out, io.LimitReader(&localBlobCapacityReader{ctx: ctx, reader: src}, copyLimit))
+	closeErr := out.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return false, err
 	}
-	return os.Rename(tmp, dst)
+	if _, err := localBlobAvailableBytes(usage, replacedBytes, written, self.maxBytes); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if ifAbsent && self.beforeCreateCommitForTest != nil {
+		self.beforeCreateCommitForTest()
+	}
+	if err := errors.Join(ctx.Err(), owner.check()); err != nil {
+		return false, err
+	}
+	if ifAbsent {
+		if err := os.Link(tmp, dst); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return false, nil
+			}
+			return false, err
+		}
+		if batchUsage != nil {
+			*batchUsage = usage + written
+		}
+		return true, nil
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return false, err
+	}
+	if batchUsage != nil {
+		*batchUsage = usage - replacedBytes + written
+	}
+	return true, nil
 }
 
+func (self *localBlobStore) PutRetained(
+	ctx context.Context,
+	key string,
+	localPath string,
+	contentType string,
+	retainUntil time.Time,
+) (*BlobRetention, error) {
+	retainUntil = retainUntil.UTC()
+	if !NowUtc().Before(retainUntil) {
+		return nil, errors.New("blob retention must end in the future")
+	}
+	if err := self.Put(ctx, key, localPath, contentType); err != nil {
+		return nil, err
+	}
+	destination := self.pathFor(key)
+	if err := os.Chmod(destination, 0400); err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		return nil, err
+	}
+	return &BlobRetention{
+		Key: key, Size: info.Size(), Mode: "LOCAL", RetainUntil: retainUntil,
+	}, nil
+}
+
+// Only committed files consume capacity. Another store instance can remove
+// its own partial after enumeration, so classify private names before stat;
+// failures inspecting ordinary files or directories still refuse admission.
 func (self *localBlobStore) usageBytes() (int64, error) {
-	var total int64
-	if _, err := os.Stat(self.root); err != nil {
-		if os.IsNotExist(err) {
+	root, err := filepath.EvalSymlinks(self.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
 		}
 		return 0, err
 	}
-	err := filepath.Walk(self.root, func(path string, info os.FileInfo, err error) error {
+	return self.usageBytesAtRoot(root)
+}
+
+// Mutating callers scan the same physical root whose capacity inode they own.
+func (self *localBlobStore) usageBytesAtRoot(root string) (int64, error) {
+	return self.usageBytesAtRootWithContext(context.Background(), root)
+}
+
+// A publication lease never retains its root while an explicitly canceled
+// census continues walking. The historical scan-only entry remains available.
+func (self *localBlobStore) usageBytesAtRootWithContext(ctx context.Context, root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			total += info.Size()
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		if self.afterUsageScanEntryForTest != nil {
+			self.afterUsageScanEntryForTest(path)
+		}
+		if entry.IsDir() || strings.HasSuffix(path, blobPartialSuffix) {
+			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Size() < 0 || total > math.MaxInt64-info.Size() {
+			return errors.New("invalid local blob usage size")
+		}
+		total += info.Size()
 		return nil
 	})
 	return total, err
@@ -510,6 +998,13 @@ func (self *localBlobStore) usageBytes() (int64, error) {
 
 func (self *localBlobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return os.Open(self.pathFor(key))
+}
+
+func (self *localBlobStore) GetVersion(ctx context.Context, key string, versionId string) (io.ReadCloser, error) {
+	if versionId != "" {
+		return nil, errors.New("local blob store does not have object versions")
+	}
+	return self.Get(ctx, key)
 }
 
 func (self *localBlobStore) List(ctx context.Context, keyPrefix string) ([]BlobObject, error) {
@@ -543,12 +1038,124 @@ func (self *localBlobStore) List(ctx context.Context, keyPrefix string) ([]BlobO
 	return objects, nil
 }
 
+// ListPage streams local directory entries in fixed batches and retains only
+// the globally smallest limit+1 matching keys, independent of filesystem walk
+// order. A separate entry cap bounds work even for zero-byte object trees.
+func (self *localBlobStore) ListPage(ctx context.Context, keyPrefix string, startAfter string, limit int) ([]BlobObject, bool, error) {
+	return self.listPage(ctx, keyPrefix, startAfter, limit, maximumLocalBlobListScanEntries)
+}
+
+// listPage carries an explicit scan limit so tests can pin fail-closed work
+// bounds without manufacturing tens of thousands of filesystem entries.
+func (self *localBlobStore) listPage(ctx context.Context, keyPrefix string, startAfter string, limit int, maximumScanEntries int) ([]BlobObject, bool, error) {
+	if limit <= 0 || MaximumBlobListPageObjects < limit {
+		return nil, false, fmt.Errorf("blob list page limit must be between 1 and %d", MaximumBlobListPageObjects)
+	}
+	if maximumScanEntries <= 0 {
+		return nil, false, errors.New("local blob list scan limit must be positive")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	scanRoot := self.root
+	if strings.HasSuffix(keyPrefix, "/") {
+		candidate := self.pathFor(strings.TrimSuffix(keyPrefix, "/"))
+		if rel, err := filepath.Rel(self.root, candidate); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			scanRoot = candidate
+		}
+	}
+	if _, err := os.Stat(scanRoot); err != nil {
+		if os.IsNotExist(err) {
+			return []BlobObject{}, false, nil
+		}
+		return nil, false, err
+	}
+	targetCount := limit + 1
+	candidates := &blobObjectMaxHeap{}
+	heap.Init(candidates)
+	directories := []string{scanRoot}
+	scannedEntries := 0
+	for 0 < len(directories) {
+		directory := directories[len(directories)-1]
+		directories = directories[:len(directories)-1]
+		err := func() error {
+			reader, err := os.Open(directory)
+			if err != nil {
+				return err
+			}
+			defer reader.Close()
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				entries, readErr := reader.ReadDir(128)
+				for _, entry := range entries {
+					scannedEntries++
+					if maximumScanEntries < scannedEntries {
+						return errLocalBlobListScanLimitExceeded
+					}
+					if self.afterListScanEntryForTest != nil {
+						self.afterListScanEntryForTest()
+					}
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					path := filepath.Join(directory, entry.Name())
+					if entry.IsDir() {
+						directories = append(directories, path)
+						continue
+					}
+					if strings.HasSuffix(path, blobPartialSuffix) {
+						continue
+					}
+					info, err := entry.Info()
+					if err != nil {
+						return err
+					}
+					rel, err := filepath.Rel(self.root, path)
+					if err != nil {
+						return err
+					}
+					key := filepath.ToSlash(rel)
+					if !strings.HasPrefix(key, keyPrefix) || key <= startAfter {
+						continue
+					}
+					object := BlobObject{Key: key, Size: info.Size()}
+					if candidates.Len() < targetCount {
+						heap.Push(candidates, object)
+					} else if key < (*candidates)[0].Key {
+						heap.Pop(candidates)
+						heap.Push(candidates, object)
+					}
+				}
+				if readErr == io.EOF {
+					return nil
+				}
+				if readErr != nil {
+					return readErr
+				}
+			}
+		}()
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	objects := make([]BlobObject, candidates.Len())
+	copy(objects, *candidates)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].Key < objects[j].Key })
+	more := limit < len(objects)
+	if more {
+		objects = objects[:limit]
+	}
+	return objects, more, nil
+}
+
 // SetLifecycle records the rules and starts (once) a background reaper bound to
 // ctx that deletes expired objects. Objects are aged by file mtime (their local
 // write/upload time), matching MinIO's object-age semantics.
 func (self *localBlobStore) SetLifecycle(ctx context.Context, rules []BlobLifecycleRule) error {
 	self.reapMu.Lock()
-	self.rules = rules
+	self.rules = append([]BlobLifecycleRule(nil), rules...)
 	self.reapMu.Unlock()
 	self.reapOnce.Do(func() {
 		go self.reapLoop(ctx)
@@ -556,9 +1163,15 @@ func (self *localBlobStore) SetLifecycle(ctx context.Context, rules []BlobLifecy
 	return nil
 }
 
+func (self *localBlobStore) CheckRetention(context.Context) error {
+	return nil
+}
+
 func (self *localBlobStore) reapLoop(ctx context.Context) {
 	for {
-		self.reapPass()
+		if err := self.reapPass(ctx); err != nil && ctx.Err() == nil {
+			connect.DefaultLogger().Warningf("[blob]local lifecycle scan failed: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -567,35 +1180,49 @@ func (self *localBlobStore) reapLoop(ctx context.Context) {
 	}
 }
 
-func (self *localBlobStore) reapPass() {
+// Expiry shares writers' physical root owner. Private coordination and staged
+// files are never lifecycle objects; cancellation stops a waiting or active scan.
+func (self *localBlobStore) reapPass(ctx context.Context) (resultErr error) {
 	self.reapMu.Lock()
-	rules := self.rules
+	rules := append([]BlobLifecycleRule(nil), self.rules...)
 	self.reapMu.Unlock()
 	if len(rules) == 0 {
-		return
+		return nil
 	}
 	if _, err := os.Stat(self.root); err != nil {
-		return
-	}
-	self.putMu.Lock()
-	defer self.putMu.Unlock()
-	now := NowUtc()
-	filepath.Walk(self.root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		rel, err := filepath.Rel(self.root, path)
+		return err
+	}
+	owner, err := self.lockCapacity(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, owner.Close()) }()
+	now := NowUtc()
+	return filepath.WalkDir(owner.root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() || strings.HasSuffix(path, blobPartialSuffix) {
 			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(owner.root, path)
+		if err != nil {
+			return err
 		}
 		key := filepath.ToSlash(rel)
 		for _, rule := range rules {
-			if rule.TTL <= 0 {
-				continue
-			}
-			if strings.HasPrefix(key, rule.KeyPrefix) && rule.TTL <= now.Sub(info.ModTime()) {
-				os.Remove(path)
-				break
+			if rule.TTL > 0 && strings.HasPrefix(key, rule.KeyPrefix) && rule.TTL <= now.Sub(info.ModTime()) {
+				return os.Remove(path)
 			}
 		}
 		return nil

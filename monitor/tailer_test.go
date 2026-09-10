@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"bufio"
@@ -7,12 +7,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
 
-// fakeStream builds a stream shaped exactly like runner.warpctlStream (child
-// process writing into an os.Pipe) around an arbitrary shell script.
+// fakeStream builds the tailer's injected stream around an arbitrary shell
+// script. Tests that need runner.warpctlStream's stdout/stderr boundary use the
+// real runner below.
 func fakeStream(script string) func(ctx context.Context) (*exec.Cmd, io.ReadCloser, error) {
 	return func(ctx context.Context) (*exec.Cmd, io.ReadCloser, error) {
 		cmd := exec.CommandContext(ctx, "sh", "-c", script)
@@ -32,6 +36,1261 @@ func fakeStream(script string) func(ctx context.Context) (*exec.Cmd, io.ReadClos
 	}
 }
 
+// A Loki failure belongs to the local observation transport, not to the
+// remote service whose logs were requested. The production failure was an
+// exhausted 502 retry whose stderr included `panic:`; when warpctlStream
+// merged stderr with stdout, every standing service tailer classified that as
+// a page-tier service panic.
+func TestWarpctlStreamDoesNotClassifyTransportStderr(t *testing.T) {
+	binDir := t.TempDir()
+	warpctlPath := filepath.Join(binDir, "warpctl")
+	script := `#!/bin/sh
+printf '%s\n' '[edge-0][taskworker][g1][cid:abc] ordinary remote log line'
+printf '%s\n' 'panic: Loki query error (502): Bad Gateway' >&2
+`
+	if err := os.WriteFile(warpctlPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	cfg := &monitorConfig{env: "main"}
+	streamRunner := newRunner(cfg)
+	var operatorDiagnostics strings.Builder
+	streamRunner.operatorDiagnostics = &operatorDiagnostics
+	tailer := newLogTailer("taskworker", &probeEnv{
+		cfg:    cfg,
+		runner: streamRunner,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tailer.tailOnce(ctx); err != nil {
+		t.Fatalf("tailOnce: %v", err)
+	}
+	const expectedOperatorDiagnostic = "panic: Loki query error (502): Bad Gateway\n"
+	if operatorDiagnostics.String() != expectedOperatorDiagnostic {
+		t.Fatalf("operator diagnostics = %q; want %q", operatorDiagnostics.String(), expectedOperatorDiagnostic)
+	}
+
+	if finding := findingByClass(t, tailer.drainWindow(), "panic"); !finding.healthy {
+		t.Fatalf("local warpctl stderr became a remote panic finding: %+v", finding)
+	}
+}
+
+func TestWarpctlStreamAggregatesInternalIPv6RouteLossWithoutServiceClassification(t *testing.T) {
+	binDir := t.TempDir()
+	warpctlPath := filepath.Join(binDir, "warpctl")
+	script := `#!/bin/sh
+printf '%s\n' '[edge-0][api][g1][cid:abc] ordinary remote log line'
+printf '%s\n' '2026/09/01 06:59:49 client.go:473: Tail read error (read tcp [2001:db8:1::10]:62001->[2001:db8:2::44]:443: read: no route to host). Reconnecting.' >&2
+`
+	if err := os.WriteFile(warpctlPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	cfg := &monitorConfig{
+		env: "main",
+		hosts: []*host{{
+			name: "edge-4",
+			edgeIPv6: []EdgeIPv6InterfaceSettings{{
+				Interface: "eno3",
+				Address:   "2001:db8:2::44",
+			}},
+		}},
+	}
+	streamRunner := newRunner(cfg)
+	var operatorDiagnostics strings.Builder
+	streamRunner.operatorDiagnostics = &operatorDiagnostics
+	env := &probeEnv{cfg: cfg, runner: streamRunner}
+	tailer := newLogTailer("api", env)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tailer.tailOnce(ctx); err != nil {
+		t.Fatalf("tailOnce: %v", err)
+	}
+	const expectedOperatorDiagnostic = "2026/09/01 06:59:49 client.go:473: Tail read error (read tcp [2001:db8:1::10]:62001->[2001:db8:2::44]:443: read: no route to host). Reconnecting.\n"
+	if operatorDiagnostics.String() != expectedOperatorDiagnostic {
+		t.Fatalf("operator diagnostics = %q; want %q", operatorDiagnostics.String(), expectedOperatorDiagnostic)
+	}
+
+	probe := &logTailProbe{tailers: []*logTailer{tailer}}
+	findings, err := probe.check(ctx, env)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	routeLoss := findingByClass(t, findings, "tailer-ipv6-route-loss")
+	if routeLoss.healthy {
+		t.Fatalf("warpctl's internal reconnect was invisible: %+v", routeLoss)
+	}
+	for _, want := range []string{
+		"edge-4",
+		"eno3/2001:db8:2::44",
+		"route_errors=1",
+		"services=1",
+		"service_sample=api",
+		"first_local=2026/09/01 06:59:49",
+		"stderr",
+		"three pinned HTTP/1.1 requests return 200",
+		"unrelated provider IPv6 prefix",
+	} {
+		combined := strings.Join([]string{
+			routeLoss.target,
+			routeLoss.frame,
+			routeLoss.observed,
+			routeLoss.evidence,
+			routeLoss.verify,
+		}, "\n")
+		if !strings.Contains(combined, want) {
+			t.Fatalf("route-loss finding missing %q:\n%+v", want, routeLoss)
+		}
+	}
+	if panicFinding := findingByClass(t, findings, "panic"); !panicFinding.healthy {
+		t.Fatalf("transport stderr became a remote panic: %+v", panicFinding)
+	}
+
+	resolved, err := probe.check(ctx, env)
+	if err != nil {
+		t.Fatalf("resolved check: %v", err)
+	}
+	if routeFinding := findingByClass(t, resolved, "tailer-ipv6-route-loss"); !routeFinding.healthy {
+		t.Fatalf("drained transport event did not resolve: %+v", routeFinding)
+	}
+}
+
+func TestTailTransportDiagnosticWriterReassemblesAndAggregatesServices(t *testing.T) {
+	const diagnostic = "2026/09/01 06:59:49 client.go:473: Tail read error (read tcp [2001:db8:1::10]:62001->[2001:db8:2::44]:443: read: no route to host). Reconnecting.\n"
+	tailers := []*logTailer{
+		newLogTailer("api", nil),
+		newLogTailer("connect", nil),
+		newLogTailer("taskworker", nil),
+	}
+	for _, tailer := range tailers {
+		writer := &tailTransportDiagnosticWriter{tailer: tailer}
+		for _, fragment := range []string{diagnostic[:17], diagnostic[17:73], diagnostic[73:]} {
+			if _, err := writer.Write([]byte(fragment)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+		}
+	}
+
+	findings, err := (&logTailProbe{tailers: tailers}).check(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	routeLoss := findingByClass(t, findings, "tailer-ipv6-route-loss")
+	if routeLoss.healthy {
+		t.Fatalf("fragmented diagnostics were not aggregated: %+v", routeLoss)
+	}
+	for _, want := range []string{
+		"route_errors=3",
+		"services=3",
+		"service_sample=api,connect,taskworker",
+		"unknown-edge-ipv6",
+	} {
+		combined := routeLoss.symptom + "\n" + routeLoss.target + "\n" + routeLoss.observed
+		if !strings.Contains(combined, want) {
+			t.Fatalf("aggregated finding missing %q:\n%+v", want, routeLoss)
+		}
+	}
+}
+
+func TestParseTailTransportMonitorRouteEvidence(t *testing.T) {
+	out := strings.Join([]string{
+		"2026-09-01 06:59:48.000 Df configd[1:2] AUTOMATIC-V6 en8: all autoconf addresses detached/deprecated",
+		"2026-09-01 06:59:49.250 Df configd[1:2] RTADV en0: router lifetime became zero",
+		"2026-09-01 06:59:49.500 Df configd[1:2] network changed: v4(en0)",
+		"2026-09-01 06:59:50.000 Df configd[1:2] AUTOMATIC-V6 en0: all autoconf addresses detached/deprecated",
+		"2026-09-01 06:59:55.750 Df configd[1:2] network changed: v4(en0) v6(en0:ready)",
+	}, "\n")
+
+	evidence := parseTailTransportMonitorRouteEvidence(out)
+	if evidence.interfaceName != "en0" || evidence.routerLifetimeExpiredCount != 1 || evidence.autoconfDetachCount != 1 {
+		t.Fatalf("wrong monitor route evidence: %+v", evidence)
+	}
+	if got := evidence.routerLifetimeExpiredAt.Format(monitorIPv6LogTimeLayout); got != "2026-09-01 06:59:49.250" {
+		t.Fatalf("router lifetime expiry time = %q", got)
+	}
+	if got := evidence.ipv6AbsentAt.Format(monitorIPv6LogTimeLayout); got != "2026-09-01 06:59:49.500" {
+		t.Fatalf("IPv6 absence time = %q", got)
+	}
+	if got := evidence.ipv6RestoredAt.Format(monitorIPv6LogTimeLayout); got != "2026-09-01 06:59:55.750" {
+		t.Fatalf("IPv6 restoration time = %q", got)
+	}
+}
+
+func TestParseTailTransportMonitorRouteEvidenceDoesNotInferExpiryFromExplicitZeroLifetimeLog(t *testing.T) {
+	out := strings.Join([]string{
+		"2026-09-01 06:59:49.250 Df configd[1:2] RTADV en0: ignoring RA (lifetime zero)",
+		"2026-09-01 06:59:49.500 Df configd[1:2] network changed: v4(en0)",
+	}, "\n")
+
+	evidence := parseTailTransportMonitorRouteEvidence(out)
+	if evidence.interfaceName != "" || evidence.routerLifetimeExpiredCount != 0 || !evidence.routerLifetimeExpiredAt.IsZero() {
+		t.Fatalf("an adjacent configd message was misclassified as stored-router expiry: %+v", evidence)
+	}
+}
+
+func TestTailTransportRouteLossUsesMonitorRouterLifetimeExpirationDiscriminator(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	tailer.recordTransportDiagnostic("2026/09/01 06:59:49 client.go:473: Tail read error (read tcp [2001:db8:1::10]:62001->[2001:db8:2::44]:443: read: no route to host). Reconnecting.")
+	probe := &logTailProbe{
+		tailers: []*logTailer{tailer},
+		monitorRouteEvidence: func(context.Context, *probeEnv, map[string]*tailTransportRouteAggregate) tailTransportMonitorRouteEvidence {
+			expiredAt, err := time.ParseInLocation(monitorIPv6LogTimeLayout, "2026-09-01 06:59:49.250", time.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restoredAt, err := time.ParseInLocation(monitorIPv6LogTimeLayout, "2026-09-01 06:59:55.750", time.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return tailTransportMonitorRouteEvidence{
+				interfaceName:              "en0",
+				routerLifetimeExpiredAt:    expiredAt,
+				routerLifetimeExpiredCount: 1,
+				autoconfDetachCount:        2,
+				ipv6AbsentAt:               expiredAt.Add(250 * time.Millisecond),
+				ipv6RestoredAt:             restoredAt,
+			}
+		},
+	}
+	env := &probeEnv{cfg: &monitorConfig{hosts: []*host{{
+		name: "edge-4",
+		edgeIPv6: []EdgeIPv6InterfaceSettings{{
+			Interface: "eno3",
+			Address:   "2001:db8:2::44",
+		}},
+	}}}}
+
+	findings, err := probe.check(context.Background(), env)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	routeLoss := findingByClass(t, findings, "tailer-ipv6-route-loss")
+	if routeLoss.healthy {
+		t.Fatalf("monitor-local router expiry was not reported: %+v", routeLoss)
+	}
+	combined := strings.Join([]string{
+		routeLoss.mechanism,
+		routeLoss.observed,
+		routeLoss.evidence,
+		routeLoss.context,
+		routeLoss.action,
+		routeLoss.verify,
+	}, "\n")
+	for _, want := range []string{
+		"default-router lifetime on en0 reached zero",
+		"monitor_interface=en0",
+		"monitor_router_lifetime_expired=1",
+		"monitor_autoconf_detach=2",
+		"monitor_ipv6_absent=2026-09-01 06:59:49.500",
+		"supersedes edge attribution",
+		"not evidence that the named production edge",
+		"Do not change the named production edge",
+		"does not distinguish an explicit zero-lifetime Router Advertisement from missed or late refresh advertisements",
+		"capture timestamped ICMPv6 type 134",
+		"For at least 30 minutes",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("monitor-local discriminator missing %q:\n%+v", want, routeLoss)
+		}
+	}
+	if strings.HasPrefix(routeLoss.action, "Immediately run the §18.1 exact-address battery") {
+		t.Fatalf("locally proven router expiry still starts with edge diagnosis: %s", routeLoss.action)
+	}
+}
+
+func TestTailTransportMonitorRouteEvidenceRequiresSameWindowIPv6Loss(t *testing.T) {
+	event := &tailTransportRouteAggregate{
+		first: "2026/09/01 06:59:49",
+		last:  "2026/09/01 06:59:50",
+	}
+	expiredAt, err := time.ParseInLocation(monitorIPv6LogTimeLayout, "2026-09-01 06:59:49.250", time.Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := tailTransportMonitorRouteEvidence{
+		interfaceName:           "en0",
+		routerLifetimeExpiredAt: expiredAt,
+		ipv6AbsentAt:            expiredAt.Add(250 * time.Millisecond),
+	}
+	if !base.matches(event) {
+		t.Fatal("same-window router expiry and IPv6 loss did not match")
+	}
+	preceding := base
+	preceding.routerLifetimeExpiredAt = expiredAt.Add(-9 * time.Second)
+	preceding.ipv6AbsentAt = preceding.routerLifetimeExpiredAt.Add(250 * time.Millisecond)
+	if !preceding.matches(event) {
+		t.Fatal("proven nine-second router-expiry precursor did not match")
+	}
+	activeInterval := base
+	activeInterval.routerLifetimeExpiredAt = expiredAt.Add(-27 * time.Second)
+	activeInterval.ipv6AbsentAt = activeInterval.routerLifetimeExpiredAt.Add(33 * time.Millisecond)
+	if !activeInterval.matches(event) {
+		t.Fatal("active 27-second IPv6-loss interval did not match the later tail error")
+	}
+	restoredBeforeTail := activeInterval
+	restoredBeforeTail.ipv6RestoredAt = expiredAt.Add(-time.Second)
+	if restoredBeforeTail.matches(event) {
+		t.Fatal("IPv6 loss restored before the tail error was treated as causal")
+	}
+	withoutLoss := base
+	withoutLoss.ipv6AbsentAt = time.Time{}
+	if withoutLoss.matches(event) {
+		t.Fatal("router-lifetime log without local IPv6 loss was treated as causal")
+	}
+	distant := base
+	distant.routerLifetimeExpiredAt = expiredAt.Add(-monitorIPv6RouteStateLookback - time.Second)
+	distant.ipv6AbsentAt = distant.routerLifetimeExpiredAt.Add(time.Second)
+	if distant.matches(event) {
+		t.Fatal("distant router expiry was correlated to this transport event")
+	}
+}
+
+func TestParseTailTransportMonitorRouteEvidenceUsesLatestActiveLossInterval(t *testing.T) {
+	out := strings.Join([]string{
+		"2026-09-04 10:17:46.534 Df configd[1:2] RTADV en0: router lifetime became zero",
+		"2026-09-04 10:17:46.565 Df configd[1:2] network changed: v4(en0)",
+		"2026-09-04 10:17:54.000 Df configd[1:2] network changed: v4(en0) v6(en0:ready)",
+		"2026-09-04 10:18:25.000 Df configd[1:2] RTADV en0: router lifetime became zero",
+		"2026-09-04 10:18:25.033 Df configd[1:2] network changed: v4(en0)",
+		"2026-09-04 10:18:26.000 Df configd[1:2] AUTOMATIC-V6 en0: all autoconf addresses detached/deprecated",
+	}, "\n")
+
+	evidence := parseTailTransportMonitorRouteEvidence(out)
+	event := &tailTransportRouteAggregate{
+		first: "2026/09/04 10:18:52",
+		last:  "2026/09/04 10:18:52",
+	}
+	if !evidence.matches(event) {
+		t.Fatalf("latest active loss interval did not match 27-second-later tail error: %+v", evidence)
+	}
+	if got := evidence.routerLifetimeExpiredAt.Format(monitorIPv6LogTimeLayout); got != "2026-09-04 10:18:25.000" {
+		t.Fatalf("latest router expiry = %q", got)
+	}
+	if evidence.routerLifetimeExpiredCount != 1 || evidence.autoconfDetachCount != 1 || !evidence.ipv6RestoredAt.IsZero() {
+		t.Fatalf("latest loss interval retained prior restored state: %+v", evidence)
+	}
+}
+
+func TestCollectTailTransportMonitorRouteEvidenceCoversProvenDiagnosticLag(t *testing.T) {
+	var commandName string
+	var commandArgs []string
+	source := &syntheticSource{localFn: func(name string, args ...string) (string, error) {
+		commandName = name
+		commandArgs = append([]string(nil), args...)
+		return strings.Join([]string{
+			"2026-09-01 06:59:40.537 Df configd[1:2] RTADV en0: router lifetime became zero",
+			"2026-09-01 06:59:40.570 Df configd[1:2] network changed: v4(en0)",
+		}, "\n"), nil
+	}}
+	env, err := newProbeEnv(syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := map[string]*tailTransportRouteAggregate{
+		"2001:db8:2::44": {
+			first: "2026/09/01 06:59:49",
+			last:  "2026/09/01 06:59:50",
+		},
+	}
+	evidence := collectTailTransportMonitorRouteEvidenceFromRunner(context.Background(), env, events)
+	if !evidence.matches(events["2001:db8:2::44"]) {
+		t.Fatalf("collector missed the proven pre-diagnostic expiry: %+v", evidence)
+	}
+	if commandName != "/usr/bin/log" {
+		t.Fatalf("local command = %q", commandName)
+	}
+	joined := strings.Join(commandArgs, " ")
+	for _, want := range []string{
+		"--start 2026-09-01 06:49:49",
+		"--end 2026-09-01 07:00:05",
+		`process == "configd"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("bounded configd command missing %q: %s", want, joined)
+		}
+	}
+}
+
+// Grafana's Loki/Mimir query engine logs the complete query at info level.
+// Searching for an error signature therefore echoes that signature into the
+// grafana service log; the standing grafana tailer must not feed the monitor's
+// own observation back into the error classifier.
+func TestGrafanaQueryEchoCannotCreateLogAlerts(t *testing.T) {
+	tailer := newLogTailer("grafana", nil)
+	redisEcho := `[by-us-fmt-5-edge-4][grafana][g1][cid:test][2026-08-31T15:16:29Z]level=info ts=2026-08-31T15:16:29Z caller=roundtrip.go:412 org_id=fake msg=\"executing query\" type=range query=\"{env=\\\"main\\\"} |= \\\"[redis][ttl]\\\"\" query_hash=1`
+	panicEcho := `[fireside][grafana][g1][cid:test][2026-08-31T15:16:30Z]level=info ts=2026-08-31T15:16:30Z caller=engine.go:274 component=querier org_id=fake msg=\"executing query\" query=\"{env=\\\"main\\\"} |= \\\"panic:\\\"\" query_hash=2`
+	metricsEcho := `[by-us-fmt-5-edge-4][grafana][g1][cid:test][2026-08-31T15:23:53Z]level=info ts=2026-08-31T15:23:53Z caller=metrics.go:285 component=querier org_id=fake latency=fast query=\"{env=\\\"main\\\", service=\\\"api\\\"} |= \\\"[redis][ttl]\\\"\" query_hash=3 query_type=filter range_type=range duration=2ms status=200 returned_lines=0`
+	tailer.classify(redisEcho)
+	tailer.classify(metricsEcho)
+	for range 5 {
+		tailer.classify(panicEcho)
+	}
+
+	findings := tailer.drainWindow()
+	for _, class := range []string{"redis-ttl-suspect", "panic", "novel"} {
+		if finding := findingByClass(t, findings, class); !finding.healthy {
+			t.Fatalf("grafana query echo became a %s finding: %+v", class, finding)
+		}
+	}
+
+	// The exclusion is deliberately narrow: an actual Grafana warning and the
+	// same text from a non-Grafana service must remain visible.
+	grafanaWarning := newLogTailer("grafana", nil)
+	grafanaWarning.classify(`[fireside][grafana][g1][cid:test]level=warn caller=redis.go:89 [redis][ttl] suspicious ttl`)
+	if finding := findingByClass(t, grafanaWarning.drainWindow(), "redis-ttl-suspect"); finding.healthy {
+		t.Fatal("real Grafana TTL warning was hidden with query metadata")
+	}
+	apiEcho := newLogTailer("api", nil)
+	apiEcho.classify(redisEcho)
+	if finding := findingByClass(t, apiEcho.drainWindow(), "redis-ttl-suspect"); finding.healthy {
+		t.Fatal("query-echo exclusion leaked outside the grafana service")
+	}
+}
+
+// The production H1 admission rejection is an info-level diagnostic and does
+// not contain a generic error-shaped word. Without an explicit class, the
+// standing monitor silently misses a carrier that can never fit on retry.
+func TestFramerMessageTooLargeIsClassifiedAndRedacted(t *testing.T) {
+	for _, line := range []string{
+		`[edge-4][connect][g2][cid:customer-one][I][2026-09-01T07:14:00Z][framer][reject]write messageLen=4232 > MaxMessageLen=4096 (maxFrameLen=4100)`,
+		`[fireside][proxy][g3][cid:customer-two][I][2026-09-01T07:14:01Z][framer][reject]read messageLen=4950 > MaxMessageLen=4096 (maxFrameLen=4100)`,
+		`[fireside][proxy][g3][cid:customer-three][I][2026-09-01T07:14:02Z][framer][reject]write batch messageLen=4187 > MaxMessageLen=4096 (maxFrameLen=4100)`,
+	} {
+		tailer := newLogTailer("connect", nil)
+		tailer.classify(line)
+		finding := findingByClass(t, tailer.drainWindow(), "framer-message-too-large")
+		if finding.healthy {
+			t.Fatalf("info-level framer rejection was not classified: %q", line)
+		}
+		for _, want := range []string{
+			"messageLen=",
+			"MaxMessageLen=4096",
+			"same immutable Pack",
+			"Connect and Proxy artifacts",
+			"c1403f16",
+			"096414ac",
+			"§8.13",
+			"§8.12",
+			"three sustained HTTP/SOCKS/WireGuard overlap campaigns",
+		} {
+			if !strings.Contains(finding.evidence+finding.mechanism+finding.action+finding.verify, want) {
+				t.Fatalf("framer rejection finding lacks %q: %+v", want, finding)
+			}
+		}
+		for _, stale := range []string{"53780b3e", "7e0fcba"} {
+			if strings.Contains(finding.action+finding.verify, stale) {
+				t.Fatalf("framer rejection finding retained former non-ancestor hash %q: %+v", stale, finding)
+			}
+		}
+		for _, secret := range []string{"customer-one", "customer-two", "customer-three", "fireside", "edge-4"} {
+			if strings.Contains(finding.evidence, secret) {
+				t.Fatalf("framer rejection evidence retained identity %q: %q", secret, finding.evidence)
+			}
+		}
+	}
+
+	adjacent := newLogTailer("connect", nil)
+	adjacent.classify(`[edge-4][connect][g2][I][framer]write messageLen=4232 MaxMessageLen=8192`)
+	if finding := findingByClass(t, adjacent.drainWindow(), "framer-message-too-large"); !finding.healthy {
+		t.Fatalf("ordinary framer log was classified as a rejection: %+v", finding)
+	}
+}
+
+func TestMimirSeriesLimitStandingWindowHasStablePrivateFrameAndHealthyControl(t *testing.T) {
+	tailer := newLogTailer("grafana", nil)
+	if finding := findingByClass(t, tailer.drainWindow(), "mimir-series-limit"); !finding.healthy {
+		t.Fatal("empty ingestion-rejection window was not healthy")
+	}
+	for _, line := range []string{
+		`Stats push rejected (400): per-user series limit exceeded; address="192.0.2.1:9999" instance="private-first"`,
+		`Stats push rejected (400): per-user series limit exceeded; address="192.0.2.2:9999" instance="private-second"`,
+	} {
+		tailer.classify(line)
+	}
+	finding := findingByClass(t, tailer.drainWindow(), "mimir-series-limit")
+	if finding.healthy || finding.tier != tierPage || finding.sustain != 1 || finding.frame != "tenant-series-admission" {
+		t.Fatalf("series admission contract: healthy=%t tier=%s sustain=%d frame=%s", finding.healthy, finding.tier, finding.sustain, finding.frame)
+	}
+	if !strings.Contains(finding.observed, "rate=2/min") || strings.Contains(finding.evidence, "private-") || strings.Contains(finding.evidence, "192.0.2.") {
+		t.Fatal("series admission count or privacy contract failed")
+	}
+	if next := findingByClass(t, tailer.drainWindow(), "mimir-series-limit"); !next.healthy || next.target != finding.target {
+		t.Fatal("quiet standing window could not resolve the same service identity")
+	}
+}
+
+func TestMimirBucketIndexLagSeparatesNormalPhaseSkew(t *testing.T) {
+	const normal = `[by-us-fmt-5-edge-1][grafana][g1][cid:normal][2026-08-31T22:42:00Z]level=warn ts=2026-08-31T22:42:00Z caller=bucket.go:1248 user=anonymous level=warn ours=2026-08-31T22:12:17Z requested=2026-08-31T22:26:50Z diff=-873 msg="bucket index version (updated_at) is older than requested"`
+	const belowThreshold = `[by-us-fmt-5-edge-1][grafana][g1][cid:below][2026-08-31T22:42:01Z]level=warn ts=2026-08-31T22:42:01Z caller=bucket.go:1248 user=anonymous level=warn ours=2026-08-31T21:56:51Z requested=2026-08-31T22:26:50Z diff=-1799 msg="bucket index version (updated_at) is older than requested"`
+	tailer := newLogTailer("grafana", nil)
+	tailer.classify(normal)
+	tailer.classify(belowThreshold)
+	if finding := findingByClass(t, tailer.drainWindow(), "mimir-bucket-index-lag"); !finding.healthy {
+		t.Fatalf("sub-threshold Mimir phase skew alerted: %+v", finding)
+	}
+
+	const stale = `[by-us-fmt-5-edge-3][grafana][g4][cid:stale][2026-08-31T22:43:00Z]level=warn ts=2026-08-31T22:43:00Z caller=bucket.go:1248 user=anonymous level=warn ours=2026-08-31T21:56:50Z requested=2026-08-31T22:26:50Z diff=-1800 msg="bucket index version (updated_at) is older than requested"`
+	tailer.classify(stale)
+	finding := findingByClass(t, tailer.drainWindow(), "mimir-bucket-index-lag")
+	if finding.healthy {
+		t.Fatal("multi-generation Mimir bucket-index lag did not alert")
+	}
+	for _, want := range []string{
+		"host=by-us-fmt-5-edge-3 generation=g4",
+		"ours=2026-08-31T21:56:50Z",
+		"requested=2026-08-31T22:26:50Z",
+		"diff=-1800",
+		"production control's exact -873-second gap",
+		"Warp 13fcd05 sets the single-tenant fleet's store-gateway discovery interval to one minute",
+		"not by itself a failed query",
+		"Verify the running Grafana artifact contains Warp 13fcd05",
+		"last successful sync remains under two minutes old",
+		"Do not suppress every bucket warning",
+		"no >=1,800-second warning",
+	} {
+		alert := alertFromFinding(
+			SignalSettings{Environment: "synthetic", Now: time.Now},
+			"1.5", "log-errors", "Log error-class rates", finding,
+		)
+		if !strings.Contains(alert.Markdown(), want) {
+			t.Fatalf("Mimir lag alert lacks %q: %+v", want, finding)
+		}
+	}
+}
+
+func TestNetEscrowAlertRetainsSiteAndRedactsEntityIDs(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	tailer.classify("[netescrow]negative counter after settle: balance=01a04ff7-83b0-1970-2353-4b9ccf6e461d contract=01a05086-db24-dde0-dd4b-cbd20ace42ca result=-21434368")
+	finding := findingByClass(t, tailer.drainWindow(), "netescrow-negative")
+	if finding.healthy {
+		t.Fatal("one negative mirror must alert")
+	}
+	if !strings.Contains(finding.evidence, "after settle") || !strings.Contains(finding.evidence, "balance=<id> contract=<id>") {
+		t.Fatalf("redacted evidence lost its useful site: %q", finding.evidence)
+	}
+	if logIDRe.MatchString(finding.evidence) {
+		t.Fatalf("net-escrow alert leaked an entity id: %q", finding.evidence)
+	}
+	if !strings.Contains(finding.evidence, "clamp_marker=absent") {
+		t.Fatalf("net-escrow alert did not distinguish an absent clamp marker from truncation: %q", finding.evidence)
+	}
+	if finding.frame != "site=settle" || !strings.Contains(finding.observed, "frame=site=settle") {
+		t.Fatalf("net-escrow alert lost its structured mutation site: frame=%q observed=%q", finding.frame, finding.observed)
+	}
+}
+
+// The production line's clamp marker follows enough metadata and identifiers
+// to fall outside the generic sample limit. Preserve it because it separates
+// an atomically contained current-binary aftermath from legacy behavior.
+func TestNetEscrowAlertPreservesClampMarkerBeyondSampleLimit(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	line := "[by-us-fmt-5-edge-4][taskworker][g1][cid:16a73fdaca8f][E][2026-08-31T11:30:52.458075-05:00][subscription_model.go:748][netescrow]negative counter after settle: balance=01a04ff7-83b0-1970-2353-4b9ccf6e461d contract=01a05086-db24-dde0-dd4b-cbd20ace42ca result=-10066 clamped_to=0"
+	if strings.Index(line, "clamped_to=0") <= 200 {
+		t.Fatal("fixture no longer places the clamp marker beyond the generic sample limit")
+	}
+	tailer.classify(line)
+
+	finding := findingByClass(t, tailer.drainWindow(), "netescrow-negative")
+	if !strings.Contains(finding.evidence, "clamped_to=0") {
+		t.Fatalf("net-escrow evidence lost the clamp marker: %q", finding.evidence)
+	}
+	if strings.Contains(finding.evidence, "clamp_marker=absent") {
+		t.Fatalf("present clamp marker was classified absent: %q", finding.evidence)
+	}
+	for _, want := range []string{
+		"absent when there are no new reservations",
+		"exactly equal the current PostgreSQL open-reservation sum",
+		"key presence alone does not disprove the atomic clamp",
+	} {
+		if !strings.Contains(finding.verify, want) {
+			t.Fatalf("net-escrow verification cannot distinguish legitimate key recreation; missing %q: %q", want, finding.verify)
+		}
+	}
+	if logIDRe.MatchString(finding.evidence) {
+		t.Fatalf("net-escrow clamp evidence leaked an entity id: %q", finding.evidence)
+	}
+}
+
+func TestNetEscrowAlertSeparatesMutationSites(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	tailer.classify("[netescrow]negative counter after settle: balance=01a04ff7-83b0-1970-2353-4b9ccf6e461d contract=01a05086-db24-dde0-dd4b-cbd20ace42ca result=-1")
+	tailer.classify("[netescrow]negative counter after quarantine release: balance=01a04ff7-83b0-1970-2353-4b9ccf6e461d contract=01a05086-db24-dde0-dd4b-cbd20ace42ca result=-2")
+
+	findings := tailer.drainWindow()
+	frames := map[string]bool{}
+	for _, finding := range findings {
+		if finding.class == "netescrow-negative" && !finding.healthy {
+			frames[finding.frame] = true
+			if logIDRe.MatchString(finding.evidence) {
+				t.Fatalf("net-escrow alert leaked an entity id: %q", finding.evidence)
+			}
+		}
+	}
+	for _, want := range []string{"site=settle", "site=quarantine release"} {
+		if !frames[want] {
+			t.Fatalf("net-escrow findings frames = %v, missing %q", frames, want)
+		}
+	}
+}
+
+func TestNetEscrowNegativeStormPages(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for range netEscrowNegativePageRate {
+		tailer.classify("[netescrow]negative counter after settle: balance=01a04ff7-83b0-1970-2353-4b9ccf6e461d contract=01a05086-db24-dde0-dd4b-cbd20ace42ca result=-10760936105")
+	}
+
+	finding := findingByClass(t, tailer.drainWindow(), "netescrow-negative")
+	if finding.tier != tierPage {
+		t.Fatalf("storm tier = %q, want page: %+v", finding.tier, finding)
+	}
+	for _, want := range []string{
+		"rate=100/min",
+		"page_threshold=100/min",
+		"frame=site=settle",
+	} {
+		if !strings.Contains(finding.observed, want) {
+			t.Fatalf("storm observation missing %q: %s", want, finding.observed)
+		}
+	}
+	if logIDRe.MatchString(finding.evidence) {
+		t.Fatalf("storm evidence leaked an entity id: %q", finding.evidence)
+	}
+}
+
+func TestRedisNetEscrowTTLAlertRedactsEntityIDs(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	tailer.classify(`[redis][ttl]"expireat" key="{escrow_019c640e-f467-4fa7-177f-d7ca43c33b6f}net" ttl 3139421360s-from-now exceeds 9600h0m0s`)
+	finding := findingByClass(t, tailer.drainWindow(), "redis-netescrow-ttl")
+	if finding.healthy {
+		t.Fatal("one suspect Redis TTL must alert")
+	}
+	if !strings.Contains(finding.evidence, `"expireat"`) ||
+		!strings.Contains(finding.evidence, `{escrow_<id>}net`) {
+		t.Fatalf("redacted evidence lost command or key family: %q", finding.evidence)
+	}
+	if logIDRe.MatchString(finding.evidence) {
+		t.Fatalf("Redis TTL alert leaked an entity id: %q", finding.evidence)
+	}
+}
+
+func payoutAttemptLogLines(second string, attempt int) (string, string) {
+	id := fmt.Sprintf("019f77ae-de17-db98-b22d-%012x", attempt)
+	processorLine := fmt.Sprintf(
+		`[edge-3][taskworker][g2][cid:test][I][%s.100000Z][circle_client_controller.go:142][circlec]error sending payment: wallet %s: asset amount owned by the wallet is insufficient`,
+		second,
+		id,
+	)
+	evaluatorLine := fmt.Sprintf(
+		`[edge-3][taskworker][g2][cid:test][I][%s.200000Z][task.go:1930][%s]eval error = asset amount owned by the wallet is insufficient`,
+		second,
+		id,
+	)
+	return processorLine, evaluatorLine
+}
+
+// Four canonical task attempts in one source second are the exact live shape
+// that immediately preceded a Circle 429. The Circle-client copy of each error
+// contributes to diagnostic volume but not attempt concurrency, and an exact
+// tail replay must not manufacture a fifth attempt.
+func TestPayoutRetryMicroburstCountsDistinctTaskAttemptsPerSecond(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	var replay string
+	for attempt := 0; attempt < 4; attempt++ {
+		processorLine, evaluatorLine := payoutAttemptLogLines("2026-08-31T15:46:23", attempt)
+		tailer.classify(processorLine)
+		tailer.classify(evaluatorLine)
+		if attempt == 0 {
+			replay = evaluatorLine
+		}
+	}
+	tailer.classify(replay)
+
+	finding := findingByClass(t, tailer.drainWindow(), "payout-retry-microburst")
+	if finding.healthy {
+		t.Fatal("four same-second payout attempts did not create a microburst finding")
+	}
+	for _, want := range []string{
+		"peak_task_attempts_per_second=4",
+		"threshold=4/s",
+		"task_attempts=4",
+		"diagnostic_lines=9",
+		"exact-replay-deduplicated task evaluator lines",
+		"separate from the operational liquidity alert",
+		"Proportional 30–90-minute jitter",
+		"independent random choices still cannot impose a fleet-wide per-second ceiling",
+		"five wallet rejections completed and a sixth transfer request received 429",
+		"four of those five rejections came from blocks whose exact executable already contained proportional jitter",
+		"commit 14928f69",
+		"commit 66525afc",
+		"atomic Redis-time rolling gate of three transfer submits/second",
+		"complete §2.14 admission metrics",
+		"peak_task_attempts_per_second stays below 4",
+		"[<id>]eval error",
+	} {
+		if combined := finding.observed + "\n" + finding.evidence + "\n" + finding.mechanism + "\n" + finding.context + "\n" + finding.action + "\n" + finding.verify; !strings.Contains(combined, want) {
+			t.Fatalf("microburst finding missing %q: %+v", want, finding)
+		}
+	}
+	if strings.Contains(finding.context, "eb7e79b6") {
+		t.Fatalf("microburst finding retained former non-ancestor deployment guidance: %+v", finding)
+	}
+	if logIDRe.MatchString(finding.evidence) {
+		t.Fatalf("microburst evidence leaked a payment id: %q", finding.evidence)
+	}
+}
+
+// A minute can begin with a sparse attempt and peak later. The alert must
+// retain a representative line from the actual peak second, not the first
+// canonical line seen in the window (the live 16:31 window peaked at five at
+// 16:31:47 but previously rendered a 16:31:33 sample).
+func TestPayoutRetryMicroburstSampleComesFromPeakSecond(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	_, first := payoutAttemptLogLines("2026-08-31T16:31:33", 1)
+	tailer.classify(first)
+	for attempt := 10; attempt < 15; attempt++ {
+		_, peak := payoutAttemptLogLines("2026-08-31T16:31:47", attempt)
+		tailer.classify(peak)
+	}
+
+	finding := findingByClass(t, tailer.drainWindow(), "payout-retry-microburst")
+	for _, want := range []string{
+		"peak_task_attempts_per_second=5",
+		"peak_source_second=2026-08-31T16:31:47Z",
+		"peak source second: 2026-08-31T16:31:47Z",
+		"sample from peak second: [edge-3][taskworker][g2][cid:test][I][2026-08-31T16:31:47",
+	} {
+		if combined := finding.observed + "\n" + finding.evidence; !strings.Contains(combined, want) {
+			t.Fatalf("peak finding missing %q: %+v", want, finding)
+		}
+	}
+	if strings.Contains(finding.evidence, "2026-08-31T16:31:33") {
+		t.Fatalf("peak evidence retained the first sparse second: %q", finding.evidence)
+	}
+}
+
+// Production taskworker envelopes use the host's explicit local offset. The
+// burst instant must render in UTC, with a zone, so an operator can join it to
+// Circle, PostgreSQL, and kernel evidence without silently shifting five
+// hours or treating an offset-free wall clock as UTC.
+func TestPayoutRetryMicroburstNormalizesPeakSourceSecondToUTC(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for attempt := 0; attempt < 4; attempt++ {
+		id := fmt.Sprintf("019f77ae-de17-db98-b22d-%012x", attempt)
+		timestamp := fmt.Sprintf("2026-08-31T18:31:16.%06dZ", attempt)
+		if attempt >= 2 {
+			timestamp = fmt.Sprintf("2026-08-31T13:31:16.%06d-05:00", attempt)
+		}
+		line := fmt.Sprintf(
+			`[edge-1][taskworker][g2][cid:test][I][%s][task.go:1930][%s]eval error = asset amount owned by the wallet is insufficient`,
+			timestamp,
+			id,
+		)
+		tailer.classify(line)
+	}
+
+	finding := findingByClass(t, tailer.drainWindow(), "payout-retry-microburst")
+	combined := finding.observed + "\n" + finding.evidence
+	for _, want := range []string{
+		"peak_source_second=2026-08-31T18:31:16Z",
+		"peak source second: 2026-08-31T18:31:16Z",
+		"normalized UTC",
+		"sample from peak second: [edge-1][taskworker][g2][cid:test][I][2026-08-31T13:31:16",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("UTC-normalized peak finding missing %q: %+v", want, finding)
+		}
+	}
+	if strings.Contains(combined, "peak_source_second=2026-08-31T13:31:16 ") ||
+		strings.Contains(combined, "peak source second: 2026-08-31T13:31:16 (") {
+		t.Fatalf("peak finding retained an offset-free local wall clock: %+v", finding)
+	}
+}
+
+func TestPaymentProcessorRateLimitCountsOneLogicalEventPerDiagnosticPair(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for attempt := 100; attempt < 105; attempt++ {
+		_, evaluatorLine := payoutAttemptLogLines("2026-08-31T16:31:47", attempt)
+		tailer.classify(evaluatorLine)
+	}
+	id := "019f77ae-de17-db98-b22d-2642f6f67594"
+	providerLine := "[edge-1][taskworker][g2][cid:test][I][2026-08-31T16:31:47.578203Z][circle_client_controller.go:142][circlec]error sending payment: Bad status: 429 Too Many Requests {\"code\":5,\"message\":\"API rate limit error\",\"payment_id\":\"" + id + "\"}"
+	evaluatorLine := "[edge-1][taskworker][g2][cid:test][I][2026-08-31T16:31:47.578638Z][task.go:1930][" + id + "]eval error = Bad status: 429 Too Many Requests {\"code\":5,\"message\":\"API rate limit error\"}"
+	tailer.classify(providerLine)
+	tailer.classify(evaluatorLine)
+	tailer.classify(evaluatorLine)
+
+	finding := findingByClass(t, tailer.drainWindow(), "payment-processor-rate-limit")
+	for _, want := range []string{
+		"rate=3/min",
+		"processor_rate_limit_events=1",
+		"diagnostic_lines=3",
+		"canonical_source=exact-replay-deduplicated-task-evaluator",
+		"logical event count: 1 exact-replay-deduplicated task evaluator line(s) from 3 diagnostic line(s)",
+		"correlated_source_seconds=1",
+		"correlated_cohort_seconds=1",
+		"coincident_wallet_attempts=5",
+		"peak_coincident_wallet_attempts_per_second=5",
+		"correlation_threshold=4/s",
+		"1/1 payment-processor-rate-limit source second(s) shared at least 4 canonical payout-wallet-insufficient attempt(s)",
+		"5 attempt(s) shared those seconds, peaking at 5/s",
+	} {
+		if combined := finding.observed + "\n" + finding.evidence; !strings.Contains(combined, want) {
+			t.Fatalf("processor rate-limit finding missing %q: %+v", want, finding)
+		}
+	}
+	if logIDRe.MatchString(finding.evidence) {
+		t.Fatalf("processor rate-limit evidence leaked an entity id: %q", finding.evidence)
+	}
+
+	// A reconnect can replay the final evaluator line after the cadence drain.
+	// Preserve its diagnostic visibility but do not manufacture another logical
+	// provider event in the next window.
+	tailer.classify(evaluatorLine)
+	replay := findingByClass(t, tailer.drainWindow(), "payment-processor-rate-limit")
+	if !strings.Contains(replay.observed, "processor_rate_limit_events=0") ||
+		!strings.Contains(replay.observed, "diagnostic_lines=1") ||
+		!strings.Contains(replay.observed, "correlated_source_seconds=0") ||
+		!strings.Contains(replay.evidence, "diagnostic replay is not a new provider event") {
+		t.Fatalf("cross-window replay manufactured a logical event: %+v", replay)
+	}
+}
+
+// A late evaluator line can arrive after the minute containing its triggering
+// wallet cohort was drained. Retain source-second attempt counts only for the
+// bounded reconciliation horizon, join an exact second across that boundary,
+// and never join the adjacent second.
+func TestPaymentProcessorRateLimitCorrelatesAcrossDrainByExactSourceSecond(t *testing.T) {
+	now := time.Date(2026, 8, 31, 16, 32, 0, 0, time.UTC)
+	tailer := newLogTailer("taskworker", nil)
+	tailer.clock = func() time.Time { return now }
+	for attempt := 200; attempt < 205; attempt++ {
+		_, evaluatorLine := payoutAttemptLogLines("2026-08-31T16:31:47", attempt)
+		tailer.classify(evaluatorLine)
+	}
+	_ = tailer.drainWindow()
+
+	now = now.Add(time.Minute)
+	rateLine := `[edge-1][taskworker][g2][cid:test][I][2026-08-31T16:31:47.900000Z][task.go:1930][019f77ae-de17-db98-b22d-aaaaaaaaaaaa]eval error = Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`
+	tailer.classify(rateLine)
+	correlated := findingByClass(t, tailer.drainWindow(), "payment-processor-rate-limit")
+	for _, want := range []string{
+		"correlated_source_seconds=1",
+		"correlated_cohort_seconds=1",
+		"coincident_wallet_attempts=5",
+		"peak_coincident_wallet_attempts_per_second=5",
+	} {
+		if combined := correlated.observed + "\n" + correlated.evidence; !strings.Contains(combined, want) {
+			t.Fatalf("cross-drain correlation missing %q: %+v", want, correlated)
+		}
+	}
+
+	adjacentLine := `[edge-1][taskworker][g2][cid:test][I][2026-08-31T16:31:48.100000Z][task.go:1930][019f77ae-de17-db98-b22d-bbbbbbbbbbbb]eval error = Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`
+	tailer.classify(adjacentLine)
+	adjacent := findingByClass(t, tailer.drainWindow(), "payment-processor-rate-limit")
+	if !strings.Contains(adjacent.observed, "correlated_source_seconds=1") ||
+		!strings.Contains(adjacent.observed, "correlated_cohort_seconds=0") ||
+		!strings.Contains(adjacent.observed, "coincident_wallet_attempts=0") {
+		t.Fatalf("adjacent source second falsely inherited the wallet cohort: %+v", adjacent)
+	}
+
+	now = now.Add(logReconcileRetention + time.Second)
+	_ = tailer.drainWindow()
+	if len(tailer.burstRecentSecondCounts) != 0 || len(tailer.burstRecentSecondSeen) != 0 {
+		t.Fatalf("expired correlation state was not pruned: counts=%v seen=%v", tailer.burstRecentSecondCounts, tailer.burstRecentSecondSeen)
+	}
+}
+
+func TestStandingReconciliationUsesBoundedTwoMinuteOverlap(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	var got string
+	source := &syntheticSource{localFn: func(name string, args ...string) (string, error) {
+		got = name + " " + strings.Join(args, " ")
+		return "", nil
+	}}
+	env := &probeEnv{
+		cfg:    &monitorConfig{env: "main"},
+		runner: &sourceRunner{source: source},
+		now:    func() time.Time { return fixedNow },
+	}
+	tailer := newLogTailer("taskworker", env)
+	tailer.reconcileOnce(context.Background())
+	want := "warpctl logs main taskworker --since=2026-08-31T18:52:00Z --limit=20000"
+	if got != want {
+		t.Fatalf("reconciliation command = %q, want %q", got, want)
+	}
+}
+
+// A connected Loki tail can miss a record ingested behind its source-time
+// cursor. The bounded overlap must add only the absent records, including the
+// canonical 429 and the two missing members of a same-second payout burst;
+// replaying the same overlap on the next cadence must add nothing.
+func TestStandingReconciliationRecoversLateRecordsWithoutReplay(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("taskworker", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(-time.Minute)
+	tailer.lastLineTime = tailer.startedAt
+
+	walletLines := make([]string, 0, 4)
+	for attempt := 0; attempt < 4; attempt++ {
+		_, evaluatorLine := payoutAttemptLogLines("2026-08-31T18:53:30", attempt)
+		walletLines = append(walletLines, evaluatorLine)
+	}
+	rateLimitLine := `[edge-0][taskworker][g1][cid:test][I][2026-08-31T18:53:31.100000Z][task.go:1930][019f77ae-de17-db98-b22d-2642f6f67594]eval error = Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`
+
+	// The stable stream delivered newer traffic but omitted attempts one and
+	// three plus the 429.
+	tailer.ingestStanding(walletLines[0], true, true)
+	tailer.ingestStanding(walletLines[2], true, true)
+	reconciled := strings.Join(append(append([]string{}, walletLines...), rateLimitLine), "\n")
+	tailer.reconcile = func(context.Context, time.Time, []string) (string, error) { return reconciled, nil }
+	tailer.reconcileOnce(context.Background())
+
+	findings := tailer.drainWindow()
+	burst := findingByClass(t, findings, "payout-retry-microburst")
+	for _, want := range []string{
+		"peak_task_attempts_per_second=4",
+		"task_attempts=4",
+		"diagnostic_lines=4",
+	} {
+		if !strings.Contains(burst.observed, want) {
+			t.Fatalf("reconciled burst missing %q: %+v", want, burst)
+		}
+	}
+	rateLimit := findingByClass(t, findings, "payment-processor-rate-limit")
+	for _, want := range []string{
+		"rate=1/min",
+		"processor_rate_limit_events=1",
+		"diagnostic_lines=1",
+	} {
+		if !strings.Contains(rateLimit.observed, want) {
+			t.Fatalf("reconciled rate limit missing %q: %+v", want, rateLimit)
+		}
+	}
+
+	// The next overlapping query necessarily contains the same records.
+	tailer.reconcileOnce(context.Background())
+	replayed := tailer.drainWindow()
+	if finding := findingByClass(t, replayed, "payout-retry-microburst"); !finding.healthy {
+		t.Fatalf("overlap replay manufactured a second burst: %+v", finding)
+	}
+	if finding := findingByClass(t, replayed, "payment-processor-rate-limit"); !finding.healthy {
+		t.Fatalf("overlap replay manufactured a second 429: %+v", finding)
+	}
+}
+
+func TestFirstStandingReconciliationDoesNotCountPreStartHistory(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("taskworker", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(-time.Minute)
+	tailer.lastLineTime = tailer.startedAt
+	oldLine := `[edge-0][taskworker][g1][cid:old][I][2026-08-31T18:52:30.100000Z][task.go:1930][019f77ae-de17-db98-b22d-111111111111]eval error = Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`
+	currentLine := `[edge-0][taskworker][g1][cid:new][I][2026-08-31T18:53:30.100000Z][task.go:1930][019f77ae-de17-db98-b22d-222222222222]eval error = Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`
+	tailer.reconcile = func(context.Context, time.Time, []string) (string, error) {
+		return oldLine + "\n" + currentLine, nil
+	}
+	tailer.reconcileOnce(context.Background())
+
+	finding := findingByClass(t, tailer.drainWindow(), "payment-processor-rate-limit")
+	if !strings.Contains(finding.observed, "rate=1/min") ||
+		!strings.Contains(finding.observed, "processor_rate_limit_events=1") {
+		t.Fatalf("first reconciliation counted pre-start history: %+v", finding)
+	}
+
+	// Remembering the old line is also important: the next overlap must not
+	// introduce it after the startup boundary has passed.
+	tailer.reconcileOnce(context.Background())
+	if replay := findingByClass(t, tailer.drainWindow(), "payment-processor-rate-limit"); !replay.healthy {
+		t.Fatalf("pre-start history entered a later window: %+v", replay)
+	}
+}
+
+func TestStandingReconciliationFailurePreservesStreamAndRaisesVisibility(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("taskworker", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(time.Minute * -2)
+	tailer.lastLineTime = tailer.startedAt
+	streamLine := `[edge-0][taskworker][g1][cid:live][I][2026-08-31T18:53:31.100000Z][task.go:1930][019f77ae-de17-db98-b22d-333333333333]eval error = Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`
+	tailer.ingestStanding(streamLine, true, true)
+	tailer.reconcile = func(context.Context, time.Time, []string) (string, error) {
+		return "", fmt.Errorf("Loki query error (502): Bad Gateway")
+	}
+	tailer.reconcileOnce(context.Background())
+
+	probe := &logTailProbe{tailers: []*logTailer{tailer}}
+	findings, err := probe.check(context.Background(), &probeEnv{now: func() time.Time { return fixedNow }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live := findingByClass(t, findings, "payment-processor-rate-limit"); live.healthy {
+		t.Fatalf("failed reconciliation discarded the live-stream finding: %+v", live)
+	}
+	visibility := findingByClass(t, findings, "tailer-reconcile")
+	if visibility.healthy || !strings.Contains(visibility.observed, "Loki query error (502)") {
+		t.Fatalf("reconciliation failure was not visible: %+v", visibility)
+	}
+}
+
+func TestStandingReconciliationLimitIsVisibilityFailure(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("grafana", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(-time.Minute)
+
+	var output strings.Builder
+	for i := 0; i < logReconcileLimit; i++ {
+		fmt.Fprintf(&output, "[edge-0][grafana][g1][cid:test][2026-08-31T18:53:30.100000Z]ordinary line %d\n", i)
+	}
+	tailer.reconcile = func(context.Context, time.Time, []string) (string, error) { return output.String(), nil }
+	tailer.reconcileOnce(context.Background())
+
+	_, _, lastSuccess, lastError := tailer.reconcileSnapshot()
+	if !lastSuccess.IsZero() || !strings.Contains(lastError, "20000-line limit") {
+		t.Fatalf("truncated overlap was accepted: last_success=%s error=%q", lastSuccess, lastError)
+	}
+	visibility := tailerReconcileFinding("grafana", fixedNow, tailer.startedAt, lastSuccess, lastError)
+	if visibility.healthy {
+		t.Fatalf("truncated overlap did not raise visibility: %+v", visibility)
+	}
+}
+
+func TestStandingReconciliationPartitionsSaturatedAggregateByBlock(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("proxy", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(-time.Minute)
+	tailer.blocks = []string{"g1", "g2"}
+
+	var saturated strings.Builder
+	for i := 0; i < logReconcileLimit; i++ {
+		fmt.Fprintf(&saturated, "[edge-0][proxy][g1][cid:test][I][2026-08-31T18:53:30.%06dZ][server.go:764]ordinary peer sync %d\n", i, i)
+	}
+	blockLines := map[string]string{
+		"g1": `[edge-0][proxy][g1][cid:test][E][2026-08-31T18:53:31Z][synthetic.go:1]synthetic proxy error alpha`,
+		"g2": `[edge-0][proxy][g2][cid:test][E][2026-08-31T18:53:32Z][synthetic.go:1]synthetic proxy error beta`,
+	}
+	type queryCall struct {
+		start  time.Time
+		blocks []string
+	}
+	var calls []queryCall
+	tailer.reconcile = func(_ context.Context, start time.Time, blocks []string) (string, error) {
+		calls = append(calls, queryCall{start: start, blocks: append([]string(nil), blocks...)})
+		if len(blocks) == 0 {
+			return saturated.String(), nil
+		}
+		return blockLines[blocks[0]], nil
+	}
+
+	tailer.reconcileOnce(context.Background())
+	if len(calls) != 3 {
+		t.Fatalf("reconciliation calls = %#v, want aggregate plus two block partitions", calls)
+	}
+	wantStart := fixedNow.Add(-logReconcileLookback)
+	for _, call := range calls {
+		if !call.start.Equal(wantStart) {
+			t.Fatalf("partition start = %s, want shared absolute start %s", call.start, wantStart)
+		}
+	}
+	if len(calls[0].blocks) != 0 || !reflect.DeepEqual(calls[1].blocks, []string{"g1"}) || !reflect.DeepEqual(calls[2].blocks, []string{"g2"}) {
+		t.Fatalf("partition calls = %#v, want aggregate, g1, g2", calls)
+	}
+
+	_, _, lastSuccess, lastError := tailer.reconcileSnapshot()
+	if !lastSuccess.Equal(fixedNow) || lastError != "" {
+		t.Fatalf("partitioned overlap not accepted: last_success=%s error=%q", lastSuccess, lastError)
+	}
+	tailer.stateLock.Lock()
+	novelCount := 0
+	for _, count := range tailer.novelCounts {
+		novelCount += count
+	}
+	tailer.stateLock.Unlock()
+	if novelCount != 2 {
+		t.Fatalf("partitioned novel records = %d, want 2", novelCount)
+	}
+}
+
+func TestStandingReconciliationRejectsSaturatedBlockPartition(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("proxy", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(-time.Minute)
+	tailer.blocks = []string{"g1", "g2"}
+
+	var saturated strings.Builder
+	for i := 0; i < logReconcileLimit; i++ {
+		fmt.Fprintf(&saturated, "[edge-0][proxy][g2][cid:test][I][2026-08-31T18:53:30.%06dZ][server.go:764]ordinary peer sync %d\n", i, i)
+	}
+	tailer.reconcile = func(_ context.Context, _ time.Time, blocks []string) (string, error) {
+		if len(blocks) == 0 || blocks[0] == "g2" {
+			return saturated.String(), nil
+		}
+		return "", nil
+	}
+
+	tailer.reconcileOnce(context.Background())
+	_, _, lastSuccess, lastError := tailer.reconcileSnapshot()
+	if !lastSuccess.IsZero() || !strings.Contains(lastError, "proxy block g2") {
+		t.Fatalf("saturated block was accepted: last_success=%s error=%q", lastSuccess, lastError)
+	}
+}
+
+func TestStandingReconciliationContinuesSaturatedBlockFromInclusiveBoundary(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	wantStart := fixedNow.Add(-logReconcileLookback)
+	boundaryAt := time.Date(2026, 8, 31, 18, 53, 30, 19999*1000, time.UTC)
+	boundaryLine := `[edge-0][proxy][g1][cid:test][E][2026-08-31T18:53:30.019999Z][synthetic.go:1]synthetic proxy error boundary`
+	laterLine := `[edge-0][proxy][g1][cid:test][E][2026-08-31T18:53:31Z][synthetic.go:1]synthetic proxy error later`
+
+	var saturated strings.Builder
+	for i := 0; i < logReconcileLimit-1; i++ {
+		fmt.Fprintf(&saturated, "[edge-0][proxy][g1][cid:test][I][2026-08-31T18:53:30.%06dZ][server.go:764]ordinary peer sync %d\n", i, i)
+	}
+	saturated.WriteString(boundaryLine + "\n")
+
+	tailer := newLogTailer("proxy", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = wantStart
+	tailer.blocks = []string{"g1", "g2"}
+	type queryCall struct {
+		start  time.Time
+		blocks []string
+	}
+	var calls []queryCall
+	tailer.reconcile = func(_ context.Context, start time.Time, blocks []string) (string, error) {
+		calls = append(calls, queryCall{start: start, blocks: append([]string(nil), blocks...)})
+		if len(blocks) == 0 || (blocks[0] == "g1" && start.Equal(wantStart)) {
+			return saturated.String(), nil
+		}
+		if blocks[0] == "g1" {
+			return boundaryLine + "\n" + laterLine + "\n", nil
+		}
+		return "", nil
+	}
+
+	tailer.reconcileOnce(context.Background())
+	if len(calls) != 4 {
+		t.Fatalf("reconciliation calls = %#v, want aggregate, g1 page 1, g1 continuation, g2", calls)
+	}
+	if !calls[2].start.Equal(boundaryAt) || !reflect.DeepEqual(calls[2].blocks, []string{"g1"}) {
+		t.Fatalf("continuation = %#v, want g1 at inclusive boundary %s", calls[2], boundaryAt)
+	}
+	_, _, lastSuccess, lastError := tailer.reconcileSnapshot()
+	if !lastSuccess.Equal(fixedNow) || lastError != "" {
+		t.Fatalf("continued block overlap not accepted: last_success=%s error=%q", lastSuccess, lastError)
+	}
+
+	tailer.stateLock.Lock()
+	novelCount := 0
+	for _, count := range tailer.novelCounts {
+		novelCount += count
+	}
+	tailer.stateLock.Unlock()
+	if novelCount != 2 {
+		t.Fatalf("continued novel records = %d, want boundary replay deduped plus one later record", novelCount)
+	}
+}
+
+func TestStandingReconciliationBoundsAdvancingContinuationPages(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 31, 18, 54, 0, 0, time.UTC)
+	tailer := newLogTailer("grafana", nil)
+	tailer.clock = func() time.Time { return fixedNow }
+	tailer.startedAt = fixedNow.Add(-logReconcileLookback)
+
+	calls := 0
+	tailer.reconcile = func(_ context.Context, _ time.Time, _ []string) (string, error) {
+		calls++
+		observedAt := fixedNow.Add(-time.Minute).Add(time.Duration(calls) * time.Second)
+		var output strings.Builder
+		for i := 0; i < logReconcileLimit; i++ {
+			fmt.Fprintf(
+				&output,
+				"[edge-0][grafana][g1][cid:test][%s]ordinary advancing page %d line %d\n",
+				observedAt.Format(time.RFC3339Nano),
+				calls,
+				i,
+			)
+		}
+		return output.String(), nil
+	}
+
+	tailer.reconcileOnce(context.Background())
+	_, _, lastSuccess, lastError := tailer.reconcileSnapshot()
+	if calls != logReconcileMaxPages {
+		t.Fatalf("continuation queries = %d, want bounded %d", calls, logReconcileMaxPages)
+	}
+	if !lastSuccess.IsZero() || !strings.Contains(lastError, "across 8 pages") {
+		t.Fatalf("unbounded hot partition was accepted: last_success=%s error=%q", lastSuccess, lastError)
+	}
+}
+
+func TestStandingTailAttributesDirectDroppedEntriesToAffectedService(t *testing.T) {
+	tailer := newLogTailer("proxy", nil)
+	tailer.classify(`[warpctl][loki-tail-dropped-entries] service=proxy count=2`)
+
+	finding := findingByClass(t, tailer.drainWindow(), "loki-tail-dropped-entries")
+	if finding.healthy {
+		t.Fatal("direct dropped_entries response was classified healthy")
+	}
+	if finding.target != "proxy" {
+		t.Fatalf("direct dropped_entries target = %q, want proxy", finding.target)
+	}
+	if !strings.Contains(finding.observed, "rate=1/min") {
+		t.Fatalf("direct dropped_entries observation = %q, want one loss response", finding.observed)
+	}
+}
+
+// Minute volume is the liquidity/retry-amplification signal, but it is not a
+// synchronized microburst when canonical attempts occupy different seconds.
+// The subsequent empty window must also resolve a prior burst identity.
+func TestPayoutRetryMicroburstRejectsSpreadMinuteAndResets(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for attempt := 0; attempt < 8; attempt++ {
+		second := fmt.Sprintf("2026-08-31T15:47:%02d", attempt)
+		processorLine, evaluatorLine := payoutAttemptLogLines(second, attempt)
+		tailer.classify(processorLine)
+		tailer.classify(evaluatorLine)
+	}
+	findings := tailer.drainWindow()
+	if payout := findingByClass(t, findings, "payout-wallet-insufficient"); payout.healthy {
+		t.Fatal("spread minute lost the parent liquidity finding")
+	}
+	if burst := findingByClass(t, findings, "payout-retry-microburst"); !burst.healthy {
+		t.Fatalf("spread minute became a synchronized burst: %+v", burst)
+	}
+	if burst := findingByClass(t, tailer.drainWindow(), "payout-retry-microburst"); !burst.healthy {
+		t.Fatalf("empty window did not resolve burst identity: %+v", burst)
+	}
+}
+
+// A tail reconnect uses --since=1s and can replay the final source second of
+// the prior drain window. Preserve exactly one prior fingerprint window so a
+// cadence-boundary reconnect cannot open the same burst twice.
+func TestPayoutRetryMicroburstDeduplicatesReplayAcrossDrainBoundary(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	lines := make([]string, 0, 4)
+	for attempt := 0; attempt < 4; attempt++ {
+		_, evaluatorLine := payoutAttemptLogLines("2026-08-31T15:46:33", attempt)
+		lines = append(lines, evaluatorLine)
+		tailer.classify(evaluatorLine)
+	}
+	if first := findingByClass(t, tailer.drainWindow(), "payout-retry-microburst"); first.healthy {
+		t.Fatal("initial same-second burst was not detected")
+	}
+
+	for _, line := range lines {
+		tailer.classify(line)
+	}
+	if replay := findingByClass(t, tailer.drainWindow(), "payout-retry-microburst"); !replay.healthy {
+		t.Fatalf("cross-window exact replay manufactured another burst: %+v", replay)
+	}
+}
+
 // a > 1MB line must cost one counted stream restart, not a dead tailer:
 // before the fix the scan loop exited on bufio.ErrTooLong but cmd.Wait()
 // blocked forever on the still-writing child and the full pipe.
@@ -40,8 +1299,9 @@ func TestTailerOversizedLineDoesNotWedge(t *testing.T) {
 	// one classifiable line, then a ~2MB single line (overflowing the 1MB
 	// scanner buffer), then the child keeps the pipe open forever — the wedge
 	// shape.
-	tailer.stream = fakeStream(
-		`echo "short line"; head -c 2097152 /dev/zero | tr '\0' 'a'; echo; sleep 3600`)
+	// One Go child owns both the oversized write and the open pipe; a shell
+	// pipeline leaves grandchildren outside the command's cancellation owner.
+	tailer.stream = tailerFixtureProcessStream("oversized")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -49,8 +1309,17 @@ func TestTailerOversizedLineDoesNotWedge(t *testing.T) {
 	type result struct{ err error }
 	done := make(chan result, 1)
 	go func() {
+		defer close(done)
 		done <- result{err: tailer.tailOnce(ctx)}
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("oversized stream owner did not join after cancellation")
+		}
+	})
 
 	select {
 	case r := <-done:
@@ -98,6 +1367,21 @@ func TestTailerCleanStreamEnd(t *testing.T) {
 	}
 }
 
+// An exhausted observation-transport request makes warpctl exit nonzero.
+// tailOnce must preserve that exit status so run() uses its escalating
+// failure backoff; discarding cmd.Wait's error caused every service tailer to
+// retry once a second through a Grafana startup outage.
+func TestTailerFailedStreamReturnsChildError(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	tailer.stream = fakeStream(`exit 2`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tailer.tailOnce(ctx); err == nil {
+		t.Fatal("tailOnce returned nil for a nonzero child exit")
+	}
+}
+
 func findingByClass(t *testing.T, findings []finding, class string) finding {
 	t.Helper()
 	for _, f := range findings {
@@ -107,6 +1391,28 @@ func findingByClass(t *testing.T, findings []finding, class string) finding {
 	}
 	t.Fatalf("no finding with class %q in %d findings", class, len(findings))
 	return finding{}
+}
+
+func TestLogTailerRendersServiceTargetAndEndpointFrame(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	for range 10 {
+		tailer.classify("dial tcp 192.0.2.10:6380: i/o timeout")
+	}
+	finding := findingByClass(t, tailer.drainWindow(), "dial-io-timeout")
+	if finding.healthy {
+		t.Fatal("dial timeout at threshold did not alert")
+	}
+	if finding.target != "api" || finding.frame != "192.0.2.10:6380" {
+		t.Fatalf("finding identity target=%q frame=%q", finding.target, finding.frame)
+	}
+	for _, want := range []string{"target=api", "frame=192.0.2.10:6380"} {
+		if !strings.Contains(finding.observed, want) {
+			t.Fatalf("observed values missing %q: %s", want, finding.observed)
+		}
+	}
+	if strings.Contains(finding.observed, "target=192.0.2.10:6380") {
+		t.Fatalf("endpoint replaced stable service target: %s", finding.observed)
+	}
 }
 
 // the §3.7 tailer self-health thresholds: silent-too-long and restarting-hot
@@ -195,5 +1501,417 @@ func TestNovelTicketOpensAcrossVaryingShapes(t *testing.T) {
 	}
 	if !opened {
 		t.Fatal("two consecutive novel minutes with different top shapes did not open a ticket")
+	}
+}
+
+// Public endpoints receive bursts of unrelated vulnerability probes. Nginx
+// logs every nonexistent path as an error, but many one-off paths are not one
+// novel server failure recurring at rate. The novelty threshold is per
+// normalized shape, not the sum of unrelated shapes in the minute.
+func TestNovelDiverseOneOffShapesDoNotAlert(t *testing.T) {
+	tailer := newLogTailer("web", nil)
+	for i := 0; i < novelRateThreshold*3; i += 1 {
+		path := fmt.Sprintf("%c%c", 'a'+rune(i/26), 'a'+rune(i%26))
+		tailer.classify(fmt.Sprintf(
+			`2026/08/30 04:08:45 [error] 16#16: *4607 open() "/etc/nginx/html/probe-%s.php" failed (2: No such file or directory)`,
+			path,
+		))
+	}
+
+	novel := findingByClass(t, tailer.drainWindow(), "novel")
+	if !novel.healthy {
+		t.Fatalf("unrelated one-off web probes produced a novel alert: %+v", novel)
+	}
+}
+
+// A minute may contain several unmatched failure shapes. The representative
+// sample must belong to the selected top shape; retaining the first global
+// sample falsely paired production's provider-tunnel top shape with unrelated
+// reliability and evaluation failures.
+func TestNovelSampleBelongsToTopShapeAndRedactsID(t *testing.T) {
+	const firstID = "11111111-1111-1111-1111-111111111111"
+	const topID = "22222222-2222-2222-2222-222222222222"
+	const correlationID = "raw-customer-correlation"
+	const customerID = "raw-customer-id"
+	const providerID = "raw-provider-id"
+	tailer := newLogTailer("taskworker", nil)
+	tailer.classify("widget error: alpha session " + firstID)
+	for i := 0; i < novelRateThreshold; i += 1 {
+		tailer.classify(fmt.Sprintf(
+			`[edge-private][taskworker][g2][cid:%s] gadget failure: beta session %s customer_id=%s {"provider_id":"%s"} attempt %d`,
+			correlationID,
+			topID,
+			customerID,
+			providerID,
+			i,
+		))
+	}
+
+	novel := findingByClass(t, tailer.drainWindow(), "novel")
+	if novel.healthy {
+		t.Fatal("top novel shape at threshold did not alert")
+	}
+	for _, want := range []string{
+		`top shape: [edge-private][taskworker][g2][cid:<id>] gadget failure: beta session # <redacted-id> {<redacted-id>} attempt #`,
+		`sample from top shape: gadget failure: beta session <id> <redacted-id> {<redacted-id>} attempt 0`,
+	} {
+		if !strings.Contains(novel.evidence, want) {
+			t.Fatalf("novel evidence lacks %q: %q", want, novel.evidence)
+		}
+	}
+	for _, unwanted := range []string{
+		"widget error",
+		firstID,
+		topID,
+		correlationID,
+		customerID,
+		providerID,
+	} {
+		if strings.Contains(novel.evidence, unwanted) {
+			t.Fatalf("novel evidence retained unrelated or private value %q: %q", unwanted, novel.evidence)
+		}
+	}
+}
+
+func TestWindowStallStructuredStatesStayOutOfNovel(t *testing.T) {
+	const privateCorrelation = "private-correlation-value"
+	nonterminalLine := "[edge-private][taskworker][g1][cid:" + privateCorrelation + "]" +
+		"[I][2026-09-08T21:56:22Z][ip_remote_multi_client_outcome.go:374][rel] event=window_stall window=quality reason=platform-unreachable failed=0"
+
+	quiet := newLogTailer("taskworker", nil)
+	quiet.classify(nonterminalLine)
+	quietFindings := quiet.drainWindow()
+	if finding := findingByClass(t, quietFindings, "window-stall"); !finding.healthy {
+		t.Fatalf("one nonterminal transition crossed the rate threshold: %+v", finding)
+	}
+	if novel := findingByClass(t, quietFindings, "novel"); !novel.healthy {
+		t.Fatalf("failed=0 became a generic novel error: %+v", novel)
+	}
+
+	atRate := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i++ {
+		atRate.classify(nonterminalLine)
+	}
+	atRateFindings := atRate.drainWindow()
+	stall := findingByClass(t, atRateFindings, "window-stall")
+	if stall.healthy {
+		t.Fatal("nonterminal window-stall transitions at rate were hidden")
+	}
+	for _, want := range []string{
+		"failed=0 is explicitly nonterminal",
+		"neither a count of failed windows nor an unclassified error",
+		"event=window_stall window=quality reason=platform-unreachable failed=0",
+		"Do not infer terminal user failure",
+	} {
+		if !strings.Contains(stall.evidence+stall.mechanism+stall.action, want) {
+			t.Fatalf("nonterminal window-stall finding lacks %q: %+v", want, stall)
+		}
+	}
+	if strings.Contains(stall.evidence, privateCorrelation) || strings.Contains(stall.evidence, "edge-private") {
+		t.Fatalf("window-stall sample retained private prefix: %q", stall.evidence)
+	}
+	if novel := findingByClass(t, atRateFindings, "novel"); !novel.healthy {
+		t.Fatalf("classified nonterminal transitions also became novel: %+v", novel)
+	}
+
+	terminal := newLogTailer("taskworker", nil)
+	terminal.classify(strings.Replace(nonterminalLine, "failed=0", "failed=1", 1))
+	terminalFindings := terminal.drainWindow()
+	terminalStall := findingByClass(t, terminalFindings, "window-stall-terminal")
+	if terminalStall.healthy || !strings.Contains(terminalStall.evidence, "failed=1") {
+		t.Fatalf("terminal window-stall state was not visible: %+v", terminalStall)
+	}
+	if nonterminal := findingByClass(t, terminalFindings, "window-stall"); !nonterminal.healthy {
+		t.Fatalf("terminal state was also counted as nonterminal: %+v", nonterminal)
+	}
+	if novel := findingByClass(t, terminalFindings, "novel"); !novel.healthy {
+		t.Fatalf("classified terminal transition also became novel: %+v", novel)
+	}
+
+	// Unknown flag values are schema drift, not a state the classifier may
+	// silently reinterpret. They remain in the generic novelty safety net.
+	ambiguous := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i++ {
+		ambiguous.classify(strings.Replace(nonterminalLine, "failed=0", "failed=unknown", 1))
+	}
+	ambiguousFindings := ambiguous.drainWindow()
+	if finding := findingByClass(t, ambiguousFindings, "window-stall"); !finding.healthy {
+		t.Fatalf("ambiguous state was classified as nonterminal: %+v", finding)
+	}
+	if finding := findingByClass(t, ambiguousFindings, "window-stall-terminal"); !finding.healthy {
+		t.Fatalf("ambiguous state was classified as terminal: %+v", finding)
+	}
+	if novel := findingByClass(t, ambiguousFindings, "novel"); novel.healthy {
+		t.Fatal("ambiguous window-stall schema drift disappeared from the novelty safety net")
+	}
+}
+
+// Connect's terminal outcome has its own event name. failOutcome logs this
+// line and calls SetStallStatus directly, so a window_stall failed=1 line is
+// not required for the terminal condition to remain visible.
+func TestWindowFailedUsesStableTerminalWindowClass(t *testing.T) {
+	const privateCorrelation = "synthetic-private-correlation"
+	line := "[synthetic-host][taskworker][synthetic-generation][cid:" + privateCorrelation + "]" +
+		"[I][2000-01-01T00:00:00Z][synthetic.go:1][rel] event=window_failed window=quality reason=providers-unresponsive after=45000"
+
+	tailer := newLogTailer("taskworker", nil)
+	tailer.classify(line)
+	findings := tailer.drainWindow()
+	terminal := findingByClass(t, findings, "window-stall-terminal")
+	if terminal.healthy {
+		t.Fatal("authoritative window_failed event was hidden")
+	}
+	if nonterminal := findingByClass(t, findings, "window-stall"); !nonterminal.healthy {
+		t.Fatalf("terminal outcome was also counted as nonterminal: %+v", nonterminal)
+	}
+	if novel := findingByClass(t, findings, "novel"); !novel.healthy {
+		t.Fatalf("classified terminal outcome also became novel: %+v", novel)
+	}
+	markdown := alertFromFinding(
+		SignalSettings{Environment: "synthetic", Now: time.Now},
+		"1.5", "log-errors", "Log error-class rates", terminal,
+	).Markdown()
+	for _, want := range []string{
+		"event=window_failed window=quality reason=providers-unresponsive after=45000",
+		"window_failed is authoritative terminal state",
+		"calls SetStallStatus directly",
+		"does not normally emit window_stall failed=1",
+		"do not restart or deploy from the terminal bit alone",
+		"No window_failed event or compatible failed=1 transition recurs",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("window_failed finding lacks %q: %+v", want, terminal)
+		}
+	}
+	for _, private := range []string{"synthetic-host", privateCorrelation} {
+		if strings.Contains(markdown, private) {
+			t.Fatalf("window_failed alert retained private value %q", private)
+		}
+	}
+
+	// A recovery event is healthy context, not a terminal or generic error.
+	recovered := newLogTailer("taskworker", nil)
+	recovered.classify("[I][2000-01-01T00:00:01Z][synthetic.go:2][rel] event=window_recovered window=quality after=46000")
+	recoveredFindings := recovered.drainWindow()
+	if terminal := findingByClass(t, recoveredFindings, "window-stall-terminal"); !terminal.healthy {
+		t.Fatalf("window recovery was classified as terminal: %+v", terminal)
+	}
+	if novel := findingByClass(t, recoveredFindings, "novel"); !novel.healthy {
+		t.Fatalf("window recovery became novel: %+v", novel)
+	}
+
+	// Unknown duration syntax is schema drift. The terminal matcher must not
+	// accept it merely because the event name contains the word failed.
+	malformed := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i++ {
+		malformed.classify("[I][2000-01-01T00:00:02Z][synthetic.go:3][rel] event=window_failed window=quality reason=providers-unresponsive after=unknown")
+	}
+	malformedFindings := malformed.drainWindow()
+	if terminal := findingByClass(t, malformedFindings, "window-stall-terminal"); !terminal.healthy {
+		t.Fatalf("malformed window_failed event was accepted as terminal: %+v", terminal)
+	}
+	if novel := findingByClass(t, malformedFindings, "novel"); novel.healthy {
+		t.Fatal("malformed window_failed event disappeared from the novelty safety net")
+	}
+}
+
+// The exact canceled-generator shapes belong to an artifact-bounded class,
+// not generic novelty. One line stays quiet; the production-rate population
+// remains paired with its independently structured nonterminal stall signal.
+func TestWindowGeneratorCanceledUsesArtifactBoundedClass(t *testing.T) {
+	const privateCorrelation = "synthetic-private-correlation"
+	lines := []string{
+		"[synthetic-host][taskworker][synthetic-generation][cid:" + privateCorrelation + "]" +
+			"[I][2000-01-01T00:00:00Z][synthetic.go:1][multi]window enumerate error timeout = generator call canceled",
+		"[synthetic-host][taskworker][synthetic-generation][cid:" + privateCorrelation + "]" +
+			"[I][2000-01-01T00:00:01Z][synthetic.go:2][multi]create client args error = generator call canceled",
+	}
+	stallLine := "[synthetic-host][taskworker][synthetic-generation][cid:" + privateCorrelation + "]" +
+		"[I][2000-01-01T00:00:02Z][synthetic.go:3][rel] event=window_stall window=quality reason=platform-unreachable failed=0"
+
+	quiet := newLogTailer("taskworker", nil)
+	quiet.classify(lines[0])
+	quietFindings := quiet.drainWindow()
+	if finding := findingByClass(t, quietFindings, "window-generator-canceled"); !finding.healthy {
+		t.Fatalf("one canceled-generator diagnostic crossed the rate threshold: %+v", finding)
+	}
+	if finding := findingByClass(t, quietFindings, "novel"); !finding.healthy {
+		t.Fatalf("one classified canceled-generator diagnostic became novel: %+v", finding)
+	}
+
+	atRate := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i++ {
+		atRate.classify(lines[i%len(lines)])
+		atRate.classify(stallLine)
+	}
+	findings := atRate.drainWindow()
+	canceled := findingByClass(t, findings, "window-generator-canceled")
+	if canceled.healthy {
+		t.Fatal("canceled-generator diagnostics at rate were hidden")
+	}
+	if stall := findingByClass(t, findings, "window-stall"); stall.healthy {
+		t.Fatal("paired structured nonterminal stalls at rate were hidden")
+	}
+	if novel := findingByClass(t, findings, "novel"); !novel.healthy {
+		t.Fatalf("classified cancellation and stall lines also became novel: %+v", novel)
+	}
+	markdown := alertFromFinding(
+		SignalSettings{Environment: "synthetic", Now: time.Now},
+		"1.5", "log-errors", "Log error-class rates", canceled,
+	).Markdown()
+	for _, want := range []string{
+		"[multi]window enumerate error timeout = generator call canceled",
+		"line alone cannot prove outer-window cancellation",
+		"legacy log-before-context ordering",
+		"proved fixed artifact",
+		"outer context was live",
+		"recorded Connect build input",
+		"one teardown boundary",
+		"ten minutes",
+		"identical text is still logged and classified",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("canceled-generator finding lacks %q: %+v", want, canceled)
+		}
+	}
+	for _, private := range []string{"synthetic-host", privateCorrelation} {
+		if strings.Contains(markdown, private) {
+			t.Fatalf("canceled-generator alert retained private value %q", private)
+		}
+	}
+}
+
+// A wrapper abandonment is affirmative hung/deadline evidence and must never
+// be swallowed by the narrower exact canceled-generator class.
+func TestWindowGeneratorAbandonmentRemainsNovel(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i++ {
+		tailer.classify("[multi]window enumerate error timeout = generator call abandoned after 20s")
+	}
+	findings := tailer.drainWindow()
+	if finding := findingByClass(t, findings, "window-generator-canceled"); !finding.healthy {
+		t.Fatalf("generator abandonment was mislabeled cancellation: %+v", finding)
+	}
+	if finding := findingByClass(t, findings, "novel"); finding.healthy {
+		t.Fatal("generator abandonment disappeared from the novelty safety net")
+	}
+}
+
+// A near-miss cancellation suffix can be a genuine inner/platform error. It
+// remains visible to generic novelty rather than being broadly suppressed.
+func TestWindowGeneratorCancellationNearMissRemainsNovel(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i++ {
+		tailer.classify("[multi]create client args error = generator call canceled by synthetic platform")
+	}
+	findings := tailer.drainWindow()
+	if finding := findingByClass(t, findings, "window-generator-canceled"); !finding.healthy {
+		t.Fatalf("non-exact inner error was mislabeled exact cancellation: %+v", finding)
+	}
+	if finding := findingByClass(t, findings, "novel"); finding.healthy {
+		t.Fatal("non-exact inner error disappeared from the novelty safety net")
+	}
+}
+
+// TestAutomaticBalanceCodeDeliveryFailurePagesPrivately pins the exact paid,
+// no-recovery error without retaining its provider or account details.
+func TestAutomaticBalanceCodeDeliveryFailurePagesPrivately(t *testing.T) {
+	line := "[synthetic-host][api][synthetic-generation][cid:synthetic-private]" +
+		"[E][2000-01-01T00:00:00Z][synthetic.go:1] Unexpected error: " +
+		"automatic balance-code delivery failed without email recovery: " +
+		"payment network does not exist id=00000000-0000-0000-0000-000000000001 " +
+		"secret=synthetic-code-secret email=synthetic@example.invalid"
+	tailer := newLogTailer("api", nil)
+	tailer.classify(line)
+	findings := tailer.drainWindow()
+	finding := findingByClass(t, findings, "payment-balance-code-undelivered")
+	if finding.healthy || finding.tier != tierPage {
+		t.Fatalf("undelivered balance-code finding = %+v", finding)
+	}
+	if novel := findingByClass(t, findings, "novel"); !novel.healthy {
+		t.Fatalf("classified balance-code failure also became novel: %+v", novel)
+	}
+	markdown := alertFromFinding(
+		SignalSettings{Environment: "synthetic", Now: time.Now},
+		"1.5", "log-errors", "Log error-class rates", finding,
+	).Markdown()
+	for _, want := range []string{
+		"paid balance code was durably created",
+		"no email delivery fallback",
+		"Intentional operator-issued",
+		"privileged payment tooling",
+		"consumed at most once",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("undelivered balance-code alert missing %q:\n%s", want, markdown)
+		}
+	}
+	for _, forbidden := range []string{
+		"synthetic-host",
+		"synthetic-private",
+		"00000000-0000-0000-0000-000000000001",
+		"synthetic-code-secret",
+		"synthetic@example.invalid",
+	} {
+		if strings.Contains(markdown, forbidden) {
+			t.Fatalf("undelivered balance-code alert retained %q:\n%s", forbidden, markdown)
+		}
+	}
+}
+
+func TestProviderTunnelReadDoneUsesArtifactBoundedClass(t *testing.T) {
+	const entityID = "raw-customer-correlation"
+	line := "[edge-private][taskworker][g2][cid:" + entityID + "] providertunnel: tun read error: Done"
+	tailer := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i += 1 {
+		tailer.classify(line)
+	}
+
+	findings := tailer.drainWindow()
+	readDone := findingByClass(t, findings, "provider-tunnel-read-done")
+	if readDone.healthy {
+		t.Fatal("provider-tunnel terminal Done rate did not alert")
+	}
+	markdown := alertFromFinding(
+		SignalSettings{Environment: "synthetic", Now: time.Now},
+		"1.5", "log-errors", "Log error-class rates", readDone,
+	).Markdown()
+	for _, want := range []string{
+		"providertunnel: tun read error: Done",
+		"v2026.9.3-1036806790",
+		"4ba0dd88",
+		"20e289bd",
+		"active Taskworker artifact",
+		"does not encode the outer context state",
+		"If it contains 20e289bd",
+		"zero for 10 minutes",
+		"live-context TUN read failure is still logged",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("provider-tunnel finding lacks %q: %+v", want, readDone)
+		}
+	}
+	for _, private := range []string{"edge-private", entityID} {
+		if strings.Contains(markdown, private) {
+			t.Fatalf("provider-tunnel alert retained private value %q", private)
+		}
+	}
+	if novel := findingByClass(t, findings, "novel"); !novel.healthy {
+		t.Fatalf("classified provider-tunnel Done also became novel: %+v", novel)
+	}
+
+	// The product fix intentionally preserves errors while the tunnel context
+	// is live. Only the exact terminal Done text belongs to this neutral class;
+	// no other read error may be suppressed or reinterpreted.
+	live := newLogTailer("taskworker", nil)
+	for i := 0; i < novelRateThreshold; i += 1 {
+		live.classify("providertunnel: tun read error: synthetic live read failure")
+	}
+	liveFindings := live.drainWindow()
+	if finding := findingByClass(t, liveFindings, "provider-tunnel-read-done"); !finding.healthy {
+		t.Fatalf("live-context read failure was mislabeled terminal Done: %+v", finding)
+	}
+	if finding := findingByClass(t, liveFindings, "novel"); finding.healthy {
+		t.Fatal("live-context read failure disappeared from the novel safety net")
 	}
 }

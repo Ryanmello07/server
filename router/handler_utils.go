@@ -28,7 +28,9 @@ var (
 	// The auth wrappers tag impl errors with one or more "[implName]" prefixes
 	// (see WrapRequireAuth), so the code may follow bracketed tags; without
 	// peeling them every tagged "%d message" error would surface as a 500.
-	httpErrorCodeRegex = regexp.MustCompile("^((?:\\[[^\\]]*\\])*)\\s*(\\d+)\\s+(.*)$")
+	// Only the first line can select a canonical error status. Joined causes
+	// belong to the message tail, not to the tag/status parsing grammar.
+	httpErrorCodeRegex = regexp.MustCompile(`^((?:\[[^\]\r\n]*\])*)[ \t]*([45][0-9]{2})[ \t]+(?s:(.*))$`)
 )
 
 // This matches the existing public load-balancer cap. Enforcing it again at
@@ -105,6 +107,23 @@ func wrap[R any](
 	writeJsonResponse(w, result)
 }
 
+// tagImplError prefixes an impl error with the impl name, the "[tag]" form
+// RaiseHttpError's httpErrorCodeRegex peels back off before the message reaches
+// the client.
+//
+// %w, not %s. RaiseHttpError reads the retry hint off a rate limit with
+// errors.As, and %s flattens the error to text, which breaks that chain. The
+// client-facing message is byte-identical either way, so the only visible
+// effect of %s was a 429 that silently lost its Retry-After -- a defect with no
+// symptom at the status code. This is one function rather than three copies so
+// that a single test can pin all three wrappers.
+func tagImplError[R any](impl ImplFunction[R], err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("[%s]%w", implName(impl), err)
+}
+
 func implName[R any](impl ImplFunction[R]) string {
 	name := runtime.FuncForPC(reflect.ValueOf(impl).Pointer()).Name()
 	// remove all /vXXXX paths in the canonical module
@@ -126,11 +145,7 @@ func WrapRequireAuth[R any](
 				return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
 			}
 			r, err := impl(session)
-			if err != nil {
-				// wrap the error to tag the impl
-				err = fmt.Errorf("[%s]%s", implName(impl), err)
-			}
-			return r, err
+			return r, tagImplError(impl, err)
 		},
 		w,
 		req,
@@ -152,11 +167,7 @@ func WrapRequireClient[R any](
 				return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
 			}
 			r, err := impl(session)
-			if err != nil {
-				// wrap the error to tag the impl
-				err = fmt.Errorf("[%s]%s", implName(impl), err)
-			}
-			return r, err
+			return r, tagImplError(impl, err)
 		},
 		w,
 		req,
@@ -173,11 +184,7 @@ func WrapNoAuth[R any](
 	wrap(
 		func(session *session.ClientSession) (R, error) {
 			r, err := impl(session)
-			if err != nil {
-				// wrap the error to tag the impl
-				err = fmt.Errorf("[%s]%s", implName(impl), err)
-			}
-			return r, err
+			return r, tagImplError(impl, err)
 		},
 		w,
 		req,
@@ -355,6 +362,33 @@ func WrapWithInputBodyFormatterRequireClient[T any, R any](
 	)
 }
 
+// WrapWithInputOptionalAuth serves signed-out callers and, when the request
+// carries an Authorization header, authenticates it exactly as RequireAuth
+// would (a bad token is a 401, not a silently signed-out request). The impl
+// checks session.ByJwt for the optional caller identity.
+func WrapWithInputOptionalAuth[T any, R any](
+	impl ImplWithInputFunction[T, R],
+	w http.ResponseWriter,
+	req *http.Request,
+	formatters ...FormatFunction[R],
+) {
+	wrapWithInput(
+		RequestBodyFormatter,
+		func(arg T, session *session.ClientSession) (R, error) {
+			if req.Header.Get("Authorization") != "" {
+				if err := session.Auth(req); err != nil {
+					var empty R
+					return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+				}
+			}
+			return impl(arg, session)
+		},
+		w,
+		req,
+		formatters...,
+	)
+}
+
 func WrapWithInputNoAuth[T any, R any](
 	impl ImplWithInputFunction[T, R],
 	w http.ResponseWriter,
@@ -392,13 +426,24 @@ func RaiseHttpError(err error, w http.ResponseWriter) (statusError bool) {
 	statusCode := http.StatusInternalServerError
 	message := err.Error()
 
-	// error messages that start with <number><space>, optionally preceded by
-	// "[tag]" prefixes, have the number peeled off and converted to the
+	// Error messages that start with <400..599><horizontal space>, optionally
+	// preceded by "[tag]" prefixes, have the number converted to the
 	// status code. The tags are dropped from the client-facing message.
 	if groups := httpErrorCodeRegex.FindStringSubmatch(message); groups != nil {
 		statusCode, _ = strconv.Atoi(groups[2])
 		message = groups[3]
 		statusError = true
+	}
+
+	// A rate limit knows when the caller may try again; without the header the
+	// client can only guess, and guessing early costs it more budget. Read
+	// through a one-method interface so the direction of the import stays as it
+	// is: model does not import the router.
+	var retryAfter interface{ RetryAfterSeconds() int }
+	if statusError && errors.As(err, &retryAfter) {
+		if seconds := retryAfter.RetryAfterSeconds(); 0 < seconds {
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		}
 	}
 
 	http.Error(w, message, statusCode)

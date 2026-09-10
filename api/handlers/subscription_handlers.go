@@ -11,8 +11,35 @@ import (
 	"github.com/urnetwork/server/session"
 )
 
+// SubscriptionBalance is the plan response. ?storefront_country=XX (the store's
+// storefront country, when the app knows it) resolves the regional price tier;
+// without it the tier is resolved from the Stripe billing country, else the
+// client ip as a display estimate.
 func SubscriptionBalance(w http.ResponseWriter, r *http.Request) {
-	router.WrapRequireAuth(controller.SubscriptionBalance, w, r)
+	storefrontCountry := r.URL.Query().Get("storefront_country")
+	impl := func(clientSession *session.ClientSession) (*controller.SubscriptionBalanceResult, error) {
+		return controller.SubscriptionBalanceForStorefront(storefrontCountry, clientSession)
+	}
+	router.WrapRequireAuth(impl, w, r)
+}
+
+// SubscriptionDetails lists every store billing the caller's network with the
+// paid-through date, the store's auto-renew state and the control that stops
+// it (the "Manage subscription" screen).
+func SubscriptionDetails(w http.ResponseWriter, r *http.Request) {
+	router.WrapRequireAuth(controller.SubscriptionDetails, w, r)
+}
+
+// SubscriptionCancel lets the Stripe subscription run out at the end of the
+// paid period; other stores answer with where to cancel instead.
+func SubscriptionCancel(w http.ResponseWriter, r *http.Request) {
+	router.WrapWithInputRequireAuth(controller.SubscriptionCancel, w, r)
+}
+
+// SubscriptionResume undoes SubscriptionCancel while the paid period is still
+// running.
+func SubscriptionResume(w http.ResponseWriter, r *http.Request) {
+	router.WrapWithInputRequireAuth(controller.SubscriptionResume, w, r)
 }
 
 func StripeWebhook(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +159,30 @@ func CreateStripePaymentIntent(w http.ResponseWriter, r *http.Request) {
 // desktop apps render in a webview). A session is one or the other, never both.
 func StripeCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 	router.WrapWithInputRequireAuth(controller.StripeCreateCheckoutSession, w, r)
+}
+
+// PayDataCheckout starts a hosted Stripe or Coinbase checkout for a data pack
+// without a signed-in session (the buy-data page).
+func PayDataCheckout(w http.ResponseWriter, r *http.Request) {
+	router.WrapWithInputNoAuth(controller.PayDataCheckout, w, r)
+}
+
+// PayDataNetworkLookup answers whether a network with exactly this name exists,
+// for the buy-data page.
+func PayDataNetworkLookup(w http.ResponseWriter, r *http.Request) {
+	router.WrapWithInputNoAuth(controller.PayDataNetworkLookup, w, r)
+}
+
+// PayDataSolanaIntent quotes a data pack for a named network and records the
+// Solana payment intent the Helius webhook credits when the USDC arrives.
+func PayDataSolanaIntent(w http.ResponseWriter, r *http.Request) {
+	router.WrapWithInputNoAuth(controller.PayDataSolanaIntent, w, r)
+}
+
+// PayDataSolanaStatus is what the buy-data page polls while it waits for the
+// USDC transfer.
+func PayDataSolanaStatus(w http.ResponseWriter, r *http.Request) {
+	router.WrapWithInputNoAuth(controller.PayDataSolanaStatus, w, r)
 }
 
 func StripeCreateCustomerPortal(w http.ResponseWriter, r *http.Request) {

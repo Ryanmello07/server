@@ -1,0 +1,658 @@
+package monitor
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// AddressMode selects which configured address is used for SSH.
+type AddressMode string
+
+const (
+	AddressModeLAN     AddressMode = "lan"
+	AddressModeOverlay AddressMode = "overlay"
+)
+
+// HostSettings describes one monitored host and its roles.
+type HostSettings struct {
+	Name           string
+	LANAddress     string
+	OverlayAddress string
+	Roles          []string
+
+	// SSHUser and SSHKeyPaths override the environment-wide SSH identity for
+	// infrastructure hosts whose administrative account is deliberately
+	// separate from service hosts, such as the management VPN server. Empty
+	// values inherit SignalSettings.
+	SSHUser     string
+	SSHKeyPaths []string
+
+	RedisEntryPort int
+	RedisNodePorts []int
+	// RedisExpectedReplicas arms SIGNALS.md §3.6 replica-cover. Zero is a
+	// valid explicit dark state for today's no-replica topology.
+	RedisExpectedReplicas int
+
+	// Proxy arms SIGNALS.md §14.5 for this host. Live service allocations are
+	// discovered from running containers on every probe; no dynamic port is
+	// cached here.
+	Proxy *ProxyHostSettings
+
+	// EdgeIPv6 is derived from the active services.yml LB version. It is not
+	// duplicated in monitor.yml, so public probes always compare the live host
+	// with the same configured identity used by warpctl.
+	EdgeIPv6 []EdgeIPv6InterfaceSettings
+
+	// PublicLB is the complete non-transparent public-interface inventory from
+	// the active services.yml version. Certificate probes use both configured
+	// address families without allowing DNS health selection to hide one edge.
+	PublicLB []PublicLBInterfaceSettings
+
+	// Subtensor arms SIGNALS.md §17.1 for this host. Stable chain identity and
+	// node endpoints live in monitor.yml so the reusable probe does not bake a
+	// testnet/mainnet choice into its implementation.
+	Subtensor *SubtensorHostSettings
+
+	// Backup arms SIGNALS.md §11.22 for this host. These are the dedicated
+	// direct SSH endpoints used for bulk archive traffic; the monitor's own
+	// connection to the host can still use its management overlay address.
+	Backup *BackupHostSettings
+}
+
+// BackupHostSettings identifies the direct bulk-transfer endpoints for the
+// PostgreSQL and Redis archive sources. Source values include the SSH user so
+// they can be compared losslessly with the effective systemd environment.
+type BackupHostSettings struct {
+	PGSource    string
+	PGPort      int
+	RedisSource string
+	RedisPort   int
+}
+
+// SubtensorHostSettings describes one Subtensor deployment and its external
+// reference chain. The reference RPC is observational only; node traffic keeps
+// using the configured archive/lightnode gateways.
+type SubtensorHostSettings struct {
+	PublicRPCURL               string
+	ExpectedChain              string
+	ExpectedGenesisHash        string
+	ExpectedSpecName           string
+	ExpectedSpecVersion        int64
+	ExpectedTransactionVersion int64
+	ExpectedEVMChainID         string
+	WarpMaxLag                 int64
+	Nodes                      []SubtensorNodeSettings
+}
+
+// SubtensorNodeSettings is one independently checked local RPC/gateway pair.
+type SubtensorNodeSettings struct {
+	Name             string
+	SyncMode         string
+	RPCPort          int
+	GatewayPort      int
+	ContainerName    string
+	ExpectedImage    string
+	ExpectedDataPath string
+}
+
+// EdgeIPv6InterfaceSettings describes one configured public IPv6 LB path.
+// ProbeHostname supplies TLS SNI while Address pins the request to this exact
+// interface instead of allowing DNS health selection to hide one failed edge.
+type EdgeIPv6InterfaceSettings struct {
+	Interface string
+
+	// Block is the exact Warp LB block argument. Warp deliberately uses the
+	// shorter interface name in the systemd unit name, so the two identities
+	// are not interchangeable.
+	Block string
+
+	Address       string
+	ProbeHostname string
+}
+
+// PublicLBInterfaceSettings identifies both public addresses owned by one
+// non-transparent load-balancer interface. An address family may be empty when
+// that interface is intentionally single-stack.
+type PublicLBInterfaceSettings struct {
+	Interface   string
+	IPv4Address string
+	IPv6Address string
+}
+
+// ProxyHostSettings contains only stable public/routing identity. Address
+// families are "ipv4" and/or "ipv6"; both are checked when omitted.
+type ProxyHostSettings struct {
+	PublicHostname   string
+	PublicInterface  string
+	RoutingTable     int
+	LoadBalancerUnit string
+	AddressFamilies  []string
+}
+
+// PostgreSQLSettings contains the connection facts used by the remote psql
+// transport. Password is sent on stdin, never as a command-line argument.
+type PostgreSQLSettings struct {
+	Port          int
+	PgBouncerPort int
+	User          string
+	Password      string
+	Database      string
+}
+
+// GrafanaSettings carries only the credential needed to exercise provisioned
+// datasources through Grafana itself. The monitor sends it as HTTP Basic Auth
+// in memory; it is never included in an alert, command line, or query body.
+type GrafanaSettings struct {
+	AdminPassword string
+}
+
+// GooglePlayReportingSettings carries the dedicated, read-only service-account
+// identity used by SIGNALS.md §20.1. Enabled distinguishes an intentionally
+// absent optional Vault resource from a present but incomplete credential. The
+// latter must remain observable instead of silently disabling the probe.
+type GooglePlayReportingSettings struct {
+	Enabled      bool
+	PackageName  string
+	ClientEmail  string
+	PrivateKey   string
+	PrivateKeyID string
+	TokenURL     string
+	LoadError    error
+}
+
+// AppleReportingSettings carries the App Store Connect team key used by
+// SIGNALS.md §20.2. The App ID comes from the existing apple.yml application
+// identity; only the reporting key lives in the optional dedicated resource.
+type AppleReportingSettings struct {
+	Enabled    bool
+	AppID      string
+	IssuerID   string
+	KeyID      string
+	PrivateKey string
+	LoadError  error
+}
+
+// CredentialRequirement is a secret-free readiness result assembled while
+// loading an environment. It deliberately retains only the resource name and
+// missing field names: credential values and parser input never enter a
+// SignalSettings value, an Alert, or monitor state.
+//
+// Required means the integration is expected to work in this environment. An
+// absent optional resource is healthy; once an optional resource is present,
+// it must still be complete and parseable so a half-configured integration
+// cannot disappear silently.
+type CredentialRequirement struct {
+	Key           string
+	Resource      string
+	Purpose       string
+	Required      bool
+	Present       bool
+	Malformed     bool
+	MissingFields []string
+}
+
+// SourceAttributionSettings arms SIGNALS.md §8.8. Each configured expected
+// address is checked through its family-specific endpoint from the monitor
+// runner itself, so a healthy API process cannot hide lost client identity.
+type SourceAttributionSettings struct {
+	IPv4URL      string
+	IPv6URL      string
+	ExpectedIPv4 string
+	ExpectedIPv6 string
+}
+
+// Row is one machine-readable PostgreSQL result row.
+type Row []string
+
+// SignalSource is the synthetic-test and alternate-transport seam for
+// signals. Production leaves Source nil and uses the SSH implementation built
+// from the remaining SignalSettings fields.
+type SignalSource interface {
+	PostgreSQL(ctx context.Context, query string) ([]Row, error)
+	Redis(ctx context.Context, host HostSettings, port int, args ...string) (string, error)
+	Host(ctx context.Context, host HostSettings, command string) (string, error)
+}
+
+// TimedSignalSource optionally supports commands whose timeout differs from
+// SignalSettings.CommandTimeout.
+type TimedSignalSource interface {
+	HostTimeout(ctx context.Context, host HostSettings, command string, timeout time.Duration) (string, error)
+}
+
+// LocalSignalSource optionally provides local commands such as warpctl.
+type LocalSignalSource interface {
+	Local(ctx context.Context, name string, args ...string) (string, error)
+}
+
+// TCPExchangeSignalSource optionally supplies a synthetic or alternate raw
+// TCP exchange. It is used for protocol-level probes where a listening socket
+// alone is not proof that the expected service owns the public path.
+type TCPExchangeSignalSource interface {
+	TCPExchange(ctx context.Context, network, address string, payload []byte, responseBytes int) ([]byte, error)
+}
+
+// TLSCertificateObservation is the peer certificate chain from a bounded TLS
+// handshake plus the ordinary system-root verification result. Certificates
+// contain DER bytes in peer order; an expired or mismatched leaf remains
+// available even when VerifyError is non-nil so a signal can classify it.
+type TLSCertificateObservation struct {
+	Certificates [][]byte
+	VerifyError  error
+}
+
+// TLSCertificateSignalSource optionally supplies synthetic or alternate TLS
+// certificate observations. Production uses the monitor's direct connector;
+// tests implement this seam without opening network sockets.
+type TLSCertificateSignalSource interface {
+	TLSCertificates(ctx context.Context, network, address, serverName string) (TLSCertificateObservation, error)
+}
+
+// StreamingSignalSource optionally provides long-running local streams. It is
+// used by the standing SIGNALS.md §1.5 log collector.
+type StreamingSignalSource interface {
+	StreamLocal(ctx context.Context, name string, args ...string) (*exec.Cmd, io.ReadCloser, error)
+}
+
+// SignalSettings is all runtime input shared by probes. SSHKeyPaths may hold
+// multiple identity files for a mixed fleet; each becomes an explicit ssh -i
+// option. Source can be supplied by tests to keep every probe synthetic.
+type SignalSettings struct {
+	Environment string
+	// PublicDomain is the active services.yml domain used to construct
+	// environment-scoped public health hostnames without duplicating them in
+	// monitor.yml.
+	PublicDomain string
+	// WebsiteDomain is the canonical product site present in services.yml's
+	// managed domains. It arms focused static-site contract probes without
+	// hard-coding a production hostname into alternate environments.
+	WebsiteDomain string
+	// ManagerHostname is armed only when the active services.yml exposes the
+	// manager alias. It prevents alternate environments from probing a hostname
+	// they do not own while keeping the source of truth out of monitor.yml.
+	ManagerHostname string
+	// LogServices is the active services.yml service inventory used to start
+	// standing log streams without querying the remote artifact registry.
+	// Alternate callers may leave it empty to use warpctl discovery.
+	LogServices []string
+	// LogServiceBlocks is the active services.yml block inventory used only
+	// when a service-wide Loki overlap reaches the bounded result cap. The
+	// tailer then repeats the same absolute window per block, preserving late
+	// ingestion coverage without raising the backend-wide query limit.
+	LogServiceBlocks map[string][]string
+	// VerificationEnabled is the canonical st-subsystem feature state. It lets
+	// task probes distinguish a legitimately slow enabled verification job
+	// from a stale recurring chain that must not exist while the subsystem is
+	// disabled.
+	VerificationEnabled bool
+	// STDeploymentKey is the exact active chain/coordinator namespace used by
+	// the ST mirror. It is compared in memory and must never be rendered into
+	// alerts; an empty value keeps missing or disabled configuration distinct
+	// from a deployment that legitimately finalized epoch zero.
+	STDeploymentKey string
+
+	SSHUser     string
+	SSHDevUser  string
+	SSHKeyPaths []string
+	AddressMode AddressMode
+
+	Hosts             []HostSettings
+	PostgreSQL        PostgreSQLSettings
+	Grafana           GrafanaSettings
+	GooglePlay        GooglePlayReportingSettings
+	AppleReporting    AppleReportingSettings
+	Credentials       []CredentialRequirement
+	SourceAttribution SourceAttributionSettings
+	StateDir          string
+
+	SSHConnectTimeout time.Duration
+	CommandTimeout    time.Duration
+
+	Source SignalSource
+	Now    func() time.Time
+
+	runtime *signalRuntime
+}
+
+type signalRuntime struct {
+	baseline       *baselineStore
+	baselineErr    error
+	remoteCommands *hostCommandLimiter
+}
+
+// ExcludeEdgeIPv6Hosts returns settings with exact public IPv6 probes disabled
+// only for the named hosts. Other probes and other hosts remain enabled.
+// Unknown names fail closed so an operational pause cannot silently miss its
+// intended target.
+func ExcludeEdgeIPv6Hosts(settings SignalSettings, names ...string) (SignalSettings, error) {
+	requested := map[string]bool{}
+	for _, name := range names {
+		requested[name] = false
+	}
+	filtered := settings
+	filtered.Hosts = append([]HostSettings(nil), settings.Hosts...)
+	for i := range filtered.Hosts {
+		if _, ok := requested[filtered.Hosts[i].Name]; !ok {
+			continue
+		}
+		requested[filtered.Hosts[i].Name] = true
+		filtered.Hosts[i].EdgeIPv6 = nil
+	}
+	for name, found := range requested {
+		if !found {
+			return SignalSettings{}, fmt.Errorf("monitor: excluded IPv6 host %q is not configured", name)
+		}
+	}
+	return filtered, nil
+}
+
+func (s SignalSettings) withDefaults() SignalSettings {
+	if s.AddressMode == "" {
+		s.AddressMode = AddressModeOverlay
+	}
+	if s.PostgreSQL.Port == 0 {
+		s.PostgreSQL.Port = 5432
+	}
+	if s.PostgreSQL.PgBouncerPort == 0 {
+		s.PostgreSQL.PgBouncerPort = 6432
+	}
+	if s.SourceAttribution.IPv4URL == "" {
+		s.SourceAttribution.IPv4URL = "https://api-v4.bringyour.com/my-ip-info"
+	}
+	if s.SourceAttribution.IPv6URL == "" {
+		s.SourceAttribution.IPv6URL = "https://api-v6.bringyour.com/my-ip-info"
+	}
+	if s.SSHConnectTimeout <= 0 {
+		s.SSHConnectTimeout = 10 * time.Second
+	}
+	if s.CommandTimeout <= 0 {
+		s.CommandTimeout = 60 * time.Second
+	}
+	if s.Now == nil {
+		s.Now = time.Now
+	}
+	return s
+}
+
+func (s SignalSettings) withRuntime() SignalSettings {
+	if s.runtime != nil {
+		return s
+	}
+	s.runtime = &signalRuntime{
+		remoteCommands: newHostCommandLimiter(maxConcurrentRemoteCommandsPerHost),
+	}
+	if s.StateDir != "" {
+		s.runtime.baseline, s.runtime.baselineErr = newBaselineStore(filepath.Join(s.StateDir, "baseline"))
+	}
+	return s
+}
+
+// Validate checks settings after applying the same defaults used by signals.
+func (s SignalSettings) Validate() error { return s.withDefaults().validate() }
+
+func (s SignalSettings) validate() error {
+	if s.AddressMode != AddressModeLAN && s.AddressMode != AddressModeOverlay {
+		return fmt.Errorf("monitor: unsupported address mode %q", s.AddressMode)
+	}
+	seenLogServices := map[string]struct{}{}
+	for _, service := range s.LogServices {
+		if service == "" || strings.TrimSpace(service) != service {
+			return fmt.Errorf("monitor: invalid log service %q", service)
+		}
+		if _, ok := seenLogServices[service]; ok {
+			return fmt.Errorf("monitor: duplicate log service %q", service)
+		}
+		seenLogServices[service] = struct{}{}
+	}
+	for service, blocks := range s.LogServiceBlocks {
+		if _, ok := seenLogServices[service]; !ok {
+			return fmt.Errorf("monitor: log blocks configured for unknown service %q", service)
+		}
+		seenBlocks := map[string]struct{}{}
+		for _, block := range blocks {
+			if block == "" || strings.TrimSpace(block) != block {
+				return fmt.Errorf("monitor: invalid log block %q for service %q", block, service)
+			}
+			if _, ok := seenBlocks[block]; ok {
+				return fmt.Errorf("monitor: duplicate log block %q for service %q", block, service)
+			}
+			seenBlocks[block] = struct{}{}
+		}
+	}
+	if s.Source != nil {
+		return nil
+	}
+	if s.SSHUser == "" && s.SSHDevUser == "" {
+		return fmt.Errorf("monitor: SSH user is required")
+	}
+	if len(s.Hosts) == 0 {
+		return fmt.Errorf("monitor: at least one host is required")
+	}
+	return nil
+}
+
+func newProbeEnv(settings SignalSettings) (*probeEnv, error) {
+	cfg := configFromSignalSettings(settings)
+	var transport probeRunner
+	if settings.Source != nil {
+		transport = &sourceRunner{source: settings.Source}
+	} else {
+		transport = newRunner(cfg)
+	}
+
+	var baseline *baselineStore
+	if settings.runtime != nil {
+		if settings.runtime.baselineErr == nil {
+			baseline = settings.runtime.baseline
+		}
+	} else if settings.StateDir != "" {
+		// Baselines refine static bands but never gate direct probes. An
+		// unavailable local state directory therefore degrades to static
+		// thresholds, matching MONITOR.md §3.3.
+		baseline, _ = newBaselineStore(filepath.Join(settings.StateDir, "baseline"))
+	}
+	return &probeEnv{cfg: cfg, runner: transport, baseline: baseline, now: settings.Now}, nil
+}
+
+func configFromSignalSettings(settings SignalSettings) *monitorConfig {
+	cfg := &monitorConfig{
+		env:                  settings.Environment,
+		publicDomain:         settings.PublicDomain,
+		websiteDomain:        settings.WebsiteDomain,
+		managerHostname:      settings.ManagerHostname,
+		logServices:          append([]string(nil), settings.LogServices...),
+		logServiceBlocks:     cloneLogServiceBlocks(settings.LogServiceBlocks),
+		verificationEnabled:  settings.VerificationEnabled,
+		stDeploymentKey:      settings.STDeploymentKey,
+		sshUser:              settings.SSHUser,
+		sshDevUser:           settings.SSHDevUser,
+		sshKeyPaths:          append([]string(nil), settings.SSHKeyPaths...),
+		addressMode:          string(settings.AddressMode),
+		pgPort:               settings.PostgreSQL.Port,
+		pgbouncerPort:        settings.PostgreSQL.PgBouncerPort,
+		pgUser:               settings.PostgreSQL.User,
+		pgPassword:           settings.PostgreSQL.Password,
+		pgDb:                 settings.PostgreSQL.Database,
+		grafanaAdminPassword: settings.Grafana.AdminPassword,
+		sourceIPv4URL:        settings.SourceAttribution.IPv4URL,
+		sourceIPv6URL:        settings.SourceAttribution.IPv6URL,
+		expectedSourceIPv4:   settings.SourceAttribution.ExpectedIPv4,
+		expectedSourceIPv6:   settings.SourceAttribution.ExpectedIPv6,
+		stateDir:             settings.StateDir,
+		sshConnectTimeout:    settings.SSHConnectTimeout,
+		commandTimeout:       settings.CommandTimeout,
+	}
+	if settings.runtime != nil {
+		cfg.remoteCommands = settings.runtime.remoteCommands
+	}
+	for _, configured := range settings.Hosts {
+		h := &host{
+			name:                  configured.Name,
+			lanIp:                 configured.LANAddress,
+			overlayIp:             configured.OverlayAddress,
+			roles:                 append([]string(nil), configured.Roles...),
+			sshUser:               configured.SSHUser,
+			sshKeyPaths:           append([]string(nil), configured.SSHKeyPaths...),
+			redisEntryPort:        configured.RedisEntryPort,
+			redisExpectedReplicas: configured.RedisExpectedReplicas,
+			proxy:                 cloneProxyHostSettings(configured.Proxy),
+			edgeIPv6:              cloneEdgeIPv6Settings(configured.EdgeIPv6),
+			publicLB:              clonePublicLBSettings(configured.PublicLB),
+			subtensor:             cloneSubtensorHostSettings(configured.Subtensor),
+			backup:                cloneBackupHostSettings(configured.Backup),
+		}
+		if len(configured.RedisNodePorts) > 0 {
+			h.redisPorts = append([]int(nil), configured.RedisNodePorts...)
+			h.redisNodeLo = configured.RedisNodePorts[0]
+			h.redisNodeHi = configured.RedisNodePorts[len(configured.RedisNodePorts)-1]
+		}
+		cfg.hosts = append(cfg.hosts, h)
+	}
+	return cfg
+}
+
+func cloneLogServiceBlocks(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(source))
+	for service, blocks := range source {
+		cloned[service] = append([]string(nil), blocks...)
+	}
+	return cloned
+}
+
+func hostSettingsFromHost(h *host) HostSettings {
+	if h == nil {
+		return HostSettings{}
+	}
+	return HostSettings{
+		Name:                  h.name,
+		LANAddress:            h.lanIp,
+		OverlayAddress:        h.overlayIp,
+		Roles:                 append([]string(nil), h.roles...),
+		SSHUser:               h.sshUser,
+		SSHKeyPaths:           append([]string(nil), h.sshKeyPaths...),
+		RedisEntryPort:        h.redisEntryPort,
+		RedisNodePorts:        h.redisNodePorts(),
+		RedisExpectedReplicas: h.redisExpectedReplicas,
+		Proxy:                 cloneProxyHostSettings(h.proxy),
+		EdgeIPv6:              cloneEdgeIPv6Settings(h.edgeIPv6),
+		PublicLB:              clonePublicLBSettings(h.publicLB),
+		Subtensor:             cloneSubtensorHostSettings(h.subtensor),
+		Backup:                cloneBackupHostSettings(h.backup),
+	}
+}
+
+func cloneProxyHostSettings(settings *ProxyHostSettings) *ProxyHostSettings {
+	if settings == nil {
+		return nil
+	}
+	clone := *settings
+	clone.AddressFamilies = append([]string(nil), settings.AddressFamilies...)
+	return &clone
+}
+
+func cloneEdgeIPv6Settings(settings []EdgeIPv6InterfaceSettings) []EdgeIPv6InterfaceSettings {
+	return append([]EdgeIPv6InterfaceSettings(nil), settings...)
+}
+
+func clonePublicLBSettings(settings []PublicLBInterfaceSettings) []PublicLBInterfaceSettings {
+	return append([]PublicLBInterfaceSettings(nil), settings...)
+}
+
+func cloneSubtensorHostSettings(settings *SubtensorHostSettings) *SubtensorHostSettings {
+	if settings == nil {
+		return nil
+	}
+	clone := *settings
+	clone.Nodes = append([]SubtensorNodeSettings(nil), settings.Nodes...)
+	return &clone
+}
+
+func cloneBackupHostSettings(settings *BackupHostSettings) *BackupHostSettings {
+	if settings == nil {
+		return nil
+	}
+	clone := *settings
+	return &clone
+}
+
+type sourceRunner struct {
+	source SignalSource
+}
+
+func (r *sourceRunner) pg(ctx context.Context, sql string) ([]pgRow, error) {
+	rows, err := r.source.PostgreSQL(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	converted := make([]pgRow, len(rows))
+	for i, row := range rows {
+		converted[i] = pgRow(row)
+	}
+	return converted, nil
+}
+
+func (r *sourceRunner) redis(ctx context.Context, h *host, port int, args ...string) (string, error) {
+	out, err := r.redisRaw(ctx, h, port, args...)
+	return strings.TrimSpace(out), err
+}
+
+func (r *sourceRunner) redisRaw(ctx context.Context, h *host, port int, args ...string) (string, error) {
+	return r.source.Redis(ctx, hostSettingsFromHost(h), port, args...)
+}
+
+func (r *sourceRunner) shell(ctx context.Context, h *host, command string) (string, error) {
+	return r.source.Host(ctx, hostSettingsFromHost(h), command)
+}
+
+func (r *sourceRunner) sshTimeout(ctx context.Context, h *host, command string, stdin string, timeout time.Duration) (string, error) {
+	if stdin != "" {
+		return "", fmt.Errorf("monitor: synthetic SignalSource cannot provide host stdin")
+	}
+	if timed, ok := r.source.(TimedSignalSource); ok {
+		return timed.HostTimeout(ctx, hostSettingsFromHost(h), command, timeout)
+	}
+	return r.source.Host(ctx, hostSettingsFromHost(h), command)
+}
+
+func (r *sourceRunner) local(ctx context.Context, name string, args ...string) (string, error) {
+	local, ok := r.source.(LocalSignalSource)
+	if !ok {
+		return "", fmt.Errorf("monitor: SignalSource does not implement LocalSignalSource")
+	}
+	return local.Local(ctx, name, args...)
+}
+
+func (r *sourceRunner) tcpExchange(ctx context.Context, network, address string, payload []byte, responseBytes int) ([]byte, error) {
+	source, ok := r.source.(TCPExchangeSignalSource)
+	if !ok {
+		return nil, fmt.Errorf("monitor: SignalSource does not implement TCPExchangeSignalSource")
+	}
+	return source.TCPExchange(ctx, network, address, payload, responseBytes)
+}
+
+func (r *sourceRunner) tlsCertificates(ctx context.Context, network, address, serverName string) (TLSCertificateObservation, error) {
+	source, ok := r.source.(TLSCertificateSignalSource)
+	if !ok {
+		return TLSCertificateObservation{}, fmt.Errorf("monitor: SignalSource does not implement TLSCertificateSignalSource")
+	}
+	return source.TLSCertificates(ctx, network, address, serverName)
+}
+
+func (r *sourceRunner) warpctl(ctx context.Context, args ...string) (string, error) {
+	return r.local(ctx, "warpctl", args...)
+}
+
+func (r *sourceRunner) warpctlStream(ctx context.Context, _ io.Writer, args ...string) (*exec.Cmd, io.ReadCloser, error) {
+	streaming, ok := r.source.(StreamingSignalSource)
+	if !ok {
+		return nil, nil, fmt.Errorf("monitor: SignalSource does not implement StreamingSignalSource")
+	}
+	return streaming.StreamLocal(ctx, "warpctl", args...)
+}

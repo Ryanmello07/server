@@ -1,0 +1,85 @@
+# Ordinary config/competition.yml. Every value is season-frozen before enable.
+enabled: false
+competition_id: sim-latency-season-1
+base_sha: REPLACE_WITH_40_HEX
+evaluator_image_digest: sha256:REPLACE_WITH_64_HEX
+artifact_root: /var/lib/urnetwork/competition
+# Bind these exact leaf directories directly and read-only. Never configure a
+# parent config/, vault/, all/, main/, or site/ path.
+config_local_directory: /srv/warp/config/local
+vault_local_directory: /srv/warp/vault/local
+season_ends_at: 2027-01-01T00:00:00Z
+retain_until: 2027-02-01T00:00:00Z
+# Six submission epochs. The one-shot worker exits after its epoch drains and
+# hands ranked significant candidates to the honesty-review gate. Approval (or
+# rejection of the final candidate) finalizes the epoch; the external promotion
+# loop then advances the source ledger and creates the next hidden-seed round.
+# The preparation window leaves time for the mandatory same-round R=9 rebaseline.
+season_policy:
+  epoch_count: 6
+  submission_window_seconds: 604800
+  preparation_window_seconds: 57600
+  # Collected exactly once by the Apex adapter before it forwards an admitted
+  # submission. Transport retries of the same adapter record are not recharged.
+  submission_fee_usd: 20
+worker_lease_seconds: 90
+worker_heartbeat_seconds: 20
+host_heartbeat_max_age_seconds: 60
+max_infrastructure_attempts: 3
+simulator_command: /usr/local/libexec/urnetwork/sim-latency
+evaluator_command: /usr/local/libexec/urnetwork/competition-evaluator
+evaluator_command_sha256: REPLACE_WITH_64_HEX
+self_check_command: /usr/local/libexec/urnetwork/competition-self-check
+self_check_command_sha256: REPLACE_WITH_64_HEX
+
+patch_policy:
+  max_patch_bytes: 262144
+  # Replace with the exact reviewed file allowlist. Directory-wide examples are
+  # intentionally not enabled here.
+  allowed_paths:
+    - REPLACE_WITH_REVIEWED_PATH.go
+  forbidden_paths:
+    - connect/sim-latency/**
+    - stats/**
+    - db_migrations.go
+    - db_migrations_*.go
+    - go.mod
+    - go.sum
+    - vendor/**
+    - .github/**
+
+evaluation_policy:
+  hardware_id: REPLACE_WITH_SIGNED_HARDWARE_ID
+  # SHA-256 of the signed host facts: image, BIOS/microcode, kernel, SMT,
+  # governor/turbo, NUMA/affinity, IRQ, cgroup, sysctl, and service versions.
+  host_qualification_sha256: REPLACE_WITH_64_HEX
+  # Deterministic sorted-file manifest digests for the two direct bind mounts.
+  config_local_sha256: REPLACE_WITH_64_HEX
+  vault_local_sha256: REPLACE_WITH_64_HEX
+  simulator_sha256: REPLACE_WITH_64_HEX
+  scorer_sha256: REPLACE_WITH_64_HEX
+  provider_count: 0
+  client_pool_size: 0
+  arrivals_per_minute: 0
+  quality_window_size: 0
+  exchange_hosts: 0
+  fleet_shards: 0
+  site_listen: 127.0.0.1:0
+  api_port: 0
+  ramp_ms: 0
+  prewarm_ms: 0
+  settle_ms: 0
+  client_warmup_timeout_ms: 0
+  duration_ms: 0
+  request_timeout_ms: 0
+  pipeline_interval_ms: 0
+  test_timeout_ms: 0
+  announce_timeout_ms: 0
+  impairment_enabled: true
+  replicates: 0
+  takeover_margin: 0
+  # Zero is the frozen sentinel for unbounded per-epoch admission. A Redis list
+  # dispatches FIFO wake-ups while PostgreSQL remains the durable ordering and
+  # recovery authority. Duplicate canonical patches remain cache hits.
+  queue_limit: 0
+  score_timeout_seconds: 10800

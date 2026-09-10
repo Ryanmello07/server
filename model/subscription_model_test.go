@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +99,8 @@ func TestEscrow(t *testing.T) {
 		sourceId := server.NewId()
 		destinationNetworkId := server.NewId()
 		destinationId := server.NewId()
+		testingCreatePaymentClient(ctx, sourceNetworkId, sourceId)
+		testingCreatePaymentClient(ctx, destinationNetworkId, destinationId)
 
 		sourceSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: sourceNetworkId,
@@ -133,10 +136,7 @@ func TestEscrow(t *testing.T) {
 		)
 
 		connect.AssertEqual(t, err, nil)
-		RedeemBalanceCode(&RedeemBalanceCodeArgs{
-			Secret:    balanceCode.Secret,
-			NetworkId: sourceSession.ByJwt.NetworkId,
-		}, ctx)
+		testingRedeemPaymentBalanceCode(t, ctx, sourceSession.ByJwt.NetworkId, balanceCode.Secret)
 
 		contractIds := GetOpenContractIds(ctx, sourceId, destinationId)
 		connect.AssertEqual(t, len(contractIds), 0)
@@ -349,6 +349,8 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 		sourceId := server.NewId()
 		destinationNetworkId := server.NewId()
 		destinationId := server.NewId()
+		testingCreatePaymentClient(ctx, sourceNetworkId, sourceId)
+		testingCreatePaymentClient(ctx, destinationNetworkId, destinationId)
 
 		sourceSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: sourceNetworkId,
@@ -384,10 +386,7 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 		)
 
 		connect.AssertEqual(t, err, nil)
-		RedeemBalanceCode(&RedeemBalanceCodeArgs{
-			Secret:    balanceCode.Secret,
-			NetworkId: destinationSession.ByJwt.NetworkId,
-		}, ctx)
+		testingRedeemPaymentBalanceCode(t, ctx, destinationSession.ByJwt.NetworkId, balanceCode.Secret)
 
 		contractIds := GetOpenContractIds(ctx, sourceId, destinationId)
 		connect.AssertEqual(t, len(contractIds), 0)
@@ -743,6 +742,10 @@ func TestClosePartialContract(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 
@@ -867,6 +870,10 @@ func TestClosePartialContractWithCheckpoint(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 
@@ -972,6 +979,10 @@ func TestClosePartialCompanionContractWithCheckpoint(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 
@@ -1104,6 +1115,10 @@ func TestClosePartialContractNoEscrow(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 
@@ -1295,6 +1310,8 @@ func TestGetOpenTransferByteCount(t *testing.T) {
 		sourceId := server.NewId()
 		destinationNetworkId := server.NewId()
 		destinationId := server.NewId()
+		testingCreatePaymentClient(ctx, sourceNetworkId, sourceId)
+		testingCreatePaymentClient(ctx, destinationNetworkId, destinationId)
 
 		sourceSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: sourceNetworkId,
@@ -1314,10 +1331,7 @@ func TestGetOpenTransferByteCount(t *testing.T) {
 		)
 
 		connect.AssertEqual(t, err, nil)
-		RedeemBalanceCode(&RedeemBalanceCodeArgs{
-			Secret:    balanceCode.Secret,
-			NetworkId: sourceSession.ByJwt.NetworkId,
-		}, ctx)
+		testingRedeemPaymentBalanceCode(t, ctx, sourceSession.ByJwt.NetworkId, balanceCode.Secret)
 
 		paid := NanoCents(0)
 		paidByteCount := ByteCount(0)
@@ -1507,6 +1521,10 @@ func TestSettleContractCheckpointPlusClose(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 		for _, networkId := range []server.Id{networkIdA, networkIdB} {
@@ -1585,6 +1603,10 @@ func TestSettleContractBothCheckpointStaysOpen(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 		for _, networkId := range []server.Id{networkIdA, networkIdB} {
@@ -1632,6 +1654,10 @@ func TestGetOpenContractIdsWithPartialCloseCheckpointPlusClose(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 		for _, networkId := range []server.Id{networkIdA, networkIdB} {
@@ -1699,6 +1725,83 @@ func TestGetOpenContractIdsWithPartialCloseCheckpointPlusClose(t *testing.T) {
 	})
 }
 
+// Prevents a no-worker sweep from reporting success without processing any
+// selected contracts.
+func TestForceCloseRequiresPositiveParallelism(t *testing.T) {
+	_, err := ForceCloseOpenContractIds(context.Background(), time.Now(), 10, 0, 0, 0)
+	connect.AssertNotEqual(t, nil, err)
+	connect.AssertEqual(t, true, strings.Contains(err.Error(), "parallelism must be positive"))
+}
+
+// Covers both one-sided checkpoint orientations emitted when a transfer
+// stops before the peer writes any close row. The sweep must preserve the
+// checkpoint usage, synthesize the matching close, finalize the checkpoint,
+// and remove the Redis route in one pass.
+func TestForceCloseOneSidedCheckpointFinalizesBothOrientations(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkIdA := server.NewId()
+		clientIdA := server.NewId()
+		networkIdB := server.NewId()
+		clientIdB := server.NewId()
+		Testing_CreateNetwork(ctx, networkIdA, "a", server.NewId())
+		Testing_CreateNetwork(ctx, networkIdB, "b", server.NewId())
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
+
+		const initialTransferBalance = ByteCount(30 * 1024 * 1024 * 1024)
+		const usedTransferByteCount = ByteCount(512 * 1024)
+		AddBasicTransferBalance(
+			ctx,
+			networkIdA,
+			initialTransferBalance,
+			server.NowUtc(),
+			server.NowUtc().Add(30*24*time.Hour),
+		)
+
+		checkpointClientIds := []server.Id{clientIdA, clientIdB}
+		contractIds := make([]server.Id, 0, len(checkpointClientIds))
+		for _, checkpointClientId := range checkpointClientIds {
+			contractId, _, err := CreateContract(
+				ctx,
+				networkIdA,
+				clientIdA,
+				networkIdB,
+				clientIdB,
+				ByteCount(1024*1024),
+			)
+			connect.AssertEqual(t, nil, err)
+			connect.AssertEqual(t, nil, CloseContract(ctx, contractId, checkpointClientId, usedTransferByteCount, true))
+			AddToStream(ctx, contractId, clientIdA, clientIdB, nil)
+			contractIds = append(contractIds, contractId)
+		}
+
+		closeCount, err := ForceCloseOpenContractIds(ctx, time.Now().Add(time.Second), 10, 1, 0, 0)
+		connect.AssertEqual(t, nil, err)
+		connect.AssertEqual(t, int64(len(contractIds)), closeCount)
+		for _, contractId := range contractIds {
+			contractClose, closed := GetContractClose(ctx, contractId)
+			connect.AssertEqual(t, true, closed)
+			connect.AssertEqual(t, string(ContractOutcomeSettled), contractClose.Outcome)
+			_, _, streamFound := GetStream(ctx, contractId)
+			connect.AssertEqual(t, false, streamFound)
+		}
+
+		transferBalances := GetActiveTransferBalances(ctx, networkIdA)
+		remainingTransferBalance := ByteCount(0)
+		for _, transferBalance := range transferBalances {
+			remainingTransferBalance += transferBalance.BalanceByteCount
+		}
+		connect.AssertEqual(
+			t,
+			initialTransferBalance-ByteCount(len(contractIds))*usedTransferByteCount,
+			remainingTransferBalance,
+		)
+	})
+}
+
 // TestForceCloseDisputedContract verifies the expiry task settles disputed
 // contracts. A dispute (close byte counts diverging beyond
 // `AcceptableTransfersByteDifference`) takes the contract out of the `open`
@@ -1718,6 +1821,10 @@ func TestForceCloseDisputedContract(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
 
 		initialTransferBalance := ByteCount(30 * 1024 * 1024 * 1024)
 		AddBasicTransferBalance(
@@ -1733,6 +1840,9 @@ func TestForceCloseDisputedContract(t *testing.T) {
 			ByteCount(1024*1024*1024),
 		)
 		connect.AssertEqual(t, nil, err)
+		AddToStream(ctx, contractId, clientIdA, clientIdB, nil)
+		_, _, streamFound := GetStream(ctx, contractId)
+		connect.AssertEqual(t, true, streamFound)
 
 		// close with byte counts that diverge beyond the acceptable difference
 		sourceUsed := ByteCount(0)
@@ -1753,6 +1863,8 @@ func TestForceCloseDisputedContract(t *testing.T) {
 		connect.AssertEqual(t, true, closed)
 		connect.AssertEqual(t, false, contractClose.Dispute)
 		connect.AssertEqual(t, string(ContractOutcomeSettled), contractClose.Outcome)
+		_, _, streamFound = GetStream(ctx, contractId)
+		connect.AssertEqual(t, false, streamFound)
 
 		// the escrow is settled with the average of the two sides,
 		// and the rest is returned to the payer's balance
@@ -1769,6 +1881,128 @@ func TestForceCloseDisputedContract(t *testing.T) {
 		contractClose, closed = GetContractClose(ctx, contractId)
 		connect.AssertEqual(t, true, closed)
 		connect.AssertEqual(t, string(ContractOutcomeSettled), contractClose.Outcome)
+	})
+}
+
+// Covers an open contract whose two final close rows already exist. Direct
+// settlement must still remove the Redis route clients use for discovery.
+func TestForceCloseDirectSettlementRemovesStream(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkIdA := server.NewId()
+		userIdA := server.NewId()
+		clientIdA := server.NewId()
+		networkIdB := server.NewId()
+		userIdB := server.NewId()
+		clientIdB := server.NewId()
+		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
+		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
+
+		contractId, err := CreateContractNoEscrow(
+			ctx,
+			networkIdA,
+			clientIdA,
+			networkIdB,
+			clientIdB,
+			1024,
+		)
+		connect.AssertEqual(t, nil, err)
+		server.Tx(ctx, func(tx server.PgTx) {
+			for _, party := range []ContractParty{ContractPartySource, ContractPartyDestination} {
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`
+                        INSERT INTO contract_close (
+                            contract_id,
+                            party,
+                            used_transfer_byte_count,
+                            close_time,
+                            checkpoint
+                        )
+                        VALUES ($1, $2, 0, $3, false)
+                    `,
+					contractId,
+					party,
+					server.NowUtc(),
+				))
+			}
+		}, server.TxReadCommitted)
+
+		AddToStream(ctx, contractId, clientIdA, clientIdB, nil)
+		_, _, streamFound := GetStream(ctx, contractId)
+		connect.AssertEqual(t, true, streamFound)
+
+		closeCount, err := ForceCloseOpenContractIds(ctx, time.Now().Add(time.Second), 10, 1, 0, 0)
+		connect.AssertEqual(t, nil, err)
+		connect.AssertEqual(t, int64(1), closeCount)
+		contractClose, closed := GetContractClose(ctx, contractId)
+		connect.AssertEqual(t, true, closed)
+		connect.AssertEqual(t, string(ContractOutcomeSettled), contractClose.Outcome)
+		_, _, streamFound = GetStream(ctx, contractId)
+		connect.AssertEqual(t, false, streamFound)
+	})
+}
+
+// Verifies that a contract which cannot pay its recorded usage is quarantined
+// and removed from Redis, while the settlement failure is still returned.
+// The cleanup process must not certify a campaign that encountered this data.
+func TestForceCloseMalformedContractRemovesStreamAndReturnsError(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkIdA := server.NewId()
+		userIdA := server.NewId()
+		clientIdA := server.NewId()
+		networkIdB := server.NewId()
+		userIdB := server.NewId()
+		clientIdB := server.NewId()
+		Testing_CreateNetwork(ctx, networkIdA, "a", userIdA)
+		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientIdA: networkIdA,
+			clientIdB: networkIdB,
+		})
+
+		const escrowByteCount = ByteCount(1024)
+		AddBasicTransferBalance(
+			ctx,
+			networkIdA,
+			escrowByteCount,
+			server.NowUtc(),
+			server.NowUtc().Add(24*time.Hour),
+		)
+		contractId, _, err := CreateContract(
+			ctx,
+			networkIdA,
+			clientIdA,
+			networkIdB,
+			clientIdB,
+			escrowByteCount,
+		)
+		connect.AssertEqual(t, nil, err)
+		AddToStream(ctx, contractId, clientIdA, clientIdB, nil)
+
+		const impossibleUsage = ByteCount(2 * escrowByteCount)
+		connect.AssertEqual(t, nil, CloseContract(ctx, contractId, clientIdA, impossibleUsage, false))
+		err = CloseContract(ctx, contractId, clientIdB, impossibleUsage, false)
+		connect.AssertNotEqual(t, nil, err)
+		_, closed := GetContractClose(ctx, contractId)
+		connect.AssertEqual(t, false, closed)
+		_, _, streamFound := GetStream(ctx, contractId)
+		connect.AssertEqual(t, true, streamFound)
+
+		closeCount, err := ForceCloseOpenContractIds(ctx, time.Now().Add(time.Second), 10, 1, 0, 0)
+		connect.AssertNotEqual(t, nil, err)
+		connect.AssertEqual(t, true, strings.Contains(err.Error(), "Escrow does not have enough value"))
+		connect.AssertEqual(t, int64(1), closeCount)
+		contractClose, closed := GetContractClose(ctx, contractId)
+		connect.AssertEqual(t, true, closed)
+		connect.AssertEqual(t, string(ContractOutcomeSettled), contractClose.Outcome)
+		_, _, streamFound = GetStream(ctx, contractId)
+		connect.AssertEqual(t, false, streamFound)
 	})
 }
 
@@ -1791,6 +2025,10 @@ func TestReconcileNetEscrowCorrectsDrift(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkId, "a", userId)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientId:  networkId,
+			clientIdB: networkIdB,
+		})
 
 		initialBalance := ByteCount(10 * 1024 * 1024 * 1024)
 		AddBasicTransferBalance(ctx, networkId, initialBalance, server.NowUtc(), server.NowUtc().Add(30*24*time.Hour))
@@ -1839,11 +2077,11 @@ func TestReconcileNetEscrowCorrectsDrift(t *testing.T) {
 }
 
 // Round trip of the net escrow counter through the real write and read paths,
-// pinning the per-balance key format (`{escrow_<balanceId>}net`) and the ttl
-// stamped at every write site:
+// pinning the per-balance key format (`{escrow_<balanceId>}net`) and its
+// lifecycle at every mutation site:
 //   - escrow creation (IncrBy + ExpireAt balance end_time + slack)
 //   - reconcile apply (Set with the fallback ttl)
-//   - settle (DecrBy + ExpireNX when the decr recreates a missing key)
+//   - settle (an atomic release deletes a non-positive mirror)
 //
 // The test redis is standalone, not a cluster, so slot spreading itself is
 // invisible here: this proves functional equivalence of the per-balance-tag
@@ -1862,6 +2100,10 @@ func TestNetEscrowKeyFormatAndTtl(t *testing.T) {
 
 		Testing_CreateNetwork(ctx, networkId, "a", userId)
 		Testing_CreateNetwork(ctx, networkIdB, "b", userIdB)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			clientId:  networkId,
+			clientIdB: networkIdB,
+		})
 
 		day := 24 * time.Hour
 		initialBalanceA := ByteCount(10 * 1024 * 1024 * 1024)
@@ -1913,18 +2155,89 @@ func TestNetEscrowKeyFormatAndTtl(t *testing.T) {
 			connect.AssertEqual(t, true, 89*day < ttl && ttl <= 90*day)
 		})
 
-		// a settle decr that recreates a missing counter stamps the fallback
-		// ttl (the counter reads negative raw, zero clamped)
+		// A settle release against a missing mirror returns a negative value for
+		// diagnostics, but atomically deletes the recreated counter. A missing
+		// counter reads as zero and cannot overstate the available balance.
 		Testing_DeleteNetEscrow(ctx, balanceId)
 		err = CloseContract(ctx, contractId, clientId, 0, false)
 		connect.AssertEqual(t, nil, err)
 		err = CloseContract(ctx, contractId, clientIdB, 0, false)
 		connect.AssertEqual(t, nil, err)
-		connect.AssertEqual(t, -contractByteCount, Testing_NetEscrowByteCount(ctx, balanceId))
+		connect.AssertEqual(t, ByteCount(0), Testing_NetEscrowByteCount(ctx, balanceId))
 		connect.AssertEqual(t, initialBalanceA+initialBalanceB, GetActiveTransferBalanceByteCount(ctx, networkId))
 		server.Redis(ctx, func(r server.RedisClient) {
-			ttl := r.TTL(ctx, key).Val()
-			connect.AssertEqual(t, true, 0 < ttl && ttl <= 90*day)
+			connect.AssertEqual(t, int64(0), r.Exists(ctx, key).Val())
+		})
+
+		// settled=false is only the partial-index prefilter. Reproduce a missed
+		// best-effort settled post after the authoritative contract outcome has
+		// closed: reconciliation must still exclude this escrow through
+		// outcome IS NULL, rather than resurrecting a closed reservation.
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `
+				UPDATE transfer_escrow
+				SET settled = false
+				WHERE contract_id = $1
+			`, contractId))
+		}, server.TxReadCommitted)
+		server.Redis(ctx, func(r server.RedisClient) {
+			r.IncrBy(ctx, key, int64(contractByteCount))
+		})
+		drift, balanceCount = ReconcileNetEscrowForNetwork(ctx, networkId, true)
+		connect.AssertEqual(t, 2, balanceCount)
+		connect.AssertEqual(t, contractByteCount, drift)
+		connect.AssertEqual(t, ByteCount(0), Testing_NetEscrowByteCount(ctx, balanceId))
+	})
+}
+
+// A durable balance may intentionally be valid for decades, but its Redis
+// reservation mirror must remain rolling state. Before the cap, every contract
+// on a 100-year balance issued EXPIREAT for 2126 and retained the key for the
+// balance's full lifetime.
+func TestNetEscrowLongLivedBalanceTtlIsCapped(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		now := server.NowUtc()
+		day := 24 * time.Hour
+
+		sourceNetworkId := server.NewId()
+		sourceUserId := server.NewId()
+		sourceClientId := server.NewId()
+		destinationNetworkId := server.NewId()
+		destinationUserId := server.NewId()
+		destinationClientId := server.NewId()
+		Testing_CreateNetwork(ctx, sourceNetworkId, "long-source", sourceUserId)
+		Testing_CreateNetwork(ctx, destinationNetworkId, "long-destination", destinationUserId)
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			sourceClientId:      sourceNetworkId,
+			destinationClientId: destinationNetworkId,
+		})
+
+		err := AddBasicTransferBalance(
+			ctx,
+			sourceNetworkId,
+			10*Tib,
+			now,
+			now.Add(100*365*day),
+		)
+		connect.AssertEqual(t, err, nil)
+		balances := GetActiveTransferBalances(ctx, sourceNetworkId)
+		connect.AssertEqual(t, len(balances), 1)
+
+		_, _, err = CreateContract(
+			ctx,
+			sourceNetworkId,
+			sourceClientId,
+			destinationNetworkId,
+			destinationClientId,
+			Mib,
+		)
+		connect.AssertEqual(t, err, nil)
+		server.Redis(ctx, func(r server.RedisClient) {
+			ttl := r.TTL(ctx, netEscrowKey(balances[0].BalanceId)).Val()
+			if !(89*day < ttl && ttl <= netEscrowFallbackTtl) {
+				t.Fatalf("100-year balance mirror ttl = %s, want rolling horizon <= %s", ttl, netEscrowFallbackTtl)
+			}
 		})
 	})
 }
@@ -1946,14 +2259,13 @@ func TestCompanionPairsToRecentlyClosedOrigin(t *testing.T) {
 		sourceId := server.NewId()
 		destinationNetworkId := server.NewId()
 		destinationId := server.NewId()
+		testingCreatePaymentClient(ctx, sourceNetworkId, sourceId)
+		testingCreatePaymentClient(ctx, destinationNetworkId, destinationId)
 
 		// fund the destination network so the origin escrow can be created
 		balanceCode, err := CreateBalanceCode(ctx, 2*netTransferByteCount, 365*24*time.Hour, 2*netRevenue, "", "", "")
 		connect.AssertEqual(t, err, nil)
-		RedeemBalanceCode(&RedeemBalanceCodeArgs{
-			Secret:    balanceCode.Secret,
-			NetworkId: destinationNetworkId,
-		}, ctx)
+		testingRedeemPaymentBalanceCode(t, ctx, destinationNetworkId, balanceCode.Secret)
 
 		// origin contract in the destination->source direction, then close it so
 		// it is matched only by the closed branch of the companion lookup

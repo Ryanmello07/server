@@ -10,7 +10,55 @@ import (
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/session"
 )
+
+// AuthNetworkClient keeps ordinary client creation in the model while owning
+// the deployment-configured post-allocation verify feed. The model cannot
+// resolve verify.yml without coupling protocol configuration into generic
+// client persistence.
+func AuthNetworkClient(
+	authClient *model.AuthNetworkClientArgs,
+	clientSession *session.ClientSession,
+) (*model.AuthNetworkClientResult, error) {
+	var verifySettings *model.VerifySettings
+	if StEnabled() {
+		// Validate the enabled subsystem's required vault/config before the
+		// model commits a proxy allocation. A missing verify.yml must not turn
+		// into a post-commit 500 with an ownerless allocation.
+		verifySettings = VerifySettings()
+	}
+	result, err := model.AuthNetworkClient(authClient, clientSession)
+	if err == nil && result != nil && result.ClientId != nil && clientSession.ByJwt != nil {
+		// onboarding attribution: an app open that follows a campaign landing
+		// click within 48h (one cheap query, never fails the caller)
+		AttributeAppOpen(clientSession, clientSession.ByJwt.NetworkId)
+		// the device's zone, locale and platform place and render the
+		// onboarding campaign's emails
+		RecordOnboardingClientContext(clientSession, clientSession.ByJwt.NetworkId, authClient.TimeZone, authClient.Locale, authClient.DeviceSpec)
+	}
+	if err != nil || result == nil || verifySettings == nil || result.ClientId == nil || result.ProxyConfigResult == nil || result.ProxyConfigResult.WgConfig == nil {
+		return result, err
+	}
+	feedAuthNetworkClientVerifyEgress(clientSession.Ctx, result, verifySettings)
+	return result, nil
+}
+
+func feedAuthNetworkClientVerifyEgress(
+	ctx context.Context,
+	result *model.AuthNetworkClientResult,
+	settings *model.VerifySettings,
+) {
+	if result == nil || result.ClientId == nil || result.ProxyConfigResult == nil || result.ProxyConfigResult.WgConfig == nil || settings == nil {
+		return
+	}
+	model.FeedVerifyEgress(
+		ctx,
+		*result.ClientId,
+		result.ProxyConfigResult.WgConfig.ClientIpv4,
+		settings,
+	)
+}
 
 func ConnectNetworkClient(
 	ctx context.Context,

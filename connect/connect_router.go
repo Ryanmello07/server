@@ -23,7 +23,15 @@ type ConnectRouter struct {
 	connectHandler *ConnectHandler
 }
 
-func NewConnectRouterWithDefaults(
+func connectHandlerSettingsFromExchange(exchange *Exchange) *ConnectHandlerSettings {
+	return &exchange.settings.ConnectHandlerSettings
+}
+
+// Keeps the handler and exchange on one settings snapshot. Callers that
+// customize ingress cannot safely reconstruct handler defaults here: doing so
+// silently restores Proxy Protocol and discards TLS identity settings after
+// the exchange has already been created.
+func NewConnectRouterFromExchange(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	exchange *Exchange,
@@ -32,7 +40,20 @@ func NewConnectRouterWithDefaults(
 		ctx,
 		cancel,
 		exchange,
-		DefaultConnectHandlerSettings(),
+		connectHandlerSettingsFromExchange(exchange),
+	)
+}
+
+func newConnectRouterFromExchange(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	exchange *Exchange,
+) (*ConnectRouter, error) {
+	return newConnectRouter(
+		ctx,
+		cancel,
+		exchange,
+		connectHandlerSettingsFromExchange(exchange),
 	)
 }
 
@@ -42,6 +63,19 @@ func NewConnectRouter(
 	exchange *Exchange,
 	connectHandlerSettings *ConnectHandlerSettings,
 ) *ConnectRouter {
+	connectRouter, err := newConnectRouter(ctx, cancel, exchange, connectHandlerSettings)
+	if err != nil {
+		panic(err)
+	}
+	return connectRouter
+}
+
+func newConnectRouter(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	exchange *Exchange,
+	connectHandlerSettings *ConnectHandlerSettings,
+) (*ConnectRouter, error) {
 	handlerId := model.CreateNetworkClientHandler(ctx)
 
 	// update the heartbeat
@@ -67,7 +101,17 @@ func NewConnectRouter(
 	service := strings.ToLower(server.RequireService())
 	envService := strings.ToLower(fmt.Sprintf("%s-%s", server.RequireEnv(), server.RequireService()))
 
-	connectHandler := NewConnectHandler(ctx, handlerId, exchange, connectHandlerSettings)
+	connectHandler, err := newConnectHandlerWithPacketConns(
+		ctx,
+		handlerId,
+		exchange,
+		connectHandlerSettings,
+		ConnectHandlerPacketConns{},
+	)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 
 	return &ConnectRouter{
 		ctx:            ctx,
@@ -76,7 +120,7 @@ func NewConnectRouter(
 		service:        service,
 		envService:     envService,
 		connectHandler: connectHandler,
-	}
+	}, nil
 }
 
 func (self *ConnectRouter) Connect(w http.ResponseWriter, r *http.Request) {

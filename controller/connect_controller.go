@@ -26,6 +26,8 @@ import (
 
 var ControlId = server.Id(connect.ControlId)
 
+var errContractDestinationInactive = model.ErrContractDestinationInactive
+
 var MinContractTransferByteCount = func() model.ByteCount {
 	settings := connect.DefaultClientSettings()
 	return max(
@@ -68,6 +70,26 @@ var contractFailureCounter = prometheus.NewCounterVec(
 	[]string{"cause", "companion"},
 )
 
+var missingOriginDetailsCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "missing_origin_details_total",
+		Help:      "Missing companion-origin failures partitioned by bounded request resolution and endpoint lifecycle classes",
+	},
+	[]string{"request_companion", "resolution", "relationship", "source_lifecycle", "destination_lifecycle"},
+)
+
+var inactiveDestinationDetailsCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "inactive_destination_details_total",
+		Help:      "Inactive contract destination failures partitioned by bounded sender lane, request resolution, and endpoint lifecycle classes",
+	},
+	[]string{"request_companion", "sender_role", "resolution", "relationship", "source_lifecycle", "destination_lifecycle"},
+)
+
 var controlFrameFailureCounter = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Namespace: "urnetwork",
@@ -79,7 +101,19 @@ var controlFrameFailureCounter = prometheus.NewCounterVec(
 )
 
 func init() {
-	prometheus.MustRegister(transferByteCounter, contractFailureCounter, controlFrameFailureCounter)
+	// CounterVec label children are lazy. Materialize both bounded partitions
+	// for the lifecycle guard so Mimir can distinguish an explicit zero from an
+	// API generation that predates the guard and cannot report it at all.
+	for _, companion := range []string{"false", "true"} {
+		contractFailureCounter.WithLabelValues("inactive_destination", companion)
+	}
+	prometheus.MustRegister(
+		transferByteCounter,
+		contractFailureCounter,
+		missingOriginDetailsCounter,
+		inactiveDestinationDetailsCounter,
+		controlFrameFailureCounter,
+	)
 }
 
 // controlFrameMessageLabel maps a control message to a bounded metric label.
@@ -145,6 +179,9 @@ func recordControlFrameFailure(message any, err error) {
 }
 
 func contractFailureClass(err error) string {
+	if errors.Is(err, errContractDestinationInactive) {
+		return "inactive_destination"
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(message, "insufficient balance"):
@@ -158,6 +195,24 @@ func contractFailureClass(err error) string {
 	}
 }
 
+// contractResultError preserves wire meaning while isolating the one failure
+// class a multi-client can act on safely. A missing companion origin or an
+// inactive destination means the selected route itself is stale, so a current
+// client must retire that exact window entry. A missing or inactive source is
+// the local caller's authorization failure, not evidence against the selected
+// destination, so it receives NoPermission without poisoning provider
+// selection. Account and legacy failures retain their prior wire result.
+func contractResultError(err error) protocol.ContractError {
+	if errors.Is(err, model.ErrMissingCompanionOrigin) ||
+		errors.Is(err, errContractDestinationInactive) {
+		return protocol.ContractError_Reliability
+	}
+	if errors.Is(err, model.ErrActiveClientNotFound) {
+		return protocol.ContractError_NoPermission
+	}
+	return protocol.ContractError_InsufficientBalance
+}
+
 func recordContractFailure(
 	clientId server.Id,
 	destinationId server.Id,
@@ -165,9 +220,46 @@ func recordContractFailure(
 	transferByteCount model.ByteCount,
 	err error,
 ) {
+	recordContractFailureResolved(
+		clientId,
+		destinationId,
+		companion,
+		transferByteCount,
+		err,
+		contractResolution{},
+	)
+}
+
+func recordContractFailureResolved(
+	clientId server.Id,
+	destinationId server.Id,
+	companion bool,
+	transferByteCount model.ByteCount,
+	err error,
+	resolution contractResolution,
+) {
 	cause := contractFailureClass(err)
 	companionLabel := fmt.Sprintf("%t", companion)
 	contractFailureCounter.WithLabelValues(cause, companionLabel).Inc()
+	if cause == "missing_companion_origin" {
+		missingOriginDetailsCounter.WithLabelValues(
+			companionLabel,
+			contractResolutionLabel(resolution.path),
+			provideRelationshipLabel(resolution.relationship),
+			clientLifecycleLabel(resolution.sourceLifecycle),
+			clientLifecycleLabel(resolution.destinationLifecycle),
+		).Inc()
+	}
+	if cause == "inactive_destination" {
+		inactiveDestinationDetailsCounter.WithLabelValues(
+			companionLabel,
+			contractSenderRoleLabel(resolution.senderRole),
+			contractResolutionLabel(resolution.path),
+			provideRelationshipLabel(resolution.relationship),
+			clientLifecycleLabel(resolution.sourceLifecycle),
+			clientLifecycleLabel(resolution.destinationLifecycle),
+		).Inc()
+	}
 
 	// A contract failure is driven by client-supplied request state (a
 	// companion request racing its origin, an exhausted balance, an unknown
@@ -392,6 +484,105 @@ func GetProvideRelationship(ctx context.Context, sourceId server.Id, destination
 	return model.GetProvideRelationship(ctx, sourceId, destinationId)
 }
 
+func getProvideRelationshipDetails(ctx context.Context, sourceId server.Id, destinationId server.Id) model.ProvideRelationshipDetails {
+	details := model.GetProvideRelationshipDetails(ctx, sourceId, destinationId)
+	if sourceId == ControlId {
+		details.Mode = model.ProvideModeNetwork
+		details.SourceLifecycle = model.NetworkClientLifecycle("control")
+	}
+	if destinationId == ControlId {
+		details.Mode = model.ProvideModeNetwork
+		details.DestinationLifecycle = model.NetworkClientLifecycle("control")
+	}
+	return details
+}
+
+type contractResolution struct {
+	path                 string
+	relationship         model.ProvideMode
+	sourceLifecycle      model.NetworkClientLifecycle
+	destinationLifecycle model.NetworkClientLifecycle
+	senderRole           *protocol.SequenceRole
+}
+
+const (
+	contractResolutionRequestedCompanion = "requested_companion"
+	contractResolutionStreamFallback     = "stream_fallback"
+	contractResolutionNetworkNormalized  = "network_normalized"
+	contractResolutionRelationship       = "relationship"
+	contractResolutionRejected           = "rejected"
+)
+
+func contractResolutionLabel(path string) string {
+	switch path {
+	case contractResolutionRequestedCompanion,
+		contractResolutionStreamFallback,
+		contractResolutionNetworkNormalized,
+		contractResolutionRelationship,
+		contractResolutionRejected:
+		return path
+	default:
+		return "unknown"
+	}
+}
+
+func provideRelationshipLabel(relationship model.ProvideMode) string {
+	switch relationship {
+	case model.ProvideModeNetwork:
+		return "network"
+	case model.ProvideModeFriendsAndFamily:
+		return "friends_family"
+	case model.ProvideModePublic:
+		return "public"
+	default:
+		return "unknown"
+	}
+}
+
+func clientLifecycleLabel(lifecycle model.NetworkClientLifecycle) string {
+	switch lifecycle {
+	case model.NetworkClientLifecycleMissing,
+		model.NetworkClientLifecycleActiveTop,
+		model.NetworkClientLifecycleInactiveTop,
+		model.NetworkClientLifecycleActiveDerived,
+		model.NetworkClientLifecycleInactiveDerived:
+		return string(lifecycle)
+	case model.NetworkClientLifecycle("control"):
+		return "control"
+	default:
+		return "unknown"
+	}
+}
+
+// contractSenderRoleLabel reduces the optional wire field to a fixed metric
+// vocabulary. An absent field identifies a sender that did not report the
+// capability; an explicitly unknown or future value remains distinct so a
+// malformed value cannot be mistaken for a legacy sender.
+func contractSenderRoleLabel(senderRole *protocol.SequenceRole) string {
+	if senderRole == nil {
+		return "absent"
+	}
+	switch *senderRole {
+	case protocol.SequenceRole_SequenceRoleClient:
+		return "client"
+	case protocol.SequenceRole_SequenceRoleServer:
+		return "server"
+	default:
+		return "unknown"
+	}
+}
+
+func contractDestinationActive(lifecycle model.NetworkClientLifecycle) bool {
+	switch lifecycle {
+	case model.NetworkClientLifecycleActiveTop,
+		model.NetworkClientLifecycleActiveDerived,
+		model.NetworkClientLifecycle("control"):
+		return true
+	default:
+		return false
+	}
+}
+
 // resolveNonCompanionProvideMode selects the provide mode a non-companion
 // contract is settled under, given the source->destination provideRelationship
 // and the modes the destination advertises (provideModes). It returns
@@ -439,8 +630,40 @@ func CreateContract(
 	// fall back to a companion contract because the destination does not advertise
 	// the ideal relationship mode.
 	companion := createContract.Companion
+	relationshipDetails := getProvideRelationshipDetails(ctx, clientId, destinationId)
+	resolution := contractResolution{
+		path:                 contractResolutionRelationship,
+		relationship:         relationshipDetails.Mode,
+		sourceLifecycle:      relationshipDetails.SourceLifecycle,
+		destinationLifecycle: relationshipDetails.DestinationLifecycle,
+		senderRole:           createContract.SenderRole,
+	}
+
+	// A provide-mode key can outlive the derived identity that published it.
+	// Reject that stale destination before mode selection or contract creation,
+	// and make the reason explicit on the wire so the requesting multi-client
+	// retires this exact route instead of retrying it for the full timeout.
+	if !contractDestinationActive(relationshipDetails.DestinationLifecycle) {
+		resolution.path = contractResolutionRejected
+		recordContractFailureResolved(
+			clientId,
+			destinationId,
+			createContract.Companion,
+			model.ByteCount(createContract.TransferByteCount),
+			errContractDestinationInactive,
+			resolution,
+		)
+		contractError := protocol.ContractError_Reliability
+		result := &protocol.CreateContractResult{Error: &contractError}
+		frame, err := connect.ToFrame(result, connect.DefaultProtocolVersion)
+		if err != nil {
+			return nil, err
+		}
+		return []*protocol.Frame{frame}, nil
+	}
 
 	if companion {
+		resolution.path = contractResolutionRequestedCompanion
 		// companion contracts use `ProvideModeStream`
 		provideMode = model.ProvideModeStream
 
@@ -448,19 +671,21 @@ func CreateContract(
 		// is same-network and the destination advertises the network mode,
 		// settle it as a non-companion network contract (the no-escrow path,
 		// same as the forward direction between network peers)
-		if GetProvideRelationship(ctx, clientId, destinationId) == model.ProvideModeNetwork &&
+		if relationshipDetails.Mode == model.ProvideModeNetwork &&
 			GetProvideModes(ctx, destinationId)[model.ProvideModeNetwork] {
 			glog.V(2).Infof("[contract][network-normalize]%s->%s companion settled as network\n", clientId, destinationId)
 			provideMode = model.ProvideModeNetwork
 			companion = false
+			resolution.path = contractResolutionNetworkNormalized
 		}
 	} else {
-		provideRelationship := GetProvideRelationship(ctx, clientId, destinationId)
+		provideRelationship := relationshipDetails.Mode
 		provideModes := GetProvideModes(ctx, destinationId)
 
 		var allowed bool
 		provideMode, companion, allowed = resolveNonCompanionProvideMode(provideRelationship, provideModes)
 		if !allowed {
+			resolution.path = contractResolutionRejected
 			glog.V(2).Infof("[contract][reject]%s->%s no-permission (companion=%t relationship=%d)\n", clientId, destinationId, createContract.Companion, provideRelationship)
 			contractError := protocol.ContractError_NoPermission
 			result := &protocol.CreateContractResult{
@@ -474,6 +699,7 @@ func CreateContract(
 			return []*protocol.Frame{frame}, nil
 		}
 		if companion {
+			resolution.path = contractResolutionStreamFallback
 			glog.V(2).Infof("[contract][companion-fallback]%s->%s relationship=%d not provided; using companion Stream\n", clientId, destinationId, provideRelationship)
 		}
 	}
@@ -542,17 +768,20 @@ func CreateContract(
 	// server.Logger().Printf("CONTROL CREATE CONTRACT TRANSFER BYTE COUNT %d %d %d\n", model.ByteCount(createContract.TransferByteCount), transferByteCount, uint64(transferByteCount))
 
 	if err != nil {
-		// The client sees only InsufficientBalance, including unrelated
-		// failures. Preserve the cause as a lossless bounded metric and a
-		// rate-limited default-visible exemplar.
-		recordContractFailure(
+		// Preserve the cause as a bounded metric. Destination lifecycle and
+		// missing-origin failures are explicit Reliability results so a current
+		// multi-client can replace the stale route. An inactive local source is
+		// NoPermission without condemning that route; legacy/account failures
+		// keep their previous InsufficientBalance result.
+		recordContractFailureResolved(
 			clientId,
 			destinationId,
 			createContract.Companion,
 			model.ByteCount(createContract.TransferByteCount),
 			err,
+			resolution,
 		)
-		contractError := protocol.ContractError_InsufficientBalance
+		contractError := contractResultError(err)
 		result := &protocol.CreateContractResult{
 			Error: &contractError,
 		}
@@ -704,17 +933,30 @@ func newContract(
 	streamVersion int,
 	contractManagerSettings *connect.ContractManagerSettings,
 ) (contractId server.Id, contractTransferByteCount model.ByteCount, priority model.Priority, streamId *server.Id, returnErr error) {
-	sourceNetworkId, err := model.FindClientNetwork(ctx, sourceId)
+	// Recheck lifecycle at the write boundary. CreateContract's detailed lookup
+	// provides the fast rejection and diagnosis; these active-only reads close
+	// the race where either endpoint is deactivated before the contract insert.
+	sourceNetworkId, err := model.FindActiveClientNetwork(ctx, sourceId)
 	if err != nil {
-		// the source is not a real client
+		// The local/source identity is no longer valid. This is not evidence
+		// against the selected destination, so do not wrap it as Reliability.
 		returnErr = err
 		return
 	}
-	destinationNetworkId, err := model.FindClientNetwork(ctx, destinationId)
+	destinationNetworkId, err := model.FindActiveClientNetwork(ctx, destinationId)
 	if err != nil {
-		// the destination is not a real client
-		returnErr = err
+		returnErr = fmt.Errorf("%w: %v", errContractDestinationInactive, err)
 		return
+	}
+	// Participant persistence happens after Redis assigns/reuses the stream id.
+	// Resolve every intermediary before reserving the payer's balance so a
+	// malformed or stale path cannot leave an unreturnable contract behind if
+	// its participant row cannot be recorded.
+	for _, intermediaryId := range intermediaryIds {
+		if _, err := model.FindActiveClientNetwork(ctx, intermediaryId); err != nil {
+			returnErr = fmt.Errorf("Contract intermediary is inactive: %s: %w", intermediaryId.String(), err)
+			return
+		}
 	}
 
 	contractTransferByteCount = min(
@@ -743,6 +985,10 @@ func newContract(
 		default:
 			if 0 < len(intermediaryIds) {
 				streamId_ := model.AddToStream(ctx, contractId, sourceId, destinationId, intermediaryIds)
+				if err := model.SetContractStream(ctx, contractId, streamId_, intermediaryIds); err != nil {
+					returnErr = err
+					return
+				}
 				streamId = &streamId_
 			} else {
 				// When the pair has an active stream, every network contract
@@ -758,9 +1004,17 @@ func newContract(
 					destinationId,
 				)
 				if ok {
+					if err := model.SetContractStream(ctx, contractId, streamId_, nil); err != nil {
+						returnErr = err
+						return
+					}
 					streamId = &streamId_
 				} else if forceStream {
 					streamId_ = model.AddToStream(ctx, contractId, sourceId, destinationId, nil)
+					if err := model.SetContractStream(ctx, contractId, streamId_, nil); err != nil {
+						returnErr = err
+						return
+					}
 					streamId = &streamId_
 				}
 			}
@@ -771,7 +1025,8 @@ func newContract(
 		// simultaneously and the encryption control carrier asks for its
 		// companion contract at session setup, frequently milliseconds before
 		// the peer's origin lands. The client cannot tell this apart from a
-		// real failure (every cause reaches it as InsufficientBalance), so
+		// real failure (at the time this wait was introduced, every cause
+		// reached it as InsufficientBalance), so
 		// answering the race with an error sent the client into its blind
 		// 30s CreateContractTimeout retry loop — a full sequence starve per
 		// occurrence (~12 per test-suite run), the residual behind the
@@ -832,13 +1087,14 @@ func newContract(
 				destinationId,
 			)
 			if ok {
+				if err := model.SetContractStream(ctx, contractId, streamId_, nil); err != nil {
+					returnErr = err
+					return
+				}
 				streamId = &streamId_
 			}
 		}
 	} else {
-		// TODO store the intermediary ids on the contract so they can be rewarded in the payout
-		// TODO the transfer should be equally divided amongst all the hops
-
 		escrow, err := model.CreateTransferEscrow(
 			ctx,
 			sourceNetworkId,
@@ -860,6 +1116,10 @@ func newContract(
 		default:
 			if forceStream || 0 < len(intermediaryIds) {
 				streamId_ := model.AddToStream(ctx, contractId, sourceId, destinationId, intermediaryIds)
+				if err := model.SetContractStream(ctx, contractId, streamId_, intermediaryIds); err != nil {
+					returnErr = err
+					return
+				}
 				streamId = &streamId_
 			}
 		}
@@ -919,8 +1179,14 @@ func SetClientKey(
 	clientId server.Id,
 	clientKey *protocol.ClientKey,
 ) error {
+	if clientKey == nil {
+		return errors.New("client public key message is missing")
+	}
 	if len(clientKey.PublicKey) != 0 && len(clientKey.PublicKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("Invalid client public key length: %d (expected %d)", len(clientKey.PublicKey), ed25519.PublicKeySize)
+	}
+	if StEnabled() {
+		return StRegisterClientKey(ctx, clientId, clientKey.PublicKey)
 	}
 	model.SetClientPublicKey(ctx, clientId, clientKey.PublicKey)
 	return nil

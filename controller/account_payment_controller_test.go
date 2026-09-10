@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"testing"
 	"time"
@@ -147,6 +148,8 @@ func TestSubscriptionSendPayment(t *testing.T) {
 		sourceId := server.NewId()
 		destinationNetworkId := server.NewId()
 		destinationId := server.NewId()
+		testingCreatePaymentClient(ctx, sourceNetworkId, sourceId)
+		testingCreatePaymentClient(ctx, destinationNetworkId, destinationId)
 
 		sourceSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: sourceNetworkId,
@@ -189,10 +192,7 @@ func TestSubscriptionSendPayment(t *testing.T) {
 			"",
 		)
 		connect.AssertEqual(t, err, nil)
-		model.RedeemBalanceCode(&model.RedeemBalanceCodeArgs{
-			Secret:    balanceCode.Secret,
-			NetworkId: sourceSession.ByJwt.NetworkId,
-		}, ctx)
+		testingRedeemPaymentBalanceCode(t, ctx, sourceSession.ByJwt.NetworkId, balanceCode.Secret)
 
 		transferEscrow, err := model.CreateTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, 1024*1024)
 		connect.AssertEqual(t, err, nil)
@@ -387,6 +387,8 @@ func TestAdvancePaymentWalletSafetyAndIdempotency(t *testing.T) {
 		sourceId := server.NewId()
 		destinationNetworkId := server.NewId()
 		destinationId := server.NewId()
+		testingCreatePaymentClient(ctx, sourceNetworkId, sourceId)
+		testingCreatePaymentClient(ctx, destinationNetworkId, destinationId)
 
 		destinationSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: destinationNetworkId,
@@ -441,10 +443,7 @@ func TestAdvancePaymentWalletSafetyAndIdempotency(t *testing.T) {
 			"",
 		)
 		connect.AssertEqual(t, err, nil)
-		model.RedeemBalanceCode(&model.RedeemBalanceCodeArgs{
-			Secret:    balanceCode.Secret,
-			NetworkId: sourceNetworkId,
-		}, ctx)
+		testingRedeemPaymentBalanceCode(t, ctx, sourceNetworkId, balanceCode.Secret)
 
 		wallet1Address := "0x1111"
 		wallet1Id := model.CreateAccountWalletExternal(destinationSession, &model.CreateAccountWalletExternalArgs{
@@ -512,28 +511,52 @@ func TestAdvancePaymentWalletSafetyAndIdempotency(t *testing.T) {
 		err = model.SetPayoutWallet(ctx, destinationNetworkId, *wallet2Id)
 		connect.AssertEqual(t, err, nil)
 
-		// the first submit fails after the processor call.
-		// the same idempotency key must be reused on the retry,
-		// so the processor cannot double-send the funds.
-		sendErr = fmt.Errorf("simulated processor error")
+		// Circle's exact invalid-destination 400 proves that no transfer was
+		// created. The attempt must be released so a corrected payout wallet can
+		// be selected on retry.
+		sendErr = &server.HttpStatusError{
+			StatusCode:   http.StatusBadRequest,
+			Status:       "400 Bad Request",
+			ResponseBody: `{"code":155219,"message":"Invalid destination address."}`,
+		}
 		result, err = AdvancePayment(advanceArgs, destinationSession)
 		connect.AssertNotEqual(t, err, nil)
 		connect.AssertEqual(t, len(sends), 1)
 		connect.AssertEqual(t, sends[0].address, wallet2Address)
+
+		wallet3Address := "0x3333"
+		wallet3Id := model.CreateAccountWalletExternal(destinationSession, &model.CreateAccountWalletExternalArgs{
+			NetworkId:        destinationNetworkId,
+			Blockchain:       "MATIC",
+			WalletAddress:    wallet3Address,
+			DefaultTokenType: "USDC",
+		})
+		connect.AssertNotEqual(t, wallet3Id, nil)
+		err = model.SetPayoutWallet(ctx, destinationNetworkId, *wallet3Id)
+		connect.AssertEqual(t, err, nil)
+
+		// An ambiguous error after the processor call is different: retain and
+		// reuse that attempt's key so a retry cannot double-send the funds.
+		sendErr = fmt.Errorf("simulated ambiguous processor error")
+		result, err = AdvancePayment(advanceArgs, destinationSession)
+		connect.AssertNotEqual(t, err, nil)
+		connect.AssertEqual(t, len(sends), 2)
+		connect.AssertNotEqual(t, sends[1].idempotencyKey, sends[0].idempotencyKey)
+		connect.AssertEqual(t, sends[1].address, wallet3Address)
 
 		sendErr = nil
 		result, err = AdvancePayment(advanceArgs, destinationSession)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, result.Complete, false)
 		connect.AssertEqual(t, result.Canceled, false)
-		connect.AssertEqual(t, len(sends), 2)
-		connect.AssertEqual(t, sends[1].idempotencyKey, sends[0].idempotencyKey)
-		connect.AssertEqual(t, sends[1].address, wallet2Address)
+		connect.AssertEqual(t, len(sends), 3)
+		connect.AssertEqual(t, sends[2].idempotencyKey, sends[1].idempotencyKey)
+		connect.AssertEqual(t, sends[2].address, wallet3Address)
 
 		sentPayment, err := model.GetPayment(ctx, payment.PaymentId)
 		connect.AssertEqual(t, err, nil)
-		connect.AssertEqual(t, *sentPayment.WalletId, *wallet2Id)
-		connect.AssertEqual(t, *sentPayment.WalletAddress, wallet2Address)
+		connect.AssertEqual(t, *sentPayment.WalletId, *wallet3Id)
+		connect.AssertEqual(t, *sentPayment.WalletAddress, wallet3Address)
 		connect.AssertEqual(t, *sentPayment.PaymentRecord, sendPaymentTransactionId)
 
 		// a failed transaction resets the record and gets a fresh
@@ -554,9 +577,9 @@ func TestAdvancePaymentWalletSafetyAndIdempotency(t *testing.T) {
 		mockCircleClient.GetTransactionFunc = defaultGetTransactionDataHandler
 		result, err = AdvancePayment(advanceArgs, destinationSession)
 		connect.AssertEqual(t, err, nil)
-		connect.AssertEqual(t, len(sends), 3)
-		connect.AssertNotEqual(t, sends[2].idempotencyKey, sends[0].idempotencyKey)
-		connect.AssertEqual(t, sends[2].address, wallet2Address)
+		connect.AssertEqual(t, len(sends), 4)
+		connect.AssertNotEqual(t, sends[3].idempotencyKey, sends[1].idempotencyKey)
+		connect.AssertEqual(t, sends[3].address, wallet3Address)
 
 		// complete the payment
 		mockTxHash := "0xabcdef"
@@ -578,8 +601,8 @@ func TestAdvancePaymentWalletSafetyAndIdempotency(t *testing.T) {
 		completedPayment, err := model.GetPayment(ctx, payment.PaymentId)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, completedPayment.Completed, true)
-		connect.AssertEqual(t, *completedPayment.WalletId, *wallet2Id)
-		connect.AssertEqual(t, *completedPayment.WalletAddress, wallet2Address)
+		connect.AssertEqual(t, *completedPayment.WalletId, *wallet3Id)
+		connect.AssertEqual(t, *completedPayment.WalletAddress, wallet3Address)
 
 	})
 }

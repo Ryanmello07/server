@@ -4,7 +4,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -574,44 +573,60 @@ type SimpleResource struct {
 	parsedObj map[string]any
 }
 
-func (self *SimpleResource) Parse() map[string]any {
-	if self.parsedObj != nil {
-		return self.parsedObj
-	}
-	var bytes []byte
-	var err error
+func (self *SimpleResource) bytes() ([]byte, error) {
 	if self.override != nil {
-		// use the override value
-		bytes = self.override
-	} else {
-		bytes, err = os.ReadFile(self.path)
-		if err != nil {
-			panic(fmt.Errorf("%s: %s", self.path, err))
-		}
+		return self.override, nil
+	}
+	bytes, err := os.ReadFile(self.path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", self.path, err)
+	}
+	return bytes, nil
+}
+
+// ParseE is the error-returning counterpart to Parse. Request-time policy
+// readers should use this form so an unavailable or malformed optional vault
+// resource fails closed instead of turning one bad configuration file into a
+// process panic.
+func (self *SimpleResource) ParseE() (map[string]any, error) {
+	if self.parsedObj != nil {
+		return self.parsedObj, nil
+	}
+	bytes, err := self.bytes()
+	if err != nil {
+		return nil, err
 	}
 	obj := map[string]any{}
-	err = yaml.Unmarshal(bytes, &obj)
-	if err != nil {
-		panic(fmt.Errorf("%s: %s", self.path, err))
+	if err := yaml.Unmarshal(bytes, &obj); err != nil {
+		return nil, fmt.Errorf("%s: %w", self.path, err)
 	}
 	self.parsedObj = obj
+	return obj, nil
+}
+
+func (self *SimpleResource) Parse() map[string]any {
+	obj, err := self.ParseE()
+	if err != nil {
+		panic(err)
+	}
 	return obj
 }
 
-func (self *SimpleResource) UnmarshalYaml(value any) {
-	var bytes []byte
-	var err error
-	if self.override != nil {
-		// use the override value
-		bytes = self.override
-	} else {
-		bytes, err = os.ReadFile(self.path)
-		if err != nil {
-			panic(err)
-		}
-	}
-	err = yaml.Unmarshal(bytes, value)
+// UnmarshalYamlE decodes a simple resource without panicking. It intentionally
+// does not cache a typed value, so callers can use independent schema structs.
+func (self *SimpleResource) UnmarshalYamlE(value any) error {
+	bytes, err := self.bytes()
 	if err != nil {
+		return err
+	}
+	if err := yaml.Unmarshal(bytes, value); err != nil {
+		return fmt.Errorf("%s: %w", self.path, err)
+	}
+	return nil
+}
+
+func (self *SimpleResource) UnmarshalYaml(value any) {
+	if err := self.UnmarshalYamlE(value); err != nil {
 		panic(err)
 	}
 }
@@ -821,29 +836,4 @@ func semverSortWithBuild(versions []semver.Version) {
 		}
 		return 0
 	})
-}
-
-var LimitExcludePrefixes = sync.OnceValue(limitExcludePrefixes)
-
-func limitExcludePrefixes() []netip.Prefix {
-	subnets := strings.Split(os.Getenv("WARP_LIMIT_EXCLUDE_SUBNETS"), ";")
-	prefixes := []netip.Prefix{}
-	for _, subnet := range subnets {
-		subnet = strings.TrimSpace(subnet)
-		if 0 < len(subnet) {
-			prefix := netip.MustParsePrefix(subnet)
-			prefixes = append(prefixes, prefix)
-		}
-	}
-	glog.Infof("[env]found limit exclude prefixes=%s\n", prefixes)
-	return prefixes
-}
-
-func IsLimitExcludeAddr(addr netip.Addr) bool {
-	for _, prefix := range LimitExcludePrefixes() {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
 }

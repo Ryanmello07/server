@@ -49,11 +49,13 @@ func newOnlineSqlMigration(sql string, auditSql string) *OnlineSqlMigration {
 
 // important these migration functions must be idempotent
 type CodeMigration struct {
+	id       string
 	callback func(context.Context)
 }
 
-func newCodeMigration(callback func(context.Context)) *CodeMigration {
+func newCodeMigration(id string, callback func(context.Context)) *CodeMigration {
 	return &CodeMigration{
+		id:       id,
 		callback: callback,
 	}
 }
@@ -143,7 +145,9 @@ func ApplyDbMigrationsUpTo(ctx context.Context, upTo int) {
 	if upTo > len(migrations) {
 		upTo = len(migrations)
 	}
-	for i := DbVersion(ctx); i < upTo; i += 1 {
+	startVersion := DbVersion(ctx)
+	verifyMigrationCatalog(ctx, startVersion)
+	for i := startVersion; i < upTo; i += 1 {
 		MaintenanceTx(ctx, func(tx PgTx) {
 			RaisePgResult(tx.Exec(
 				ctx,
@@ -188,6 +192,7 @@ func ApplyDbMigrationsUpTo(ctx context.Context, upTo int) {
 				i,
 				i+1,
 			))
+			Raise(recordMigrationIdentityIfCatalogExists(ctx, tx, i))
 		})
 	}
 }
@@ -1334,7 +1339,7 @@ var migrations = []any{
         ALTER TABLE device ALTER COLUMN device_spec TYPE varchar(256)
     `),
 
-	newCodeMigration(migration_20240124_PopulateDevice),
+	newCodeMigration("20240124_populate_device", migration_20240124_PopulateDevice),
 
 	// ALTERED the run_at_block size is 1 second
 	// extract(epoch ...) is epoch in seconds
@@ -1527,7 +1532,7 @@ var migrations = []any{
             UNIQUE (referral_code)
         )
     `),
-	newCodeMigration(migration_20240725_PopulateNetworkReferralCodes),
+	newCodeMigration("20240725_populate_network_referral_codes", migration_20240725_PopulateNetworkReferralCodes),
 
 	newSqlMigration(`
         ALTER TABLE transfer_contract ADD COLUMN payer_network_id uuid NULL
@@ -1584,7 +1589,7 @@ var migrations = []any{
         ALTER TABLE account_wallet ADD COLUMN circle_wallet_id uuid NULL
     `),
 
-	newCodeMigration(migration_20240802_AccountPaymentPopulateCircleWalletId),
+	newCodeMigration("20240802_account_payment_populate_circle_wallet_id", migration_20240802_AccountPaymentPopulateCircleWalletId),
 
 	newSqlMigration(`
         ALTER TABLE network_client_location
@@ -1744,7 +1749,7 @@ var migrations = []any{
         ALTER TABLE network_referral_code ADD CONSTRAINT network_referral_code_referral_code_key UNIQUE (referral_code);
     `),
 
-	newCodeMigration(migration_20250402_ReferralCodeToAlphaNumeric),
+	newCodeMigration("20250402_referral_code_to_alphanumeric", migration_20250402_ReferralCodeToAlphaNumeric),
 
 	newSqlMigration(
 		`ALTER TABLE account_feedback ADD COLUMN star_count integer NOT NULL DEFAULT 0;`,
@@ -3585,41 +3590,6 @@ var migrations = []any{
         )
     `),
 
-	// seedphrase auth
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS network_user_auth_seedphrase (
-            user_id             uuid NOT NULL PRIMARY KEY,
-            seedphrase_lookup   bytea NOT NULL,
-            seedphrase_hash     bytea NOT NULL,
-            seedphrase_salt     bytea NOT NULL,
-            create_time         timestamp NOT NULL DEFAULT now()
-        )
-    `),
-	newSqlMigration(`
-        CREATE UNIQUE INDEX IF NOT EXISTS network_user_auth_seedphrase_lookup
-            ON network_user_auth_seedphrase (seedphrase_lookup)
-    `),
-
-	// network name reclaim (1-day cooldown)
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS network_name_reclaim (
-            old_name         varchar(256) NOT NULL PRIMARY KEY,
-            cool_down_until  timestamp NOT NULL
-        )
-    `),
-
-	// Index for bulk client deactivation via `client_id = ANY($1) AND network_id = $2`.
-	// background task path (RemoveNetworkClientsTask, 200k ids per invocation) use
-	// this predicate. Without this index the query planner must scan for each batch;
-	// at 200k IDs across 20 batches that can cause long lock times on large tables.
-	// On the large existing network_client table this must be built manually with
-	// CREATE INDEX CONCURRENTLY out of band — the IF NOT EXISTS gate makes this
-	// migration a no-op once it is pre-created.
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS network_client_network_id_client_id
-        ON network_client (network_id, client_id)
-    `),
-
 	// the net-escrow reconcile task (model/subscription_model.go
 	// `openEscrowReservedByBalance`, rescheduled every 5 minutes) sums open
 	// escrow per balance by joining the full transfer_escrow and
@@ -4121,9 +4091,9 @@ var migrations = []any{
 
 	// Indexed reap-eligibility for the transfer_contract retention reaper. reap_time
 	// is the instant a contract becomes due for hard deletion: it is set to
-	// complete_time + CompletedContractExpiration when the contract's payment
-	// completes (CompletePayment), and to now() when an aged closed-but-never-
-	// completed straggler is marked by the retention task. The reaper then deletes
+	// complete_time + CompletedContractExpiration by the bounded retention worker
+	// after the contract's payment completes, and to now() when an aged closed
+	// straggler is marked by the retention task. The reaper then deletes
 	// by an index range-scan over reap_time instead of the old un-indexable
 	// anti-join full scan over the whole old-closed table that caused a prod
 	// incident. Nullable (no default), so the ADD COLUMN is a fast metadata-only
@@ -4418,6 +4388,29 @@ var migrations = []any{
         ON transfer_contract (destination_id) WHERE open
     `),
 
+	// seedphrase auth
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_user_auth_seedphrase (
+            user_id             uuid NOT NULL PRIMARY KEY,
+            seedphrase_lookup   bytea NOT NULL,
+            seedphrase_hash     bytea NOT NULL,
+            seedphrase_salt     bytea NOT NULL,
+            create_time         timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE UNIQUE INDEX IF NOT EXISTS network_user_auth_seedphrase_lookup
+            ON network_user_auth_seedphrase (seedphrase_lookup)
+    `),
+
+	// network name reclaim (1-day cooldown)
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_name_reclaim (
+            old_name         varchar(256) NOT NULL PRIMARY KEY,
+            cool_down_until  timestamp NOT NULL
+        )
+    `),
+
 	// network create rate limit (5 per IP per day)
 	newSqlMigration(`
         CREATE TABLE IF NOT EXISTS network_create_attempt (
@@ -4429,6 +4422,19 @@ var migrations = []any{
 	newSqlMigration(`
         CREATE INDEX IF NOT EXISTS network_create_attempt_hash_time
             ON network_create_attempt (client_address_hash, create_time)
+    `),
+
+	// Index for bulk client deactivation via `client_id = ANY($1) AND network_id = $2`.
+	// Both the synchronous batch path (RemoveNetworkClientsBatch, ≤10k ids) and the
+	// background task path (RemoveNetworkClientsTask, 200k ids per invocation) use
+	// this predicate. Without this index the query planner must scan for each batch;
+	// at 200k IDs across 20 batches that can cause long lock times on large tables.
+	// On the large existing network_client table this must be built manually with
+	// CREATE INDEX CONCURRENTLY out of band — the IF NOT EXISTS gate makes this
+	// migration a no-op once it is pre-created.
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_client_network_id_client_id
+        ON network_client (network_id, client_id)
     `),
 
 	// Defuse the 2026-07-17 planner-stats landmine (monitor/SIGNALS.md 2.3/5.8): at
@@ -4462,96 +4468,6 @@ var migrations = []any{
         ALTER TABLE client_reliability ADD COLUMN connection_excused_new_count bigint NOT NULL DEFAULT 0
     `),
 
-	// account-based (not IP-based) daily rate limits on sensitive account
-	// actions: add/remove auth method, change/claim network name, and
-	// generate/regenerate seedphrase. One shared table, keyed by (user_id,
-	// action), so each action gets its own independent daily counter.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS network_user_action_attempt (
-            network_user_action_attempt_id uuid NOT NULL PRIMARY KEY,
-            user_id                        uuid NOT NULL,
-            action                         varchar(64) NOT NULL,
-            create_time                    timestamp NOT NULL DEFAULT now()
-        )
-    `),
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS network_user_action_attempt_user_action_time
-            ON network_user_action_attempt (user_id, action, create_time)
-    `),
-
-	// a single, deployment-wide ledger for the bulk client removal API
-	// (RemoveNetworkClients): each admitted request records how many client
-	// ids it covered, and CheckAndRecordBulkClientRemovalQuota sums this
-	// column over the trailing hour to enforce MaxBulkClientRemovalsPerHour.
-	// network_id is stored for observability only -- the limit itself is
-	// global, not scoped per network.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS bulk_client_removal_quota (
-            bulk_client_removal_quota_id uuid NOT NULL PRIMARY KEY,
-            network_id                   uuid NOT NULL,
-            client_count                 int NOT NULL,
-            create_time                  timestamp NOT NULL DEFAULT now()
-        )
-    `),
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS bulk_client_removal_quota_create_time
-            ON bulk_client_removal_quota (create_time)
-    `),
-
-	// bulk_client_removal_quota moves from a rolling trailing-hour window to
-	// fixed, non-overlapping hourly buckets (UTC): ReserveBulkClientRemovalSlot
-	// reserves a row against a specific bucket_start (the current hour, or a
-	// future one if the current hour is full), instead of every row implicitly
-	// counting against whatever "now" happens to be when queried. create_time
-	// remains as an audit field (when the reservation was made), separate from
-	// bucket_start (which hour it counts toward). No rows exist yet in
-	// practice, so the NOT NULL default here is never relied on for real data.
-	newSqlMigration(`
-        ALTER TABLE bulk_client_removal_quota
-            ADD COLUMN IF NOT EXISTS bucket_start timestamp NOT NULL DEFAULT now()
-    `),
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS bulk_client_removal_quota_bucket_start
-            ON bulk_client_removal_quota (bucket_start)
-    `),
-
-	// provider egress locations: locations learned by an operator-run prober
-	// that routes geolocation lookups through a provider's own egress rather
-	// than trusting a lookup on the provider's control-connection ip, since
-	// the egress is where user traffic actually exits and can differ from
-	// where the provider's control connection originates (e.g. behind a VPN
-	// or hosting network). Keyed by client_id, one row per provider, upserted
-	// by the operator's prober. location_id is the canonical country (or
-	// city, when the probe was city-confident) location row. observed_at is
-	// when the probe ran, and is what freshness is judged against.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_egress_location (
-            client_id      uuid NOT NULL PRIMARY KEY,
-            location_id    uuid NOT NULL,
-            country_code   varchar(2) NOT NULL,
-            asn            int NOT NULL DEFAULT 0,
-            org            varchar(256) NOT NULL DEFAULT '',
-            hosting        bool NOT NULL DEFAULT false,
-            proxy          bool NOT NULL DEFAULT false,
-            mobile         bool NOT NULL DEFAULT false,
-            city_confident bool NOT NULL DEFAULT false,
-            observed_at    timestamp NOT NULL,
-            update_time    timestamp NOT NULL
-        )
-    `),
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS provider_egress_location_observed_at
-            ON provider_egress_location (observed_at)
-    `),
-	// asn was created as int4, which tops out at 2147483647. 32-bit ASNs run to
-	// 4294967295, so anything above the int4 ceiling -- the private 4200000000+
-	// range in particular -- fails to insert and sends the ingest into a retry
-	// loop. Widen in place rather than editing the create above, which has
-	// already been applied here.
-	newSqlMigration(`
-        ALTER TABLE provider_egress_location
-            ALTER COLUMN asn TYPE bigint
-    `),
 	// block users marker (model/network_stats_model.go
 	// `StampTopLevelClientContractTime`): the last time a transfer contract
 	// was created with this top-level client — or one of its child clients —
@@ -4574,687 +4490,6 @@ var migrations = []any{
         CREATE INDEX IF NOT EXISTS network_client_top_level_contract_time
         ON network_client (contract_time) WHERE (active = true AND source_client_id IS NULL AND contract_time IS NOT NULL)
     `),
-
-	// provider egress probe attempts: when the prober last *tried* a provider,
-	// successful or not, and how the try failed.
-	//
-	// This cannot live on provider_egress_location, because the case it exists
-	// to handle is precisely a provider that has no row there. A provider that
-	// connects, holds a Public provide key and fails every probe (firewalled
-	// egress, dead upstream) never gets an egress row, so its observed_at stays
-	// NULL, so it sorts to the head of the due queue forever. Enough of them and
-	// every batch the prober asks for is the same set of permanently-dead
-	// providers, and no healthy provider's location is ever refreshed -- while
-	// the endpoint keeps returning a full, plausible-looking batch.
-	// GetProviderEgressLocationDue defers on a recent attempt as well as a fresh
-	// success, which needs somewhere to record the attempt.
-	//
-	// Pulled forward from the P2 verdict model
-	// (docs/superpowers/specs/2026-07-25-enforced-provider-geo-probing-design.md,
-	// probe_attempt_at / probe_failure) because the P1 schedule cannot function
-	// without it. Deliberately only the two columns the schedule reads, not the
-	// rest of that model.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_egress_probe_attempt (
-            client_id     uuid NOT NULL PRIMARY KEY,
-            attempt_at    timestamp NOT NULL,
-            probe_failure varchar(64) NOT NULL DEFAULT '',
-            update_time   timestamp NOT NULL
-        )
-    `),
-
-	// serves the sweep in RemoveExpiredProviderEgressProbeAttempts. The due
-	// query reaches this table by primary key through the left join, so it
-	// needs no index of its own.
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS provider_egress_probe_attempt_attempt_at
-            ON provider_egress_probe_attempt (attempt_at)
-    `),
-
-	// serves the stale-but-probed pass of GetProviderEgressLocationDue, which
-	// drives from provider_egress_location with `observed_at < $n ORDER BY
-	// observed_at, client_id LIMIT $m`. With client_id in the index the
-	// predicate and the whole ORDER BY -- tie-break included -- are one ordered
-	// index scan that stops when the batch is full: no sort, and no heap visit
-	// to resolve the tie. The pre-existing (observed_at) index alone leaves the
-	// client_id tie-break to a sort.
-	//
-	// The other pass (never-probed) needs no new index: it is an anti-join over
-	// network_client_location_reliability ordered by client_id, which the
-	// existing (valid, connected, client_id) index already serves as an ordered
-	// scan, and both anti-joins plus the provide_key EXISTS are primary-key
-	// probes.
-	//
-	// This supersedes provider_egress_location_observed_at, which is now a
-	// prefix of it -- including for the RemoveExpiredProviderEgressLocations
-	// sweep. The redundant index is left in place deliberately: dropping it is a
-	// separate decision with its own (small) risk, and this migration is meant
-	// to be purely additive.
-	//
-	// Appended, never inserted: migrations here apply by slice index, so
-	// editing or reordering an already-applied entry corrupts live databases.
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS provider_egress_location_observed_at_client_id
-            ON provider_egress_location (observed_at, client_id)
-    `),
-
-	// The recorded judgement for a probed egress location: `verdict` is
-	// verified/unverified/suspect, `verdict_reason` the short failure class that
-	// produced it (see probeverdict), and `assurance` how the probe reached the
-	// provider (`direct` until multi-hop lands in P3).
-	//
-	// All three are additive with safe defaults, so every existing row reads as
-	// an unjudged direct probe and every existing reader of
-	// provider_egress_location is unaffected. Nothing writes a non-default
-	// verdict until the ingest path computes one.
-	//
-	// Appended, never inserted: migrations here apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. IF NOT EXISTS on every
-	// statement makes a re-run -- or a duplicated merge resolution -- a no-op.
-	newSqlMigration(`
-        ALTER TABLE provider_egress_location
-            ADD COLUMN IF NOT EXISTS verdict varchar(16) NOT NULL DEFAULT 'unverified',
-            ADD COLUMN IF NOT EXISTS verdict_reason varchar(64) NOT NULL DEFAULT '',
-            ADD COLUMN IF NOT EXISTS assurance varchar(16) NOT NULL DEFAULT 'direct'
-    `),
-
-	// One measured throughput figure per provider, from either source (passive
-	// aggregation of settled bytes, or an active sampled download) -- consumers
-	// read one number and the `source` column says which produced it.
-	//
-	// client_id is the primary key, so a new measurement overwrites the old one
-	// (mirrors provider_egress_location's own shape). This is a ranking input,
-	// not a history: keeping every sample would grow without bound for a value
-	// only ever read as "the current figure".
-	//
-	// SUPERSEDED: a later migration in this file re-keys the table on
-	// (client_id, source) so each source keeps its own current figure. The
-	// statement below is left exactly as applied -- see that migration for why.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_bandwidth (
-            client_id          uuid NOT NULL PRIMARY KEY,
-            bytes_per_second   double precision NOT NULL,
-            source             varchar(16) NOT NULL,
-            sample_byte_count  bigint NOT NULL,
-            window_start       timestamp NOT NULL,
-            window_end         timestamp NOT NULL,
-            update_time        timestamp NOT NULL
-        )
-    `),
-
-	// serves staleness sweeps and "who needs a fresh measurement" scans, which
-	// range on window_end. Lookups of a single provider's figure go through the
-	// primary key and need no index of their own.
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS provider_bandwidth_window_end
-            ON provider_bandwidth (window_end)
-    `),
-
-	// The deployment-wide byte budget for active bandwidth probing, in the
-	// same shape as bulk_client_removal_quota: one row per admitted
-	// reservation, counting against a fixed hourly bucket. See
-	// ReserveProviderBandwidthSlot for why active probe bytes need a spend
-	// limit at all -- they are real, paid contract traffic on any deployment
-	// where payouts are planned, regardless of the balance code used.
-	//
-	// byte_count is bigint, not int: a bucket's budget is measured in hundreds
-	// of megabytes, where the bulk-delete table's client_count counts rows and
-	// fits an int comfortably. client_id is stored for observability only,
-	// exactly as network_id is there -- the limit itself is global, not scoped
-	// per provider.
-	//
-	// Appended, never inserted: migrations here apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. IF NOT EXISTS on every
-	// statement makes a re-run -- or a duplicated merge resolution -- a no-op.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_bandwidth_quota (
-            provider_bandwidth_quota_id uuid NOT NULL PRIMARY KEY,
-            client_id                   uuid NOT NULL,
-            byte_count                  bigint NOT NULL,
-            bucket_start                timestamp NOT NULL,
-            create_time                 timestamp NOT NULL
-        )
-    `),
-
-	// every read of this table is a range over the lookahead window
-	// (`$1 <= bucket_start AND bucket_start < $2`), and the reaper deletes by
-	// the same column, so bucket_start is the only index it needs.
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS provider_bandwidth_quota_bucket_start
-            ON provider_bandwidth_quota (bucket_start)
-    `),
-
-	// Re-key provider_bandwidth on (client_id, source).
-	//
-	// The active probe measures two independent targets per provider -- the
-	// operator's own download endpoint and a public CDN -- and the two figures
-	// are the point: a provider that prioritises one path and not the other is
-	// invisible in a single number and obvious in a pair. Keyed on client_id
-	// alone the two overwrite each other on every pass, so only one target can
-	// be stored at all. Averaging them into the one row would lose the same
-	// signal more quietly.
-	//
-	// The source becomes part of the key rather than each target getting its
-	// own columns, because a further target then needs no migration at all:
-	// 'passive', 'active-operator' and 'active-cdn' are three rows in the same
-	// shape, and a fourth would be a fourth row.
-	//
-	// No backfill: provider_bandwidth is empty on every deployment (nothing has
-	// written to it yet -- the active prober is the first writer and ships with
-	// this change), so re-keying cannot orphan or collide with an existing row.
-	//
-	// Appended, never inserted: migrations apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. DROP CONSTRAINT IF EXISTS
-	// paired with the ADD makes the whole statement idempotent -- a re-run
-	// drops whatever primary key is present and re-adds this one.
-	newSqlMigration(`
-        ALTER TABLE provider_bandwidth
-            DROP CONSTRAINT IF EXISTS provider_bandwidth_pkey,
-            ADD CONSTRAINT provider_bandwidth_pkey PRIMARY KEY (client_id, source)
-    `),
-
-	// The latest egress-health run per provider: does this provider actually
-	// carry traffic to the real internet, across several independent classes
-	// of destination. The prober has computed this every pass since P2 and
-	// only ever logged it, so the signal rolls off with the container logs.
-	//
-	// Keyed on client_id alone, so a run replaces the previous one -- the
-	// current picture per provider, not a history, exactly as
-	// provider_egress_location behaves. Trending, if it is ever wanted,
-	// belongs in a separate partitioned append table rather than a second key
-	// column here.
-	//
-	// class_results is jsonb rather than a column per class because the class
-	// set is the prober's, not the schema's: adding a destination class must
-	// not need a migration, and the per-class tally is read as a diagnostic
-	// document ("dns=4/4 cdn=0/5 site=12/12" separates a datacenter-refusal
-	// from a blackhole) rather than filtered or aggregated on in sql.
-	//
-	// reputation_ok/reputation_total and reputation_failed_names are stored
-	// SEPARATELY from ok_count/total_count and must never be folded into them.
-	// The reputation class measures whether big vendors treat the exit ip as a
-	// datacenter address; nearly every honest hosted provider fails most of it
-	// because it IS hosted. Summing it into the health figure would score a
-	// provider that carried every byte it was asked for as partly broken. The
-	// ingest endpoint rejects a 'reputation' key inside class_results for the
-	// same reason.
-	//
-	// Appended, never inserted: migrations here apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. IF NOT EXISTS makes a
-	// re-run -- or a duplicated merge resolution -- a no-op.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_egress_health (
-            client_id               uuid NOT NULL,
-            measured_at             timestamp NOT NULL,
-            ok_count                int NOT NULL,
-            total_count             int NOT NULL,
-            class_results           jsonb NOT NULL,
-            reputation_ok           int NOT NULL,
-            reputation_total        int NOT NULL,
-            failed_names            text NOT NULL DEFAULT '',
-            reputation_failed_names text NOT NULL DEFAULT '',
-
-            PRIMARY KEY (client_id)
-        )
-    `),
-
-	// Blackhole verdicts reported by real clients: one row per report, per
-	// provider, per reporting network. A client that removes a provider for
-	// carrying nothing (see connect's detectBlackhole) says so here.
-	//
-	// APPEND-ONLY ON PURPOSE. A reporter may say anything as often as it likes;
-	// the cap is on what a reporter can COUNT FOR -- at most one verdict per
-	// reporter network per provider per aggregation window -- and it is applied
-	// at read time, in ProviderClientVerdictQuorumMet, never on the write path.
-	// Capping the writes instead would make the table lie about what was
-	// actually reported, and would put a rate-limit decision in front of the
-	// one signal that says a provider is dead.
-	//
-	// reporter_network_id comes from the authenticated session and never from
-	// the request body. It is the entire basis of the quorum: distinct networks
-	// are what a griefer has to buy, and a body-supplied reporter id would cost
-	// nothing at all.
-	//
-	// A met quorum only REPRIORITISES the provider for probing -- it never
-	// demotes, excludes, or touches filter sets, scores, PassesMinimums or
-	// find-providers2. See ProviderClientVerdictQuorumMet for why the trigger
-	// (client verdicts) and the punishment (the prober) are separated.
-	//
-	// syn_sent/syn_received are accepted and validated by the endpoint but
-	// deliberately not columns here: aggregation keys on receive_ack_count
-	// alone, and a column nothing reads is a column that drifts.
-	//
-	// Appended, never inserted: migrations here apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. IF NOT EXISTS makes a
-	// re-run -- or a duplicated merge resolution -- a no-op.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_client_verdict (
-            provider_client_id  uuid NOT NULL,
-            reporter_network_id uuid NOT NULL,
-            reason              text NOT NULL,
-            send_ack_count      bigint NOT NULL,
-            send_ack_bytes      bigint NOT NULL,
-            receive_ack_count   bigint NOT NULL,
-            receive_ack_bytes   bigint NOT NULL,
-            window_seconds      int NOT NULL,
-            create_time         timestamp NOT NULL,
-
-            PRIMARY KEY (provider_client_id, reporter_network_id, create_time)
-        )
-    `),
-
-	// serves the window read (GetProviderClientVerdictsInWindow), which is
-	// `provider_client_id = $1 AND $2 <= create_time ORDER BY create_time`.
-	// The primary key's leading column alone would find the provider's rows and
-	// then filter and sort every verdict ever written about it -- and this table
-	// is append-only and unbounded per reporter, so that set only grows. With
-	// create_time second the window is an ordered range scan that stops at the
-	// scan limit.
-	//
-	// reporter_network_id is deliberately not in the index: the read does not
-	// filter on it, and the one-verdict-per-reporter cap is applied in Go, not
-	// by the database.
-	newSqlMigration(`
-        CREATE INDEX IF NOT EXISTS provider_client_verdict_provider_create_time
-            ON provider_client_verdict (provider_client_id, create_time)
-    `),
-
-	// the certificate pins this server has OBSERVED for the geolocation source
-	// hosts, by connecting to each host directly -- on the server's own
-	// network, no provider in the path -- and validating the chain under full
-	// WebPKI. See model.GeolocationSourcePin for why a direct, verified
-	// observation is the only thing that may ever write this table: a pin
-	// learned through a provider tunnel would let the provider under test teach
-	// the server its own forged certificate.
-	//
-	// One row per host, upserted: this is the current observation, not a
-	// history. A rotation is recorded in the refresh job's log line (old and
-	// new values), which is what was missing when the hardcoded pins went stale
-	// and silently took every source out of the consensus set.
-	//
-	// Both spki columns are NOT NULL and never written empty. An empty pin is
-	// not "no constraint", it is a pin that matches nothing, so a half-observed
-	// row would fail the prober closed for that host just as surely as a wrong
-	// one. The observation job leaves the previous row untouched rather than
-	// writing a partial one.
-	//
-	// No secondary index: the primary key on host serves both access paths --
-	// the per-host upsert, and the unqualified read of every row (three rows,
-	// one per source host).
-	//
-	// Appended, never inserted: migrations here apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. IF NOT EXISTS makes a
-	// re-run -- or a duplicated merge resolution -- a no-op.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS geolocation_source_pin (
-            host              text NOT NULL,
-            leaf_spki         text NOT NULL,
-            intermediate_spki text NOT NULL,
-            observed_at       timestamp NOT NULL,
-
-            PRIMARY KEY (host)
-        )
-    `),
-
-	// Backfill every location row that was created with a blank
-	// `location_name`, then forbid the state structurally.
-	//
-	// The rows come from `AddDefaultLocations`' location-group member path,
-	// which built a `Location` with only a `CountryCode` and no `Country`;
-	// `CreateLocation` wrote `location_name` straight from that empty field. On
-	// the live beta deployment that is 161 country rows and 2 region rows (`hk`,
-	// `sg`) -- 163 of 565. The creating path is fixed in the two commits before
-	// this one; this is the data those commits arrived too late to prevent.
-	//
-	// The 249-entry mapping below is GENERATED from `model.ISOCountryName` --
-	// the same table `CreateLocation` now resolves through -- by probing all 676
-	// two-letter codes and emitting the ones it answers for. A migration cannot
-	// call Go, and 249 hand-typed names is exactly how a wrong one gets in, so
-	// the SQL is machine-derived from the Go table rather than transcribed
-	// alongside it. It is the full ISO table, not just the 161 codes beta
-	// happens to hold, so the same migration repairs any deployment.
-	//
-	// Order matters twice, and neither order is cosmetic:
-	//
-	//  1. The backfill must precede the CHECK. Adding the constraint first fails
-	//     the migration on the 163 rows it exists to prevent.
-	//  2. The city `location_full_name` repair must precede the region rename,
-	//     because it selects its rows by the region still being blank. Renaming
-	//     first would leave the cities holding ", ," forever.
-	//
-	// Appended, never inserted: migrations here apply by slice index
-	// (`for i := DbVersion(ctx); i < upTo; i++`), so editing or reordering an
-	// already-applied entry corrupts live databases. The temp table is
-	// ON COMMIT DROP and the constraint is dropped-if-exists before being added,
-	// so a re-run -- or a duplicated merge resolution -- is a no-op.
-	newSqlMigration(`
-        CREATE TEMP TABLE iso_country_name_backfill (
-            country_code char(2) PRIMARY KEY,
-            country_name varchar(128) NOT NULL
-        ) ON COMMIT DROP;
-
-        INSERT INTO iso_country_name_backfill (country_code, country_name) VALUES
-            ('ad', 'Andorra'),
-            ('ae', 'United Arab Emirates'),
-            ('af', 'Afghanistan'),
-            ('ag', 'Antigua and Barbuda'),
-            ('ai', 'Anguilla'),
-            ('al', 'Albania'),
-            ('am', 'Armenia'),
-            ('ao', 'Angola'),
-            ('aq', 'Antarctica'),
-            ('ar', 'Argentina'),
-            ('as', 'American Samoa'),
-            ('at', 'Austria'),
-            ('au', 'Australia'),
-            ('aw', 'Aruba'),
-            ('ax', 'Åland Islands'),
-            ('az', 'Azerbaijan'),
-            ('ba', 'Bosnia and Herzegovina'),
-            ('bb', 'Barbados'),
-            ('bd', 'Bangladesh'),
-            ('be', 'Belgium'),
-            ('bf', 'Burkina Faso'),
-            ('bg', 'Bulgaria'),
-            ('bh', 'Bahrain'),
-            ('bi', 'Burundi'),
-            ('bj', 'Benin'),
-            ('bl', 'Saint Barthélemy'),
-            ('bm', 'Bermuda'),
-            ('bn', 'Brunei Darussalam'),
-            ('bo', 'Bolivia'),
-            ('bq', 'Bonaire, Sint Eustatius and Saba'),
-            ('br', 'Brazil'),
-            ('bs', 'Bahamas'),
-            ('bt', 'Bhutan'),
-            ('bv', 'Bouvet Island'),
-            ('bw', 'Botswana'),
-            ('by', 'Belarus'),
-            ('bz', 'Belize'),
-            ('ca', 'Canada'),
-            ('cc', 'Cocos (Keeling) Islands'),
-            ('cd', 'Congo, The Democratic Republic of the'),
-            ('cf', 'Central African Republic'),
-            ('cg', 'Congo'),
-            ('ch', 'Switzerland'),
-            ('ci', 'Côte d''Ivoire'),
-            ('ck', 'Cook Islands'),
-            ('cl', 'Chile'),
-            ('cm', 'Cameroon'),
-            ('cn', 'China'),
-            ('co', 'Colombia'),
-            ('cr', 'Costa Rica'),
-            ('cu', 'Cuba'),
-            ('cv', 'Cabo Verde'),
-            ('cw', 'Curaçao'),
-            ('cx', 'Christmas Island'),
-            ('cy', 'Cyprus'),
-            ('cz', 'Czechia'),
-            ('de', 'Germany'),
-            ('dj', 'Djibouti'),
-            ('dk', 'Denmark'),
-            ('dm', 'Dominica'),
-            ('do', 'Dominican Republic'),
-            ('dz', 'Algeria'),
-            ('ec', 'Ecuador'),
-            ('ee', 'Estonia'),
-            ('eg', 'Egypt'),
-            ('eh', 'Western Sahara'),
-            ('er', 'Eritrea'),
-            ('es', 'Spain'),
-            ('et', 'Ethiopia'),
-            ('fi', 'Finland'),
-            ('fj', 'Fiji'),
-            ('fk', 'Falkland Islands (Malvinas)'),
-            ('fm', 'Micronesia, Federated States of'),
-            ('fo', 'Faroe Islands'),
-            ('fr', 'France'),
-            ('ga', 'Gabon'),
-            ('gb', 'United Kingdom'),
-            ('gd', 'Grenada'),
-            ('ge', 'Georgia'),
-            ('gf', 'French Guiana'),
-            ('gg', 'Guernsey'),
-            ('gh', 'Ghana'),
-            ('gi', 'Gibraltar'),
-            ('gl', 'Greenland'),
-            ('gm', 'Gambia'),
-            ('gn', 'Guinea'),
-            ('gp', 'Guadeloupe'),
-            ('gq', 'Equatorial Guinea'),
-            ('gr', 'Greece'),
-            ('gs', 'South Georgia and the South Sandwich Islands'),
-            ('gt', 'Guatemala'),
-            ('gu', 'Guam'),
-            ('gw', 'Guinea-Bissau'),
-            ('gy', 'Guyana'),
-            ('hk', 'Hong Kong'),
-            ('hm', 'Heard Island and McDonald Islands'),
-            ('hn', 'Honduras'),
-            ('hr', 'Croatia'),
-            ('ht', 'Haiti'),
-            ('hu', 'Hungary'),
-            ('id', 'Indonesia'),
-            ('ie', 'Ireland'),
-            ('il', 'Israel'),
-            ('im', 'Isle of Man'),
-            ('in', 'India'),
-            ('io', 'British Indian Ocean Territory'),
-            ('iq', 'Iraq'),
-            ('ir', 'Iran'),
-            ('is', 'Iceland'),
-            ('it', 'Italy'),
-            ('je', 'Jersey'),
-            ('jm', 'Jamaica'),
-            ('jo', 'Jordan'),
-            ('jp', 'Japan'),
-            ('ke', 'Kenya'),
-            ('kg', 'Kyrgyzstan'),
-            ('kh', 'Cambodia'),
-            ('ki', 'Kiribati'),
-            ('km', 'Comoros'),
-            ('kn', 'Saint Kitts and Nevis'),
-            ('kp', 'North Korea'),
-            ('kr', 'South Korea'),
-            ('kw', 'Kuwait'),
-            ('ky', 'Cayman Islands'),
-            ('kz', 'Kazakhstan'),
-            ('la', 'Laos'),
-            ('lb', 'Lebanon'),
-            ('lc', 'Saint Lucia'),
-            ('li', 'Liechtenstein'),
-            ('lk', 'Sri Lanka'),
-            ('lr', 'Liberia'),
-            ('ls', 'Lesotho'),
-            ('lt', 'Lithuania'),
-            ('lu', 'Luxembourg'),
-            ('lv', 'Latvia'),
-            ('ly', 'Libya'),
-            ('ma', 'Morocco'),
-            ('mc', 'Monaco'),
-            ('md', 'Moldova'),
-            ('me', 'Montenegro'),
-            ('mf', 'Saint Martin (French part)'),
-            ('mg', 'Madagascar'),
-            ('mh', 'Marshall Islands'),
-            ('mk', 'North Macedonia'),
-            ('ml', 'Mali'),
-            ('mm', 'Myanmar'),
-            ('mn', 'Mongolia'),
-            ('mo', 'Macao'),
-            ('mp', 'Northern Mariana Islands'),
-            ('mq', 'Martinique'),
-            ('mr', 'Mauritania'),
-            ('ms', 'Montserrat'),
-            ('mt', 'Malta'),
-            ('mu', 'Mauritius'),
-            ('mv', 'Maldives'),
-            ('mw', 'Malawi'),
-            ('mx', 'Mexico'),
-            ('my', 'Malaysia'),
-            ('mz', 'Mozambique'),
-            ('na', 'Namibia'),
-            ('nc', 'New Caledonia'),
-            ('ne', 'Niger'),
-            ('nf', 'Norfolk Island'),
-            ('ng', 'Nigeria'),
-            ('ni', 'Nicaragua'),
-            ('nl', 'Netherlands'),
-            ('no', 'Norway'),
-            ('np', 'Nepal'),
-            ('nr', 'Nauru'),
-            ('nu', 'Niue'),
-            ('nz', 'New Zealand'),
-            ('om', 'Oman'),
-            ('pa', 'Panama'),
-            ('pe', 'Peru'),
-            ('pf', 'French Polynesia'),
-            ('pg', 'Papua New Guinea'),
-            ('ph', 'Philippines'),
-            ('pk', 'Pakistan'),
-            ('pl', 'Poland'),
-            ('pm', 'Saint Pierre and Miquelon'),
-            ('pn', 'Pitcairn'),
-            ('pr', 'Puerto Rico'),
-            ('ps', 'Palestine, State of'),
-            ('pt', 'Portugal'),
-            ('pw', 'Palau'),
-            ('py', 'Paraguay'),
-            ('qa', 'Qatar'),
-            ('re', 'Réunion'),
-            ('ro', 'Romania'),
-            ('rs', 'Serbia'),
-            ('ru', 'Russian Federation'),
-            ('rw', 'Rwanda'),
-            ('sa', 'Saudi Arabia'),
-            ('sb', 'Solomon Islands'),
-            ('sc', 'Seychelles'),
-            ('sd', 'Sudan'),
-            ('se', 'Sweden'),
-            ('sg', 'Singapore'),
-            ('sh', 'Saint Helena, Ascension and Tristan da Cunha'),
-            ('si', 'Slovenia'),
-            ('sj', 'Svalbard and Jan Mayen'),
-            ('sk', 'Slovakia'),
-            ('sl', 'Sierra Leone'),
-            ('sm', 'San Marino'),
-            ('sn', 'Senegal'),
-            ('so', 'Somalia'),
-            ('sr', 'Suriname'),
-            ('ss', 'South Sudan'),
-            ('st', 'Sao Tome and Principe'),
-            ('sv', 'El Salvador'),
-            ('sx', 'Sint Maarten (Dutch part)'),
-            ('sy', 'Syria'),
-            ('sz', 'Eswatini'),
-            ('tc', 'Turks and Caicos Islands'),
-            ('td', 'Chad'),
-            ('tf', 'French Southern Territories'),
-            ('tg', 'Togo'),
-            ('th', 'Thailand'),
-            ('tj', 'Tajikistan'),
-            ('tk', 'Tokelau'),
-            ('tl', 'Timor-Leste'),
-            ('tm', 'Turkmenistan'),
-            ('tn', 'Tunisia'),
-            ('to', 'Tonga'),
-            ('tr', 'Türkiye'),
-            ('tt', 'Trinidad and Tobago'),
-            ('tv', 'Tuvalu'),
-            ('tw', 'Taiwan'),
-            ('tz', 'Tanzania'),
-            ('ua', 'Ukraine'),
-            ('ug', 'Uganda'),
-            ('um', 'United States Minor Outlying Islands'),
-            ('us', 'United States'),
-            ('uy', 'Uruguay'),
-            ('uz', 'Uzbekistan'),
-            ('va', 'Holy See (Vatican City State)'),
-            ('vc', 'Saint Vincent and the Grenadines'),
-            ('ve', 'Venezuela'),
-            ('vg', 'Virgin Islands, British'),
-            ('vi', 'Virgin Islands, U.S.'),
-            ('vn', 'Vietnam'),
-            ('vu', 'Vanuatu'),
-            ('wf', 'Wallis and Futuna'),
-            ('ws', 'Samoa'),
-            ('ye', 'Yemen'),
-            ('yt', 'Mayotte'),
-            ('za', 'South Africa'),
-            ('zm', 'Zambia'),
-            ('zw', 'Zimbabwe');
-
-        -- The city rows under a blank region are not themselves blank, but their
-        -- location_full_name carries the empty region through the same
-        -- composition -- "Hong Kong, , hk". Repaired to the shape the city INSERT
-        -- writes, city, region, code, using the name the region is about to get.
-        -- This runs FIRST: after the rename the region is no longer blank and this
-        -- statement would match nothing.
-        UPDATE location AS city
-        SET location_full_name =
-            city.location_name || ', ' || iso.country_name || ', ' || city.country_code
-        FROM location AS region
-        JOIN iso_country_name_backfill AS iso
-            ON iso.country_code = region.country_code
-        WHERE
-            city.location_type = 'city' AND
-            city.region_location_id = region.location_id AND
-            region.location_type = 'region' AND
-            region.location_name = '';
-
-        -- The 2 blank region rows are RENAMED, not deleted: each has a city child
-        -- pointing at it through region_location_id (Hong Kong under hk,
-        -- Singapore under sg), so dropping them would orphan a live city. They
-        -- exist because the geolocation database returns no subdivision for a
-        -- subdivision-less country, so the region was created with an empty name;
-        -- the only fact such a row carries is "the whole of this country", which is
-        -- why it is named after its country rather than after a subdivision that
-        -- was never in the source data. location_full_name is composed the way
-        -- the region INSERT composes it, name, code.
-        UPDATE location AS region
-        SET
-            location_name = iso.country_name,
-            location_full_name = iso.country_name || ', ' || region.country_code
-        FROM iso_country_name_backfill AS iso
-        WHERE
-            region.location_type = 'region' AND
-            region.location_name = '' AND
-            iso.country_code = region.country_code;
-
-        -- The 161 country rows. location_full_name is deliberately NOT touched:
-        -- the country INSERT writes the bare country code into it, so these rows
-        -- already hold exactly what a correctly-named country row holds. Only the
-        -- name was ever missing.
-        UPDATE location AS country
-        SET location_name = iso.country_name
-        FROM iso_country_name_backfill AS iso
-        WHERE
-            country.location_type = 'country' AND
-            country.location_name = '' AND
-            iso.country_code = country.country_code;
-
-        DROP TABLE iso_country_name_backfill;
-
-        -- The structural backstop. A blank name is never a real location, so it is
-        -- rejected by the database rather than depending on every future caller
-        -- remembering to resolve one.
-        ALTER TABLE location DROP CONSTRAINT IF EXISTS location_name_not_blank;
-
-        ALTER TABLE location
-            ADD CONSTRAINT location_name_not_blank
-            CHECK (location_name <> '')
-    `),
-
-	// --- merged from urnetwork/main 2026-08-08 ---
-	// Appended, never inserted: end_version_number is the slice index + 1, so
-	// inserting above an already-applied position silently renumbers every later
-	// migration out from under the live DB (currently at version 547).
 
 	// oauth 2.1 / openid connect authorization server (IDP.md).
 	//
@@ -5376,6 +4611,59 @@ var migrations = []any{
         )
     `),
 
+	// account-based (not IP-based) daily rate limits on sensitive account
+	// actions: add/remove auth method, change/claim network name, and
+	// generate/regenerate seedphrase. One shared table, keyed by (user_id,
+	// action), so each action gets its own independent daily counter.
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS network_user_action_attempt (
+            network_user_action_attempt_id uuid NOT NULL PRIMARY KEY,
+            user_id                        uuid NOT NULL,
+            action                         varchar(64) NOT NULL,
+            create_time                    timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS network_user_action_attempt_user_action_time
+            ON network_user_action_attempt (user_id, action, create_time)
+    `),
+
+	// a single, deployment-wide ledger for the bulk client removal API
+	// (RemoveNetworkClients): each admitted request records how many client
+	// ids it covered, and CheckAndRecordBulkClientRemovalQuota sums this
+	// column over the trailing hour to enforce MaxBulkClientRemovalsPerHour.
+	// network_id is stored for observability only -- the limit itself is
+	// global, not scoped per network.
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS bulk_client_removal_quota (
+            bulk_client_removal_quota_id uuid NOT NULL PRIMARY KEY,
+            network_id                   uuid NOT NULL,
+            client_count                 int NOT NULL,
+            create_time                  timestamp NOT NULL DEFAULT now()
+        )
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS bulk_client_removal_quota_create_time
+            ON bulk_client_removal_quota (create_time)
+    `),
+
+	// bulk_client_removal_quota moves from a rolling trailing-hour window to
+	// fixed, non-overlapping hourly buckets (UTC): ReserveBulkClientRemovalSlot
+	// reserves a row against a specific bucket_start (the current hour, or a
+	// future one if the current hour is full), instead of every row implicitly
+	// counting against whatever "now" happens to be when queried. create_time
+	// remains as an audit field (when the reservation was made), separate from
+	// bucket_start (which hour it counts toward). No rows exist yet in
+	// practice, so the NOT NULL default here is never relied on for real data.
+	newSqlMigration(`
+        ALTER TABLE bulk_client_removal_quota
+            ADD COLUMN IF NOT EXISTS bucket_start timestamp NOT NULL DEFAULT now()
+    `),
+	newSqlMigration(`
+        CREATE INDEX IF NOT EXISTS bulk_client_removal_quota_bucket_start
+            ON bulk_client_removal_quota (bucket_start)
+    `),
+
 	// city point coordinates from the ip mmdb, written by `CreateLocation`.
 	// NULL means unknown (rows created before this column existed, or created
 	// without coordinates); `FindProviders2` omits city_coordinates for those.
@@ -5437,7 +4725,7 @@ var migrations = []any{
 			ALTER COLUMN client_address SET DEFAULT ''
 	`),
 	// rewrite the raw addresses already persisted by the three call sites
-	newCodeMigration(migration_20260807_ScrubTaskAndAuditClientAddresses),
+	newCodeMigration("20260807_scrub_task_and_audit_client_addresses", migration_20260807_ScrubTaskAndAuditClientAddresses),
 
 	// Ledger of Stripe invoices that have already been credited, mirroring the
 	// apple_subscription_transaction shape: the insert (ON CONFLICT DO NOTHING)
@@ -5492,12 +4780,14 @@ var migrations = []any{
 
 	// Audit trail for the hourly payment reconciliation task (UPGRADE.md §8).
 	// Every repair the reconciler makes -- a credit for a lost webhook, an
-	// entitlement ended because the store says it is already over -- is a row
-	// here, with the store evidence id it acted on. Operator visibility is the
-	// point: a spike in repair counts IS the alarm that webhooks are broken. A
+	// entitlement ended because the store says it is already over, or an exact
+	// provider-confirmed Pro-metadata restoration -- is a row here, with the
+	// store evidence id it acted on. Operator visibility is the point: a spike
+	// in repair counts IS the alarm that webhooks are broken. A
 	// run that repairs nothing writes only a heartbeat row (store = 'all'),
 	// and a store skipped for missing credentials writes a skipped_store row.
-	// action: credited | ended | skipped_store | heartbeat | error.
+	// action: credited | ended | entitlement_repaired | skipped_store |
+	// heartbeat | error.
 	newSqlMigration(`
 		CREATE TABLE payment_reconciliation_event (
 			event_id uuid NOT NULL PRIMARY KEY,
@@ -5534,8 +4824,9 @@ var migrations = []any{
 
 	// Dry-run audit support for manual reconciliation runs (bringyourctl
 	// payments reconcile --dry-run). A dry run records would_credit /
-	// would_end events -- the same evidence and details the real repair would
-	// carry -- plus its own heartbeat/error rows, all tagged dry_run = true.
+	// would_end / would_repair_entitlement events -- the same evidence and
+	// details the real repair would carry -- plus its own heartbeat/error rows,
+	// all tagged dry_run = true.
 	// The default false keeps every existing query correct: operator queries
 	// over real repairs, heartbeats, and errors exclude dry runs without
 	// changing.
@@ -6336,44 +5627,11 @@ var migrations = []any{
             CHECK (location_name <> '')
     `),
 
-	// Blackhole detection is a SEPARATE signal from egress health, not a cheaper
-	// version of it.
-	//
-	// Egress health samples ~131 destinations across several classes and takes
-	// minutes per provider, so it can only sweep the fleet slowly -- on beta a
-	// provider went days between measurements. A provider that stops carrying
-	// traffic is invisible for that whole window: it stays connected, keeps
-	// accepting clients, and answers nothing. This table holds the cheap hourly
-	// answer to the single question "did ANY traffic get through", so a provider
-	// that goes dark leaves the public list within the hour instead of within
-	// days.
-	//
-	// One row per provider, keyed on client_id like provider_egress_health: this
-	// is the current picture, not a history. `failure` is a short class, the same
-	// shape and width as provider_egress_probe_attempt.probe_failure, so the
-	// server can reject an oversized value rather than silently truncating it.
-	newSqlMigration(`
-        CREATE TABLE IF NOT EXISTS provider_blackhole_check (
-            client_id uuid NOT NULL,
-            checked_at timestamp NOT NULL,
-            ok bool NOT NULL,
-            failure varchar(64) NOT NULL DEFAULT '',
-            update_time timestamp NOT NULL,
-
-            PRIMARY KEY (client_id)
-        );
-
-        -- the due query orders by "checked least recently first", and the sweep
-        -- has to find the oldest rows without scanning the whole table once the
-        -- fleet is large
-        CREATE INDEX IF NOT EXISTS provider_blackhole_check_checked_at
-            ON provider_blackhole_check (checked_at ASC, client_id ASC)
-    `),
 	// A leaked application connection held an UPDATE transaction idle for more
 	// than 80 minutes, pinning xmin and blocking handler cleanup. New sessions
 	// inherit this database-level backstop; legitimate long-running statements
 	// are unaffected because the timer runs only while a transaction is idle.
-	newCodeMigration(migrationSetIdleInTransactionTimeout),
+	newCodeMigration("20260813_set_idle_in_transaction_timeout", migrationSetIdleInTransactionTimeout),
 
 	// pending_task has a few hundred live rows but updates its scheduling columns
 	// on every claim and heartbeat. Fixed thresholds keep vacuum cadence tied to
@@ -6388,7 +5646,7 @@ var migrations = []any{
 			autovacuum_analyze_threshold = 50
 		)
 	`),
-	newCodeMigration(migrationVacuumPendingTask),
+	newCodeMigration("20260813_vacuum_pending_task", migrationVacuumPendingTask),
 
 	// Superseded companion lookup index: since the 2026-08-09 stats reset this
 	// 99GB index served only eight scans, while the hot open branch uses the
@@ -6428,15 +5686,57 @@ var migrations = []any{
 			)
 	`),
 
+	// Blackhole detection is a SEPARATE signal from egress health, not a cheaper
+	// version of it.
+	//
+	// Egress health samples ~131 destinations across several classes and takes
+	// minutes per provider, so it can only sweep the fleet slowly -- on beta a
+	// provider went days between measurements. A provider that stops carrying
+	// traffic is invisible for that whole window: it stays connected, keeps
+	// accepting clients, and answers nothing. This table holds the cheap answer
+	// to the single question "did ANY traffic get through" -- cheap enough to
+	// sweep the whole fleet hourly -- so a provider that goes dark leaves the
+	// public list within hours instead of within days. See
+	// ProviderBlackholeCheckMaxAge for the tolerance that gives the sweep three
+	// attempts at a provider before its evidence lapses.
+	//
+	// One row per provider, keyed on client_id like provider_egress_health: this
+	// is the current picture, not a history. `failure` is a short class, the same
+	// shape and width as provider_egress_probe_attempt.probe_failure, so the
+	// server can reject an oversized value rather than silently truncating it.
+	//
+	// NOTE ON POSITION: this entry is placed before the competition control-plane
+	// block rather than at the end of the list. ApplyDbMigrationsUpTo iterates
+	// `for i := DbVersion(ctx); i < upTo; i += 1`, so a migration runs only when
+	// its list INDEX is at or past the deployed version -- a database already
+	// past this index skips it. Hence IF NOT EXISTS on both statements: they have
+	// to be safe to apply out of band and safe to re-apply.
+	newSqlMigration(`
+        CREATE TABLE IF NOT EXISTS provider_blackhole_check (
+            client_id uuid NOT NULL,
+            checked_at timestamp NOT NULL,
+            ok bool NOT NULL,
+            failure varchar(64) NOT NULL DEFAULT '',
+            update_time timestamp NOT NULL,
+
+            PRIMARY KEY (client_id)
+        );
+
+        -- the due query orders by "checked least recently first", and the sweep
+        -- has to find the oldest rows without scanning the whole table once the
+        -- fleet is large
+        CREATE INDEX IF NOT EXISTS provider_blackhole_check_checked_at
+            ON provider_blackhole_check (checked_at ASC, client_id ASC)
+    `),
 	// The egress prober's own network identity, as a single row.
 	//
 	// The prober authenticates to the platform with a network CLIENT jwt. Until
 	// now an operator minted that by hand -- create a network, POST
-	// /network/auth-client, paste the by_client_jwt into beta-vault/prober.env --
-	// so a deployment that had not had that done had no egress probing at all,
-	// silently. taskworker/work/prober_bootstrap_work.go does it instead, and
-	// this table is what makes a job that re-runs every six hours FOREVER safe:
-	// it is the only record that the account already exists.
+	// /network/auth-client, paste the by_client_jwt into the prober's
+	// environment -- so a deployment that had not had that done had no egress
+	// probing at all, silently. taskworker/work/prober_bootstrap_work.go does it
+	// instead, and this table is what makes a job that re-runs every six hours
+	// FOREVER safe: it is the only record that the account already exists.
 	//
 	// Looking the network up by name could not replace it. The seedphrase branch
 	// of model.NetworkCreate ignores the requested name and calls
@@ -6451,22 +5751,18 @@ var migrations = []any{
 	// re-mint re-auths the SAME client instead of accumulating one client per
 	// refresh, and create_attempts bounds account creation if the create keeps
 	// failing (see MaxProberBootstrapAttempts).
-	// NOTE: on an ALREADY-DEPLOYED database this migration does not run, and that
-	// is a property of where it sits, not a mistake to correct by moving it.
 	//
-	// ApplyDbMigrationsUpTo iterates `for i := DbVersion(ctx); i < upTo; i += 1`,
-	// so a migration only executes when its INDEX is at or past the deployed
-	// version. This one is placed before the three competition migrations,
-	// which TestCompetitionMigrationsFollowOriginMigrations requires to remain a
-	// contiguous suffix -- so on a database already at that suffix's version the
-	// index is behind and is skipped. Reachability and that suffix invariant
-	// cannot both hold for a new fork-local migration; the suffix won.
+	// NOTE ON POSITION: this entry is placed before the competition control-plane
+	// block rather than at the end of the list, and on an ALREADY-DEPLOYED
+	// database that means it does not run. ApplyDbMigrationsUpTo iterates
+	// `for i := DbVersion(ctx); i < upTo; i += 1`, so a migration executes only
+	// when its list INDEX is at or past the deployed version, and a database
+	// already past this index skips it.
 	//
-	// Hence IF NOT EXISTS, matching every other fork-local table in this file:
-	// the statement has to be safe to apply out of band and safe to re-apply.
-	// `bringyourctl db audit --fix` emits CREATE TABLE for a missing table and is
-	// what actually creates this one on a deployed database -- the same tool that
-	// recovered mainnet from a comparable gap.
+	// Hence IF NOT EXISTS: the statement has to be safe to apply out of band and
+	// safe to re-apply. `bringyourctl db audit --fix` emits CREATE TABLE for a
+	// missing table and is what actually creates this one on a deployed
+	// database.
 	//
 	// SO: after deploying this to an existing database, run
 	//   bringyourctl db audit --fix
@@ -6475,9 +5771,8 @@ var migrations = []any{
 	// `relation "prober_identity" does not exist`.
 	//
 	// The durable fix is not to shuffle this entry: it is to resolve migrations
-	// by identity rather than by list index, or to agree where fork-local
-	// migrations live relative to the competition suffix. Until then every new
-	// fork-local table hits this.
+	// by identity rather than by list index. Until then every new table added
+	// ahead of the competition block hits this.
 	newSqlMigration(`
 		CREATE TABLE IF NOT EXISTS prober_identity (
 			singleton bool PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -6493,6 +5788,209 @@ var migrations = []any{
 			create_time timestamp NULL,
 			last_mint_time timestamp NULL
 		)
+	`),
+
+	// Release 1.0 snapshots payout ownership per provider client. Rows are
+	// append-only so a wallet rotation can never rewrite a prior epoch.
+	newSqlMigration(`
+		CREATE TABLE st_provider_wallet_history (
+			wallet_version bigserial PRIMARY KEY,
+			client_id uuid NOT NULL,
+			network_id uuid NOT NULL,
+			coldkey_ss58 varchar(128) NOT NULL,
+			coldkey_pubkey bytea NOT NULL CHECK (octet_length(coldkey_pubkey) = 32),
+			set_time timestamp NOT NULL
+		);
+
+		CREATE INDEX st_provider_wallet_history_snapshot
+		ON st_provider_wallet_history (client_id, set_time DESC, wallet_version DESC);
+
+		CREATE FUNCTION st_provider_wallet_append_only_guard()
+		RETURNS trigger LANGUAGE plpgsql AS $st_provider_wallet_guard$
+		BEGIN
+			RAISE EXCEPTION 'st provider wallet history is append-only';
+		END
+		$st_provider_wallet_guard$;
+
+		CREATE TRIGGER st_provider_wallet_append_only
+		BEFORE UPDATE OR DELETE ON st_provider_wallet_history
+		FOR EACH ROW EXECUTE FUNCTION st_provider_wallet_append_only_guard();
+	`),
+
+	// Release 1.0 chain history is finalized and hash-bound. A block number
+	// alone cannot detect an endpoint reorg/equivocation after restart.
+	newSqlMigration(`
+		ALTER TABLE st_event
+		ADD COLUMN block_hash varchar(80) NOT NULL DEFAULT '';
+
+		ALTER TABLE st_chain_sync
+		ADD COLUMN block_hash varchar(80) NOT NULL DEFAULT '';
+	`),
+
+	newSqlMigration(`
+		CREATE TABLE st_payout_artifact (
+			epoch bigint NOT NULL,
+			no_id bigint NOT NULL,
+			content_hash varchar(80) NOT NULL,
+			content_key text NOT NULL,
+			history_key text NOT NULL,
+			payout_root bytea NOT NULL CHECK (octet_length(payout_root) = 32),
+			create_time timestamp NOT NULL,
+			PRIMARY KEY (epoch, no_id),
+			UNIQUE (content_hash)
+		);
+
+		CREATE FUNCTION st_payout_artifact_immutable_guard()
+		RETURNS trigger LANGUAGE plpgsql AS $st_payout_artifact_guard$
+		BEGIN
+			RAISE EXCEPTION 'st payout artifacts are immutable';
+		END
+		$st_payout_artifact_guard$;
+
+		CREATE TRIGGER st_payout_artifact_immutable
+		BEFORE UPDATE OR DELETE ON st_payout_artifact
+		FOR EACH ROW EXECUTE FUNCTION st_payout_artifact_immutable_guard();
+	`),
+	newSqlMigration(`
+		ALTER TABLE st_payout_leaf ADD COLUMN client_id uuid NULL;
+		CREATE INDEX st_payout_leaf_client_epoch ON st_payout_leaf (client_id, epoch, no_id);
+	`),
+
+	// Release 1.0 chain writes are durable before signing or broadcasting.
+	// The intent owns the account nonce; individual attempts record the exact
+	// signed bytes so a restart can rebroadcast/reconcile without ever creating
+	// a second logical operation.  Calldata is intentionally retained: the
+	// server API history is the canonical audit surface from the deployment
+	// boundary, and calldata contains no private key material.
+	newSqlMigration(`
+		CREATE TABLE st_transaction_intent (
+			intent_id uuid PRIMARY KEY,
+			intent_key varchar(255) NOT NULL UNIQUE,
+			profile varchar(16) NOT NULL,
+			deployment_id varchar(128) NOT NULL,
+			chain_id bigint NOT NULL CHECK (chain_id > 0),
+			from_address varchar(42) NOT NULL,
+			to_address varchar(42) NOT NULL,
+			calldata_hash varchar(66) NOT NULL,
+			calldata bytea NOT NULL,
+			nonce bigint NOT NULL CHECK (nonce >= 0),
+			status varchar(16) NOT NULL CHECK (
+				status IN ('prepared', 'signed', 'broadcast', 'mined', 'finalized', 'failed', 'uncertain')
+			),
+			current_tx_hash varchar(80) NULL,
+			attempt_count int NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+			error varchar(2048) NULL,
+			create_time timestamp NOT NULL,
+			update_time timestamp NOT NULL,
+
+			UNIQUE (profile, deployment_id, chain_id, from_address, nonce),
+			CHECK (from_address ~ '^0x[0-9a-f]{40}$'),
+			CHECK (to_address ~ '^0x[0-9a-f]{40}$'),
+			CHECK (calldata_hash ~ '^0x[0-9a-f]{64}$')
+		);
+
+		CREATE INDEX st_transaction_intent_reconcile
+		ON st_transaction_intent (profile, deployment_id, status, update_time);
+
+		CREATE TABLE st_transaction_attempt (
+			intent_id uuid NOT NULL REFERENCES st_transaction_intent(intent_id),
+			attempt int NOT NULL CHECK (attempt > 0),
+			tx_hash varchar(80) NOT NULL UNIQUE,
+			raw_transaction bytea NOT NULL,
+			gas_limit bigint NOT NULL CHECK (gas_limit > 0),
+			gas_price varchar(80) NULL,
+			gas_tip_cap varchar(80) NULL,
+			gas_fee_cap varchar(80) NULL,
+			status varchar(16) NOT NULL CHECK (
+				status IN ('signed', 'broadcast', 'mined', 'finalized', 'failed', 'uncertain', 'replaced')
+			),
+			inclusion_block bigint NULL,
+			inclusion_hash varchar(80) NULL,
+			finalized_block bigint NULL,
+			finalized_hash varchar(80) NULL,
+			error varchar(2048) NULL,
+			create_time timestamp NOT NULL,
+			update_time timestamp NOT NULL,
+
+			PRIMARY KEY (intent_id, attempt),
+			CHECK (
+				(gas_price IS NOT NULL AND gas_tip_cap IS NULL AND gas_fee_cap IS NULL) OR
+				(gas_price IS NULL AND gas_tip_cap IS NOT NULL AND gas_fee_cap IS NOT NULL)
+			),
+			CHECK (tx_hash ~ '^0x[0-9a-f]{64}$')
+		);
+	`),
+
+	// Wallet auth must never outlive its owning user. NOT VALID keeps rollout
+	// safe if a legacy orphan exists, while PostgreSQL still enforces the
+	// constraint for every new or changed row. Operations can validate the
+	// historical rows after auditing any legacy orphan separately.
+	newSqlMigration(`
+		ALTER TABLE network_user_auth_wallet
+		ADD CONSTRAINT network_user_auth_wallet_user_fk
+		FOREIGN KEY (user_id) REFERENCES network_user(user_id)
+		ON DELETE CASCADE NOT VALID;
+	`),
+
+	// Privacy-filtered webmaster aggregates. Query text reaches this table only
+	// after the minimum-impression floor, PII redaction, and length cap. The
+	// synthetic hash key keeps long page/query text out of a PostgreSQL btree
+	// primary key while preserving idempotent overlapping imports.
+	newSqlMigration(`
+		CREATE TABLE web_search_analytics (
+			row_key char(64) PRIMARY KEY CHECK (row_key ~ '^[0-9a-f]{64}$'),
+			provider varchar(32) NOT NULL,
+			site varchar(255) NOT NULL,
+			period_start timestamp NOT NULL,
+			period_end timestamp NOT NULL,
+			search_type varchar(32) NOT NULL,
+			query varchar(640) NOT NULL CHECK (query <> ''),
+			path varchar(4096) NOT NULL,
+			region varchar(16) NOT NULL,
+			device varchar(32) NOT NULL,
+			clicks double precision NOT NULL CHECK (clicks >= 0 AND clicks < 'Infinity'::double precision),
+			impressions double precision NOT NULL CHECK (impressions >= 10 AND impressions < 'Infinity'::double precision),
+			average_position double precision NOT NULL CHECK (average_position >= 0 AND average_position < 'Infinity'::double precision),
+			update_time timestamp NOT NULL,
+			CHECK (period_start < period_end)
+		);
+
+		CREATE INDEX web_search_analytics_time
+		ON web_search_analytics (site, provider, period_start DESC);
+
+		CREATE INDEX web_search_analytics_expiry
+		ON web_search_analytics (period_end);
+
+		CREATE INDEX web_search_analytics_volume
+		ON web_search_analytics (impressions, period_end);
+
+		CREATE INDEX web_search_analytics_group_volume
+		ON web_search_analytics (
+			provider, site, period_start, period_end, search_type,
+			impressions DESC, clicks DESC
+		);
+
+		CREATE TABLE web_search_ingest_state (
+			provider varchar(32) NOT NULL,
+			site varchar(255) NOT NULL,
+			stream varchar(32) NOT NULL,
+			last_attempt timestamp,
+			last_success timestamp,
+			cursor_time timestamp,
+			last_error varchar(64) NOT NULL DEFAULT '',
+			update_time timestamp NOT NULL,
+			PRIMARY KEY (provider, site, stream)
+		);
+
+		CREATE TABLE web_search_manual_import (
+			provider varchar(32) NOT NULL,
+			object_key text NOT NULL,
+			content_sha256 char(64) NOT NULL CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+			rows_accepted int NOT NULL CHECK (rows_accepted >= 0),
+			rows_rejected int NOT NULL CHECK (rows_rejected >= 0),
+			process_time timestamp NOT NULL,
+			PRIMARY KEY (provider, object_key, content_sha256)
+		);
 	`),
 
 	// Durable sim-latency competition control plane. The queue is deliberately
@@ -6804,134 +6302,1292 @@ var migrations = []any{
 		$competition_round_guard$;
 	`),
 
-	// Release 1.0 snapshots payout ownership per provider client. Rows are
-	// append-only so a wallet rotation can never rewrite a prior epoch.
+	// Six-epoch batch lifecycle and immutable winner publication. Historical
+	// pre-launch rounds receive their deterministic creation-order epoch so the
+	// migration remains safe on staging databases; production admits at most the
+	// configured six through the application and unique database identity.
 	newSqlMigration(`
-		CREATE TABLE st_provider_wallet_history (
-			wallet_version bigserial PRIMARY KEY,
+		ALTER TABLE competition_round
+			ADD COLUMN epoch_number integer,
+			ADD COLUMN finalized_at timestamp NULL,
+			ADD COLUMN winner_job_id uuid NULL;
+
+		WITH ranked AS (
+			SELECT round_id,
+			       row_number() OVER (
+			           PARTITION BY competition_id ORDER BY created_at, round_id
+			       ) AS epoch_number
+			FROM competition_round
+		)
+		UPDATE competition_round AS round
+		SET epoch_number = ranked.epoch_number
+		FROM ranked
+		WHERE ranked.round_id = round.round_id;
+
+		ALTER TABLE competition_round
+			ALTER COLUMN epoch_number SET NOT NULL,
+			ADD CONSTRAINT competition_round_epoch_positive CHECK (epoch_number > 0),
+			ADD CONSTRAINT competition_round_winner_job_fk
+				FOREIGN KEY (winner_job_id) REFERENCES competition_job(job_id);
+
+		CREATE UNIQUE INDEX competition_round_epoch_identity
+		ON competition_round (competition_id, epoch_number);
+
+		CREATE INDEX competition_round_finalize_idx
+		ON competition_round (competition_id, closes_at, epoch_number)
+		WHERE canceled = false AND finalized_at IS NULL;
+
+		CREATE OR REPLACE FUNCTION competition_round_immutable_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_epoch_lifecycle_guard$
+		BEGIN
+			IF OLD.round_id IS DISTINCT FROM NEW.round_id OR
+			   OLD.competition_id IS DISTINCT FROM NEW.competition_id OR
+			   OLD.epoch_number IS DISTINCT FROM NEW.epoch_number OR
+			   OLD.workload_commitment IS DISTINCT FROM NEW.workload_commitment OR
+			   OLD.seed_nonce IS DISTINCT FROM NEW.seed_nonce OR
+			   OLD.seed_ciphertext IS DISTINCT FROM NEW.seed_ciphertext OR
+			   OLD.providers_sha256 IS DISTINCT FROM NEW.providers_sha256 OR
+			   OLD.providers_path IS DISTINCT FROM NEW.providers_path OR
+			   OLD.policy_json IS DISTINCT FROM NEW.policy_json OR
+			   OLD.opens_at IS DISTINCT FROM NEW.opens_at OR
+			   OLD.closes_at IS DISTINCT FROM NEW.closes_at OR
+			   OLD.reveal_at IS DISTINCT FROM NEW.reveal_at OR
+			   OLD.created_at IS DISTINCT FROM NEW.created_at OR
+			   (OLD.canceled AND NOT NEW.canceled) OR
+			   (OLD.finalized_at IS NOT NULL AND (
+			       OLD.finalized_at IS DISTINCT FROM NEW.finalized_at OR
+			       OLD.winner_job_id IS DISTINCT FROM NEW.winner_job_id
+			   )) OR
+			   (NEW.finalized_at IS NULL AND NEW.winner_job_id IS NOT NULL) OR
+			   (NEW.finalized_at IS NOT NULL AND NEW.finalized_at < NEW.closes_at)
+			THEN
+				RAISE EXCEPTION 'competition round immutable fields changed';
+			END IF;
+			IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM competition_job AS job
+				WHERE job.job_id = NEW.winner_job_id
+				  AND job.round_id = NEW.round_id
+				  AND job.state = 'succeeded'
+				  AND (job.score_json->>'placeable')::boolean
+				  AND (job.score_json->>'takeover_eligible')::boolean
+			) THEN
+				RAISE EXCEPTION 'competition winner is not an eligible job in this round';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_epoch_lifecycle_guard$;
+	`),
+
+	// Bind every accepted job to the exact API image that admitted it and every
+	// attempt to the exact worker image that executed it. API identity is
+	// immutable; worker identity may advance only while a nonterminal job is
+	// retried, with every attempt also preserved in the append-only event log.
+	newSqlMigration(`
+		ALTER TABLE competition_job
+			ADD COLUMN api_image_digest varchar(71),
+			ADD COLUMN worker_image_digest varchar(71) NULL;
+
+		DO $competition_image_identity_backfill_guard$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM competition_job WHERE api_image_digest IS NULL) THEN
+				RAISE EXCEPTION 'pre-release competition jobs must be removed before runtime image identity is enabled';
+			END IF;
+		END
+		$competition_image_identity_backfill_guard$;
+
+		ALTER TABLE competition_job
+			ALTER COLUMN api_image_digest SET NOT NULL,
+			ADD CONSTRAINT competition_job_api_image_digest_format CHECK (
+				api_image_digest ~ '^sha256:[0-9a-f]{64}$'
+			),
+			ADD CONSTRAINT competition_job_worker_image_digest_format CHECK (
+				worker_image_digest IS NULL OR worker_image_digest ~ '^sha256:[0-9a-f]{64}$'
+			);
+
+		CREATE OR REPLACE FUNCTION competition_job_immutable_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_job_image_identity_guard$
+		BEGIN
+			IF (OLD.state IN ('succeeded', 'failed', 'canceled') AND OLD IS DISTINCT FROM NEW) OR
+			   OLD.job_id IS DISTINCT FROM NEW.job_id OR
+			   OLD.round_id IS DISTINCT FROM NEW.round_id OR
+			   OLD.patch_bytes IS DISTINCT FROM NEW.patch_bytes OR
+			   OLD.patch_sha256 IS DISTINCT FROM NEW.patch_sha256 OR
+			   OLD.cache_key IS DISTINCT FROM NEW.cache_key OR
+			   OLD.submitted_at IS DISTINCT FROM NEW.submitted_at OR
+			   OLD.api_image_digest IS DISTINCT FROM NEW.api_image_digest OR
+			   OLD.artifact_retain_until IS DISTINCT FROM NEW.artifact_retain_until OR
+			   NEW.attempt_count < OLD.attempt_count OR
+			   (OLD.score_json IS NOT NULL AND OLD.score_json IS DISTINCT FROM NEW.score_json) OR
+			   (OLD.eval_error_json IS NOT NULL AND OLD.eval_error_json IS DISTINCT FROM NEW.eval_error_json) OR
+			   (OLD.artifact_manifest_json IS NOT NULL AND OLD.artifact_manifest_json IS DISTINCT FROM NEW.artifact_manifest_json) OR
+			   (OLD.artifact_manifest_sha256 IS NOT NULL AND OLD.artifact_manifest_sha256 IS DISTINCT FROM NEW.artifact_manifest_sha256)
+			THEN
+				RAISE EXCEPTION 'competition job immutable fields changed';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_job_image_identity_guard$;
+	`),
+
+	// A statistically eligible score is only a candidate, never an automatic
+	// winner. Operator-controlled honesty review is append-only and ordered by
+	// the frozen score ranking. The database blocks winner publication while an
+	// earlier candidate remains unresolved or unless the selected winner has an
+	// explicit approved review record.
+	newSqlMigration(`
+		CREATE TABLE competition_candidate_review (
+			review_id bigserial PRIMARY KEY,
+			round_id uuid NOT NULL REFERENCES competition_round(round_id),
+			job_id uuid NOT NULL REFERENCES competition_job(job_id),
+			candidate_rank integer NOT NULL CHECK (candidate_rank > 0),
+			decision varchar(16) NOT NULL CHECK (decision IN ('approved', 'rejected')),
+			reviewer_id varchar(128) NOT NULL CHECK (
+				reviewer_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+			),
+			reason text NOT NULL CHECK (octet_length(reason) BETWEEN 1 AND 4096),
+			-- json (rather than jsonb) preserves the exact reviewed evidence bytes
+			-- whose SHA-256 is recorded alongside the append-only decision.
+			evidence_json json NOT NULL CHECK (json_typeof(evidence_json) = 'object'),
+			evidence_sha256 varchar(64) NOT NULL CHECK (evidence_sha256 ~ '^[0-9a-f]{64}$'),
+			reviewed_at timestamp NOT NULL,
+			UNIQUE (round_id, job_id)
+		);
+
+		CREATE UNIQUE INDEX competition_candidate_review_one_approval
+		ON competition_candidate_review (round_id)
+		WHERE decision = 'approved';
+
+		CREATE INDEX competition_candidate_review_order
+		ON competition_candidate_review (round_id, candidate_rank);
+
+		CREATE TRIGGER competition_candidate_review_append_only
+		BEFORE UPDATE OR DELETE ON competition_candidate_review
+		FOR EACH ROW EXECUTE FUNCTION competition_append_only_guard();
+
+		CREATE FUNCTION competition_candidate_review_insert_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_candidate_review_gate$
+		DECLARE
+			epoch_round competition_round%ROWTYPE;
+			expected_rank bigint;
+			unresolved_better bigint;
+		BEGIN
+			SELECT * INTO epoch_round
+			FROM competition_round
+			WHERE round_id = NEW.round_id;
+			IF NOT FOUND OR epoch_round.canceled OR epoch_round.finalized_at IS NOT NULL OR
+			   NEW.reviewed_at < epoch_round.closes_at OR EXISTS (
+				SELECT 1 FROM competition_job
+				WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+			) OR EXISTS (
+				SELECT 1 FROM competition_candidate_review
+				WHERE round_id = NEW.round_id AND decision = 'approved'
+			) THEN
+				RAISE EXCEPTION 'competition epoch is not ready for candidate review';
+			END IF;
+
+			WITH eligible AS (
+				SELECT job_id,
+				       row_number() OVER (
+				           ORDER BY (score_json->>'normalized_score')::numeric DESC,
+				                    (score_json->>'raw_score')::numeric ASC,
+				                    submitted_at, job_id
+				       ) AS candidate_rank
+				FROM competition_job
+				WHERE round_id = NEW.round_id AND state = 'succeeded'
+				  AND score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+				  AND score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+				  AND jsonb_typeof(score_json->'gates') = 'object'
+				  AND score_json->'gates' <> '{}'::jsonb
+				  AND NOT EXISTS (
+				      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+				      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+				  )
+			)
+			SELECT candidate.candidate_rank,
+			       count(better.job_id) FILTER (
+			           WHERE NOT EXISTS (
+			               SELECT 1 FROM competition_candidate_review AS prior_review
+			               WHERE prior_review.round_id = NEW.round_id
+			                 AND prior_review.job_id = better.job_id
+			                 AND prior_review.decision = 'rejected'
+			           )
+			       )
+			INTO expected_rank, unresolved_better
+			FROM eligible AS candidate
+			LEFT JOIN eligible AS better ON better.candidate_rank < candidate.candidate_rank
+			WHERE candidate.job_id = NEW.job_id
+			GROUP BY candidate.candidate_rank;
+
+			IF expected_rank IS NULL OR NEW.candidate_rank <> expected_rank THEN
+				RAISE EXCEPTION 'competition review job is not an eligible ranked candidate';
+			END IF;
+			IF unresolved_better <> 0 THEN
+				RAISE EXCEPTION 'competition review skipped a higher-ranked candidate';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_candidate_review_gate$;
+
+		CREATE TRIGGER competition_candidate_review_ordered
+		BEFORE INSERT ON competition_candidate_review
+		FOR EACH ROW EXECUTE FUNCTION competition_candidate_review_insert_guard();
+
+		CREATE FUNCTION competition_round_honesty_review_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_honesty_review_gate$
+		BEGIN
+			IF NEW.finalized_at IS NOT NULL AND OLD.finalized_at IS NULL THEN
+				IF EXISTS (
+					SELECT 1 FROM competition_job
+					WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+				) THEN
+					RAISE EXCEPTION 'competition epoch still has active evaluations';
+				END IF;
+				IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM competition_candidate_review
+					WHERE round_id = NEW.round_id AND job_id = NEW.winner_job_id
+					  AND decision = 'approved'
+				) THEN
+					RAISE EXCEPTION 'competition winner has not passed honesty review';
+				END IF;
+				IF NEW.winner_job_id IS NULL AND EXISTS (
+					SELECT 1
+					FROM competition_job AS candidate
+					WHERE candidate.round_id = NEW.round_id AND candidate.state = 'succeeded'
+					  AND candidate.score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+					  AND candidate.score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+					  AND jsonb_typeof(candidate.score_json->'gates') = 'object'
+					  AND candidate.score_json->'gates' <> '{}'::jsonb
+					  AND NOT EXISTS (
+					      SELECT 1 FROM jsonb_each(candidate.score_json->'gates') AS gate
+					      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+					  )
+					  AND NOT EXISTS (
+					      SELECT 1 FROM competition_candidate_review AS review
+					      WHERE review.round_id = NEW.round_id
+					        AND review.job_id = candidate.job_id
+					        AND review.decision = 'rejected'
+					  )
+				) THEN
+					RAISE EXCEPTION 'competition epoch has an unresolved significant candidate';
+				END IF;
+			END IF;
+			RETURN NEW;
+		END
+		$competition_round_honesty_review_gate$;
+
+		CREATE TRIGGER competition_round_honesty_reviewed
+		BEFORE UPDATE OF finalized_at, winner_job_id ON competition_round
+		FOR EACH ROW EXECUTE FUNCTION competition_round_honesty_review_guard();
+	`),
+
+	// These migrations were originally added after the six competition
+	// migrations above had already been executed by release-1.0 testnet. Keep
+	// that published 593-migration prefix immutable: moving new migrations in
+	// front of an applied suffix makes the numeric audit version name different
+	// SQL and can both skip new DDL and replay old DDL.
+	//
+	// Net-escrow reconciliation reads one fresh bounded balance page immediately
+	// before correcting Redis. Without this access path, every page would scan
+	// all transfer_escrow history and the cure for the stale-global-snapshot
+	// incident would be slower than the old scan. Build online because escrow
+	// creation and settlement are continuous production writes.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_escrow_balance_contract
+		 ON transfer_escrow (balance_id, contract_id)`,
+		`CREATE INDEX IF NOT EXISTS transfer_escrow_balance_contract
+		 ON transfer_escrow (balance_id, contract_id)`,
+	),
+
+	// Completing a processor payment must remain a small, durable transaction.
+	// The old implementation updated every transfer_contract owned by the
+	// payment before committing `completed = true`; large payouts timed out and
+	// could remain locally unpaid after the transfer was already on chain. The
+	// queue bit and UUID keyset cursor let the retention worker perform that
+	// fanout in bounded, resumable transactions. Existing rows default to not
+	// pending because the pre-deploy CompletePayment path stamped them inline.
+	// Recently completed rows are queued defensively: this repairs any deadline
+	// inherited from the former straggler rule while preserving the full seven
+	// days after completion. The explicit reap-time backfill remains the repair
+	// for older history.
+	newSqlMigration(`
+		/* account_payment_contract_retention_queue */
+		ALTER TABLE account_payment
+			ADD COLUMN contract_retention_cursor uuid NULL,
+			ADD COLUMN contract_retention_pending bool NOT NULL DEFAULT false;
+
+		UPDATE account_payment
+		SET contract_retention_pending = true
+		WHERE
+			completed AND
+			complete_time >= now() - interval '7 days'
+	`),
+
+	// The queue contains only newly completed payments, but account_payment is
+	// append-only and large enough that polling it should never become a table
+	// scan. Build online so payout writes continue during rollout.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS account_payment_contract_retention_pending
+		 ON account_payment (complete_time, payment_id)
+		 WHERE contract_retention_pending`,
+		`CREATE INDEX IF NOT EXISTS account_payment_contract_retention_pending
+		 ON account_payment (complete_time, payment_id)
+		 WHERE contract_retention_pending`,
+	),
+
+	// A payment's retention cursor reads its contract ids in UUID order. The old
+	// payment_id-only index found the rows but forced a potentially huge sort for
+	// every batch; this covering order makes each keyset step an index range.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_escrow_sweep_payment_contract
+		 ON transfer_escrow_sweep (payment_id, contract_id)`,
+		`CREATE INDEX IF NOT EXISTS transfer_escrow_sweep_payment_contract
+		 ON transfer_escrow_sweep (payment_id, contract_id)`,
+	),
+
+	// One release candidate briefly placed the four migrations above before the
+	// already-published competition suffix. A testnet operator reached numeric
+	// version 594 after replaying the workload migration, thereby skipping the
+	// first new index when the historical order was restored. Repeating this
+	// online, IF NOT EXISTS migration closes that exact durable partial state for
+	// every affected database without blocking live escrow writes.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_escrow_balance_contract
+		 ON transfer_escrow (balance_id, contract_id)`,
+		`CREATE INDEX IF NOT EXISTS transfer_escrow_balance_contract
+		 ON transfer_escrow (balance_id, contract_id)`,
+	),
+
+	newSqlMigration(migrationCatalogSchemaSQL),
+
+	newCodeMigration("20260830_install_migration_catalog", migrationInstallCatalog),
+
+	// ReconcileNetEscrow visits the roughly 1.8M active balances in bounded
+	// pages, but transfer_escrow retains more than a billion historical rows.
+	// Even a structural per-balance lateral lookup is slow when each range must
+	// visit settled history and then fetch balance_byte_count from the heap.
+	// `outcome IS NULL` remains the authoritative open-reservation test in the
+	// query; `settled = false` is only its safe necessary prefilter because the
+	// settled post runs after the contract outcome is claimed. The reverse need
+	// not hold when a best-effort settled post is missed.
+	//
+	// Keep this online: transfer_escrow receives continuous production writes,
+	// and the one-time build must not block escrow creation or settlement.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_escrow_unsettled_balance_contract
+		 ON transfer_escrow (balance_id, contract_id)
+		 INCLUDE (balance_byte_count)
+		 WHERE settled = false`,
+		`CREATE INDEX IF NOT EXISTS transfer_escrow_unsettled_balance_contract
+		 ON transfer_escrow (balance_id, contract_id)
+		 INCLUDE (balance_byte_count)
+		 WHERE settled = false`,
+	),
+
+	// Reliability running sums used to omit blocks according to one median over
+	// the caller's moving lookback. When a sustained fleet drop became the new
+	// median, those blocks re-entered the score denominator without re-entering
+	// the already-materialized numerator. Version 1 classifies each block against
+	// its own immutable trailing neighborhood. Existing rows stay at version 0,
+	// causing the first current Taskworker pass to re-anchor every lookback before
+	// it publishes corrected scores. The next migration couples this marker to
+	// each physical write so a mixed rollout cannot let an older Taskworker
+	// preserve false version-1 trust.
+	newSqlMigration(`
+		ALTER TABLE client_reliability_running_window
+		ADD COLUMN degraded_classification_version smallint NOT NULL DEFAULT 0
+	`),
+
+	// A mixed Taskworker rollout must not let a legacy writer silently retain a
+	// version-1 marker while replacing the corresponding running sums with the
+	// old moving-window classification. Current writers rotate an opaque token
+	// in the same UPSERT as the bounds/version. A legacy writer does not know the
+	// token, so this trigger resets its row to version 0 atomically with the
+	// incompatible write. The next current writer must then re-anchor that
+	// lookback before it can publish version 1 again. Keep this guard after the
+	// rollout so an accidental rollback remains fail-safe.
+	newSqlMigration(`
+		ALTER TABLE client_reliability_running_window
+		ADD COLUMN degraded_classification_write_token uuid NULL;
+
+		CREATE FUNCTION client_reliability_running_window_classification_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $client_reliability_running_window_classification_guard$
+		BEGIN
+			IF TG_OP = 'INSERT' THEN
+				IF NEW.degraded_classification_write_token IS NULL THEN
+					NEW.degraded_classification_version = 0;
+				END IF;
+			ELSIF NEW.degraded_classification_write_token IS NULL OR
+				NEW.degraded_classification_write_token IS NOT DISTINCT FROM
+					OLD.degraded_classification_write_token THEN
+				NEW.degraded_classification_version = 0;
+			END IF;
+			RETURN NEW;
+		END
+		$client_reliability_running_window_classification_guard$;
+
+		CREATE TRIGGER client_reliability_running_window_classification_guard
+		BEFORE INSERT OR UPDATE ON client_reliability_running_window
+		FOR EACH ROW
+		EXECUTE FUNCTION client_reliability_running_window_classification_guard()
+	`),
+
+	// A certificate-authentication failure cannot be represented safely as one
+	// failed destination inside ok_count/total_count: a provider that forged one
+	// TLS identity could still clear the 90% score. Keep the hard integrity bit
+	// beside (but outside) the score. Appended after every published migration;
+	// never insert migrations into the historical slice.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_health
+		ADD COLUMN tls_authentication_failure bool NOT NULL DEFAULT false;
+
+		CREATE INDEX provider_egress_health_tls_authentication_failed
+		ON provider_egress_health (client_id)
+		WHERE tls_authentication_failure = true
+	`),
+
+	// Earnings phase: a device's stored consent for one fleet-binding
+	// generation (WHITEPAPER §11.4). The operator fetches the assembled
+	// calldata and submits it from their own key; the server sends nothing on
+	// chain. Appended after every published migration.
+	newSqlMigration(`
+		CREATE TABLE st_fleet_binding_signature (
 			client_id uuid NOT NULL,
 			network_id uuid NOT NULL,
-			coldkey_ss58 varchar(128) NOT NULL,
-			coldkey_pubkey bytea NOT NULL CHECK (octet_length(coldkey_pubkey) = 32),
-			set_time timestamp NOT NULL
+			generation bigint NOT NULL,
+			hotkey bytea NOT NULL,
+			digest bytea NOT NULL,
+			binding_json text NOT NULL,
+			client_signature bytea NOT NULL,
+			hotkey_signature bytea NULL,
+			create_time timestamp NOT NULL DEFAULT now(),
+
+			PRIMARY KEY (client_id, generation)
 		);
 
-		CREATE INDEX st_provider_wallet_history_snapshot
-		ON st_provider_wallet_history (client_id, set_time DESC, wallet_version DESC);
-
-		CREATE FUNCTION st_provider_wallet_append_only_guard()
-		RETURNS trigger LANGUAGE plpgsql AS $st_provider_wallet_guard$
-		BEGIN
-			RAISE EXCEPTION 'st provider wallet history is append-only';
-		END
-		$st_provider_wallet_guard$;
-
-		CREATE TRIGGER st_provider_wallet_append_only
-		BEFORE UPDATE OR DELETE ON st_provider_wallet_history
-		FOR EACH ROW EXECUTE FUNCTION st_provider_wallet_append_only_guard();
+		CREATE INDEX st_fleet_binding_signature_network
+		ON st_fleet_binding_signature (network_id, create_time DESC)
 	`),
 
-	// Release 1.0 chain history is finalized and hash-bound. A block number
-	// alone cannot detect an endpoint reorg/equivocation after restart.
+	// Once-per-epoch earnings notification claim: the first finalize path to
+	// insert the epoch row sends the email; every other path and worker sees
+	// the conflict and skips.
 	newSqlMigration(`
-		ALTER TABLE st_event
-		ADD COLUMN block_hash varchar(80) NOT NULL DEFAULT '';
-
-		ALTER TABLE st_chain_sync
-		ADD COLUMN block_hash varchar(80) NOT NULL DEFAULT '';
-	`),
-
-	newSqlMigration(`
-		CREATE TABLE st_payout_artifact (
+		CREATE TABLE st_epoch_notification (
 			epoch bigint NOT NULL,
-			no_id bigint NOT NULL,
-			content_hash varchar(80) NOT NULL,
-			content_key text NOT NULL,
-			history_key text NOT NULL,
-			payout_root bytea NOT NULL CHECK (octet_length(payout_root) = 32),
-			create_time timestamp NOT NULL,
-			PRIMARY KEY (epoch, no_id),
-			UNIQUE (content_hash)
-		);
+			notify_time timestamp NOT NULL DEFAULT now(),
 
-		CREATE FUNCTION st_payout_artifact_immutable_guard()
-		RETURNS trigger LANGUAGE plpgsql AS $st_payout_artifact_guard$
+			PRIMARY KEY (epoch)
+		)
+	`),
+	// All-time points leaderboard (android/POINTSLEADERBOARD.md). The opt-in is
+	// separate from leaderboard_public, which only controls whether the network
+	// NAME shows; emoji_tag is 1-6 emoji validated by connect/emoji.
+	newSqlMigration(`
+		ALTER TABLE network ADD COLUMN points_leaderboard_public boolean NOT NULL DEFAULT false
+	`),
+	newSqlMigration(`
+		ALTER TABLE network ADD COLUMN emoji_tag text NULL
+	`),
+	// One header row per rebuild; the newest two snapshots are retained so a
+	// cursor minted just before a rebuild still resolves.
+	newSqlMigration(`
+		CREATE TABLE network_points_leaderboard_snapshot (
+			snapshot_id uuid NOT NULL,
+			create_time timestamp NOT NULL DEFAULT now(),
+			latest_epoch bigint NOT NULL,
+			total_ranked bigint NOT NULL,
+
+			PRIMARY KEY (snapshot_id)
+		)
+	`),
+	// rank_* is the competition rank (1, 2, 2, 4) shown to users; pos_* is the
+	// row_number of the same ordering, a total order the keyset cursor pages on.
+	newSqlMigration(`
+		CREATE TABLE network_points_leaderboard (
+			snapshot_id uuid NOT NULL,
+			network_id uuid NOT NULL,
+			total_nano_points bigint NOT NULL,
+			blocks_with_points int NOT NULL,
+			streak int NOT NULL,
+			longest_streak int NOT NULL,
+			rank_points bigint NOT NULL,
+			rank_blocks bigint NOT NULL,
+			rank_streak bigint NOT NULL,
+			pos_points bigint NOT NULL,
+			pos_blocks bigint NOT NULL,
+			pos_streak bigint NOT NULL,
+
+			PRIMARY KEY (snapshot_id, network_id)
+		)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_points_leaderboard_pos_points ON network_points_leaderboard (snapshot_id, pos_points)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_points_leaderboard_pos_blocks ON network_points_leaderboard (snapshot_id, pos_blocks)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_points_leaderboard_pos_streak ON network_points_leaderboard (snapshot_id, pos_streak)
+	`),
+
+	// Every ST mirror row must belong to one exact EVM chain/coordinator
+	// identity. Reusing a human deployment label while replacing a failed
+	// testnet coordinator previously let old open epochs and checkpoints drive
+	// writes against the new contract. Preserve those historical rows under a
+	// non-active legacy namespace, replace collision-prone primary keys, and
+	// remove defaults so all future writers must name their deployment.
+	newSqlMigration(`
+		ALTER TABLE st_epoch ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_payout_leaf ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_publish ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_event ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_chain_sync ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_head_binding ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_payout_artifact ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+
+		ALTER TABLE st_epoch DROP CONSTRAINT st_epoch_pkey;
+		ALTER TABLE st_epoch ADD PRIMARY KEY (deployment_key, epoch);
+
+		ALTER TABLE st_payout_leaf DROP CONSTRAINT st_payout_leaf_pkey;
+		ALTER TABLE st_payout_leaf DROP CONSTRAINT st_payout_leaf_epoch_no_id_coldkey_key;
+		ALTER TABLE st_payout_leaf ADD PRIMARY KEY (deployment_key, epoch, no_id, leaf_index);
+		ALTER TABLE st_payout_leaf ADD UNIQUE (deployment_key, epoch, no_id, coldkey);
+
+		ALTER TABLE st_event DROP CONSTRAINT st_event_pkey;
+		ALTER TABLE st_event ADD PRIMARY KEY (deployment_key, block_number, log_index);
+
+		ALTER TABLE st_chain_sync DROP CONSTRAINT st_chain_sync_pkey;
+		ALTER TABLE st_chain_sync ADD PRIMARY KEY (deployment_key, singleton_id);
+
+		ALTER TABLE st_head_binding DROP CONSTRAINT st_head_binding_pkey;
+		ALTER TABLE st_head_binding ADD PRIMARY KEY (deployment_key, ckey);
+
+		ALTER TABLE st_payout_artifact DROP CONSTRAINT st_payout_artifact_pkey;
+		ALTER TABLE st_payout_artifact ADD PRIMARY KEY (deployment_key, epoch, no_id);
+
+		DROP INDEX st_epoch_status;
+		CREATE INDEX st_epoch_status ON st_epoch (deployment_key, status, epoch);
+		DROP INDEX st_publish_epoch_kind;
+		CREATE INDEX st_publish_epoch_kind ON st_publish (deployment_key, epoch, kind, create_time);
+		DROP INDEX st_event_kind_block;
+		CREATE INDEX st_event_kind_block ON st_event (deployment_key, kind, block_number, log_index);
+		DROP INDEX st_payout_leaf_client_epoch;
+		CREATE INDEX st_payout_leaf_client_epoch ON st_payout_leaf (deployment_key, client_id, epoch, no_id);
+
+		ALTER TABLE st_epoch ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_payout_leaf ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_publish ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_event ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_chain_sync ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_head_binding ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_payout_artifact ALTER COLUMN deployment_key DROP DEFAULT;
+	`),
+
+	// EVM nonces belong to one chain account, not to a human profile or
+	// deployment label. Persist the exact coordinator identity beside every
+	// intent and split the stable logical operation from its retry generation.
+	// Existing rows remain auditable under the inactive legacy namespace.
+	newSqlMigration(`
+		ALTER TABLE st_transaction_intent
+			ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy',
+			ADD COLUMN logical_key varchar(255) NULL,
+			ADD COLUMN generation int NOT NULL DEFAULT 0 CHECK (generation >= 0);
+
+		UPDATE st_transaction_intent SET logical_key = intent_key;
+
+		ALTER TABLE st_transaction_intent
+			ALTER COLUMN deployment_key DROP DEFAULT,
+			ALTER COLUMN logical_key SET NOT NULL,
+			ALTER COLUMN generation DROP DEFAULT;
+	`),
+
+	// Fail closed if historical labels ever allocated the same Ethereum nonce:
+	// silently choosing one signed transaction would strand or double-apply a
+	// custody operation. Build online so unrelated service writes continue.
+	newOnlineSqlMigration(
+		`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS st_transaction_intent_chain_account_nonce
+		 ON st_transaction_intent (chain_id, from_address, nonce)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS st_transaction_intent_chain_account_nonce
+		 ON st_transaction_intent (chain_id, from_address, nonce)`,
+	),
+
+	newOnlineSqlMigration(
+		`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS st_transaction_intent_logical_generation
+		 ON st_transaction_intent (logical_key, generation)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS st_transaction_intent_logical_generation
+		 ON st_transaction_intent (logical_key, generation)`,
+	),
+
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS st_transaction_intent_account_reconcile
+		 ON st_transaction_intent (chain_id, from_address, nonce)
+		 WHERE status IN ('prepared', 'signed', 'broadcast', 'mined', 'uncertain')`,
+		`CREATE INDEX IF NOT EXISTS st_transaction_intent_account_reconcile
+		 ON st_transaction_intent (chain_id, from_address, nonce)
+		 WHERE status IN ('prepared', 'signed', 'broadcast', 'mined', 'uncertain')`,
+	),
+
+	// A configured genesis hash distinguishes a deliberate testnet reset that
+	// reuses its EVM chain id. Without this final namespace component, durable
+	// nonces from the old chain would strand every transaction on the reset.
+	newSqlMigration(`
+		ALTER TABLE st_transaction_intent
+			ADD COLUMN genesis_hash varchar(66) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_transaction_intent
+			ALTER COLUMN genesis_hash DROP DEFAULT;
+	`),
+
+	newOnlineSqlMigration(
+		`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS st_transaction_intent_genesis_account_nonce
+		 ON st_transaction_intent (chain_id, genesis_hash, from_address, nonce)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS st_transaction_intent_genesis_account_nonce
+		 ON st_transaction_intent (chain_id, genesis_hash, from_address, nonce)`,
+	),
+
+	newOnlineSqlMigration(
+		`DROP INDEX CONCURRENTLY IF EXISTS st_transaction_intent_chain_account_nonce`,
+		`DROP INDEX IF EXISTS st_transaction_intent_chain_account_nonce`,
+	),
+
+	newOnlineSqlMigration(
+		`DROP INDEX CONCURRENTLY IF EXISTS st_transaction_intent_account_reconcile`,
+		`DROP INDEX IF EXISTS st_transaction_intent_account_reconcile`,
+	),
+
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS st_transaction_intent_account_reconcile_v2
+		 ON st_transaction_intent (chain_id, genesis_hash, from_address, nonce)
+		 WHERE status IN ('prepared', 'signed', 'broadcast', 'mined', 'uncertain')`,
+		`CREATE INDEX IF NOT EXISTS st_transaction_intent_account_reconcile_v2
+		 ON st_transaction_intent (chain_id, genesis_hash, from_address, nonce)
+		 WHERE status IN ('prepared', 'signed', 'broadcast', 'mined', 'uncertain')`,
+	),
+
+	// Separate canonical chain outcomes from local integrity failures. Only a
+	// finalized revert consumes the nonce while proving the requested contract
+	// transition did not occur; cancellation and external consumption are also
+	// terminal nonce outcomes used by account reconciliation.
+	newSqlMigration(`
+		ALTER TABLE st_transaction_intent
+			DROP CONSTRAINT st_transaction_intent_status_check;
+		ALTER TABLE st_transaction_intent
+			ADD CONSTRAINT st_transaction_intent_status_check CHECK (
+				status IN (
+					'prepared', 'signed', 'broadcast', 'mined', 'finalized',
+					'failed', 'uncertain', 'reverted', 'invalid', 'canceled', 'superseded'
+				)
+			);
+
+		ALTER TABLE st_transaction_attempt
+			DROP CONSTRAINT st_transaction_attempt_status_check;
+		ALTER TABLE st_transaction_attempt
+			ADD CONSTRAINT st_transaction_attempt_status_check CHECK (
+				status IN (
+					'signed', 'broadcast', 'mined', 'finalized', 'failed',
+					'uncertain', 'replaced', 'reverted', 'invalid', 'canceled', 'superseded'
+				)
+			);
+	`),
+
+	// A stale-deployment nonce is retired with a signed self-transaction, never
+	// by replaying its obsolete coordinator calldata. Keep that cancellation in
+	// the same append-only attempt history so whichever same-nonce transaction
+	// becomes canonical remains independently auditable.
+	newSqlMigration(`
+		ALTER TABLE st_transaction_attempt
+			ADD COLUMN kind varchar(16) NOT NULL DEFAULT 'execution' CHECK (
+				kind IN ('execution', 'cancellation')
+			);
+		ALTER TABLE st_transaction_attempt ALTER COLUMN kind DROP DEFAULT;
+	`),
+
+	// The original label-scoped nonce constraint is now both redundant and
+	// wrong across a deliberate same-chain-id genesis reset. The exact genesis
+	// account index above is the sole durable nonce uniqueness boundary.
+	newSqlMigration(`
+		ALTER TABLE st_transaction_intent
+			DROP CONSTRAINT IF EXISTS st_transaction_intent_profile_deployment_id_chain_id_from_a_key;
+	`),
+
+	// Earnings notifications and operator-submitted fleet-binding signatures
+	// were added on the local release line before ST mirror rows became scoped
+	// by the exact chain/coordinator identity. Give those two durable artifacts
+	// the same boundary so a replacement testnet deployment cannot suppress an
+	// epoch notification or reuse consent signed for an earlier coordinator.
+	newSqlMigration(`
+		ALTER TABLE st_fleet_binding_signature
+			ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+		ALTER TABLE st_epoch_notification
+			ADD COLUMN deployment_key varchar(96) NOT NULL DEFAULT 'legacy';
+
+		ALTER TABLE st_fleet_binding_signature
+			DROP CONSTRAINT st_fleet_binding_signature_pkey;
+		ALTER TABLE st_fleet_binding_signature
+			ADD PRIMARY KEY (deployment_key, client_id, generation);
+		ALTER TABLE st_epoch_notification
+			DROP CONSTRAINT st_epoch_notification_pkey;
+		ALTER TABLE st_epoch_notification
+			ADD PRIMARY KEY (deployment_key, epoch);
+
+		DROP INDEX st_fleet_binding_signature_network;
+		CREATE INDEX st_fleet_binding_signature_network
+			ON st_fleet_binding_signature (deployment_key, network_id, create_time DESC);
+
+		ALTER TABLE st_fleet_binding_signature ALTER COLUMN deployment_key DROP DEFAULT;
+		ALTER TABLE st_epoch_notification ALTER COLUMN deployment_key DROP DEFAULT;
+	`),
+
+	// A transfer contract stores only its two endpoints, while a streamed path
+	// can contain intermediary providers. Persist the stream association on the
+	// contract and the intermediary client/network set by stream id so every
+	// contract on that stream (including reverse companion contracts) settles
+	// against the same durable participant set. Endpoint participants continue
+	// to come from transfer_contract itself.
+	newSqlMigration(`
+		ALTER TABLE transfer_contract ADD COLUMN stream_id uuid NULL;
+
+		CREATE TABLE contract_participant (
+			stream_id uuid NOT NULL,
+			client_id uuid NOT NULL,
+			network_id uuid NOT NULL,
+
+			PRIMARY KEY (stream_id, client_id)
+		)
+	`),
+
+	// The orphan-participant sweep probes whether any retained contract still
+	// references a stream. Existing rows are all NULL at migration time, making
+	// this partial index cheap to introduce on the large contract table.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_contract_stream_id
+		 ON transfer_contract (stream_id) WHERE stream_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS transfer_contract_stream_id
+		 ON transfer_contract (stream_id) WHERE stream_id IS NOT NULL`,
+	),
+
+	// Epoch zero is a one-time API integration round. It exercises authenticated
+	// admission and polling without entering the evaluator, ranking, fee, or
+	// winner paths. Committing the first production epoch logically discards it;
+	// retained rows and artifacts remain immutable evidence of the staging test.
+	newSqlMigration(`
+		ALTER TABLE competition_round
+			ADD COLUMN staging boolean NOT NULL DEFAULT false;
+		ALTER TABLE competition_round
+			ALTER COLUMN staging DROP DEFAULT,
+			DROP CONSTRAINT competition_round_epoch_positive,
+			ADD CONSTRAINT competition_round_epoch_kind CHECK (
+				(staging = true AND epoch_number = 0) OR
+				(staging = false AND epoch_number > 0)
+			);
+
+		CREATE FUNCTION competition_round_staging_identity_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_staging_identity_guard$
 		BEGIN
-			RAISE EXCEPTION 'st payout artifacts are immutable';
+			IF OLD.staging IS DISTINCT FROM NEW.staging THEN
+				RAISE EXCEPTION 'competition round staging identity changed';
+			END IF;
+			RETURN NEW;
 		END
-		$st_payout_artifact_guard$;
+		$competition_round_staging_identity_guard$;
 
-		CREATE TRIGGER st_payout_artifact_immutable
-		BEFORE UPDATE OR DELETE ON st_payout_artifact
-		FOR EACH ROW EXECUTE FUNCTION st_payout_artifact_immutable_guard();
+		CREATE TRIGGER competition_round_staging_identity_immutable
+		BEFORE UPDATE OF staging ON competition_round
+		FOR EACH ROW EXECUTE FUNCTION competition_round_staging_identity_guard();
+
+		CREATE FUNCTION competition_staging_candidate_review_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_staging_candidate_review_guard$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM competition_round
+				WHERE round_id = NEW.round_id AND staging = true
+			) THEN
+				RAISE EXCEPTION 'competition staging round cannot enter candidate review';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_staging_candidate_review_guard$;
+
+		CREATE TRIGGER competition_staging_candidate_review_blocked
+		BEFORE INSERT ON competition_candidate_review
+		FOR EACH ROW EXECUTE FUNCTION competition_staging_candidate_review_guard();
+
+		CREATE FUNCTION competition_staging_finalization_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_staging_finalization_guard$
+		BEGIN
+			IF NEW.staging = true AND (
+				NEW.finalized_at IS DISTINCT FROM OLD.finalized_at OR
+				NEW.winner_job_id IS DISTINCT FROM OLD.winner_job_id
+			) THEN
+				RAISE EXCEPTION 'competition staging round cannot be finalized';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_staging_finalization_guard$;
+
+		CREATE TRIGGER competition_staging_finalization_blocked
+		BEFORE UPDATE OF finalized_at, winner_job_id ON competition_round
+		FOR EACH ROW EXECUTE FUNCTION competition_staging_finalization_guard();
+	`),
+
+	// Keep the exact provider allocation on the same atomic row as its account
+	// payment. A NULL value explicitly denotes legacy single-attribution data;
+	// the subnet reader accepts that fallback only for endpoint-backed contracts
+	// without the stream aggregation marker; mutable stream membership is not
+	// historical evidence of a sole provider.
+	// Adding a nullable column does not rewrite the existing large sweep table.
+	newSqlMigration(`
+		ALTER TABLE transfer_escrow_sweep
+			ADD COLUMN provider_payouts jsonb NULL;
+		ALTER TABLE transfer_escrow_sweep
+			ADD CONSTRAINT transfer_escrow_sweep_provider_payouts_shape CHECK (
+				provider_payouts IS NULL OR (
+					jsonb_typeof(provider_payouts) = 'array' AND
+					jsonb_array_length(provider_payouts) > 0
+				)
+			) NOT VALID;
+	`),
+
+	// transfer_contract.open is equivalent to this CASE predicate, but the CASE
+	// is a deliberate planner boundary. If ANALYZE observes no open rows, every
+	// `WHERE open` and `WHERE outcome IS NULL` partial index is recorded with
+	// reltuples=0 and an unrelated global index can look free. PostgreSQL cannot
+	// derive either legacy predicate from the opaque CASE, so pair-scoped
+	// readers remain inside this family. The redundant NOT NULL arm separates
+	// pair and payer families. create_time preserves the earliest-origin order;
+	// included columns cover the other pair readers without widening the btree
+	// ordering key.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_contract_unresolved_source_pair_create_time
+		 ON transfer_contract (source_id, destination_id, create_time)
+		 INCLUDE (contract_id, companion_contract_id, transfer_byte_count, priority)
+		 WHERE (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END)
+		   AND source_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS transfer_contract_unresolved_source_pair_create_time
+		 ON transfer_contract (source_id, destination_id, create_time)
+		 INCLUDE (contract_id, companion_contract_id, transfer_byte_count, priority)
+		 WHERE (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END)
+		   AND source_id IS NOT NULL`,
+	),
+
+	// The endpoint-sync query has symmetric source/destination arms. Keeping a
+	// reverse-key sibling lets PostgreSQL form an exact BitmapOr even when the
+	// open-value statistics and all legacy open-partial sizes are false-zero.
+	// It is also an exact (reversed) pair path if it competes with the source
+	// index for a two-ended lookup.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_contract_unresolved_destination_pair_create_time
+		 ON transfer_contract (destination_id, source_id, create_time)
+		 INCLUDE (contract_id, companion_contract_id, transfer_byte_count, priority)
+		 WHERE (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END)
+		   AND destination_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS transfer_contract_unresolved_destination_pair_create_time
+		 ON transfer_contract (destination_id, source_id, create_time)
+		 INCLUDE (contract_id, companion_contract_id, transfer_byte_count, priority)
+		 WHERE (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END)
+		   AND destination_id IS NOT NULL`,
+	),
+
+	// The open-byte SUM is the third hot shape affected by the same false-zero
+	// plan. Its predicate discriminator makes the pair indexes ineligible, and
+	// the INCLUDE column keeps the aggregate index-only after visibility permits.
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_contract_unresolved_payer_transfer_byte_count
+		 ON transfer_contract (payer_network_id)
+		 INCLUDE (transfer_byte_count)
+		 WHERE (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END)
+		   AND payer_network_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS transfer_contract_unresolved_payer_transfer_byte_count
+		 ON transfer_contract (payer_network_id)
+		 INCLUDE (transfer_byte_count)
+		 WHERE (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END)
+		   AND payer_network_id IS NOT NULL`,
+	),
+
+	// The legacy target of 10000 makes every ANALYZE sample three million rows.
+	// On the billion-row production table, the 2026-09-08 incident showed that
+	// this could run for hours under a read stampede and still miss the clustered
+	// true values. The three preceding predicate/index families make pair and
+	// payer plan selection independent of the generated-open sample. Keep a
+	// still-above-default target for general estimates, but restore the table's
+	// fixed one-million-change autoanalyze cadence without making each pass an
+	// availability event.
+	newSqlMigration(`
+		ALTER TABLE transfer_contract
+			ALTER COLUMN open SET STATISTICS 300,
+			SET (
+				autovacuum_analyze_scale_factor = 0,
+				autovacuum_analyze_threshold = 1000000
+			)
+	`),
+
+	// ----- onboarding program (mmm/onboarding/PLAN.md) -----
+
+	// The welcome offer: one row per network, issued once, never re-issued.
+	// expires_at = issued_at + onboarding.yml offer.validity_days. The purchase
+	// paths stamp redeemed_at + store; the per-store redemption handles are fixed
+	// at issue time.
+	newSqlMigration(`
+		CREATE TABLE network_onboarding_offer (
+			network_id uuid NOT NULL,
+			issued_at timestamp NOT NULL,
+			expires_at timestamp NOT NULL,
+			issued_by varchar(16) NOT NULL,
+			surface varchar(32) NOT NULL DEFAULT '',
+			tier varchar(32) NOT NULL DEFAULT '',
+			percent_off int NOT NULL,
+			months_free int NOT NULL,
+			redeemed_at timestamp NULL,
+			store varchar(16) NULL,
+			stripe_coupon_id varchar(64) NULL,
+			apple_offer_code varchar(64) NULL,
+			play_offer_tag varchar(64) NULL,
+
+			PRIMARY KEY (network_id)
+		)
+	`),
+
+	// App Store Connect one-time offer code pool: loaded from the configured batch
+	// csv (and, later, from App Store Connect batch generation), one code handed
+	// to each issued offer.
+	newSqlMigration(`
+		CREATE TABLE network_onboarding_apple_offer_code (
+			code varchar(64) NOT NULL,
+			expires_at timestamp NOT NULL,
+			network_id uuid NULL,
+			assigned_at timestamp NULL,
+
+			PRIMARY KEY (code)
+		)
+	`),
+
+	newSqlMigration(`
+		CREATE INDEX network_onboarding_apple_offer_code_available
+		ON network_onboarding_apple_offer_code (expires_at, code)
+		WHERE network_id IS NULL
+	`),
+
+	// Product events: POST /client/events (closed schema) plus the server-written
+	// attribution and outcome events. props is the closed per-name prop set.
+	// RETENTION: 400 days (model.OnboardingEventRetention); rows older than that
+	// are pruned by the nightly results job.
+	newSqlMigration(`
+		CREATE TABLE network_onboarding_event (
+			event_id uuid NOT NULL,
+			network_id uuid NOT NULL,
+			name varchar(64) NOT NULL,
+			at timestamp NOT NULL,
+			received_at timestamp NOT NULL,
+			platform varchar(16) NOT NULL DEFAULT '',
+			app_version varchar(64) NOT NULL DEFAULT '',
+			locale varchar(32) NOT NULL DEFAULT '',
+			tier varchar(32) NOT NULL DEFAULT '',
+			path varchar(8) NOT NULL DEFAULT '',
+			experiment varchar(64) NOT NULL DEFAULT '',
+			variant varchar(64) NOT NULL DEFAULT '',
+			session varchar(64) NOT NULL DEFAULT '',
+			props jsonb NULL,
+
+			PRIMARY KEY (event_id)
+		)
+	`),
+
+	newSqlMigration(`
+		CREATE INDEX network_onboarding_event_network_id_at
+		ON network_onboarding_event (network_id, at)
+	`),
+
+	newSqlMigration(`
+		CREATE INDEX network_onboarding_event_name_at
+		ON network_onboarding_event (name, at)
+	`),
+
+	// The regional price tier a subscription row was sold at (pro.yml
+	// pro.price_tiers name), recorded by every purchase path from now on.
+	newSqlMigration(`
+		ALTER TABLE subscription_renewal ADD COLUMN price_tier varchar(32) NULL
+	`),
+
+	// The Stripe customer's billing country (upper-case ISO alpha-2), cached from
+	// the card's billing details so the plan response resolves the price tier
+	// without a Stripe API call.
+	newSqlMigration(`
+		ALTER TABLE stripe_customer ADD COLUMN billing_country varchar(2) NULL
+	`),
+
+	// ----- onboarding campaign (mmm/onboarding/PLAN.md "THE EMAIL SEQUENCE") -----
+	// One row per network: which path it is on (A saw the in-app offer, B did
+	// not), whether it can receive email at all, the local time zone and locale
+	// used to place and render the sends, the email.sequence experiment variant,
+	// when each step went out, what is scheduled next, and why it stopped.
+	newSqlMigration(`
+		CREATE TABLE network_onboarding (
+			network_id uuid NOT NULL,
+			created_at timestamp NOT NULL,
+			path varchar(1) NOT NULL DEFAULT '',
+			email bool NOT NULL,
+			time_zone varchar(64) NOT NULL DEFAULT '',
+			platform varchar(16) NOT NULL DEFAULT '',
+			locale varchar(32) NOT NULL DEFAULT '',
+			country varchar(2) NOT NULL DEFAULT '',
+			experiment_id varchar(64) NOT NULL DEFAULT '',
+			email_variant varchar(64) NOT NULL DEFAULT '',
+			e1_sent_at timestamp NULL,
+			e2_sent_at timestamp NULL,
+			e3_sent_at timestamp NULL,
+			e4_sent_at timestamp NULL,
+			e5_sent_at timestamp NULL,
+			last_step varchar(8) NOT NULL DEFAULT '',
+			next_step varchar(8) NOT NULL DEFAULT '',
+			next_send_at timestamp NULL,
+			exit_reason varchar(32) NOT NULL DEFAULT '',
+			exited_at timestamp NULL,
+			bounced bool NOT NULL DEFAULT false,
+			complained bool NOT NULL DEFAULT false,
+			complained_step varchar(8) NOT NULL DEFAULT '',
+			send_failures int NOT NULL DEFAULT 0,
+			last_send_error varchar(256) NOT NULL DEFAULT '',
+			PRIMARY KEY (network_id)
+		)
 	`),
 	newSqlMigration(`
-		ALTER TABLE st_payout_leaf ADD COLUMN client_id uuid NULL;
-		CREATE INDEX st_payout_leaf_client_epoch ON st_payout_leaf (client_id, epoch, no_id);
+		CREATE INDEX network_onboarding_next_send_at
+		ON network_onboarding (next_send_at)
+		WHERE next_send_at IS NOT NULL
+	`),
+	// One row per campaign email sent through Brevo, keyed by Brevo's message id
+	// so the transactional webhook events (delivered/opened/click/bounce/
+	// complaint) can be attributed to the network and step.
+	newSqlMigration(`
+		CREATE TABLE network_onboarding_email (
+			message_id varchar(256) NOT NULL,
+			network_id uuid NOT NULL,
+			step varchar(8) NOT NULL,
+			template varchar(32) NOT NULL,
+			variant varchar(32) NOT NULL,
+			experiment varchar(64) NOT NULL DEFAULT '',
+			experiment_variant varchar(64) NOT NULL DEFAULT '',
+			template_id int NOT NULL,
+			locale varchar(32) NOT NULL DEFAULT '',
+			sent_at timestamp NOT NULL,
+			PRIMARY KEY (message_id)
+		)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_onboarding_email_network_id_sent_at
+		ON network_onboarding_email (network_id, sent_at)
+	`),
+	// onboarding results (PLAN.md "OPTIMIZATION LOOP" §3): the nightly aggregate
+	// per (cohort day, experiment, variant, surface, platform, tier, path).
+	// Counts are networks. matured_days is the cohort's age at computation.
+	newSqlMigration(`
+		CREATE TABLE onboarding_results_daily (
+			cohort_day timestamp NOT NULL,
+			experiment varchar(64) NOT NULL,
+			variant varchar(64) NOT NULL,
+			surface varchar(64) NOT NULL,
+			platform varchar(32) NOT NULL,
+			tier varchar(32) NOT NULL,
+			path varchar(16) NOT NULL,
+			exposures int NOT NULL DEFAULT 0,
+			sent int NOT NULL DEFAULT 0,
+			delivered int NOT NULL DEFAULT 0,
+			opened int NOT NULL DEFAULT 0,
+			clicked int NOT NULL DEFAULT 0,
+			landing_clicked int NOT NULL DEFAULT 0,
+			app_open_48h int NOT NULL DEFAULT 0,
+			connect_7d int NOT NULL DEFAULT 0,
+			widget_7d int NOT NULL DEFAULT 0,
+			feedback_7d int NOT NULL DEFAULT 0,
+			pro_start_14d int NOT NULL DEFAULT 0,
+			trial_to_paid_35d int NOT NULL DEFAULT 0,
+			refund_60d int NOT NULL DEFAULT 0,
+			retention_d7 int NOT NULL DEFAULT 0,
+			retention_d30 int NOT NULL DEFAULT 0,
+			unsubscribe int NOT NULL DEFAULT 0,
+			complaint int NOT NULL DEFAULT 0,
+			matured_days int NOT NULL DEFAULT 0,
+			computed_at timestamp NOT NULL,
+			PRIMARY KEY (cohort_day, experiment, variant, surface, platform, tier, path)
+		)
+	`),
+	// experiment-state overlay (§5): a paused variant is served control without
+	// editing the registry. Written by the guardrail check and bringyourctl.
+	newSqlMigration(`
+		CREATE TABLE network_onboarding_experiment_state (
+			experiment_id varchar(64) NOT NULL,
+			variant varchar(64) NOT NULL,
+			status varchar(16) NOT NULL,
+			reason varchar(256) NOT NULL DEFAULT '',
+			updated_at timestamp NOT NULL,
+			PRIMARY KEY (experiment_id, variant)
+		)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_onboarding_created_at
+		ON network_onboarding (created_at)
 	`),
 
-	// Release 1.0 chain writes are durable before signing or broadcasting.
-	// The intent owns the account nonce; individual attempts record the exact
-	// signed bytes so a restart can rebroadcast/reconcile without ever creating
-	// a second logical operation.  Calldata is intentionally retained: the
-	// server API history is the canonical audit surface from the deployment
-	// boundary, and calldata contains no private key material.
+	// Preserve operator-signed key history independently of mutable Redis
+	// projection and retire current access atomically with client deletion.
+	newSqlMigration(clientKeyHistorySchemaSQL),
+
+	// Staging is an independently numbered, repeatable pre-production era. Its
+	// jobs traverse the real evaluator and become public after close and drain,
+	// but can never enter honesty review, select a winner, or consume one of the
+	// six production epoch identities. The existing epoch-zero row remains the
+	// first immutable staging record.
 	newSqlMigration(`
-		CREATE TABLE st_transaction_intent (
-			intent_id uuid PRIMARY KEY,
-			intent_key varchar(255) NOT NULL UNIQUE,
-			profile varchar(16) NOT NULL,
-			deployment_id varchar(128) NOT NULL,
-			chain_id bigint NOT NULL CHECK (chain_id > 0),
-			from_address varchar(42) NOT NULL,
-			to_address varchar(42) NOT NULL,
-			calldata_hash varchar(66) NOT NULL,
-			calldata bytea NOT NULL,
-			nonce bigint NOT NULL CHECK (nonce >= 0),
-			status varchar(16) NOT NULL CHECK (
-				status IN ('prepared', 'signed', 'broadcast', 'mined', 'finalized', 'failed', 'uncertain')
-			),
-			current_tx_hash varchar(80) NULL,
-			attempt_count int NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-			error varchar(2048) NULL,
-			create_time timestamp NOT NULL,
-			update_time timestamp NOT NULL,
+		DROP TRIGGER competition_staging_finalization_blocked ON competition_round;
+		DROP FUNCTION competition_staging_finalization_guard();
 
-			UNIQUE (profile, deployment_id, chain_id, from_address, nonce),
-			CHECK (from_address ~ '^0x[0-9a-f]{40}$'),
-			CHECK (to_address ~ '^0x[0-9a-f]{40}$'),
-			CHECK (calldata_hash ~ '^0x[0-9a-f]{64}$')
-		);
+		ALTER TABLE competition_round
+			DROP CONSTRAINT competition_round_epoch_kind,
+			ADD CONSTRAINT competition_round_epoch_kind CHECK (
+				(staging = true AND epoch_number >= 0) OR
+				(staging = false AND epoch_number > 0)
+			);
 
-		CREATE INDEX st_transaction_intent_reconcile
-		ON st_transaction_intent (profile, deployment_id, status, update_time);
+		DROP INDEX competition_round_epoch_identity;
+		CREATE UNIQUE INDEX competition_round_epoch_identity
+		ON competition_round (competition_id, staging, epoch_number);
 
-		CREATE TABLE st_transaction_attempt (
-			intent_id uuid NOT NULL REFERENCES st_transaction_intent(intent_id),
-			attempt int NOT NULL CHECK (attempt > 0),
-			tx_hash varchar(80) NOT NULL UNIQUE,
-			raw_transaction bytea NOT NULL,
-			gas_limit bigint NOT NULL CHECK (gas_limit > 0),
-			gas_price varchar(80) NULL,
-			gas_tip_cap varchar(80) NULL,
-			gas_fee_cap varchar(80) NULL,
-			status varchar(16) NOT NULL CHECK (
-				status IN ('signed', 'broadcast', 'mined', 'finalized', 'failed', 'uncertain', 'replaced')
-			),
-			inclusion_block bigint NULL,
-			inclusion_hash varchar(80) NULL,
-			finalized_block bigint NULL,
-			finalized_hash varchar(80) NULL,
-			error varchar(2048) NULL,
-			create_time timestamp NOT NULL,
-			update_time timestamp NOT NULL,
+		CREATE UNIQUE INDEX competition_round_one_active_staging
+		ON competition_round (competition_id)
+		WHERE staging = true AND canceled = false AND finalized_at IS NULL;
 
-			PRIMARY KEY (intent_id, attempt),
-			CHECK (
-				(gas_price IS NOT NULL AND gas_tip_cap IS NULL AND gas_fee_cap IS NULL) OR
-				(gas_price IS NULL AND gas_tip_cap IS NOT NULL AND gas_fee_cap IS NOT NULL)
-			),
-			CHECK (tx_hash ~ '^0x[0-9a-f]{64}$')
-		);
+		CREATE OR REPLACE FUNCTION competition_round_honesty_review_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_honesty_review_gate$
+		BEGIN
+			IF NEW.finalized_at IS NOT NULL AND OLD.finalized_at IS NULL THEN
+				IF EXISTS (
+					SELECT 1 FROM competition_job
+					WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+				) THEN
+					RAISE EXCEPTION 'competition epoch still has active evaluations';
+				END IF;
+				IF NEW.staging = true THEN
+					IF NEW.winner_job_id IS NOT NULL THEN
+						RAISE EXCEPTION 'competition staging round cannot select a winner';
+					END IF;
+					RETURN NEW;
+				END IF;
+				IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM competition_candidate_review
+					WHERE round_id = NEW.round_id AND job_id = NEW.winner_job_id
+					  AND decision = 'approved'
+				) THEN
+					RAISE EXCEPTION 'competition winner has not passed honesty review';
+				END IF;
+				IF NEW.winner_job_id IS NULL AND EXISTS (
+					SELECT 1
+					FROM competition_job AS candidate
+					WHERE candidate.round_id = NEW.round_id AND candidate.state = 'succeeded'
+					  AND candidate.score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+					  AND candidate.score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+					  AND jsonb_typeof(candidate.score_json->'gates') = 'object'
+					  AND candidate.score_json->'gates' <> '{}'::jsonb
+					  AND NOT EXISTS (
+					      SELECT 1 FROM jsonb_each(candidate.score_json->'gates') AS gate
+					      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+					  )
+					  AND NOT EXISTS (
+					      SELECT 1 FROM competition_candidate_review AS review
+					      WHERE review.round_id = NEW.round_id
+					        AND review.job_id = candidate.job_id
+					        AND review.decision = 'rejected'
+					  )
+				) THEN
+					RAISE EXCEPTION 'competition epoch has an unresolved significant candidate';
+				END IF;
+			END IF;
+			RETURN NEW;
+		END
+		$competition_round_honesty_review_gate$;
+	`),
+
+	// Closing a staging admission early must not rewrite its published schedule
+	// or workload commitment. This one-way marker is serialized with admission;
+	// queued work remains eligible and finalization may occur after the marker.
+	newSqlMigration(`
+		ALTER TABLE competition_round
+			ADD COLUMN admission_closed_at timestamp NULL,
+			ADD CONSTRAINT competition_round_admission_closed_kind CHECK (
+				admission_closed_at IS NULL OR (
+					staging = true AND
+					opens_at <= admission_closed_at AND
+					admission_closed_at <= closes_at
+				)
+			);
+
+		CREATE OR REPLACE FUNCTION competition_round_immutable_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_epoch_lifecycle_guard$
+		BEGIN
+			IF OLD.round_id IS DISTINCT FROM NEW.round_id OR
+			   OLD.competition_id IS DISTINCT FROM NEW.competition_id OR
+			   OLD.epoch_number IS DISTINCT FROM NEW.epoch_number OR
+			   OLD.workload_commitment IS DISTINCT FROM NEW.workload_commitment OR
+			   OLD.seed_nonce IS DISTINCT FROM NEW.seed_nonce OR
+			   OLD.seed_ciphertext IS DISTINCT FROM NEW.seed_ciphertext OR
+			   OLD.providers_sha256 IS DISTINCT FROM NEW.providers_sha256 OR
+			   OLD.providers_path IS DISTINCT FROM NEW.providers_path OR
+			   OLD.policy_json IS DISTINCT FROM NEW.policy_json OR
+			   OLD.opens_at IS DISTINCT FROM NEW.opens_at OR
+			   OLD.closes_at IS DISTINCT FROM NEW.closes_at OR
+			   OLD.reveal_at IS DISTINCT FROM NEW.reveal_at OR
+			   OLD.created_at IS DISTINCT FROM NEW.created_at OR
+			   (OLD.admission_closed_at IS NOT NULL AND
+			       OLD.admission_closed_at IS DISTINCT FROM NEW.admission_closed_at) OR
+			   (OLD.canceled AND NOT NEW.canceled) OR
+			   (OLD.finalized_at IS NOT NULL AND (
+			       OLD.finalized_at IS DISTINCT FROM NEW.finalized_at OR
+			       OLD.winner_job_id IS DISTINCT FROM NEW.winner_job_id
+			   )) OR
+			   (NEW.finalized_at IS NULL AND NEW.winner_job_id IS NOT NULL) OR
+			   (NEW.finalized_at IS NOT NULL AND
+			       NEW.finalized_at < COALESCE(NEW.admission_closed_at, NEW.closes_at))
+			THEN
+				RAISE EXCEPTION 'competition round immutable fields changed';
+			END IF;
+			IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM competition_job AS job
+				WHERE job.job_id = NEW.winner_job_id
+				  AND job.round_id = NEW.round_id
+				  AND job.state = 'succeeded'
+				  AND (job.score_json->>'placeable')::boolean
+				  AND (job.score_json->>'takeover_eligible')::boolean
+			) THEN
+				RAISE EXCEPTION 'competition winner is not an eligible job in this round';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_epoch_lifecycle_guard$;
+	`),
+
+	// A zero blocks/streak value is meaningful only after at least one finalized
+	// ST epoch was available to the rebuild. Keep that availability on the
+	// snapshot so API clients never render missing chain history as real zeroes.
+	newSqlMigration(`
+		ALTER TABLE network_points_leaderboard_snapshot
+		ADD COLUMN epoch_metrics_available boolean NOT NULL DEFAULT false
 	`),
 }

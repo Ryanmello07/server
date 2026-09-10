@@ -656,6 +656,16 @@ func calibrationWorkloadTimeout(profile networkProfile, byteCount int64) time.Du
 	return max(minimumTimeout, 60*roundTrip, 60*rateDuration)
 }
 
+// A test-level liveness cap preserves its ordinary allowance while inheriting
+// the calibrated race-runtime budget used by the workload it encloses.
+func calibrationWorkloadTestTimeout(
+	profile networkProfile,
+	byteCount int64,
+	ordinaryTimeout time.Duration,
+) time.Duration {
+	return max(ordinaryTimeout, calibrationWorkloadTimeout(profile, byteCount))
+}
+
 // One or more inner TCP flows verify exact bytes and content in one direction.
 func measureTCPWorkload(
 	ctx context.Context,
@@ -1220,21 +1230,71 @@ func (self *workloadDormantCandidateHarness) assertJoined(
 	}
 }
 
+// Each independent direction owns its complete calibrated budget. Canceling
+// one iteration before starting the next prevents its context from leaking
+// into the sibling lifecycle.
+func forEachTCPWorkloadDirection(
+	parent context.Context,
+	timeout time.Duration,
+	run func(context.Context, bool),
+) {
+	for _, forward := range []bool{true, false} {
+		func() {
+			ctx, cancel := context.WithTimeout(parent, timeout)
+			defer cancel()
+			run(ctx, forward)
+		}()
+	}
+}
+
+// The second directional context remains live after the first one's exact
+// cancellation boundary, without relying on elapsed time or scheduler order.
+func TestTCPWorkloadDirectionsUseIndependentContexts(t *testing.T) {
+	var firstCtx context.Context
+	callCount := 0
+	forEachTCPWorkloadDirection(t.Context(), time.Minute, func(ctx context.Context, forward bool) {
+		callCount += 1
+		if forward {
+			firstCtx = ctx
+			return
+		}
+		if firstCtx == nil {
+			t.Fatal("reverse direction ran before the forward direction")
+		}
+		if err := firstCtx.Err(); err != context.Canceled {
+			t.Fatalf("first directional context error=%v, want canceled", err)
+		}
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("second directional context inherited first cancellation: %v", err)
+		}
+	})
+	if callCount != 2 {
+		t.Fatalf("direction call count=%d, want 2", callCount)
+	}
+}
+
 // The logical quota counts three identified winners even when three dormant
 // candidates reached preface reads first; receiver hooks run for winners only.
 func TestTCPWorkloadClaimsAllFlowsAfterDormantAcceptedCandidates(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	const flowCount = 3
 	const warmupByteCount = 16*1024 + 1
 	const measuredByteCount = 32*1024 + 3
+	profile := initialNetworkProfiles(20260811)["clean-lan"]
+	ctx, cancel := context.WithTimeout(
+		t.Context(),
+		calibrationWorkloadTimeout(
+			profile,
+			int64(flowCount)*(warmupByteCount+measuredByteCount),
+		),
+	)
+	defer cancel()
 	harness := newWorkloadDormantCandidateHarness(flowCount)
 	defer harness.close()
 	var warmupHookCount atomic.Int64
 	var startHookCount atomic.Int64
 	result, err := measureTCPWorkloadWithWarmupAndFlowTestSettings(
 		ctx,
-		initialNetworkProfiles(20260811)["clean-lan"],
+		profile,
 		defaultTunResourceProfile(),
 		true,
 		flowCount,
@@ -1281,12 +1341,11 @@ func TestTCPWorkloadClaimsAllFlowsAfterDormantAcceptedCandidates(t *testing.T) {
 // A non-chunk-aligned warmup proves the receiver resets its hash at an exact
 // same-connection barrier before measuring either simulated direction.
 func TestWarmedTCPWorkloadSeparatesWarmupAndMeasuredPayload(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	profile := initialNetworkProfiles(20260810)["clean-lan"]
 	const warmupByteCount = 512*1024 + 1
 	const measuredByteCount = 64*1024 + 3
-	for _, forward := range []bool{true, false} {
+	timeout := calibrationWorkloadTimeout(profile, warmupByteCount+measuredByteCount)
+	forEachTCPWorkloadDirection(t.Context(), timeout, func(ctx context.Context, forward bool) {
 		startBoundaryCount := 0
 		result, err := measureTCPWorkloadWithWarmupAndStartHook(
 			ctx,
@@ -1327,16 +1386,17 @@ func TestWarmedTCPWorkloadSeparatesWarmupAndMeasuredPayload(t *testing.T) {
 				dataLink,
 			)
 		}
-	}
+	})
 }
 
 // A packet admitted after the first all-links-idle observation forces an exact
 // generation retry, so the untunneled measured phase cannot start early.
 func TestWarmedTCPWorkloadRetriesWarmupLinkGeneration(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	profile := initialNetworkProfiles(20260811)["clean-lan"]
-	for _, forward := range []bool{true, false} {
+	const warmupByteCount = 64*1024 + 1
+	const measuredByteCount = 128*1024 + 3
+	timeout := calibrationWorkloadTimeout(profile, warmupByteCount+measuredByteCount)
+	forEachTCPWorkloadDirection(t.Context(), timeout, func(ctx context.Context, forward bool) {
 		retryReached := make(chan struct{})
 		releaseRetry := make(chan struct{})
 		measuredStarted := make(chan struct{})
@@ -1355,8 +1415,8 @@ func TestWarmedTCPWorkloadRetriesWarmupLinkGeneration(t *testing.T) {
 				defaultTunResourceProfile(),
 				forward,
 				1,
-				64*1024+1,
-				128*1024+3,
+				warmupByteCount,
+				measuredByteCount,
 				func(path *tunPath, forward bool) error {
 					dataLink := path.forwardLink
 					if !forward {
@@ -1407,8 +1467,8 @@ func TestWarmedTCPWorkloadRetriesWarmupLinkGeneration(t *testing.T) {
 			if completion.err != nil {
 				t.Fatalf("forward=%t warmed workload: %v", forward, completion.err)
 			}
-			if completion.result.WarmupByteCount != 64*1024+1 ||
-				completion.result.UsefulByteCount != 128*1024+3 {
+			if completion.result.WarmupByteCount != warmupByteCount ||
+				completion.result.UsefulByteCount != measuredByteCount {
 				t.Fatalf("forward=%t warmed result=%+v", forward, completion.result)
 			}
 		case <-ctx.Done():
@@ -1422,7 +1482,7 @@ func TestWarmedTCPWorkloadRetriesWarmupLinkGeneration(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("forward=%t injected generation did not terminate: %v", forward, ctx.Err())
 		}
-	}
+	})
 }
 
 // Sequence metadata gives UDP exact loss, duplication, reorder, and latency accounting.
@@ -2288,6 +2348,13 @@ type loadedLatencyProbeResponse struct {
 	err         error
 }
 
+// Optional barriers expose the response handoff without changing measurements.
+type loadedLatencyProbeTestSettings struct {
+	afterAttemptHook          func(int)
+	afterResponseReadHook     func()
+	unbufferedResponseHandoff bool
+}
+
 // Offers probes at a fixed rate until the bulk goroutine exits. Multiple UDP
 // requests may be outstanding, so a timeout never suppresses later demand.
 func runLoadedLatencyProbes(
@@ -2297,7 +2364,7 @@ func runLoadedLatencyProbes(
 	timeout time.Duration,
 	interval time.Duration,
 	workloadDone <-chan struct{},
-	afterAttempt func(int),
+	testSettings *loadedLatencyProbeTestSettings,
 ) latencyProbeSamples {
 	select {
 	case <-ctx.Done():
@@ -2308,20 +2375,30 @@ func runLoadedLatencyProbes(
 	}
 
 	probeCtx, probeCancel := context.WithCancel(ctx)
-	responses := make(chan loadedLatencyProbeResponse, 64)
+	responseBufferCount := 64
+	if testSettings != nil && testSettings.unbufferedResponseHandoff {
+		responseBufferCount = 0
+	}
+	responses := make(chan loadedLatencyProbeResponse, responseBufferCount)
 	responseInput := (<-chan loadedLatencyProbeResponse)(responses)
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
 		defer close(responses)
+		publishError := func(err error) {
+			if probeCtx.Err() != nil {
+				return
+			}
+			responses <- loadedLatencyProbeResponse{
+				receiveTime: time.Now(),
+				err:         err,
+			}
+		}
 		for {
 			if err := connection.SetReadDeadline(
 				time.Now().Add(loadedLatencyProbeReadInterval),
 			); err != nil {
-				select {
-				case responses <- loadedLatencyProbeResponse{err: err}:
-				case <-probeCtx.Done():
-				}
+				publishError(err)
 				return
 			}
 			var packet [32]byte
@@ -2334,21 +2411,19 @@ func runLoadedLatencyProbes(
 				if errors.As(err, &netErr) && netErr.Timeout() {
 					continue
 				}
-				select {
-				case responses <- loadedLatencyProbeResponse{err: err}:
-				case <-probeCtx.Done():
-				}
+				publishError(err)
 				return
 			}
 			response := loadedLatencyProbeResponse{
 				packet:      packet,
 				receiveTime: time.Now(),
 			}
-			select {
-			case responses <- response:
-			case <-probeCtx.Done():
-				return
+			if testSettings != nil && testSettings.afterResponseReadHook != nil {
+				testSettings.afterResponseReadHook()
 			}
+			// A complete read belongs to the measurement until the owner applies
+			// its receive-time boundary. Cancellation cannot discard the handoff.
+			responses <- response
 		}
 	}()
 
@@ -2369,8 +2444,8 @@ func runLoadedLatencyProbes(
 			}
 		}
 		state.attempt(sequence, sendTime, err)
-		if afterAttempt != nil {
-			afterAttempt(state.samples.attemptCount)
+		if testSettings != nil && testSettings.afterAttemptHook != nil {
+			testSettings.afterAttemptHook(state.samples.attemptCount)
 		}
 	}
 	writeProbe()
@@ -2405,16 +2480,22 @@ func runLoadedLatencyProbes(
 		}
 	}
 
+	receiveBoundary := time.Now()
 	probeCancel()
 	_ = connection.SetReadDeadline(time.Now())
-	<-readerDone
 	for response := range responses {
-		if response.err == nil {
-			state.receive(response.packet, response.receiveTime)
-		} else if state.samples.firstFailure == nil {
-			state.samples.firstFailure = response.err
+		if receiveBoundary.Before(response.receiveTime) {
+			continue
 		}
+		if response.err != nil {
+			if state.samples.firstFailure == nil {
+				state.samples.firstFailure = response.err
+			}
+			continue
+		}
+		state.receive(response.packet, response.receiveTime)
 	}
+	<-readerDone
 	state.expire(time.Now())
 	state.finish()
 	_ = connection.SetDeadline(time.Time{})
@@ -2750,9 +2831,11 @@ func measureLatencyUnderLoadWithFlowTestSettingsDirection(
 		})
 	}
 	defer joinBulkSender(true)
-	var afterLoadedProbeAttempt func(int)
+	var loadedProbeTestSettings *loadedLatencyProbeTestSettings
 	if testSettings != nil {
-		afterLoadedProbeAttempt = testSettings.afterLoadedProbeAttemptHook
+		loadedProbeTestSettings = &loadedLatencyProbeTestSettings{
+			afterAttemptHook: testSettings.afterLoadedProbeAttemptHook,
+		}
 	}
 	loadedSamples := runLoadedLatencyProbes(
 		ctx,
@@ -2764,7 +2847,7 @@ func measureLatencyUnderLoadWithFlowTestSettingsDirection(
 			bulkRateBitsPerSecond,
 		),
 		bulkLoadedFinished,
-		afterLoadedProbeAttempt,
+		loadedProbeTestSettings,
 	)
 	var bulkErr error
 	select {
@@ -2808,9 +2891,13 @@ func measureLatencyUnderLoadWithFlowTestSettingsDirection(
 // A dormant first bulk candidate cannot consume the one-flow receiver quota or
 // fire the post-handshake hook reserved for the later identified winner.
 func TestLatencyUnderLoadUsesWinnerAfterDormantAcceptedCandidate(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
 	const bulkByteCount = 1024 * 1024
+	profile := initialNetworkProfiles(20260811)["clean-lan"]
+	ctx, cancel := context.WithTimeout(
+		t.Context(),
+		calibrationWorkloadTestTimeout(profile, bulkByteCount, 45*time.Second),
+	)
+	defer cancel()
 	harness := newWorkloadDormantCandidateHarness(1)
 	defer harness.close()
 	var startHookCount atomic.Int64
@@ -2818,7 +2905,7 @@ func TestLatencyUnderLoadUsesWinnerAfterDormantAcceptedCandidate(t *testing.T) {
 	resources.TcpBufferDefault = 128 * 1024
 	result, err := measureLatencyUnderLoadWithFlowTestSettings(
 		ctx,
-		initialNetworkProfiles(20260811)["clean-lan"],
+		profile,
 		resources,
 		bulkByteCount,
 		func(*tunPath) error {
@@ -2849,7 +2936,12 @@ func TestLatencyUnderLoadUsesWinnerAfterDormantAcceptedCandidate(t *testing.T) {
 // An error after bulk readiness closes the UDP listener but cannot return
 // while the probe server retains its final goroutine lifecycle credit.
 func TestLatencyUnderLoadEarlyErrorJoinsProbeServer(t *testing.T) {
-	safetyCtx, safetyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	const bulkByteCount = 1024 * 1024
+	profile := initialNetworkProfiles(20260811)["clean-lan"]
+	safetyCtx, safetyCancel := context.WithTimeout(
+		t.Context(),
+		calibrationWorkloadTestTimeout(profile, bulkByteCount, 30*time.Second),
+	)
 	defer safetyCancel()
 	expectedErr := errors.New("stop after latency bulk readiness")
 	probeServerHeld := make(chan struct{})
@@ -2875,9 +2967,9 @@ func TestLatencyUnderLoadEarlyErrorJoinsProbeServer(t *testing.T) {
 	go func() {
 		_, err := measureLatencyUnderLoadWithFlowTestSettings(
 			safetyCtx,
-			initialNetworkProfiles(20260811)["clean-lan"],
+			profile,
 			defaultTunResourceProfile(),
-			1024*1024,
+			bulkByteCount,
 			func(*tunPath) error {
 				return expectedErr
 			},
@@ -2916,7 +3008,12 @@ func TestLatencyUnderLoadEarlyErrorJoinsProbeServer(t *testing.T) {
 // Loaded probes remain active after the sender fills its socket until the
 // receiver has consumed the complete bulk payload.
 func TestLatencyUnderLoadLoadedProbesFollowReceiverCompletion(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	const bulkByteCount = 64 * 1024
+	profile := initialNetworkProfiles(20260818)["clean-lan"]
+	ctx, cancel := context.WithTimeout(
+		t.Context(),
+		calibrationWorkloadTestTimeout(profile, bulkByteCount, 45*time.Second),
+	)
 	defer cancel()
 	bulkSenderDone := make(chan struct{})
 	bulkReceiverHeld := make(chan struct{})
@@ -2950,9 +3047,9 @@ func TestLatencyUnderLoadLoadedProbesFollowReceiverCompletion(t *testing.T) {
 	go func() {
 		result, err := measureLatencyUnderLoadWithFlowTestSettings(
 			ctx,
-			initialNetworkProfiles(20260818)["clean-lan"],
+			profile,
 			defaultTunResourceProfile(),
-			64*1024,
+			bulkByteCount,
 			nil,
 			testSettings,
 		)
@@ -2994,7 +3091,12 @@ func TestLatencyUnderLoadLoadedProbesFollowReceiverCompletion(t *testing.T) {
 // Cancellation after the final bulk write cannot return while the sender is
 // held immediately before publishing its result and releasing its lifecycle.
 func TestLatencyUnderLoadCancellationJoinsBulkSender(t *testing.T) {
-	safetyCtx, safetyCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	const bulkByteCount = 1024 * 1024
+	profile := initialNetworkProfiles(20260811)["clean-lan"]
+	safetyCtx, safetyCancel := context.WithTimeout(
+		t.Context(),
+		calibrationWorkloadTestTimeout(profile, bulkByteCount, 45*time.Second),
+	)
 	defer safetyCancel()
 	workloadCtx, workloadCancel := context.WithCancel(safetyCtx)
 	defer workloadCancel()
@@ -3023,9 +3125,9 @@ func TestLatencyUnderLoadCancellationJoinsBulkSender(t *testing.T) {
 	go func() {
 		_, err := measureLatencyUnderLoadWithFlowTestSettings(
 			workloadCtx,
-			initialNetworkProfiles(20260811)["clean-lan"],
+			profile,
 			resources,
-			1024*1024,
+			bulkByteCount,
 			nil,
 			testSettings,
 		)
@@ -3405,6 +3507,23 @@ func TestCalibrationWorkloadTimeoutPreservesRaceInstrumentationAllowance(t *test
 	}
 	if timeout := calibrationWorkloadTimeout(profile, byteCount); timeout != expected {
 		t.Fatalf("clean 32 MiB calibration timeout=%s want=%s", timeout, expected)
+	}
+}
+
+// The outer test context cannot truncate a valid inner calibration budget, and
+// a deliberately larger ordinary liveness cap remains authoritative.
+func TestCalibrationWorkloadTestTimeoutIncludesInnerBudget(t *testing.T) {
+	profile := initialNetworkProfiles(5005)["clean-lan"]
+	const byteCount = 1024 * 1024
+	expected := 45 * time.Second
+	if perfvarRaceEnabled {
+		expected = 4 * time.Minute
+	}
+	if timeout := calibrationWorkloadTestTimeout(profile, byteCount, 45*time.Second); timeout != expected {
+		t.Fatalf("calibration test timeout=%s want=%s", timeout, expected)
+	}
+	if timeout := calibrationWorkloadTestTimeout(profile, byteCount, 5*time.Minute); timeout != 5*time.Minute {
+		t.Fatalf("larger outer liveness timeout=%s want=5m", timeout)
 	}
 }
 

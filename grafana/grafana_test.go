@@ -15,19 +15,48 @@ import (
 )
 
 type testDashboard struct {
-	Uid        string   `json:"uid"`
-	Title      string   `json:"title"`
-	Tags       []string `json:"tags"`
-	Templating struct {
+	Uid         string              `json:"uid"`
+	Title       string              `json:"title"`
+	Description string              `json:"description"`
+	Tags        []string            `json:"tags"`
+	Links       []testDashboardLink `json:"links"`
+	Templating  struct {
 		List []any `json:"list"`
 	} `json:"templating"`
 	Panels []testPanel `json:"panels"`
 }
 
+type testDashboardLink struct {
+	Title       string `json:"title"`
+	Url         string `json:"url"`
+	KeepTime    bool   `json:"keepTime"`
+	IncludeVars bool   `json:"includeVars"`
+}
+
 type testPanel struct {
-	Id      int    `json:"id"`
-	Type    string `json:"type"`
-	Title   string `json:"title"`
+	Id          int    `json:"id"`
+	Type        string `json:"type"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	FieldConfig struct {
+		Defaults struct {
+			Thresholds struct {
+				Steps []struct {
+					Color string   `json:"color"`
+					Value *float64 `json:"value"`
+				} `json:"steps"`
+			} `json:"thresholds"`
+		} `json:"defaults"`
+		Overrides []struct {
+			Matcher struct {
+				Options string `json:"options"`
+			} `json:"matcher"`
+			Properties []struct {
+				Id    string          `json:"id"`
+				Value json.RawMessage `json:"value"`
+			} `json:"properties"`
+		} `json:"overrides"`
+	} `json:"fieldConfig"`
 	GridPos struct {
 		H int `json:"h"`
 		W int `json:"w"`
@@ -50,11 +79,272 @@ type testPanel struct {
 	Targets []testTarget `json:"targets"`
 }
 
+func TestEgressProbeDashboardUsesPopulationAwareOutcomeClasses(t *testing.T) {
+	dashboard := readTestDashboard(t, "egress-probes.json")
+	failures := dashboardPanelById(dashboard, 8)
+	if failures == nil || len(failures.Targets) != 1 {
+		t.Fatal("egress current-failure panel is missing")
+	}
+	if failures.Title != "current proved failures" {
+		t.Fatalf("egress failure panel title = %q", failures.Title)
+	}
+	expression := failures.Targets[0].Expr
+	for _, class := range []string{
+		"tunnel_failed", "contract_failed", "no_consensus", "locate_failed",
+		"not_confident", "submit_failed", "unknown_failure",
+	} {
+		if !strings.Contains(expression, class) {
+			t.Errorf("egress failure expression omits %q: %s", class, expression)
+		}
+	}
+	for _, neutral := range []string{"unobserved", "inconsistent", `result!="ok"`} {
+		if strings.Contains(expression, neutral) {
+			t.Errorf("egress failure expression counts neutral state %q: %s", neutral, expression)
+		}
+	}
+	if strings.Contains(expression, "vector(0)") {
+		t.Errorf("egress failure stat hides an absent exporter as zero: %s", expression)
+	}
+	if !strings.Contains(expression, "fleet_snapshot_timestamp_seconds") ||
+		!strings.Contains(expression, "topk(1,") {
+		t.Errorf("egress failure stat does not select one fresh fleet snapshot: %s", expression)
+	}
+
+	dominant := dashboardPanelById(dashboard, 10)
+	share := dashboardPanelById(dashboard, 11)
+	fleet := dashboardPanelById(dashboard, 14)
+	if dominant == nil || !strings.Contains(dominant.Description, "complete") ||
+		!strings.Contains(dominant.Description, "eligible") ||
+		share == nil || !strings.Contains(share.Description, "eligible population") ||
+		fleet == nil || fleet.Title != "eligible fleet by probe outcome" ||
+		!strings.Contains(fleet.Description, "unobserved") {
+		t.Fatal("egress dashboard does not explain the reconstructed eligible-population semantics")
+	}
+	if len(fleet.Targets) != 1 || !strings.Contains(fleet.Targets[0].Expr, "sum by (result)") {
+		t.Fatal("egress fleet panel must preserve each outcome in the selected snapshot")
+	}
+	success := dashboardPanelById(dashboard, 9)
+	if success == nil || len(success.Targets) != 1 ||
+		!strings.HasPrefix(success.Targets[0].Expr, "sum(") ||
+		strings.Contains(success.Targets[0].Expr, "vector(0)") {
+		t.Fatal("egress success panel must preserve exporter absence in its selected fleet snapshot")
+	}
+	for id := 5; id <= 14; id++ {
+		panel := dashboardPanelById(dashboard, id)
+		if panel == nil || len(panel.Targets) != 1 {
+			t.Fatalf("fleet snapshot panel %d is missing", id)
+		}
+		expression := panel.Targets[0].Expr
+		for _, contract := range []string{
+			"fleet_snapshot_timestamp_seconds",
+			"topk(1,",
+			"and on(env,service,block,host,instance)",
+			`service="taskworker"`,
+			"time() - 900",
+			"time() + 30",
+		} {
+			if !strings.Contains(expression, contract) {
+				t.Errorf("fleet snapshot panel %d omits %q: %s", id, contract, expression)
+			}
+		}
+		if strings.Contains(expression, "vector(0)") {
+			t.Errorf("fleet snapshot panel %d hides stale or absent telemetry as zero: %s", id, expression)
+		}
+	}
+	if !strings.Contains(dashboard.Description, "go no-data after 15 minutes") ||
+		!strings.Contains(dashboard.Description, "§2.23") {
+		t.Fatal("egress dashboard does not disclose snapshot freshness and direct-database authority")
+	}
+}
+
+func TestCompetitionDashboardOperationalSignals(t *testing.T) {
+	dashboard := readTestDashboard(t, "competition.json")
+	joined := strings.Join(dashboardExpressions(dashboard), "\n")
+	for _, metric := range []string{
+		"urnetwork_competition_runner_heartbeat_timestamp_seconds",
+		"urnetwork_competition_submission_queue_size",
+		"urnetwork_competition_current_evaluation_info",
+		"urnetwork_competition_current_evaluation_elapsed_seconds",
+		"urnetwork_competition_significant_submission_found",
+		"urnetwork_competition_evaluation_duration_estimate_seconds",
+		"urnetwork_competition_submission_backlog_estimated_seconds",
+		"urnetwork_competition_live_evaluation_metric_value",
+		"urnetwork_competition_current_round_staging",
+	} {
+		if !strings.Contains(joined, metric) {
+			t.Errorf("competition dashboard is missing %s", metric)
+		}
+	}
+
+	heartbeat := dashboardPanelById(dashboard, 15)
+	if heartbeat == nil || heartbeat.Title != "runner heartbeat age" || len(heartbeat.Targets) != 1 {
+		t.Fatal("competition runner heartbeat panel is missing")
+	}
+	if !strings.Contains(heartbeat.Targets[0].Expr, "time() - max(") {
+		t.Errorf("runner heartbeat panel does not calculate heartbeat age: %s", heartbeat.Targets[0].Expr)
+	}
+	foundWarning := false
+	for _, step := range heartbeat.FieldConfig.Defaults.Thresholds.Steps {
+		if step.Color == "orange" && step.Value != nil && *step.Value == 30 {
+			foundWarning = true
+		}
+	}
+	if !foundWarning {
+		t.Fatal("runner heartbeat panel must warn at 30 seconds")
+	}
+	era := dashboardPanelById(dashboard, 26)
+	if era == nil || era.Title != "current era" || len(era.Targets) != 1 ||
+		!strings.Contains(era.Targets[0].Expr, "urnetwork_competition_current_round_staging") {
+		t.Fatal("competition staging-era panel is missing")
+	}
+	for _, panelId := range []int{22, 23, 24, 25} {
+		panel := dashboardPanelById(dashboard, panelId)
+		if panel == nil || panel.Type != "bargauge" || len(panel.Targets) != 1 ||
+			!strings.Contains(panel.Targets[0].Expr, "urnetwork_competition_live_evaluation_metric_value") {
+			t.Errorf("live evaluation plot %d is missing or invalid", panelId)
+		}
+		colors := map[string]string{}
+		if panel != nil {
+			for _, override := range panel.FieldConfig.Overrides {
+				for _, property := range override.Properties {
+					if property.Id == "color" {
+						var color struct {
+							FixedColor string `json:"fixedColor"`
+						}
+						if err := json.Unmarshal(property.Value, &color); err != nil {
+							t.Fatalf("parse live plot color override: %v", err)
+						}
+						colors[override.Matcher.Options] = color.FixedColor
+					}
+				}
+			}
+		}
+		if colors[`.*\[improved\].*`] != "#3987e5" || colors[`.*\[regressed\].*`] != "#e02f44" {
+			t.Errorf("live evaluation plot %d does not map improvement blue and regression red: %#v", panelId, colors)
+		}
+	}
+}
+
+func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
+	dashboard := readTestDashboard(t, "backup-archives.json")
+	joined := strings.Join(dashboardExpressions(dashboard), "\n")
+	for _, required := range []string{
+		"urnetwork_backup_archive_latest_timestamp_seconds",
+		"urnetwork_backup_archive_in_progress",
+		"urnetwork_backup_archive_storage_bytes",
+		"urnetwork_backup_archive_volume_free_bytes",
+		`host="planetoid"`,
+		`archive="pg"`,
+		`archive="redis"`,
+		`archive="github-urnetwork"`,
+		`archive="github-urfoundation"`,
+	} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("backup archive dashboard is missing %q", required)
+		}
+	}
+
+	activity := dashboardPanelById(dashboard, 3)
+	if activity == nil || activity.Title != "current backup activity" || len(activity.Targets) != 1 {
+		t.Fatal("backup archive activity panel is missing")
+	}
+	if !strings.Contains(activity.Targets[0].Expr, "max by (archive)") ||
+		!strings.Contains(activity.Targets[0].Expr, "urnetwork_backup_archive_in_progress") {
+		t.Errorf("backup activity does not identify the running archive: %s", activity.Targets[0].Expr)
+	}
+
+	archives := map[int]string{
+		5: `archive="pg"`,
+		6: `archive="redis"`,
+		7: `archive="github-urnetwork"`,
+		8: `archive="github-urfoundation"`,
+	}
+	for panelID, archiveSelector := range archives {
+		panel := dashboardPanelById(dashboard, panelID)
+		if panel == nil || len(panel.Targets) != 1 {
+			t.Errorf("backup freshness panel %d is missing", panelID)
+			continue
+		}
+		expression := panel.Targets[0].Expr
+		for _, required := range []string{archiveSelector, "time()", "432000", "vector(1)"} {
+			if !strings.Contains(expression, required) {
+				t.Errorf("backup freshness panel %d is missing %q: %s", panelID, required, expression)
+			}
+		}
+		foundErrorThreshold := false
+		for _, step := range panel.FieldConfig.Defaults.Thresholds.Steps {
+			if step.Color == "red" && step.Value != nil && *step.Value == 1 {
+				foundErrorThreshold = true
+			}
+		}
+		if !foundErrorThreshold {
+			t.Errorf("backup freshness panel %d must render ERROR in red", panelID)
+		}
+	}
+
+	for _, panelID := range []int{9, 10, 11, 12} {
+		panel := dashboardPanelById(dashboard, panelID)
+		if panel == nil || len(panel.Targets) != 1 ||
+			!strings.Contains(panel.Targets[0].Expr, "topk(1") ||
+			!strings.Contains(panel.Targets[0].Expr, "* 1000") {
+			t.Errorf("latest stored archive panel %d is missing or does not select the newest generation", panelID)
+		}
+	}
+
+	storage := dashboardPanelById(dashboard, 15)
+	if storage == nil || storage.Type != "bargauge" || storage.Title != "archive volume storage breakdown" || len(storage.Targets) != 2 {
+		t.Fatal("backup archive storage breakdown panel is missing")
+	}
+	for _, required := range []string{
+		"urnetwork_backup_archive_storage_bytes",
+		`archive=~"pg|redis|code"`,
+		"urnetwork_backup_archive_volume_free_bytes",
+	} {
+		if !strings.Contains(storage.Targets[0].Expr+"\n"+storage.Targets[1].Expr, required) {
+			t.Errorf("backup storage breakdown is missing %q", required)
+		}
+	}
+}
+
+func TestRedisClusterCounterRatesCoverStaggeredScrapes(t *testing.T) {
+	dashboard := readTestDashboard(t, "redis-cluster.json")
+	wantMetrics := map[int][]string{
+		8:  {"redis_commands_duration_seconds_total", "redis_commands_processed_total"},
+		9:  {"redis_commands_processed_total"},
+		11: {"redis_evicted_keys_total", "redis_expired_keys_total"},
+	}
+
+	for panelID, metrics := range wantMetrics {
+		panel := dashboardPanelById(dashboard, panelID)
+		if panel == nil {
+			t.Errorf("Redis counter-rate panel %d is missing", panelID)
+			continue
+		}
+		expressions := make([]string, 0, len(panel.Targets))
+		for _, target := range panel.Targets {
+			expressions = append(expressions, target.Expr)
+		}
+		joined := strings.Join(expressions, "\n")
+		for _, metric := range metrics {
+			if !strings.Contains(joined, "rate("+metric) {
+				t.Errorf("Redis panel %d is missing rate for %s: %s", panelID, metric, joined)
+			}
+		}
+		if strings.Contains(joined, "$__rate_interval") {
+			t.Errorf("Redis panel %d uses $__rate_interval, which can be shorter than the 61–92 second staggered scrape interval: %s", panelID, joined)
+		}
+		if strings.Count(joined, "[5m]") != len(metrics) {
+			t.Errorf("Redis panel %d must use one five-minute range per counter, got: %s", panelID, joined)
+		}
+	}
+}
+
 type testTarget struct {
-	Expr    string `json:"expr"`
-	Instant bool   `json:"instant"`
-	Range   *bool  `json:"range"`
-	Format  string `json:"format"`
+	Expr         string `json:"expr"`
+	Instant      bool   `json:"instant"`
+	Range        *bool  `json:"range"`
+	Format       string `json:"format"`
+	LegendFormat string `json:"legendFormat"`
 }
 
 func readTestDashboard(t *testing.T, name string) testDashboard {
@@ -136,6 +426,215 @@ func TestDefaultDashboardDocumentsAreValid(t *testing.T) {
 
 		if slices.Contains(dashboard.Tags, PublicTag) && len(dashboard.Templating.List) != 0 {
 			t.Errorf("public dashboard %s uses template variables, which Grafana public dashboards do not support", entry.Name())
+		}
+	}
+}
+
+func TestWebAnalyticsDashboardPrivacyContract(t *testing.T) {
+	dashboard := readTestDashboard(t, "web-analytics.json")
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("web analytics contains search terms and must remain an authenticated dashboard")
+	}
+	joined := strings.Join(dashboardExpressions(dashboard), "\n")
+	for _, metric := range []string{
+		"urnetwork_web_search_clicks_total",
+		"urnetwork_web_search_impressions_total",
+		"urnetwork_web_search_ingest_rows_total",
+		"urnetwork_web_search_ingest_last_success_timestamp_seconds",
+	} {
+		if !strings.Contains(joined, metric) {
+			t.Errorf("web analytics is missing %s", metric)
+		}
+	}
+	for _, panelID := range []int{2, 3, 4, 6, 7, 8, 9} {
+		panel := dashboardPanelById(dashboard, panelID)
+		if panel == nil || len(panel.Targets) != 1 {
+			t.Fatalf("web analytics page-view panel %d is missing", panelID)
+		}
+		expression := panel.Targets[0].Expr
+		for _, required := range []string{
+			`service="web"`,
+			`event="web_page_view"`,
+			`privacy_safe="true"`,
+			"count_over_time",
+		} {
+			if !strings.Contains(expression, required) {
+				t.Errorf("page-view panel %d lacks %s: %s", panelID, required, expression)
+			}
+		}
+	}
+	privateLabel := regexp.MustCompile(`(?i)\b(ip|client_ip|remote_addr|user_id|cookie|full_referrer)\b`)
+	if privateLabel.MatchString(joined) {
+		t.Errorf("web analytics query references a forbidden user-level field: %s", privateLabel.FindString(joined))
+	}
+	searchTerms := dashboardPanelById(dashboard, 15)
+	if searchTerms == nil || searchTerms.Type != "logs" || len(searchTerms.Targets) != 1 {
+		t.Fatal("web analytics privacy-filtered search terms panel is missing")
+	}
+	termQuery := searchTerms.Targets[0].Expr
+	for _, required := range []string{
+		`service="taskworker"`,
+		`event="web_search_query"`,
+		`privacy_safe="true"`,
+		`{{.query}}`,
+	} {
+		if !strings.Contains(termQuery, required) {
+			t.Errorf("search terms query lacks %s: %s", required, termQuery)
+		}
+	}
+	// Query text is intentionally a parsed Loki field, never a persistent
+	// Prometheus label on a high-cardinality metric.
+	for _, expression := range dashboardExpressions(dashboard) {
+		if strings.Contains(expression, "urnetwork_web_") && strings.Contains(expression, `query=`) {
+			t.Errorf("raw search query used as a metric label: %s", expression)
+		}
+	}
+}
+
+func TestServiceLogsLinksToLogsDrilldown(t *testing.T) {
+	dashboard := readTestDashboard(t, "service-logs.json")
+	for _, link := range dashboard.Links {
+		if link.Title != "Logs Drilldown" {
+			continue
+		}
+		if link.Url != "/a/grafana-lokiexplore-app/explore?var-ds=warp-loki" {
+			t.Fatalf("Logs Drilldown URL = %q", link.Url)
+		}
+		if !link.KeepTime {
+			t.Fatal("Logs Drilldown link must preserve the dashboard time range")
+		}
+		if link.IncludeVars {
+			t.Fatal("service dashboard variables are not Logs Drilldown variables")
+		}
+		return
+	}
+	t.Fatal("service logs dashboard is missing its Logs Drilldown link")
+}
+
+func TestInfrastructureDashboardsCoverServiceAndHostSignals(t *testing.T) {
+	tests := []struct {
+		name           string
+		diskMountpoint string
+		serviceMetrics []string
+	}{
+		{
+			name:           "minio.json",
+			diskMountpoint: "/mnt/data",
+			serviceMetrics: []string{
+				"minio_cluster_health_nodes_online_count",
+				"minio_cluster_health_drives_offline_count",
+				"minio_cluster_health_capacity_usable_free_bytes",
+				"minio_cluster_usage_buckets_total_bytes",
+				"minio_api_requests_5xx_errors_total",
+			},
+		},
+		{
+			name:           "subtensor.json",
+			diskMountpoint: "/",
+			serviceMetrics: []string{
+				"substrate_block_height",
+				"substrate_sub_libp2p_peers_count",
+				"substrate_sub_libp2p_is_major_syncing",
+				"substrate_ready_transactions_number",
+				"substrate_rpc_sessions_opened",
+			},
+		},
+		{
+			name:           "postgres.json",
+			diskMountpoint: "/",
+			serviceMetrics: []string{
+				"pg_up",
+				"pg_stat_activity_count",
+				"pg_stat_activity_max_tx_duration",
+				"pg_settings_max_connections",
+				"pg_stat_database_xact_commit",
+				"pg_stat_database_deadlocks",
+				"pg_locks_count",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dashboard := readTestDashboard(t, test.name)
+			queries := strings.Join(dashboardExpressions(dashboard), "\n")
+			for _, metric := range test.serviceMetrics {
+				if !strings.Contains(queries, metric) {
+					t.Errorf("dashboard is missing service metric %s", metric)
+				}
+			}
+			if !strings.Contains(queries, "node_cpu_seconds_total") ||
+				!strings.Contains(queries, "node_memory_MemAvailable_bytes") {
+				t.Error("dashboard must include host CPU and memory context")
+			}
+			if !strings.Contains(queries, "node_filesystem_avail_bytes") ||
+				!strings.Contains(queries, `mountpoint="`+test.diskMountpoint+`"`) {
+				t.Errorf("dashboard must include host disk context for %s", test.diskMountpoint)
+			}
+			if !strings.Contains(queries, `{env="$env"`) ||
+				!strings.Contains(queries, `host=~"$host"`) {
+				t.Error("dashboard queries must be scoped by env and host")
+			}
+		})
+	}
+}
+
+func TestSubtensorDashboardSeparatesArchiveAndLightnodeMetrics(t *testing.T) {
+	dashboard := readTestDashboard(t, "subtensor.json")
+	queries := dashboardExpressions(dashboard)
+	for _, query := range queries {
+		if strings.Contains(query, "substrate_") && !strings.Contains(query, `job=~"$node"`) {
+			t.Errorf("Subtensor query does not honor the archive/lightnode selector: %s", query)
+		}
+	}
+	raw, err := dashboardsFs.ReadFile("dashboards/subtensor.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	for _, required := range []string{
+		`"name": "node"`,
+		`subtensor(|-lightnode)`,
+		`max by (host,chain,job)`,
+		`{{job}}`,
+	} {
+		if !strings.Contains(content, required) {
+			t.Errorf("Subtensor dashboard does not separate both node jobs: missing %s", required)
+		}
+	}
+}
+
+func TestSubtensorDashboardDistinguishesRealLagFromStaleExport(t *testing.T) {
+	dashboard := readTestDashboard(t, "subtensor.json")
+	queries := strings.Join(dashboardExpressions(dashboard), "\n")
+	for _, required := range []string{
+		`status="sync_target"`,
+		`status="best"`,
+		`deriv(substrate_block_height`,
+		`[1h]`,
+		`time() - max by (host,chain,job) (timestamp(`,
+		`max by (host,chain)`,
+		`[1h:15s]`,
+		` >= time() - 90`,
+		` >= 200`,
+	} {
+		if !strings.Contains(queries, required) {
+			t.Errorf("Subtensor dashboard cannot disambiguate lag/export freshness: missing %s", required)
+		}
+	}
+	for _, id := range []int{13, 14} {
+		panel := dashboardPanelById(dashboard, id)
+		if panel == nil || len(panel.Targets) != 1 {
+			t.Fatalf("missing target panel %d", id)
+		}
+		query := panel.Targets[0].Expr
+		for _, required := range []string{`job=~"^(?:subtensor|subtensor-lightnode)$"`, `job=~"$node"`, `substrate_sub_libp2p_is_major_syncing`, `on (host,chain)`} {
+			if !strings.Contains(query, required) {
+				t.Errorf("target panel %d missing %s", id, required)
+			}
+		}
+		if strings.Contains(query, "max by (job)") || strings.Contains(query, "max by (host)") {
+			t.Errorf("target panel %d merges host or chain identity", id)
 		}
 	}
 }
@@ -367,6 +866,39 @@ func TestExchangeTrafficDashboardsUseLiveIoWithoutDoubleCounting(t *testing.T) {
 	}
 }
 
+func TestAdmissionCacheAndSourcePanelsUseActionableQueries(t *testing.T) {
+	signalExpressions := dashboardExpressions(readTestDashboard(t, "signals.json"))
+	for _, expression := range []string{
+		`sum(rate(urnetwork_circle_transfer_admissions_total{env="$env"}[$__rate_interval]))`,
+		`sum(rate(urnetwork_circle_transfer_deferrals_total{env="$env"}[$__rate_interval]))`,
+		`sum(rate(urnetwork_circle_transfer_admission_errors_total{env="$env"}[$__rate_interval]))`,
+		`histogram_quantile(0.50, sum by (le) (rate(urnetwork_circle_transfer_admission_wait_seconds_bucket{env="$env"}[$__rate_interval])))`,
+		`histogram_quantile(0.95, sum by (le) (rate(urnetwork_circle_transfer_admission_wait_seconds_bucket{env="$env"}[$__rate_interval])))`,
+		`sum(rate(urnetwork_circle_transfer_admission_wait_seconds_sum{env="$env"}[$__rate_interval])) / sum(rate(urnetwork_circle_transfer_admission_wait_seconds_count{env="$env"}[$__rate_interval]))`,
+		`max by (host, block, instance) (urnetwork_proxy_lock_cache_entries{env="$env"})`,
+		`max by (host, block, instance) (urnetwork_proxy_lock_cache_capacity{env="$env"})`,
+		`sum(rate(urnetwork_proxy_lock_cache_hits_total{env="$env"}[$__rate_interval]))`,
+		`sum(rate(urnetwork_proxy_lock_cache_misses_total{env="$env"}[$__rate_interval]))`,
+		`sum(rate(urnetwork_proxy_lock_cache_expirations_total{env="$env"}[$__rate_interval]))`,
+		`sum(rate(urnetwork_proxy_lock_cache_evictions_total{env="$env"}[$__rate_interval]))`,
+		`max by (host, block) (urnetwork_proxy_lifecycle_join_enabled{env="$env"})`,
+	} {
+		if !slices.Contains(signalExpressions, expression) {
+			t.Errorf("signals dashboard is missing actionable query %q", expression)
+		}
+	}
+
+	sourcePanel := dashboardPanelById(readTestDashboard(t, "services-overview.json"), 6)
+	if sourcePanel == nil || sourcePanel.Type != "table" || len(sourcePanel.Targets) != 1 {
+		t.Fatal("running source revisions table is missing")
+	}
+	wantSourceQuery := `urnetwork_source_info{env="$env",service=~"$service",block=~"$block",host=~"$host"}`
+	sourceTarget := sourcePanel.Targets[0]
+	if sourceTarget.Expr != wantSourceQuery || sourceTarget.Format != "table" || !sourceTarget.Instant {
+		t.Errorf("running source revisions query = %+v, want instant table %q", sourceTarget, wantSourceQuery)
+	}
+}
+
 // registeredApplicationMetrics inventories prometheus option literals in the
 // production Go sources. The stats collector creates its gauges through
 // small wrappers (newStatsGauge, newStatsGaugeVec), so their string-literal
@@ -387,10 +919,19 @@ func registeredApplicationMetrics(t *testing.T) []string {
 
 	err := filepath.WalkDir("..", func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if strings.HasPrefix(
+				filepath.ToSlash(path),
+				"../connect/sim-latency/eval-",
+			) {
+				return filepath.SkipDir
+			}
 			return walkErr
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == "vendor" {
+			if entry.Name() == ".git" || entry.Name() == "vendor" || strings.HasPrefix(
+				filepath.ToSlash(path),
+				"../connect/sim-latency/eval-",
+			) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -487,6 +1028,143 @@ func TestInternalDashboardsCoverEveryApplicationMetric(t *testing.T) {
 	for _, metric := range metrics {
 		if !strings.Contains(queries, metric) {
 			t.Errorf("custom application metric %s is absent from the internal dashboards", metric)
+		}
+	}
+}
+
+// The lossless failure total identifies the alerting cause, while this bounded
+// breakdown distinguishes request shapes without exposing client identifiers.
+func TestMissingOriginDetailsHaveActionableDashboardQuery(t *testing.T) {
+	dashboard := readTestDashboard(t, "signals.json")
+	wantTitle := "\u00a74 contract failures + origin/destination details / min (lossless)"
+	var detailsTarget *testTarget
+	for panelIndex := range dashboard.Panels {
+		panel := &dashboard.Panels[panelIndex]
+		if panel.Title != wantTitle {
+			continue
+		}
+		for targetIndex := range panel.Targets {
+			target := &panel.Targets[targetIndex]
+			if strings.Contains(target.Expr, "urnetwork_connect_missing_origin_details_total") {
+				detailsTarget = target
+				break
+			}
+		}
+		break
+	}
+	if detailsTarget == nil {
+		t.Fatalf("signals dashboard panel %q lacks the missing-origin detail query", wantTitle)
+	}
+
+	wantQuery := `sum by (request_companion, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_missing_origin_details_total{env="$env",instance!=""}[$__rate_interval])) * 60`
+	if detailsTarget.Expr != wantQuery {
+		t.Errorf("missing-origin detail query = %q, want %q", detailsTarget.Expr, wantQuery)
+	}
+	wantLegend := "missing origin request_companion={{request_companion}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}"
+	if detailsTarget.LegendFormat != wantLegend {
+		t.Errorf("missing-origin detail legend = %q, want %q", detailsTarget.LegendFormat, wantLegend)
+	}
+}
+
+// Keep the lossless aggregate beside its bounded diagnostic breakdown. Rate
+// each process counter before summing, retain every finite causal dimension,
+// and never turn missing detail into zero or expose raw endpoint identifiers.
+func TestInactiveDestinationDetailsHaveActionableDashboardQuery(t *testing.T) {
+	dashboard := readTestDashboard(t, "signals.json")
+	wantTitle := "\u00a74 contract failures + origin/destination details / min (lossless)"
+	var targets []testTarget
+	for _, panel := range dashboard.Panels {
+		if panel.Title == wantTitle {
+			targets = panel.Targets
+			break
+		}
+	}
+	if targets == nil {
+		t.Fatalf("signals dashboard lacks panel %q", wantTitle)
+	}
+	tests := []struct {
+		metric string
+		query  string
+		legend string
+	}{
+		{
+			metric: "urnetwork_connect_contract_failures_total",
+			query:  `sum by (cause, companion) (rate(urnetwork_connect_contract_failures_total{env="$env",instance!=""}[$__rate_interval])) * 60`,
+			legend: "{{cause}} companion={{companion}}",
+		},
+		{
+			metric: "urnetwork_connect_inactive_destination_details_total",
+			query:  `sum by (request_companion, sender_role, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_inactive_destination_details_total{env="$env",instance!=""}[$__rate_interval])) * 60`,
+			legend: "inactive destination request_companion={{request_companion}} sender_role={{sender_role}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}",
+		},
+	}
+	for _, test := range tests {
+		matches := 0
+		for _, target := range targets {
+			if !strings.Contains(target.Expr, test.metric) {
+				continue
+			}
+			matches++
+			if target.Expr != test.query {
+				t.Errorf("%s query = %q, want %q", test.metric, target.Expr, test.query)
+			}
+			if target.LegendFormat != test.legend {
+				t.Errorf("%s legend = %q, want %q", test.metric, target.LegendFormat, test.legend)
+			}
+		}
+		if matches != 1 {
+			t.Errorf("%s has %d panel queries, want exactly one", test.metric, matches)
+		}
+	}
+}
+
+func TestProxyWireGuardRuntimeFailuresHaveActionableDashboardQueries(t *testing.T) {
+	expressions := dashboardExpressions(readTestDashboard(t, "signals.json"))
+	tests := []struct {
+		metric   string
+		required []string
+	}{
+		{
+			metric: "urnetwork_proxy_wg_inbound_peer_queue_drop_packets",
+			required: []string{
+				"rate(",
+				`{env="$env"}`,
+				"[$__rate_interval]",
+			},
+		},
+		{
+			metric: "urnetwork_proxy_wg_inbound_decryption_queue_drop_packets",
+			required: []string{
+				"rate(",
+				`{env="$env"}`,
+				"[$__rate_interval]",
+			},
+		},
+		{
+			metric: "urnetwork_proxy_wg_receive_routine_failures",
+			required: []string{
+				"max_over_time(",
+				`{env="$env"}`,
+				"[$__rate_interval]",
+			},
+		},
+	}
+	for _, test := range tests {
+		var query string
+		for _, expression := range expressions {
+			if strings.Contains(expression, test.metric) {
+				query = expression
+				break
+			}
+		}
+		if query == "" {
+			t.Errorf("signals dashboard is missing %s", test.metric)
+			continue
+		}
+		for _, required := range test.required {
+			if !strings.Contains(query, required) {
+				t.Errorf("%s query is missing %q: %s", test.metric, required, query)
+			}
 		}
 	}
 }

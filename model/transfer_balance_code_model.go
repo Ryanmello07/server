@@ -21,6 +21,7 @@ type BalanceCode struct {
 	PurchaseEventId  string
 	PurchaseRecord   string
 	PurchaseEmail    string
+	RedeemNetworkId  *server.Id
 }
 
 type RedeemBalanceCodeArgs struct {
@@ -44,11 +45,18 @@ type RedeemBalanceCodeError struct {
 	Message string `json:"message"`
 }
 
+// RedeemBalanceCodeInTx consumes one code only after locking its destination
+// network against concurrent deletion.
 func RedeemBalanceCodeInTx(
 	redeemBalanceCode *RedeemBalanceCodeArgs,
 	ctx context.Context,
 	tx server.PgTx,
 ) (redeemBalanceCodeResult *RedeemBalanceCodeResult, returnErr error) {
+	redeemBalanceCodeResult = nil
+	returnErr = LockPaymentNetworkInTx(tx, ctx, redeemBalanceCode.NetworkId)
+	if returnErr != nil {
+		return
+	}
 
 	result, err := tx.Query(
 		ctx,
@@ -185,7 +193,7 @@ func RedeemBalanceCode(
 			ctx,
 			tx,
 		)
-	})
+	}, server.TxReadCommitted)
 
 	return
 }
@@ -365,11 +373,14 @@ func CreateBalanceCode(
 	return
 }
 
+// Loads the complete public balance-code state, including whether it has been
+// redeemed. Nullable database timestamps remain zero-valued until populated.
 func GetBalanceCode(
 	ctx context.Context,
 	balanceCodeId server.Id,
 ) (balanceCode *BalanceCode, returnErr error) {
 	server.Db(ctx, func(conn server.PgConn) {
+		var redeemTime *time.Time
 		result, err := conn.Query(
 			ctx,
 			`
@@ -382,7 +393,9 @@ func GetBalanceCode(
                     balance_code_secret,
                     purchase_event_id,
                     purchase_record,
-                    purchase_email
+                    purchase_email,
+                    redeem_time,
+                    network_id
                 FROM transfer_balance_code
                 WHERE balance_code_id = $1
             `,
@@ -403,7 +416,12 @@ func GetBalanceCode(
 					&balanceCode.PurchaseEventId,
 					&balanceCode.PurchaseRecord,
 					&balanceCode.PurchaseEmail,
+					&redeemTime,
+					&balanceCode.RedeemNetworkId,
 				))
+				if redeemTime != nil {
+					balanceCode.RedeemTime = *redeemTime
+				}
 			} else {
 				returnErr = fmt.Errorf("Balance code not found.")
 			}

@@ -33,6 +33,7 @@ import (
 	// "github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/jwt"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/session"
 )
 
 // each client connection is a transport for the resident client
@@ -235,10 +236,21 @@ func (self *connectH3DatagramCollector) Collect(metrics chan<- prometheus.Metric
 const AllowOnlyIpv4 = false
 
 const (
-	connectH1WriteBatchMaxMessageCount = 8
+	// Drain more ACK-sized messages without retaining a larger socket buffer.
+	// Payload traffic stops after 12 KiB, so one complete ordinary <=4-KiB H1
+	// data message fits the existing 16-KiB coalescer. A larger handshake
+	// carrier may make the bounded wrapper flush its prefix before the batch
+	// ends. The drain is ready-only: sparse traffic still writes immediately.
+	connectH1WriteBatchMaxMessageCount = 32
+	connectH1WriteBatchDrainByteCount  = 12 * 1024
 	connectH3WriteBatchMaxMessageCount = 16
 	connectH3WriteBatchMaxByteCount    = 64 * 1024
 )
+
+func connectH1WriteBatchCanDrain(messageCount int, messageByteCount int) bool {
+	return messageCount < connectH1WriteBatchMaxMessageCount &&
+		messageByteCount < connectH1WriteBatchDrainByteCount
+}
 
 // Mirrors the client-side pre-publication query. quic-go v0.61.0 cannot queue
 // a 2,048-byte DATAGRAM because its packet buffer is capped at 1,452 bytes, so
@@ -307,7 +319,7 @@ func (self *connectH1BatchResponseWriter) Hijack() (
 	return connect.NewWebSocketWriteBatchConn(conn), readWriter, nil
 }
 
-// Writes one user frame immediately, plus at most seven more frames already
+// Writes one user frame immediately, plus a bounded set of frames already
 // queued at the same instant. Every dequeued pooled buffer is returned after
 // the terminal flush; successful accounting is published only after that
 // flush reaches the delegated connection.
@@ -328,10 +340,11 @@ func writeConnectH1UserReadyBatch(
 	var messageStorage [connectH1WriteBatchMaxMessageCount][]byte
 	messageStorage[0] = firstMessage
 	messageCount := 1
+	messageByteCount := len(firstMessage)
 	open = true
 	if writeBatch != nil {
 	drainReady:
-		for messageCount < len(messageStorage) {
+		for connectH1WriteBatchCanDrain(messageCount, messageByteCount) {
 			select {
 			case <-ctx.Done():
 				open = false
@@ -343,6 +356,7 @@ func writeConnectH1UserReadyBatch(
 				}
 				messageStorage[messageCount] = message
 				messageCount += 1
+				messageByteCount += len(message)
 			default:
 				break drainReady
 			}
@@ -437,8 +451,8 @@ func DefaultConnectHandlerSettings() *ConnectHandlerSettings {
 		ListenerRestartMaxDelay:     5 * time.Second,
 		EnableProxyProtocol:         true,
 		// Floor the framer at the connect runtime minimum message length: every
-		// framer on the resident exchange flow must admit the handshake's TLS
-		// server flight (one ~2.2 KiB pack). Also backs the websocket read limit.
+		// framer on the resident exchange flow must admit the measured 4,950-byte
+		// handshake carrier. Also backs the websocket read limit.
 		FramerSettings:       connect.DefaultFramerSettings(int(connect.DefaultClientSettings().MinimumMessageLenLimit())),
 		TransportTlsSettings: server.DefaultTransportTlsSettings(),
 		EnableH3Datagrams:    true,
@@ -480,15 +494,27 @@ type ConnectHandlerSettings struct {
 	ConnectionTestConfig *TestConfig
 	ConnectionAnnounceSettings
 	ConnectionRateLimitSettings
+	// Tests replace only the configuration loader so initialization failure can
+	// be held before any listener goroutine exists.
+	transportTlsLoader func(*server.TransportTlsSettings) (*server.TransportTls, error)
 }
 
 // Keeps server-resident Transfer recovery symmetric with the client H3 path.
-func connectH3TransferCarrierProperties(useH3Datagrams bool) connect.TransferCarrierProperties {
-	return connect.TransferCarrierProperties{
+func connectH3TransferCarrierProperties(
+	useH3Datagrams bool,
+	settings *connect.H3DatagramSettings,
+	maxDatagramByteCount int,
+) connect.TransferCarrierProperties {
+	properties := connect.TransferCarrierProperties{
 		Unreliable:              useH3Datagrams,
 		UnreliableFlowIsolation: useH3Datagrams,
 		UnreliableFlowReserve:   useH3Datagrams,
 	}
+	if useH3Datagrams {
+		properties.UnreliableMaxMessageByteCount =
+			connect.H3DatagramTransferFrameByteLimit(settings, maxDatagramByteCount)
+	}
+	return properties
 }
 
 // Joins all per-connection workers before their handler releases shared state.
@@ -566,6 +592,9 @@ type ConnectHandler struct {
 
 	listenerStateLock sync.RWMutex
 	listenerStates    map[connectListenerKey]bool
+	// Optional synchronization hook for deterministic listener lifecycle
+	// tests. It runs after the guarded state transition and must not block.
+	listenerStateObserver func(connectListenerKey, bool)
 
 	activeLock  sync.Mutex
 	activeCount int
@@ -676,6 +705,24 @@ func NewConnectHandlerWithPacketConns(
 	settings *ConnectHandlerSettings,
 	packetConns ConnectHandlerPacketConns,
 ) *ConnectHandler {
+	handler, err := newConnectHandlerWithPacketConns(ctx, handlerId, exchange, settings, packetConns)
+	if err != nil {
+		panic(err)
+	}
+	return handler
+}
+
+// newConnectHandlerWithPacketConns is the checked construction path used by
+// process startup. TLS identity must exist before listener supervision begins:
+// an empty fallback loader can bind UDP and report ready while rejecting every
+// ClientHello with TLS internal_error.
+func newConnectHandlerWithPacketConns(
+	ctx context.Context,
+	handlerId server.Id,
+	exchange *Exchange,
+	settings *ConnectHandlerSettings,
+	packetConns ConnectHandlerPacketConns,
+) (*ConnectHandler, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	packetEndpoints := connectHandlerPacketEndpoints(settings, packetConns)
 	activeZero := make(chan struct{})
@@ -692,10 +739,14 @@ func NewConnectHandlerWithPacketConns(
 		).Set(0)
 	}
 
-	transportTls, err := server.NewTransportTlsFromConfig(settings.TransportTlsSettings)
+	transportTlsLoader := settings.transportTlsLoader
+	if transportTlsLoader == nil {
+		transportTlsLoader = server.NewTransportTlsFromConfig
+	}
+	transportTls, err := transportTlsLoader(settings.TransportTlsSettings)
 	if err != nil {
-		glog.Errorf("[c]Could not initialize tls config. Disabling transport. = %s\n", err)
-		transportTls = server.NewTransportTls(map[string]bool{}, server.DefaultTransportTlsSettings())
+		cancel()
+		return nil, fmt.Errorf("initialize Connect transport TLS: %w", err)
 	}
 	h3DatagramSettings := settings.H3DatagramSettings
 	if h3DatagramSettings == nil {
@@ -744,7 +795,7 @@ func NewConnectHandlerWithPacketConns(
 
 	go server.HandleError(h.run, cancel)
 
-	return h
+	return h, nil
 }
 
 func (self *ConnectHandler) run() {
@@ -801,6 +852,9 @@ func (self *ConnectHandler) setListenerUp(key connectListenerKey, up bool) {
 		value = 1
 	}
 	h3ListenerUpGauge.WithLabelValues(key.transport, strconv.Itoa(key.port)).Set(value)
+	if self.listenerStateObserver != nil {
+		self.listenerStateObserver(key, up)
+	}
 }
 
 // ListenerReadyUdpPorts reports the dynamic state and logical UDP ports of
@@ -1014,18 +1068,12 @@ func (self *ConnectHandler) Connect(w http.ResponseWriter, r *http.Request) {
 	connectedGauge.Add(1)
 	defer connectedGauge.Sub(1)
 
-	// find the client ip:port from the request header
-	// `X-Forwarded-For` is added by the warp lb
-	clientAddress := r.Header.Get("X-UR-Forwarded-For")
-	if clientAddress == "" {
-		clientIpStr := r.Header.Get("X-Forwarded-For")
-		clientPortStr := r.Header.Get("X-Forwarded-Source-Port")
-		if clientIpStr != "" && clientPortStr != "" {
-			clientAddress = fmt.Sprintf("%s:%s", clientIpStr, clientPortStr)
-		}
-	}
-	if clientAddress == "" {
-		// use the raw connection remote address
+	// The fleet-standard resolver accepts only the header overwritten by Warp.
+	// Backend service ports must remain unreachable outside the ingress network.
+	clientAddress, resolveErr := session.ResolveClientAddressFromRequest(r)
+	if resolveErr != nil {
+		// unparseable remote address — keep the raw value; the parse below
+		// decides what to do with it, exactly as before
 		clientAddress = r.RemoteAddr
 	}
 
@@ -1292,9 +1340,10 @@ func (self *ConnectHandler) Connect(w http.ResponseWriter, r *http.Request) {
 					pingTracker.Receive()
 
 					messageByteCount := len(message)
-					sendResult := residentTransport.trySendMessage(
+					sendResult := residentTransport.sendReceivedMessage(
 						handleCtx.Done(),
 						message,
+						connect.CarrierReliabilityReliable,
 					)
 					if sendResult == pooledMessageSendDone {
 						return
@@ -1838,12 +1887,23 @@ func (self *ConnectHandler) connectQuic(conn *quic.Conn) error {
 		)
 		defer finishConnectionAnnounce(announce)
 
+		maxDatagramByteCount := 0
+		if useH3Datagrams {
+			maxDatagramByteCount = initialConnectH3DatagramPathByteCount(
+				self.settings.H3DatagramSettings.TargetDatagramByteCount,
+				conn.SendDatagram,
+			)
+		}
 		residentTransport := NewResidentTransportWithProperties(
 			handleCtx,
 			self.exchange,
 			clientId,
 			instanceId,
-			connectH3TransferCarrierProperties(useH3Datagrams),
+			connectH3TransferCarrierProperties(
+				useH3Datagrams,
+				self.settings.H3DatagramSettings,
+				maxDatagramByteCount,
+			),
 		)
 		var datagramFragmenter *connect.H3DatagramFragmenter
 		var datagramReassembler *connect.H3DatagramReassembler
@@ -1888,15 +1948,19 @@ func (self *ConnectHandler) connectQuic(conn *quic.Conn) error {
 		})
 
 		pingTracker := NewPingTracker(self.settings.PingTrackerCount)
-		deliverRoutedMessage := func(message []byte) bool {
+		deliverRoutedMessage := func(
+			message []byte,
+			reliability connect.CarrierReliability,
+		) bool {
 			// Reliability tracking remains at the complete Transfer boundary,
 			// independent of the selected hybrid lane or DATAGRAM fragments.
 			announce.ReceiveMessage(ByteCount(len(message)))
 			pingTracker.Receive()
 			messageByteCount := len(message)
-			sendResult := residentTransport.trySendMessage(
+			sendResult := residentTransport.sendReceivedMessage(
 				handleCtx.Done(),
 				message,
+				reliability,
 			)
 			if sendResult == pooledMessageSendDone {
 				return false
@@ -1913,7 +1977,8 @@ func (self *ConnectHandler) connectQuic(conn *quic.Conn) error {
 		if useH3Datagrams {
 			// Authentication, liveness, and routed frames above the negotiated
 			// hybrid threshold share this reliable stream. DATAGRAM has its own
-			// receive pump below; neither reader waits on resident admission.
+			// receive pump below. The stream propagates fixed-queue backpressure;
+			// DATAGRAM admission remains nonblocking.
 			// Clear the authentication deadline because DATAGRAM activity does
 			// not satisfy a stream read deadline. QUIC's connection-level idle
 			// timeout owns peer liveness in hybrid mode, while handler cleanup
@@ -1930,7 +1995,10 @@ func (self *ConnectHandler) connectQuic(conn *quic.Conn) error {
 					}
 					if len(message) != 0 {
 						self.settings.H3DatagramStats.RecordStreamReceived(len(message))
-						if !deliverRoutedMessage(message) {
+						if !deliverRoutedMessage(
+							message,
+							connect.CarrierReliabilityReliable,
+						) {
 							return
 						}
 						continue
@@ -1975,7 +2043,11 @@ func (self *ConnectHandler) connectQuic(conn *quic.Conn) error {
 					}
 				}
 
-				if !deliverRoutedMessage(message) {
+				reliability := connect.CarrierReliabilityReliable
+				if useH3Datagrams {
+					reliability = connect.CarrierReliabilityUnreliable
+				}
+				if !deliverRoutedMessage(message, reliability) {
 					return
 				}
 			}
@@ -2003,10 +2075,6 @@ func (self *ConnectHandler) connectQuic(conn *quic.Conn) error {
 			}
 			connect.MessagePoolReturn(message)
 		}
-		maxDatagramByteCount := initialConnectH3DatagramPathByteCount(
-			self.settings.H3DatagramSettings.TargetDatagramByteCount,
-			conn.SendDatagram,
-		)
 		sendDatagramMessage := func(message []byte) (useStream bool, sendErr error) {
 			var nextMaxDatagramByteCount int
 			useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(

@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect"
@@ -23,11 +25,99 @@ func TestContractFailureClassIsBounded(t *testing.T) {
 		{fmt.Errorf("Insufficient balance (0)."), "insufficient_balance"},
 		{fmt.Errorf("Missing origin contract for companion."), "missing_companion_origin"},
 		{fmt.Errorf("Client does not exist."), "client_not_found"},
+		{fmt.Errorf("wrapped: %w", errContractDestinationInactive), "inactive_destination"},
 		{fmt.Errorf("postgres unavailable"), "other"},
 	}
 	for _, test := range tests {
 		if got := contractFailureClass(test.err); got != test.want {
 			t.Fatalf("contractFailureClass(%q) = %q, want %q", test.err, got, test.want)
+		}
+	}
+}
+
+func TestContractResultErrorSeparatesReliabilityFromAccountFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want protocol.ContractError
+	}{
+		{
+			name: "missing companion origin",
+			err:  model.ErrMissingCompanionOrigin,
+			want: protocol.ContractError_Reliability,
+		},
+		{
+			name: "inactive destination at write boundary",
+			err:  fmt.Errorf("write-boundary race: %w", model.ErrContractDestinationInactive),
+			want: protocol.ContractError_Reliability,
+		},
+		{
+			name: "inactive source",
+			err:  fmt.Errorf("write-boundary source: %w", model.ErrActiveClientNotFound),
+			want: protocol.ContractError_NoPermission,
+		},
+		{
+			name: "insufficient balance",
+			err:  fmt.Errorf("Insufficient balance (0)."),
+			want: protocol.ContractError_InsufficientBalance,
+		},
+		{
+			name: "unknown legacy failure",
+			err:  fmt.Errorf("postgres unavailable"),
+			want: protocol.ContractError_InsufficientBalance,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := contractResultError(test.err); got != test.want {
+				t.Fatalf("contractResultError() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestContractDestinationActive(t *testing.T) {
+	for _, test := range []struct {
+		lifecycle model.NetworkClientLifecycle
+		want      bool
+	}{
+		{model.NetworkClientLifecycleActiveTop, true},
+		{model.NetworkClientLifecycleActiveDerived, true},
+		{model.NetworkClientLifecycle("control"), true},
+		{model.NetworkClientLifecycleInactiveTop, false},
+		{model.NetworkClientLifecycleInactiveDerived, false},
+		{model.NetworkClientLifecycleMissing, false},
+		{model.NetworkClientLifecycle("future-value"), false},
+	} {
+		if got := contractDestinationActive(test.lifecycle); got != test.want {
+			t.Fatalf("contractDestinationActive(%q) = %t, want %t", test.lifecycle, got, test.want)
+		}
+	}
+}
+
+func TestContractFailureCounterInitializesInactiveDestinationPartitions(t *testing.T) {
+	metrics := make(chan prometheus.Metric)
+	go func() {
+		contractFailureCounter.Collect(metrics)
+		close(metrics)
+	}()
+
+	seen := map[string]bool{}
+	for metric := range metrics {
+		value := &dto.Metric{}
+		if err := metric.Write(value); err != nil {
+			t.Fatal(err)
+		}
+		labels := map[string]string{}
+		for _, label := range value.Label {
+			labels[label.GetName()] = label.GetValue()
+		}
+		if labels["cause"] == "inactive_destination" {
+			seen[labels["companion"]] = true
+		}
+	}
+	for _, companion := range []string{"false", "true"} {
+		if !seen[companion] {
+			t.Errorf("inactive_destination companion=%s zero series was not initialized", companion)
 		}
 	}
 }
@@ -53,6 +143,7 @@ func TestRecordContractFailureCounts(t *testing.T) {
 		{fmt.Errorf("Missing origin contract for companion."), true, "missing_companion_origin"},
 		{fmt.Errorf("Insufficient balance (0)."), false, "insufficient_balance"},
 		{fmt.Errorf("Client does not exist."), false, "client_not_found"},
+		{errContractDestinationInactive, false, "inactive_destination"},
 		// an unclassified cause still lands in a bounded bucket: `other`
 		// rising is the signal to enable V(1) and look
 		{fmt.Errorf("postgres unavailable"), false, "other"},
@@ -74,6 +165,154 @@ func TestRecordContractFailureCounts(t *testing.T) {
 		fmt.Errorf("Missing origin contract for companion."))
 	if after := count("missing_companion_origin", true); after != before {
 		t.Fatalf("a companion=false failure moved the companion=true counter: %v -> %v", before, after)
+	}
+}
+
+func TestRecordMissingOriginDetailsAreBounded(t *testing.T) {
+	count := func(
+		requestCompanion bool,
+		resolution string,
+		relationship string,
+		sourceLifecycle string,
+		destinationLifecycle string,
+	) float64 {
+		return testutil.ToFloat64(missingOriginDetailsCounter.WithLabelValues(
+			fmt.Sprintf("%t", requestCompanion),
+			resolution,
+			relationship,
+			sourceLifecycle,
+			destinationLifecycle,
+		))
+	}
+
+	resolution := contractResolution{
+		path:                 contractResolutionStreamFallback,
+		relationship:         model.ProvideModePublic,
+		sourceLifecycle:      model.NetworkClientLifecycleActiveTop,
+		destinationLifecycle: model.NetworkClientLifecycleInactiveDerived,
+	}
+	before := count(false, "stream_fallback", "public", "active_top", "inactive_derived")
+	recordContractFailureResolved(
+		server.NewId(),
+		server.NewId(),
+		false,
+		16384,
+		model.ErrMissingCompanionOrigin,
+		resolution,
+	)
+	if after := count(false, "stream_fallback", "public", "active_top", "inactive_derived"); after != before+1 {
+		t.Fatalf("missing-origin detail counter = %v, want %v", after, before+1)
+	}
+
+	// Every label passes through a fixed vocabulary even if a future caller
+	// accidentally supplies free-form values.
+	unknownBefore := count(false, "unknown", "unknown", "unknown", "unknown")
+	recordContractFailureResolved(
+		server.NewId(),
+		server.NewId(),
+		false,
+		16384,
+		model.ErrMissingCompanionOrigin,
+		contractResolution{
+			path:                 "client-controlled-value",
+			relationship:         999,
+			sourceLifecycle:      model.NetworkClientLifecycle("unbounded-source"),
+			destinationLifecycle: model.NetworkClientLifecycle("unbounded-destination"),
+		},
+	)
+	if after := count(false, "unknown", "unknown", "unknown", "unknown"); after != unknownBefore+1 {
+		t.Fatalf("unknown detail counter = %v, want %v", after, unknownBefore+1)
+	}
+
+	// Other contract causes stay out of this diagnostic family.
+	before = count(false, "stream_fallback", "public", "active_top", "inactive_derived")
+	recordContractFailureResolved(
+		server.NewId(),
+		server.NewId(),
+		false,
+		16384,
+		fmt.Errorf("postgres unavailable"),
+		resolution,
+	)
+	if after := count(false, "stream_fallback", "public", "active_top", "inactive_derived"); after != before {
+		t.Fatalf("non-missing failure moved detail counter: %v -> %v", before, after)
+	}
+}
+
+func TestRecordInactiveDestinationDetailsAreBounded(t *testing.T) {
+	count := func(
+		requestCompanion bool,
+		senderRole string,
+		resolution string,
+		relationship string,
+		sourceLifecycle string,
+		destinationLifecycle string,
+	) float64 {
+		return testutil.ToFloat64(inactiveDestinationDetailsCounter.WithLabelValues(
+			fmt.Sprintf("%t", requestCompanion),
+			senderRole,
+			resolution,
+			relationship,
+			sourceLifecycle,
+			destinationLifecycle,
+		))
+	}
+
+	serverRole := protocol.SequenceRole_SequenceRoleServer
+	resolution := contractResolution{
+		path:                 contractResolutionRequestedCompanion,
+		relationship:         model.ProvideModePublic,
+		sourceLifecycle:      model.NetworkClientLifecycleActiveTop,
+		destinationLifecycle: model.NetworkClientLifecycleInactiveDerived,
+		senderRole:           &serverRole,
+	}
+	before := count(true, "server", "requested_companion", "public", "active_top", "inactive_derived")
+	recordContractFailureResolved(
+		server.NewId(),
+		server.NewId(),
+		true,
+		16384,
+		errContractDestinationInactive,
+		resolution,
+	)
+	if after := count(true, "server", "requested_companion", "public", "active_top", "inactive_derived"); after != before+1 {
+		t.Fatalf("inactive-destination detail counter = %v, want %v", after, before+1)
+	}
+
+	// Absence proves only that the sender did not report the additive field;
+	// explicitly unknown and future values stay in a separate bounded bucket.
+	absentBefore := count(false, "absent", "unknown", "unknown", "unknown", "unknown")
+	recordContractFailureResolved(
+		server.NewId(), server.NewId(), false, 16384, errContractDestinationInactive,
+		contractResolution{},
+	)
+	if after := count(false, "absent", "unknown", "unknown", "unknown", "unknown"); after != absentBefore+1 {
+		t.Fatalf("absent-role detail counter = %v, want %v", after, absentBefore+1)
+	}
+
+	futureRole := protocol.SequenceRole(999)
+	unknownBefore := count(false, "unknown", "unknown", "unknown", "unknown", "unknown")
+	recordContractFailureResolved(
+		server.NewId(), server.NewId(), false, 16384, errContractDestinationInactive,
+		contractResolution{
+			path:                 "client-controlled-value",
+			relationship:         999,
+			sourceLifecycle:      model.NetworkClientLifecycle("unbounded-source"),
+			destinationLifecycle: model.NetworkClientLifecycle("unbounded-destination"),
+			senderRole:           &futureRole,
+		},
+	)
+	if after := count(false, "unknown", "unknown", "unknown", "unknown", "unknown"); after != unknownBefore+1 {
+		t.Fatalf("unknown-role detail counter = %v, want %v", after, unknownBefore+1)
+	}
+
+	// Other causes must not enter the inactive-destination diagnostic family.
+	before = count(true, "server", "requested_companion", "public", "active_top", "inactive_derived")
+	recordContractFailureResolved(
+		server.NewId(), server.NewId(), true, 16384, fmt.Errorf("postgres unavailable"), resolution,
+	)
+	if after := count(true, "server", "requested_companion", "public", "active_top", "inactive_derived"); after != before {
+		t.Fatalf("other failure moved inactive-destination detail counter: %v -> %v", before, after)
 	}
 }
 
@@ -291,6 +530,155 @@ func TestCreateContractCompanionFallback(t *testing.T) {
 				connect.AssertEqual(t, *result.Error, protocol.ContractError_NoPermission)
 			}
 		}
+
+		// Scenario 4: a stale provide key must not keep an inactive derived
+		// destination contractible. This is the production failure shape: the
+		// Redis mode survives lifecycle invalidation, relationship lookup still
+		// sees the same network, and the old path created a successful no-escrow
+		// contract to an identity that could no longer receive it.
+		{
+			networkId := newFundedNetwork()
+			provider := newClient(networkId)
+			consumer := newClient(networkId)
+			model.SetProvide(ctx, consumer, map[model.ProvideMode][]byte{
+				model.ProvideModeNetwork: networkKey,
+				model.ProvideModeStream:  streamKey,
+			})
+			server.Tx(ctx, func(tx server.PgTx) {
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`
+					UPDATE network_client
+					SET active = false, source_client_id = $2, deactivate_time = $3
+					WHERE client_id = $1
+					`,
+					consumer,
+					provider,
+					server.NowUtc(),
+				))
+			})
+
+			result := createReturnContract(provider, consumer)
+			connect.AssertEqual(t, result.Contract == nil, true)
+			connect.AssertEqual(t, result.Error != nil, true)
+			if result.Error != nil {
+				connect.AssertEqual(t, *result.Error, protocol.ContractError_Reliability)
+			}
+		}
+	})
+}
+
+// Ensures Redis-cached provide state cannot authorize a new contract after
+// either party is removed. An active destination with no connection row stays
+// eligible because durable identity activity, not connectivity, authorizes it.
+func TestCreateContractRejectsInactiveClient(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, fmt.Sprintf("inactive-contract-%s", networkId), server.NewId())
+
+		sourceId := server.NewId()
+		inactiveSourceId := server.NewId()
+		inactiveDestinationId := server.NewId()
+		activeDisconnectedId := server.NewId()
+		for _, clientId := range []server.Id{sourceId, inactiveSourceId, inactiveDestinationId, activeDisconnectedId} {
+			model.Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
+		}
+		secretKey := []byte("inactive-contract-network-key-00")
+		for _, destinationId := range []server.Id{inactiveDestinationId, activeDisconnectedId} {
+			model.SetProvide(ctx, destinationId, map[model.ProvideMode][]byte{
+				model.ProvideModeNetwork: secretKey,
+			})
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE network_client SET active = false WHERE client_id = ANY($1::uuid[])`,
+				[]string{inactiveSourceId.String(), inactiveDestinationId.String()},
+			))
+		})
+
+		decodeResult := func(requestSourceId server.Id, destinationId server.Id) *protocol.CreateContractResult {
+			frames, err := CreateContract(
+				ctx,
+				requestSourceId,
+				&protocol.CreateContract{
+					DestinationId:     destinationId.Bytes(),
+					TransferByteCount: uint64(1024 * 1024),
+				},
+				connect.DefaultContractManagerSettings(),
+			)
+			if err != nil {
+				t.Fatalf("create contract to %s: %v", destinationId, err)
+			}
+			if len(frames) != 1 {
+				t.Fatalf("create contract frame count = %d, want 1", len(frames))
+			}
+			message, err := connect.FromFrame(frames[0])
+			if err != nil {
+				t.Fatalf("decode create contract result: %v", err)
+			}
+			result, ok := message.(*protocol.CreateContractResult)
+			if !ok {
+				t.Fatalf("create contract response type = %T", message)
+			}
+			return result
+		}
+
+		inactiveResult := decodeResult(sourceId, inactiveDestinationId)
+		if inactiveResult.Error == nil || *inactiveResult.Error != protocol.ContractError_Reliability {
+			t.Fatalf("inactive destination error = %v, want Reliability", inactiveResult.Error)
+		}
+		if inactiveResult.Contract != nil {
+			t.Fatal("inactive destination received a contract")
+		}
+		inactiveSourceResult := decodeResult(inactiveSourceId, activeDisconnectedId)
+		if inactiveSourceResult.Error == nil || *inactiveSourceResult.Error != protocol.ContractError_NoPermission {
+			t.Fatalf("inactive source error = %v, want NoPermission", inactiveSourceResult.Error)
+		}
+		if inactiveSourceResult.Contract != nil {
+			t.Fatal("inactive source received a contract")
+		}
+
+		var inactiveContractCount int
+		var activeConnectionCount int
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`
+					SELECT
+						(SELECT count(*) FROM transfer_contract
+							WHERE (source_id = $1 AND destination_id = $2)
+								OR (source_id = $3 AND destination_id = $4)),
+						(SELECT count(*) FROM network_client_connection WHERE client_id = $4)
+				`,
+				sourceId,
+				inactiveDestinationId,
+				inactiveSourceId,
+				activeDisconnectedId,
+			)
+			server.WithPgResult(result, err, func() {
+				if !result.Next() {
+					t.Fatal("missing contract and connection counts")
+				}
+				server.Raise(result.Scan(&inactiveContractCount, &activeConnectionCount))
+			})
+		})
+		if inactiveContractCount != 0 {
+			t.Fatalf("inactive destination contract count = %d, want 0", inactiveContractCount)
+		}
+		if activeConnectionCount != 0 {
+			t.Fatalf("active disconnected client has %d connection rows, want 0", activeConnectionCount)
+		}
+
+		activeResult := decodeResult(sourceId, activeDisconnectedId)
+		if activeResult.Error != nil {
+			t.Fatalf("active disconnected destination error = %v, want nil", *activeResult.Error)
+		}
+		if activeResult.Contract == nil {
+			t.Fatal("active disconnected destination did not receive a contract")
+		}
 	})
 }
 
@@ -375,7 +763,7 @@ func TestCreateContractCompanionStreamId(t *testing.T) {
 		connect.AssertEqual(t, err, nil)
 		streamedOriginContractId, err := model.CreateContractNoEscrow(ctx, networkId, consumer, networkId, provider, model.ByteCount(1024*1024))
 		connect.AssertEqual(t, err, nil)
-		intermediaryId := server.NewId()
+		intermediaryId := newClient(networkId)
 		streamId := model.AddToStream(ctx, streamedOriginContractId, consumer, provider, []server.Id{intermediaryId})
 
 		result := createCompanionContract(provider, consumer, &streamVersion1)

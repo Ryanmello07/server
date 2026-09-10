@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	// "fmt"
 	mathrand "math/rand"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -121,6 +122,8 @@ type ConnectionAnnounceSettings struct {
 	// are nil in production.
 	LifecycleStarted func()
 	LifecycleDone    func()
+	// Synchronous test barrier after the Redis recorder returns.
+	reliabilityStatsRecordedForTest func(server.Id, model.ClientReliabilityStats)
 }
 
 type LatencyTest struct {
@@ -383,8 +386,11 @@ func (self *ConnectionAnnounce) run() {
 	// egress for `/verify` source-ip attribution. Feed on connect,
 	// ttl-refresh while connected, clear on disconnect. The bijection gate in
 	// the model excludes shared or ambiguous ips (§8.2).
-	verifySettings := model.DefaultVerifySettings()
-	verifyEgressIp, verifyEgressOk := model.ParseVerifyEgressIp(self.clientAddress)
+	verifySettings, verifyEnabled := connectionVerifySettings()
+	verifyEgressIp, verifyEgressOk := netip.Addr{}, false
+	if verifyEnabled {
+		verifyEgressIp, verifyEgressOk = model.ParseVerifyEgressIp(self.clientAddress)
+	}
 	if verifyEgressOk {
 		model.FeedVerifyEgress(self.ctx, self.clientId, verifyEgressIp, verifySettings)
 		self.startWorker(func() {
@@ -624,9 +630,23 @@ func (self *ConnectionAnnounce) run() {
 					nextStartTime,
 					stats,
 				)
+				if recorded := self.settings.reliabilityStatsRecordedForTest; recorded != nil {
+					recorded(self.clientId, *stats)
+				}
 			}
 		}
 	}
+}
+
+// Connect and API are separate processes, so the observed-egress writer must
+// resolve the same canonical verify.yml settings as the API reader. Using the
+// model defaults here creates a second, unkeyed Redis namespace whenever the
+// deployment configures the required egress HMAC key.
+func connectionVerifySettings() (*model.VerifySettings, bool) {
+	if !controller.StEnabled() {
+		return nil, false
+	}
+	return controller.VerifySettings(), true
 }
 
 func (self *ConnectionAnnounce) setConnectionId(connectionId server.Id) {

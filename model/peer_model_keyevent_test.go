@@ -1,7 +1,11 @@
+// Network peer key-event tests cover registry lifecycle and deterministic
+// listener fanout behavior.
 package model
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,11 +13,110 @@ import (
 	"github.com/urnetwork/server"
 )
 
+// TestNetworkPeerDeltaLoadsOnceAcrossListeners reproduces the live-delta
+// fanout that multiplied one peer metadata read by every resident listener.
+// All listeners contend on the same blocked loader, then must receive the
+// update from exactly one completed load.
+func TestNetworkPeerDeltaLoadsOnceAcrossListeners(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const listenerCount = 16
+	networkId := server.NewId()
+	clientId := server.NewId()
+	peer := &NetworkPeer{
+		ClientId:   clientId,
+		DeviceName: "shared peer",
+	}
+	eventChans := make([]chan *NetworkPeerEvent, listenerCount)
+	listeners := make([]*NetworkPeerListener, listenerCount)
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var releaseOnce sync.Once
+	var loadCount atomic.Int64
+	defer func() {
+		releaseOnce.Do(func() {
+			close(releaseLoad)
+		})
+		for _, listener := range listeners {
+			listener.CloseAndWait()
+		}
+	}()
+
+	for i := range listenerCount {
+		eventChans[i] = make(chan *NetworkPeerEvent, 4)
+		listeners[i] = NewNetworkPeerListener(
+			ctx,
+			networkId,
+			func(event *NetworkPeerEvent) {
+				eventChans[i] <- event
+			},
+			10*time.Minute,
+			0,
+		)
+		listeners[i].ApplySnapshot(PrepareNetworkPeerSnapshot(41, nil))
+	}
+	for i := range listenerCount {
+		select {
+		case event := <-eventChans[i]:
+			if event.NetworkPeerEventType != NetworkPeerEventTypeReset {
+				t.Fatalf("listener %d initial event = %d; want reset", i, event.NetworkPeerEventType)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("listener %d did not apply its initial snapshot", i)
+		}
+	}
+
+	delta := newNetworkPeerDelta(clientId, "set", func() networkPeerDeltaValue {
+		if loadCount.Add(1) == 1 {
+			close(loadStarted)
+		}
+		<-releaseLoad
+		return networkPeerDeltaValue{
+			peer:       peer,
+			eventId:    42,
+			hasEventId: true,
+		}
+	})
+	for _, listener := range listeners {
+		listener.ApplyDelta(delta)
+	}
+
+	select {
+	case <-loadStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shared delta loader did not start")
+	}
+	releaseOnce.Do(func() {
+		close(releaseLoad)
+	})
+
+	for i := range listenerCount {
+		select {
+		case event := <-eventChans[i]:
+			if event.NetworkPeerEventType != NetworkPeerEventTypeUpdated {
+				t.Fatalf("listener %d event = %d; want updated", i, event.NetworkPeerEventType)
+			}
+			if event.EventId != 42 {
+				t.Fatalf("listener %d event id = %d; want 42", i, event.EventId)
+			}
+			if len(event.Peers) != 1 || event.Peers[0] != peer {
+				t.Fatalf("listener %d did not receive the shared peer: %+v", i, event.Peers)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("listener %d did not apply the shared delta", i)
+		}
+	}
+	if got := loadCount.Load(); got != 1 {
+		t.Fatalf("shared delta loader ran %d times; want 1", got)
+	}
+}
+
 // TestNetworkPeerMemberKeys asserts the PEERSSTREAMS2 per-member key
 // lifecycle alongside the registry writers: add writes the key with the
 // registration ttl, refresh extends the ttl without rewriting, provide-mode
-// updates rewrite preserving the ttl, remove deletes, and the delta read
-// surfaces the registered peer.
+// updates rewrite preserving the ttl, a missing member forces a fresh re-add,
+// remove deletes, and the delta read surfaces the registered peer.
 func TestNetworkPeerMemberKeys(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -57,12 +160,19 @@ func TestNetworkPeerMemberKeys(t *testing.T) {
 		// no-ops — assert the key survived untouched instead)
 		connect.AssertEqual(t, ttl < memberTtl(), true)
 
-		// refresh restores a vanished member key
+		// A vanished member means the registration was lost. Refresh must not
+		// restore metadata captured before a concurrent replacement; its caller
+		// takes the false branch and re-adds with a fresh canonical profile.
 		server.Redis(ctx, func(r server.RedisClient) {
 			r.Del(ctx, networkPeerMemberKey(networkId, clientId))
 		})
 		ok = RefreshNetworkPeer(ctx, networkId, clientId, residentId, ttl)
-		connect.AssertEqual(t, ok, true)
+		connect.AssertEqual(t, ok, false)
+		connect.AssertEqual(t, memberTtl() < 0, true)
+		AddNetworkPeer(ctx, networkId, &NetworkPeer{
+			ClientId:   clientId,
+			DeviceName: "device a",
+		}, residentId, ttl)
 		connect.AssertEqual(t, 0 < memberTtl(), true)
 
 		// remove deletes the member key

@@ -13,8 +13,8 @@ The signal catalog — WHAT to measure, HOW, healthy/broken bands — lives in
 SIGNALS.md (this directory). This document is the architecture of the program
 that encodes those signals as automated probes.
 
-Related: FOLLOWUP.md (open items ledger), SIGNALS.md §7 (the alert emission
-spec this service implements).
+Related: RUN-MAIN.md (continuous root-cause agent harness), FOLLOWUP.md (open
+items ledger), SIGNALS.md §7 (the alert emission spec this service implements).
 
 ---
 
@@ -38,6 +38,12 @@ spec this service implements).
    battery per host); a probe that times out is *recorded as an observation*
    (often the strongest signal — e.g. a hung redis PING), never retried hot.
    The monitor never mutates the monitored systems.
+   Durable task identifiers are correlation material, not alert content: a
+   probe may use an exact identifier in memory to join PostgreSQL and log
+   lifecycle records, but `Alert`/Markdown emits only a correlation boolean,
+   task family, duration, lifecycle timestamps, executor, and bounded error
+   class. The identifier must be obtained separately through a protected
+   operator lookup before any authorized mutation.
 4. **Baseline over threshold.** Static bands from SIGNALS.md are the floor,
    but the strongest detections are deviations from *learned normal* ("a ton
    of table-scan queries when normally we don't have that"). The monitor
@@ -47,8 +53,18 @@ spec this service implements).
    from the warp logs (journalctl) and docker container status on the edge
    hosts themselves — not from a side-channel feed or a dashboard. The same
    rule everywhere: pg state from pg_stat_* on the primary, redis state from
-   the nodes' own INFO/CLUSTER NODES, host state from the host. Derived or
-   aggregated sources (grafana, exported metrics) are never a probe input.
+   the nodes' own INFO/CLUSTER NODES, host state from the host. Dashboards and
+   inferred aggregates are not probe inputs. The narrow exceptions are §2.12
+   and §11.20:
+   Go runtime counters are emitted by the process itself and queried from
+   Mimir with host/block/instance identity plus a 90-second freshness bound,
+   because `/proc` RSS cannot distinguish allocated Go heap from retained
+   pages. `HeapAlloc` can include unreachable objects awaiting the next GC;
+   it is still the direct allocator/collector pressure signal, not a claim
+   that every sampled byte remains reachable. The Mimir-continuity probe tests
+   the metric store itself with the raw range of an always-emitted build-info
+   control; it never treats a dashboard rendering or traffic aggregate as the
+   signal.
 6. **Identity, not volume.** Dedup key = (signal id, class, target, frame)
    per SIGNALS.md §6. Rate is reported; volume is never severity. One ticket
    per identity, updated in place, auto-resolved when the signal returns to
@@ -64,7 +80,7 @@ host, redis-cli on the redis hosts, top/ss/dmesg/journalctl/docker anywhere.
 ssh authentication is delegated to `~/.ssh/config` (host → IdentityFile),
 assumed set up on whatever runs the monitor; no key material lives in
 `vault/<env>/monitor.yml` — it carries only the login user, host roles,
-overlay IPs, and redis ports.
+operator-disabled state, overlay IPs, and redis ports.
 
 **ssh-exec is the universal transport.** Every command in SIGNALS.md is
 written as a run-on-the-host command, and that is exactly how the monitor
@@ -77,8 +93,11 @@ consequences:
   LAN IPs like 192.168.51.x are NOT routable but 172.28.208.x is). Address
   selection is a config knob, not an architecture change.
 - No pg/redis client libraries needed for the remote side; psql/redis-cli
-  on the hosts are the client. Output is parsed (psql `-A -F'|' -t` for
-  machine-readable rows; `INFO`/`CLUSTER NODES` are line protocols).
+  on the hosts are the client. Output is parsed (psql `--csv -t` with a
+  structural CSV decoder for machine-readable rows; `INFO`/`CLUSTER NODES`
+  are line protocols). Embedded newlines, pipes, and quotes remain inside the
+  PostgreSQL cell that owns them; malformed or unterminated CSV fails closed
+  as an observation error.
 - Direct TCP connectors (pgx to 5432, go-redis to nodes) are a later
   in-LAN optimization behind the same connector interface, not a
   requirement.
@@ -102,10 +121,16 @@ tags on the edges, not git.
 The monitor has full vault + config access (the standard WARP_HOME
 resolvers) and reads every shared fact from its source of truth rather than
 duplicating it: pg credentials from `vault/<env>/pg.yml`, redis credentials
-from `vault/<env>/redis.yml`, host LAN IPs from `config/<env>/settings.yml`
-routes. `vault/<env>/monitor.yml` (§7) carries only what exists nowhere
-else: the monitor ssh identity, host roles, overlay IPs (local dev), and
-redis port layout. The pg path has one special rule from
+from `vault/<env>/redis.yml`, the Grafana datasource-probe credential from
+`vault/<env>/grafana.yml`, optional read-only mobile-reporting credentials from
+`vault/<env>/google-play-reporting.json` and
+`vault/<env>/apple-reporting.yml`, and host LAN IPs from
+`config/<env>/settings.yml` routes. Public edge IPv6 identities come from the
+first active version in `vault/<env>/services.yml`; historical versions are
+never probe targets.
+`vault/<env>/monitor.yml` (§7) carries only what exists nowhere else: the
+monitor ssh identity, host roles, explicit operator-disabled state, overlay
+IPs (local dev), and redis port layout. The pg path has one special rule from
 the 2026-07-17 incident: diagnose on **direct 5432**, never through
 pgbouncer 6432 — but *also* probe 6432 cheaply, because "6432 queues/dies
 while 5432 connects instantly" is itself a documented discriminator
@@ -148,25 +173,39 @@ while 5432 connects instantly" is itself a documented discriminator
    of pg/redis so it works precisely when they don't
 ```
 
-### 3.1 Probes
+### 3.1 Signals
 
-One probe per SIGNALS.md signal, registered with id, tier, cadence, and the
-alert-spec row it implements (§7 tables are the authoritative probe list).
+One reusable `Signal` per automated SIGNALS.md check is registered by
+`NewSignals`. Each catalog section declares a short semantic `Probe:` key;
+`contract-rate`, for example, lives in `signal_contract_rate.go` and has a
+synthetic failure in `signal_contract_rate_test.go`. The Go file comments its
+source section (`SIGNALS.md §1.1`). The registry test enforces the catalog key,
+semantic filenames, source comment, and registration together.
 
 ```go
-type Probe interface {
-    Id() string                  // "pg/active-pileup" — matches §7 id
-    Tier() Tier                  // TierPage | TierWarn
-    Cadence() time.Duration      // 60s tier-0; 5m–1h tier-1; 24h daily
-    Check(ctx context.Context, env *Env) ([]Observation, error)
+type Signal interface {
+    Number() string
+    Key() string
+    ID() string
+    Name() string
+    Cadence() time.Duration
+    Run(context.Context, SignalSettings) (Alerts, error)
 }
 ```
 
-An `Observation` is a named metric sample plus structured evidence
-(query text, node ip:port, error class, sample log line). `Check` returning
-an error is itself an observation about reachability (see §3.6) — probes
-must distinguish "the check ran and the value is X" from "the check could
-not run".
+`SignalSettings` contains environment inventory, canonical feature state used
+to classify feature-owned work, PostgreSQL settings, SSH users and identity
+paths, timeouts, state directory, and an injectable `SignalSource`. Production
+uses the read-only SSH transport; every synthetic
+test supplies a source with deterministic PostgreSQL, Redis, host-command,
+local-command, and raw TCP-exchange output. An `Alert` carries stable identity
+plus symptom, mechanism, baseline, observed values, evidence, action,
+verification, and playbook fields. `Alert.Markdown` and `AlertsMarkdown`
+render the same value as a detailed human-readable alert file;
+`WriteAlertsJSONL` emits the ordered structured values one alert per line.
+Task-oriented synthetic failures also assert that every seeded identifier is
+absent from the rendered Markdown, while exact internal lifecycle correlation
+still selects the correct attempt and executor.
 
 Probes are cheap by construction: tier-0 is five queries/commands per 60s
 tick (SIGNALS.md §1 — contract rate, canaries, idle-in-tx/active split,
@@ -290,21 +329,40 @@ Logs are a first-class signal (SIGNALS.md 1.5): the monitor tails ALL
 services AT ALL TIMES looking for error signatures. Unlike cadence probes,
 a tailer is a standing collector: one long-running `warpctl logs <env>
 <service> -f` per service, each line classified against the SIGNALS.md §4
-taxonomy as it arrives. Per minute, each tailer folds its counts into
+taxonomy as it arrives. A connected external WebSocket is not a completeness
+proof: Loki can ingest an older source timestamp behind an already-advanced
+cursor, and an internal gRPC tail backend can fail while the external stream
+stays open. Each tailer therefore also runs a bounded two-minute range
+reconciliation every 45 seconds. Exact fingerprints make alert-relevant
+overlap idempotent; ordinary lines are not retained. Per
+minute, each tailer folds its counts into
 findings — (class, target ip:port, innermost frame) identity, rate, one
 sample line — through the same evaluator/ticket path as every other probe.
 Unmatched error-shaped lines at rate are reported as class `novel` (new
 panic frames and unseen failure modes are exactly what a fixed taxonomy
 misses). Tailer self-health: a tailer that exits or goes silent while its
 service is running restarts with backoff and raises `monitor/visibility`
-if it cannot stay up. Escalation batteries pull incident windows
-non-interactively with `--since=<duration>` instead of tailing.
+if it cannot stay up. Failed, stale, or truncated reconciliation raises the
+independent `tailer-reconcile` visibility class, because a connected process
+does not prove complete contents. The separate `loki-tail-backend-eof` class
+matches only the internal tail-querier's unquoted EOF; client-driven
+`context canceled` during deliberate watcher retirement is excluded.
+Escalation batteries pull incident windows non-interactively with
+`--since=<duration>` instead of tailing.
 
 ## 4. Scheduler and load budget
 
-- Per-probe tickers with jitter; a probe never overlaps itself.
-- Per-host semaphore (1 concurrent battery, small cap for probes) so the
-  monitor cannot pile onto a struggling host.
+- Per-probe cadence timers; a probe never overlaps itself.
+- Each probe starts a fresh cadence timer after its observation and alert
+  handler complete. Time spent queued or running therefore cannot create a
+  buffered or wall-aligned back-to-back catch-up query against an already-slow
+  dependency.
+- One runtime-shared semaphore per destination host, capped at two actual SSH
+  commands across every probe and probe-local battery. A limiter created per
+  probe is not sufficient: four admitted signals can each fan out internally
+  and cross OpenSSH's default `MaxStartups=10` before authentication. Different
+  hosts retain independent budgets, and the command timeout begins only after
+  a host slot is admitted, so queue time cannot masquerade as host failure.
 - Global kill: SIGTERM drains in-flight commands (same quitEvent pattern as
   the other services).
 - Budget at steady state (all tier-0 + tier-1): a handful of
@@ -315,11 +373,13 @@ non-interactively with `--since=<duration>` instead of tailing.
 
 | cadence | probes (SIGNALS.md ref) |
 |---|---|
-| 60s | contract rate 1.1; canary completions + failing tasks 1.2; idle-in-tx/active split 1.3; cluster_state + per-node PING 1.4 |
+| 60s | contract rate 1.1; canary completions + failing tasks 1.2; idle-in-tx/active split 1.3; cluster_state + per-node PING 1.4; taskworker allocated-heap skew 2.12 |
 | 5m | open-set count 2.6; per-node INFO memory 3.1/3.2; connected_clients 3.5; parked tasks 1.2; pgbouncer 6432 reachability; control-plane clock (journalctl warp logs + docker container status per host — feeds every ticket's CONTEXT line) |
-| continuous | log tailers §3.7: one `warpctl logs <service> -f` per service, §4 classification per line, per-minute rate findings |
+| continuous | log tailers §3.7: one `warpctl logs <service> -f` per service plus a 45s bounded overlap reconciliation, §4 classification per line, per-minute rate findings |
 | 15m | pg_stat_statements top-20 mean drift 2.3 |
+| 30m | Google Play crash issue/version advances plus explicit vitals freshness 20.1 |
 | 1h | vacuum health 2.4; task duration percentiles 2.5; phantom/replica topology 3.6; zombie-tx 1.3 |
+| 6h | Apple App Crashes daily instances, privacy visibility, and replacement corrections 20.2 |
 | 24h | stats-landmine check (pg_stats n_distinct on transfer_contract.open + open-partial reltuples) §7; keyspace family histogram on fullest node 3.3; dmesg OOM scan 3.4 |
 
 The log tailers are always-on (a standing `warpctl logs -f` per service),
@@ -328,29 +388,29 @@ cheapest first read on most log classes and stays as its own probe.
 
 ## 6. Package layout
 
-One flat `package main` at `server/monitor` (connect/CODESTYLE.md package
-layering: a package must never import its own subpackages; shared code that
-several files need is just a file in the package, grouped by filename
-prefix — the `bringyourctl` precedent):
+One importable `package monitor` at `server/monitor`; process wiring is the
+thin `server/cli/monitor` command:
 
 ```
 server/monitor/
   MONITOR.md            this design
   SIGNALS.md            the signal catalog (what "wrong" looks like)
-  main.go               docopt usage, probe registry, scheduler loop, --once
-  config.go             monitor.yml + pg.yml + settings.yml routes assembly
+  alert.go              structured Alert plus Markdown and JSONL rendering
+  settings.go           SignalSettings and injectable SignalSource
+  signal.go             Signal interface and common adapter
+  registry.go           Monitor constructor and explicit signal registry
+  run.go                run-all, one-signal, and cadence scheduling utilities
+  provider_reports.go   bounded provider HTTP/auth-adjacent, cursor, checksum,
+                        gzip, pagination, locking, and evidence utilities
+  signal_short_key.go       focused implementation linked to SIGNALS.md §X.Y
+  signal_short_key_test.go  synthetic broken-state test for that probe
+  config.go             monitor/shared vault + settings.yml routes assembly
   conn.go               ssh-exec transport; pg/redis/shell/warpctl runners
   baseline.go           local metric history (trailing medians, retention)
-  probe.go              probe interface, finding, tiers, small helpers
-  probe_pg.go           tier-0 pg: state split 1.3, contract rate 1.1
-  probe_pg_tier1.go     open-set 2.6, pgbouncer, vacuum 2.4, stats-landmine
-  probe_tasks.go        canary + parked 1.2, duration regression 2.5
-  probe_redis.go        tier-0 redis: cluster state + per-node ping 1.4
-  probe_redis_tier1.go  per-node memory/skew/buffers/conns 3.1-3.5, topology 3.6
   battery.go            escalation batteries (5.8 plan wall, 5.2/5.4 node)
   tailer.go             always-on log tailers + §4 classifier + novel class
-  ticket.go             identity, lifecycle, hysteresis, §6b rendering
-  emit_console.go       console emitter (webhook/github pr deferred)
+server/cli/monitor/
+  main.go               flags, process signals, and calls into package monitor
 ```
 
 Follows the repo's conventions: built automatically by the existing
@@ -367,26 +427,67 @@ the full inventory; abbreviated shape):
 ssh:
   user: monitor       # deployed login user (in-lan)
   dev_user: by        # login user for local dev over the overlay
+  identity_files:     # optional; otherwise ~/.ssh/config remains authoritative
+    - /run/secrets/monitor_ed25519
 address_mode: overlay # lan (deployed) | overlay (local dev)
 hosts:                # only monitor-specific facts; lan ips come
   - name: by-us-fmt-5-edge-2   # from config settings.yml routes by name
     overlay_ip: 172.28.208.182
     roles: [pg-primary]
+  - name: by-us-fmt-5-edge-5
+    disabled: true             # known offline; excluded from all probes
+    overlay_ip: 172.28.208.176
+    roles: [services]
   - name: by-us-fmt-5-edge-6
     overlay_ip: 172.28.208.177
     roles: [redis-cluster, minio]
-    redis: {entry_port: 6379, node_ports: [6380, 6411]}
-  # ... service hosts with roles [services], snow [subtensor]
+    redis: {entry_port: 6379, node_ports: [6380, 6411], expected_replicas: 0}
+  - name: fireside.bringyour.com
+    roles: [services]
+    proxy:
+      public_hostname: fireside.bringyour.com
+      public_interface: eno1
+      routing_table: 100
+      load_balancer_unit: warp-main-lb-eno1.service
+      address_families: [ipv4, ipv6]
+  - name: snow
+    overlay_ip: 172.28.208.185
+    roles: [subtensor]
+    subtensor:
+      public_rpc_url: https://test.finney.opentensor.ai
+      expected_chain: Bittensor
+      expected_genesis_hash: "0x..."
+      expected_spec_name: node-subtensor
+      expected_spec_version: 455  # current verified upstream pin; update with Xops
+      expected_transaction_version: 1
+      expected_evm_chain_id: "0x3b1"
+      warp_max_lag: 4096
+      nodes:
+        - {name: archive, sync_mode: full, rpc_port: 9945, gateway_port: 9944}
+        - {name: lightnode, sync_mode: warp, rpc_port: 9947, gateway_port: 9946}
+  # ... other service hosts with roles [services]
 pg:
   port: 5432          # direct; 6432 probed separately as pgbouncer
+source_attribution:   # optional; each expected address arms that family
+  expected_ipv4: 203.0.113.10
+  expected_ipv6: 2001:db8::10
 ```
 
-ssh keys are not stored here — `~/.ssh/config` supplies the IdentityFile per
-host (assumed set up). Everything else shared is read from its source of
+SSH identity paths are optional; when omitted, `~/.ssh/config` supplies the
+IdentityFile per host. Everything else shared is read from its source of
 truth, never duplicated here (§2): pg credentials from `vault/<env>/pg.yml`
 (password passed on stdin line 1 of each battery, never argv), redis
 credentials from `vault/<env>/redis.yml`, LAN routes from
-`config/<env>/settings.yml`.
+`config/<env>/settings.yml`, the Grafana admin credential used only for the
+authenticated datasource control from `vault/<env>/grafana.yml`, and active
+nontransparent edge IPv6 interfaces from the first
+`vault/<env>/services.yml` version. The Google package and Apple numeric app ID
+remain authoritative in `google.yml` and `apple.yml`; the dedicated reporting
+resources contain only provider identities. Either reporting resource may be
+absent, in which case its corresponding §20 signal performs no validation,
+opens no network connection, and returns no alert. Once a resource exists,
+malformed or incomplete content is a visibility failure rather than an
+implicit disable.
 
 ## 8. Development plan
 
@@ -399,9 +500,14 @@ Run it locally:
 
 ```
 WARP_HOME=/Users/brien/urnetwork WARP_ENV=main WARP_VERSION=0.0.0 \
-  go run ./monitor --once        # one pass, print what would fire
-WARP_HOME=... WARP_ENV=main ... go run ./monitor   # the 60s loop
+  go run ./cli/monitor --once        # one pass, render a Markdown alert file
+WARP_HOME=... WARP_ENV=main ... go run ./cli/monitor   # cadence loop
 ```
+
+During an explicit per-host routing maintenance window, add
+`-exclude-edge-ipv6-host <configured-host-name>`. This removes only that
+host's exact public IPv6 targets from both edge IPv6 and Grafana ingress
+probes; every other signal and host continues. Unknown host names fail closed.
 
 1. **Skeleton + tier-0 — DONE (2026-07-17).** main loop + `--once`, sshExec
    connector (conn/), four tier-0 probes (contract rate 1.1, pg state split
@@ -415,6 +521,11 @@ WARP_HOME=... WARP_ENV=main ... go run ./monitor   # the 60s loop
    PGOPTIONS at connection); `--once` needs `Immediate` mode to surface
    findings without waiting for the multi-tick sustain. (Log-class probe 1.5
    deferred to phase 6.)
+   A 2026-09-07 task error exposed a second shared framing bug: newline/pipe
+   splitting could turn an error continuation into a synthetic task-family
+   frame, bypassing the error-cell identifier redactor. The PostgreSQL
+   transport now decodes psql CSV structurally and rejects malformed or
+   truncated output instead of attributing a fragment.
 2. **Ticket lifecycle — DONE in phase 1** (identity/dedupe/hysteresis/
    auto-resolve; JSON event line on stderr). Additional alerting channels
    (webhook, github pr, persistence/spool) deliberately DEFERRED — console
@@ -451,11 +562,36 @@ WARP_HOME=... WARP_ENV=main ... go run ./monitor   # the 60s loop
    exemplars; the lossless bounded counter and file-provisioned Grafana rules
    own their rate alerts (SIGNALS.md §4). The same pass found a real Grafana
    panic-loop (stale CloudWatch datasource, log group missing).
-6. **Log tailers — DONE (2026-07-17)** (§3.7): standing `warpctl logs -f`
-   per service (service list from `warpctl ls services`), §4 taxonomy
-   classifier + novel-class detection, per-minute drain through a probe
-   into the same ticket path; restart-with-backoff. Loop mode only
-   (--no-tail to disable); not exercised by --once.
+6. **Log tailers — DONE (2026-07-17; reconciled 2026-08-31)** (§3.7):
+   standing `warpctl logs -f` per configured service, §4 taxonomy classifier
+   + novel-class detection, per-minute drain through a probe into the same
+   ticket path; restart-with-backoff. A bounded two-minute reconciliation
+   closes the late-ingestion timestamp-cursor gap and has independent
+   visibility health. If the aggregate query reaches its 20,000-line cap, the
+   monitor repeats the same absolute window for each block in the active
+   `services.yml` version. A cap-sized block continues from its inclusive
+   final source timestamp, de-duplicates that boundary, and may consume at
+   most eight pages. A live Proxy full-sync burst exercised both levels; the
+   same burst made Loki reset its dropped-stream metadata 18,165 times/minute,
+   which is now an explicit `loki-tail-dropped-streams` finding. Deterministic
+   tests cover partition recovery, boundary recovery, non-advancement, and the
+   page bound. The ingester reset remains `loki-tail-dropped-streams`; the raw
+   Grafana log is not affected-selector attribution. Upstream Loki 3.7.3
+   discards its internal `DroppedStreams` metadata at the querier hop, while
+   Warp commit `5927527` forwards that bounded metadata into Loki's existing
+   HTTP `dropped_entries` response without raising a queue. The later
+   querier-to-WebSocket overflow uses the same field. Warpctl at Warp commit
+   `26089b2` surfaces every non-empty response as one privacy-safe service/count
+   summary. The monitor maps that direct, service-attributed evidence to the
+   separate `loki-tail-dropped-entries` class and correlates it with the raw
+   reset to distinguish the earlier stage.
+   A later exact 60-second Loki backend-EOF cadence exposed
+   Warp's ring TCP application read deadline; the classifier now distinguishes
+   that internal EOF from expected client cancellation while reconciliation
+   continues to cover the independent cursor boundary. The first v152 live
+   minute classified six EOFs while all eight tails and reconciliation stayed
+   healthy; gracefully retiring v151 did not misclassify its cancellation
+   burst. Loop mode only (--no-tail to disable); not exercised by --once.
 7. **Deployment**: provision `monitor` user + vault/main/monitor.yml,
    deploy as a warp service in-LAN; webhook emitter for the diagnosing
    system.
@@ -472,12 +608,13 @@ Decided (2026-07-17):
   control-plane probe maintains the per-host "last deploy/restart" clock
   that every ticket's CONTEXT line reads from. No side-channel feed.
 - **Grafana split**: the monitor identifies issues — events/alerts that
-  need investigation, delivered as tickets. Grafana collects metrics to
-  support decisions: it is the data source for the *fixer/debugger* working
-  a ticket. The monitor never consumes Grafana/Prometheus as a probe input
-  (principle 5). File-provisioned Grafana alerts are the explicit exception
-  for bounded application counters whose lossless rate cannot be reconstructed
-  after required log sampling; contract-failure causes use that path.
+  need investigation, delivered as tickets. Grafana normally supports the
+  *fixer/debugger* working a ticket, not detection. Explicit exceptions are
+  bounded application-counter rates whose lossless rate cannot be reconstructed
+  after required log sampling, §2.12's fresh process-originated Go heap
+  metrics, and §11.20's raw always-emitted control used to test Mimir
+  continuity. All retain concrete series identity and static bands; none uses
+  a dashboard-derived judgment as the signal.
 - **Runtime**: developed and run locally first (address_mode: overlay,
   ssh_override with the existing workstation access) against main; in-LAN
   deployment as a warp service comes after the probe set stabilizes.
@@ -487,7 +624,7 @@ Decided (2026-07-17):
   IdentityFile per host (assumed set up). The `monitor` user does NOT exist
   on hosts yet — provisioning is an ops task.
 - **Vault + config access**: the monitor runs with the standard WARP_HOME
-  resolvers and reads shared values (pg/redis credentials, LAN routes)
+  resolvers and reads shared values (pg/redis/Grafana credentials, LAN routes)
   directly from vault/<env> and config/<env> — monitor.yml never duplicates
   a fact that has a source of truth elsewhere.
 

@@ -7,11 +7,24 @@ import (
 	"github.com/urnetwork/connect"
 )
 
-func TestPriorityReindexIndexesAreCoveredExactlyOncePerCycle(t *testing.T) {
-	if dbMaintenanceShouldReindexTable("transfer_contract") {
-		t.Fatal("transfer_contract would still be rebuilt as a whole")
+func TestDbMaintenanceSkipsWholeReindexForLargeHighChurnTables(t *testing.T) {
+	for _, tableName := range []string{
+		"contract_participant",
+		"contract_close",
+		"transfer_contract",
+		"transfer_escrow",
+		"transfer_escrow_sweep",
+	} {
+		if dbMaintenanceShouldReindexTable(tableName) {
+			t.Fatalf("%s would still be rebuilt as a whole", tableName)
+		}
 	}
+	if !dbMaintenanceShouldReindexTable("account_feedback") {
+		t.Fatal("ordinary table was excluded from the reindex rotation")
+	}
+}
 
+func TestPriorityReindexIndexesAreCoveredExactlyOncePerCycle(t *testing.T) {
 	seen := map[string]int{}
 	for epoch := uint64(0); epoch < DbReindexEpochs; epoch++ {
 		for _, name := range priorityReindexIndexesForEpoch(epoch) {
@@ -33,6 +46,55 @@ func TestPriorityReindexIndexesAreCoveredExactlyOncePerCycle(t *testing.T) {
 			}
 		})
 		t.Fatalf("unexpected priority indexes selected: %v", extra)
+	}
+}
+
+func TestDbMaintenanceObjectStepsGuardEveryDefaultReindex(t *testing.T) {
+	want := []dbMaintenanceObjectStep{
+		dbMaintenanceCleanupBefore,
+		dbMaintenanceReindex,
+		dbMaintenanceCleanupAfter,
+	}
+	if got := dbMaintenanceObjectSteps(true, true); !slices.Equal(got, want) {
+		t.Fatalf("default maintenance steps = %v, want %v", got, want)
+	}
+
+	wantCleanupOnly := []dbMaintenanceObjectStep{dbMaintenanceCleanupBefore}
+	if got := dbMaintenanceObjectSteps(true, false); !slices.Equal(got, wantCleanupOnly) {
+		t.Fatalf("cleanup-only maintenance steps = %v, want %v", got, wantCleanupOnly)
+	}
+
+	wantReindexOnly := []dbMaintenanceObjectStep{dbMaintenanceReindex}
+	if got := dbMaintenanceObjectSteps(false, true); !slices.Equal(got, wantReindexOnly) {
+		t.Fatalf("reindex-only maintenance steps = %v, want %v", got, wantReindexOnly)
+	}
+}
+
+func TestDbMaintenanceObjectStepsCleanFailedReindexBeforeNextAttempt(t *testing.T) {
+	steps := dbMaintenanceObjectSteps(true, true)
+
+	run := []dbMaintenanceObjectStep{}
+	runDbMaintenanceObjectSteps(steps, func(step dbMaintenanceObjectStep) bool {
+		run = append(run, step)
+		return step != dbMaintenanceReindex
+	})
+	want := []dbMaintenanceObjectStep{
+		dbMaintenanceCleanupBefore,
+		dbMaintenanceReindex,
+		dbMaintenanceCleanupAfter,
+	}
+	if !slices.Equal(run, want) {
+		t.Fatalf("steps after reindex failure = %v, want cleanup after failure %v", run, want)
+	}
+
+	run = nil
+	runDbMaintenanceObjectSteps(steps, func(step dbMaintenanceObjectStep) bool {
+		run = append(run, step)
+		return false
+	})
+	want = []dbMaintenanceObjectStep{dbMaintenanceCleanupBefore}
+	if !slices.Equal(run, want) {
+		t.Fatalf("steps after prerequisite cleanup failure = %v, want no reindex %v", run, want)
 	}
 }
 

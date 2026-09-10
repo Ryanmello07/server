@@ -1,0 +1,225 @@
+schema: 1
+status_date: 2026-09-04
+launch_state: local_validation_complete_evaluator_rebuild_and_external_actions_pending
+
+evaluation_host:
+  authoritative_hosts_required: 1
+  physical_cpu_count: 12
+  evaluation_cpu_count: 10
+  management_cpu_count: 2
+  memory_gib: 128
+
+season:
+  epoch_count: 6
+  submission_window_seconds: 604800
+  reveal: after_close_drain_and_honesty_review_finalization
+  grading: immediate_redis_fifo_with_post_close_drain
+  worker_lifecycle: one_shot_exit_after_epoch_drain_before_honesty_review
+  next_epoch_control: external_agentic_review_and_promotion_loop
+  preparation_window_seconds: 57600
+  submission_fee_usd: 20
+  queue_limit: 0
+  score_timeout_seconds: 10800
+  first_opens_at: null
+  season_ends_at: null
+  retain_until: null
+  baseline_source_policy: promote_significant_winner_or_carry_forward_unchanged
+
+significance:
+  authority: config/main/sim-latency.yml
+  method: one-sided-welch-t
+  alpha: 0.05
+  initial_improvement_percent: 16.1
+  threshold_scope: per_source_epoch
+  evaluation_record: means_variances_p_value_and_next_epoch_recommendation
+  winner_requirement: placeable_margin_statistical_significance_and_approved_honesty_review
+  no_winner_policy: carry_commits_and_threshold_forward_when_none_significant_or_all_rejected
+
+honesty_review:
+  authority: postgres_append_only_competition_candidate_review
+  command: sim-latency epoch-review
+  environment: main
+  ordering: normalized_score_desc_raw_score_asc_submitted_at_job_id
+  candidate_materialization: fresh_mode_0700_temp_dir_with_mode_0400_patch_score_and_metadata
+  evidence: bounded_json_object_with_sha256_reviewer_reason_and_timestamp
+  reject_behavior: advance_to_next_ranked_significant_candidate
+  approve_behavior: atomically_finalize_exact_candidate_as_winner
+  exhaustion_behavior: atomically_finalize_without_winner
+  public_before_finalization: false
+
+evaluation_source:
+  manifest: config/main/sim-latency.yml
+  authoritative_fields: branch_epoch_commits_and_significant_improvement_percent
+  repositories:
+    - server
+    - connect
+    - sdk
+    - proxy
+    - glog
+    - goidenticons
+    - userwireguard
+    - sn
+  canonical_patch_repository: server
+  round_source_epoch_offset: -1
+  promotion_command: sim-latency promote
+  activation_order: repository_branches_then_config_ledger
+  promotion_review_gate: finalized_exact_approved_job_patch_sha256_and_full_score_document
+  unevaluated_repository_patches: rejected
+  protected_evaluator_tree: connect/sim-latency/**
+  protected_evaluator_tree_policy: hard_reject_and_verify_git_tree_unchanged
+
+evaluator_release:
+  source_epoch: 0
+  server_source_commit: 8f4cde37b382ab735e40f9471dca4d051b1f326d
+  evaluator_image_id: null
+  local_image_load:
+    status: rebuild_required_after_source_lock_expansion
+    runtime: docker
+    immutable_reference: null
+    convenience_tag: null
+    verified_at: null
+  simulator_sha256: null
+  superseded_release:
+    evaluator_image_id: sha256:2cc50a579199dc111a9265d5a7e4840aba0b1b794ba82cdd741724c683f90f6b
+    simulator_sha256: a345375aa543839b49dff6bd4b663217902a7a924a373a1eb9ffdc8349c83b6b
+    reason: incomplete_four_repository_source_lock
+
+release_record:
+  control_plane_branch: main
+  control_plane_commits_are_scoring_inputs: false
+  exact_runtime_image_digest_persisted_per_evaluation: true
+  openapi_sha256: ca2c4bd849292b1a5d91215b924aff4a95a18061100b37f58a2d4df91577320e
+  recorded_by: local_finalization
+  recorded_at: 2026-09-04T21:03:03Z
+
+validation:
+  completed_at: 2026-08-29T04:37:06Z
+  sim_latency_go_race_suite: pass
+  sim_latency_go_race_suite_consecutive_passes: 3
+  competition_api_go_race_suite: pass
+  competition_controller_lifecycle_go_race_suite: pass
+  apex_adapter_conformance_race_repetitions: 20
+  launch_endpoint_and_credential_transport_tests: pass
+  go_vet: pass
+  migration_order_and_application: pass
+  postgres_redis_lifecycle_integration: pass
+  openapi_conformance: pass
+  grafana_dashboard_and_alert_tests: pass
+  adversarial_cleanup:
+    status: pass
+    evaluation_cpuset: "0,2,4,6,8,10,12,14,16,18"
+    management_cpuset: "20,22"
+    memory_exit_code: 137
+    memory_oom_killed: true
+    cleanup_elapsed_ms: 655
+    cleanup_limit_ms: 10000
+    residual_containers: 0
+    residual_networks: 0
+
+retention:
+  backend: server/blob
+  service: minio
+  required_mode: COMPLIANCE
+  versioning_required: true
+  enabled_replication_destination_required: true
+  post_upload_authentication: sha256_and_size
+  candidate_credentials_exposed: false
+  warn_used_percent: 75
+  page_used_percent: 90
+  deletion_owner: support@ur.xyz
+
+monitoring:
+  destination: main_grafana_mimir
+  dashboard: server/grafana/dashboards/competition.json
+  alert_rules: warp/grafana/alerting/competition.yml
+  contact_policy: existing_main_policy
+  on_call_record: support@ur.xyz
+  runner_heartbeat_interval_seconds: 15
+  runner_heartbeat_warning_age_seconds: 30
+  operational_signals:
+    - submission_queue_size
+    - current_submission
+    - current_evaluation_elapsed_seconds
+    - significant_submission_found
+    - evaluation_duration_p75_estimate_seconds
+    - submission_backlog_estimated_seconds
+    - live_ttfb_p50_p95_by_replicate
+    - live_throughput_p50_p95_by_replicate
+  live_reveal:
+    visibility: internal_grafana_only
+    update_boundary: authenticated_replicate_completion
+    provisional_alpha: 0.05
+    final_score_remains_authoritative: true
+    public_before_epoch_finalization: false
+
+checklist:
+  - id: evaluator_and_baseline
+    status: complete
+    evidence: connect/sim-latency/baseline/final-baseline.html
+  - id: single_host_containment
+    status: complete
+    evidence: connect/sim-latency/baseline/v1/lineage/finalization-audit.json
+  - id: main_postgres_redis_restore
+    status: complete_operator_confirmed
+    evidence: existing_main_environment
+  - id: api_migration_worker_ordering
+    status: complete_operator_confirmed
+    evidence: existing_main_environment
+  - id: public_ingress_controls
+    status: complete_operator_confirmed
+    evidence: existing_main_environment
+  - id: competition_api_and_leaderboard
+    status: complete
+    evidence: sn/api/competition.yml
+  - id: staging_era
+    status: implementation_complete_multi_epoch_apex_proof_pending
+    evidence: server/controller/competition_controller.go and server/connect/sim-latency/run-main.sh
+    lifecycle: fee_free_real_fifo_evaluation_against_source_epoch_zero_auto_finalize_no_winner_no_leaderboard
+  - id: six_epoch_immediate_fifo_lifecycle
+    status: complete
+    evidence: server/controller/competition_controller.go and server/connect/sim-latency/run-main.sh
+  - id: immutable_artifact_implementation
+    status: complete
+    evidence: server/controller/competition_controller.go and server/blob.go
+  - id: grafana_implementation
+    status: complete
+    evidence: server/grafana/dashboards/competition.json
+  - id: final_calendar
+    status: apex_activation_time_required
+  - id: credential_bundle
+    status: apex_custodian_and_stage_distribution_pending
+  - id: runtime_control_plane_identity
+    status: complete
+    evidence: server/controller/competition_controller.go
+  - id: epoch_zero_evaluator_image
+    status: rebuild_required_after_source_lock_expansion
+    evidence: config/main/sim-latency.yml and server/connect/sim-latency/evaluator/container/build-base.sh
+  - id: live_minio_readiness_backup_capacity_and_deletion_owner
+    status: deployment_verification_required
+    deletion_owner: support@ur.xyz
+    local_implementation: complete_object_lock_versioning_replication_and_capacity_preflight
+  - id: grafana_deploy_contact_routing_and_on_call
+    status: deployment_verification_required
+    on_call_and_incident_contact: support@ur.xyz
+    local_implementation: complete_service_labeled_alerts_and_support_contact_policy
+  - id: miner_onboarding_token_distribution_and_revocation
+    status: implementation_complete_distribution_pending
+    evidence: server/connect/sim-latency/launch/ONBOARDING.md and server/connect/sim-latency/credentials.go
+  - id: incident_response
+    status: implementation_complete_live_roster_confirmation_pending
+    evidence: server/connect/sim-latency/launch/INCIDENT-RESPONSE.md
+  - id: rewards_eligibility_legal_and_abuse
+    status: apex_terms_record_required
+    evidence: submission_fee_usd is frozen at 20; remaining publication terms require approval
+  - id: winner_source_policy
+    status: complete
+    evidence: config/main/sim-latency.yml and server/connect/sim-latency/source_promote.go
+  - id: winner_honesty_review_gate
+    status: complete
+    evidence: server/controller/competition_controller.go, server/db_migrations.go, and server/connect/sim-latency/epoch_review.go
+  - id: per_evaluation_significance_record
+    status: complete
+    evidence: server/connect/sim-latency/score_significance.go
+  - id: apex_adapter_staging_registry_and_signed_handoff
+    status: implementation_complete_live_apex_proof_and_signed_handoff_pending
+    evidence: server/controller/competition_controller.go and server/connect/sim-latency/launch/APEX-HANDOFF.md

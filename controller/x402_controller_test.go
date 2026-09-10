@@ -79,7 +79,7 @@ func TestX402PaymentRequiredQuotesEveryNetwork(t *testing.T) {
 		connect.AssertEqual(t, accept.Scheme, "exact")
 		connect.AssertEqual(t, accept.PayTo, "0xmerchant")
 		connect.AssertEqual(t, accept.Asset, "usdc")
-		connect.AssertEqual(t, accept.MaxAmountRequired, "5000000")
+		connect.AssertEqual(t, accept.MaxAmountRequired, "3000000")
 		connect.AssertEqual(t, accept.Resource, "/x402/purchase")
 	}
 	connect.AssertEqual(t, paymentRequired.Accepts[0].Network, "base")
@@ -104,7 +104,7 @@ func TestX402RefusesToQuoteBadSku(t *testing.T) {
 		Asset:         "usdc",
 		MaxPaymentUsd: 10,
 		Skus: map[string]x402SkuConfig{
-			// data_10tib IS in the catalog, but pro.yml prices it at $30 -- over the
+			// data_10tib IS in the catalog, but pro.yml prices it at $20 -- over the
 			// server-side ceiling below
 			X402SkuData10Tib: {},
 			X402SkuData1Tib:  {},
@@ -126,7 +126,7 @@ func TestX402RefusesToQuoteBadSku(t *testing.T) {
 	// in the catalog and in bounds -> quoted, at pro.yml's price
 	paymentRequired, err := x402PaymentRequiredForConfig(c, "/x402/purchase", X402SkuData1Tib, "")
 	connect.AssertEqual(t, err, nil)
-	connect.AssertEqual(t, paymentRequired.Accepts[0].MaxAmountRequired, "5000000") // $5, from pro.yml
+	connect.AssertEqual(t, paymentRequired.Accepts[0].MaxAmountRequired, "3000000") // $3, from pro.yml
 }
 
 // TestX402PricesComeFromProYml pins the single source of truth: an agent must never be
@@ -156,8 +156,8 @@ func TestX402PricesComeFromProYml(t *testing.T) {
 	// exactly the numbers in pro.yml -- the same ones the site shows and Stripe charges
 	connect.AssertEqual(t, prices[X402SkuProMonth], model.Pro().PriceMonthlyUsd())
 	connect.AssertEqual(t, prices[X402SkuProMonth], float64(5))
-	connect.AssertEqual(t, prices[X402SkuData1Tib], float64(5))
-	connect.AssertEqual(t, prices[X402SkuData10Tib], float64(30))
+	connect.AssertEqual(t, prices[X402SkuData1Tib], float64(3))
+	connect.AssertEqual(t, prices[X402SkuData10Tib], float64(20))
 }
 
 // TestX402RequirementsForNetwork pins that a payment is always checked against the

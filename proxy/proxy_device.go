@@ -22,12 +22,53 @@ func DefaultProxyDeviceManagerSettings() *ProxyDeviceManagerSettings {
 	return &ProxyDeviceManagerSettings{
 		CheckProxyDeviceIdleTimeout: 1 * time.Minute,
 		SequenceBufferSize:          2048,
+		DeviceMemoryTargetByteCount: proxyDeviceMemoryTargetByteCountFromConfig(),
 	}
+}
+
+const defaultProxyDeviceMemoryTargetByteCount = model.ByteCount(24 * model.Mib)
+
+// proxyDeviceMemoryTargetByteCountFromConfig loads the single DeviceLocal
+// steady-state target. Older environments without proxy.yml retain the 24 MiB
+// default; a present but invalid value fails startup instead of silently
+// restoring the process-global carrier budget.
+func proxyDeviceMemoryTargetByteCountFromConfig() model.ByteCount {
+	resource, err := server.Config.SimpleResource("proxy.yml")
+	if err != nil {
+		return defaultProxyDeviceMemoryTargetByteCount
+	}
+	values := resource.String("device_memory_budget")
+	if len(values) == 0 {
+		return defaultProxyDeviceMemoryTargetByteCount
+	}
+	if len(values) != 1 {
+		panic(fmt.Errorf("proxy.yml: device_memory_budget must have exactly one value"))
+	}
+	byteCount, err := model.ParseByteCount(values[0])
+	if err != nil {
+		panic(fmt.Errorf(
+			"proxy.yml: invalid device_memory_budget %q: %w",
+			values[0],
+			err,
+		))
+	}
+	if byteCount <= 0 {
+		panic(fmt.Errorf(
+			"proxy.yml: device_memory_budget must be positive, got %q",
+			values[0],
+		))
+	}
+	return byteCount
 }
 
 type ProxyDeviceManagerSettings struct {
 	CheckProxyDeviceIdleTimeout time.Duration
 	SequenceBufferSize          int
+	DeviceMemoryTargetByteCount model.ByteCount
+	// HoldWindowIdentityRestore keeps a replacement from restoring identities
+	// while its predecessor is still draining. Fresh lazy-open identities are
+	// buffered and become durable when ReleaseWindowIdentityRestore runs.
+	HoldWindowIdentityRestore bool
 
 	// when set, this overrides the default client security policy for all devices
 	// opened by this manager (see ProxyDeviceSettings). Integration tests use it
@@ -46,7 +87,27 @@ type ProxyDeviceManager struct {
 	cancel   context.CancelFunc
 	settings *ProxyDeviceManagerSettings
 
-	// networkSpace *sdk.NetworkSpace
+	// Close rejects new opens before waiting for every admitted construction
+	// and device worker. The shared NetworkSpace is released only after those
+	// borrowers have stopped, so its client strategy cannot disappear beneath
+	// a hosted API refresh or transport callback.
+	lifecycleLock sync.Mutex
+	closed        bool
+	openWorkers   sync.WaitGroup
+	deviceWorkers sync.WaitGroup
+	joinOnce      sync.Once
+	closeDone     chan struct{}
+
+	// Every production device borrows one manager-owned NetworkSpace. Its API
+	// request core and client strategy are shared; sdk.DeviceLocal isolates the
+	// mutable hosted credential session and all memory budgets per device.
+	networkSpaceOnce    sync.Once
+	networkSpace        *sdk.NetworkSpace
+	networkSpaceBuilder func(context.Context) *sdk.NetworkSpace
+	networkSpaceCloser  func(*sdk.NetworkSpace)
+	ownsNetworkSpace    bool
+	proxyDeviceBuilder  func(server.Id) (*ProxyDevice, error)
+	windowIdentityGate  *windowIdentityRestoreGate
 
 	// stateLock guards the proxyDevices map. It is read-mostly: every
 	// OpenProxyDevice looks up an existing pdState (RLock, concurrent), and only
@@ -58,9 +119,9 @@ type ProxyDeviceManager struct {
 
 	// The ip lock, memoized. ValidCaller runs on EVERY accepted connection, so reading
 	// the device config from redis each time would put a round-trip on the accept path.
-	// The ttl bounds how long a stale lock is enforced after the config changes.
-	lockCacheLock sync.Mutex
-	lockCache     map[server.Id]proxyLockEntry
+	// The bounded TTL+LRU cache keeps that fast path without retaining every proxy id
+	// observed during the whole process lifetime.
+	lockCache *proxyLockCache
 }
 
 // proxyLockCacheTtl bounds how long a stale ip lock can be enforced after the proxy
@@ -82,18 +143,74 @@ func NewProxyDeviceManagerWithDefaults(ctx context.Context) *ProxyDeviceManager 
 
 func NewProxyDeviceManager(ctx context.Context, settings *ProxyDeviceManagerSettings) *ProxyDeviceManager {
 	cancelCtx, cancel := context.WithCancel(ctx)
-
-	return &ProxyDeviceManager{
-		ctx:      cancelCtx,
-		cancel:   cancel,
-		settings: settings,
-		// networkSpace: networkSpace,
-		proxyDevices: map[server.Id]*proxyDeviceState{},
-		lockCache:    map[server.Id]proxyLockEntry{},
+	manager := &ProxyDeviceManager{
+		ctx:              cancelCtx,
+		cancel:           cancel,
+		settings:         settings,
+		closeDone:        make(chan struct{}),
+		networkSpace:     settings.NetworkSpace,
+		ownsNetworkSpace: settings.NetworkSpace == nil,
+		proxyDevices:     map[server.Id]*proxyDeviceState{},
+		lockCache:        newProxyLockCache(proxyLockCacheMaxEntries),
+		windowIdentityGate: newWindowIdentityRestoreGate(
+			settings.HoldWindowIdentityRestore,
+		),
 	}
+	manager.networkSpaceBuilder = newProxyDeviceManagerNetworkSpace
+	manager.networkSpaceCloser = func(networkSpace *sdk.NetworkSpace) {
+		networkSpace.Close()
+	}
+	manager.proxyDeviceBuilder = manager.newProxyDevice
+	return manager
+}
+
+// Opens restoration after the old instance's drain-complete handoff. The
+// gate first publishes every fresh snapshot formed by early lazy opens.
+func (self *ProxyDeviceManager) ReleaseWindowIdentityRestore() {
+	self.windowIdentityGate.Release()
+}
+
+// newProxyDeviceManagerNetworkSpace builds the one production NetworkSpace
+// owned by a manager. It is lazy so construction-only unit tests do not need
+// environment configuration.
+func newProxyDeviceManagerNetworkSpace(ctx context.Context) *sdk.NetworkSpace {
+	connectSettings := connect.DefaultConnectSettings()
+	// Embedded devices must be silent: this host runs thousands of clients.
+	connectSettings.Log = connect.NewNoopLogger()
+	return sdk.NewPlatformNetworkSpace(
+		ctx,
+		server.RequireEnv(),
+		server.RequireDomain(),
+		connectSettings,
+	)
+}
+
+// networkSpaceForDevice returns the single manager-owned NetworkSpace. sync.Once
+// makes simultaneous cold device opens share exactly one strategy/API core.
+func (self *ProxyDeviceManager) networkSpaceForDevice() *sdk.NetworkSpace {
+	self.networkSpaceOnce.Do(func() {
+		if self.networkSpace == nil {
+			select {
+			case <-self.ctx.Done():
+				return
+			default:
+			}
+			self.networkSpace = self.networkSpaceBuilder(self.ctx)
+		}
+	})
+	return self.networkSpace
 }
 
 func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice, error) {
+	self.lifecycleLock.Lock()
+	if self.closed {
+		self.lifecycleLock.Unlock()
+		return nil, fmt.Errorf("Proxy device manager closed.")
+	}
+	self.openWorkers.Add(1)
+	self.lifecycleLock.Unlock()
+	defer self.openWorkers.Done()
+
 	pdState := func() *proxyDeviceState {
 		// fast path: an existing entry, read concurrently (the common case)
 		self.stateLock.RLock()
@@ -122,7 +239,8 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 				pdState.StateLock.Unlock()
 				return pd, nil
 			}
-			// idled out, or the egress window collapsed: drop the dead device
+			// The proxy or its DeviceLocal lifecycle ended. A merely unsatisfied
+			// window stays installed and keeps refilling under the same device.
 			pd.Cancel()
 			pdState.ProxyDevice = nil
 		}
@@ -152,14 +270,29 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 		pdState.creating = c
 		pdState.StateLock.Unlock()
 
-		pd, err := self.newProxyDevice(proxyId)
+		pd, err := self.proxyDeviceBuilder(proxyId)
 
+		accepted := false
 		pdState.StateLock.Lock()
 		pdState.creating = nil
 		if err == nil {
-			pdState.ProxyDevice = pd
+			self.lifecycleLock.Lock()
+			if self.closed {
+				err = fmt.Errorf("Proxy device manager closed.")
+			} else {
+				self.deviceWorkers.Add(2)
+				pdState.ProxyDevice = pd
+				accepted = true
+			}
+			self.lifecycleLock.Unlock()
 		}
 		pdState.StateLock.Unlock()
+
+		if accepted {
+			self.startProxyDevice(proxyId, pd)
+		} else if pd != nil {
+			_ = pd.Close()
+		}
 
 		// waiters re-read pdState.ProxyDevice (re-validating liveness) on wake, so
 		// only the error needs to be shared directly
@@ -173,39 +306,36 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 	}
 }
 
-// newProxyDevice creates a fresh proxy device for the proxy id and starts its
-// run + idle-check goroutines. It does db + network + tun setup, so it must be
-// called WITHOUT holding any manager or pdState lock (see OpenProxyDevice).
+// Constructs a fresh device without publishing or starting it. Database,
+// network and tun setup run without manager or device-state locks.
 func (self *ProxyDeviceManager) newProxyDevice(proxyId server.Id) (*ProxyDevice, error) {
 	proxyDeviceConfig := model.GetProxyDeviceConfig(self.ctx, proxyId)
 	if proxyDeviceConfig == nil {
 		return nil, fmt.Errorf("Proxy device does not exist.")
 	}
 
-	networkSpace := self.settings.NetworkSpace
+	networkSpace := self.networkSpaceForDevice()
 	if networkSpace == nil {
-		connectSettings := connect.DefaultConnectSettings()
-		// FIXME use only ipv4 when communicating back to the platform
-		connectSettings.DisableIpv6 = true
-		// embedded devices must be silent: this host runs thousands of clients.
-		// the network space logger silences the shared client strategy.
-		connectSettings.Log = connect.NewNoopLogger()
-		networkSpace = sdk.NewPlatformNetworkSpace(
-			self.ctx,
-			server.RequireEnv(),
-			server.RequireDomain(),
-			connectSettings,
-		)
+		return nil, fmt.Errorf("Proxy device manager closed.")
 	}
 
 	settings := DefaultProxyDeviceSettingsWithBufferSize(self.settings.SequenceBufferSize)
 	settings.ClientSecurityPolicyGenerator = self.settings.ClientSecurityPolicyGenerator
+	settings.MemoryTargetByteCount = self.settings.DeviceMemoryTargetByteCount
+	settings.windowIdentityGate = self.windowIdentityGate
 	pd, err := NewProxyDevice(self.ctx, proxyDeviceConfig, networkSpace, settings)
 	if err != nil {
 		return nil, err
 	}
 
+	return pd, nil
+}
+
+// Runs the externally managed device lifecycle and its idle watcher. The
+// caller publishes the device and admits both workers before calling this.
+func (self *ProxyDeviceManager) startProxyDevice(proxyId server.Id, pd *ProxyDevice) {
 	go server.HandleError(func() {
+		defer self.deviceWorkers.Done()
 		defer func() {
 			// forget the device (if it is still the installed one), then close it
 			// OUTSIDE the manager lock: deviceLocal/tun close can block, and holding
@@ -236,6 +366,7 @@ func (self *ProxyDeviceManager) newProxyDevice(proxyId server.Id) (*ProxyDevice,
 	})
 
 	go server.HandleError(func() {
+		defer self.deviceWorkers.Done()
 		for {
 			if pd.CancelIfIdle() {
 				return
@@ -248,8 +379,6 @@ func (self *ProxyDeviceManager) newProxyDevice(proxyId server.Id) (*ProxyDevice,
 			}
 		}
 	})
-
-	return pd, nil
 }
 
 // ValidCaller reports whether a caller at `addr` is authorized to use `proxyId`.
@@ -304,16 +433,20 @@ func (self *ProxyDeviceManager) ValidCaller(proxyId server.Id, addr netip.Addr) 
 func (self *ProxyDeviceManager) proxyLock(proxyId server.Id) proxyLockEntry {
 	now := time.Now()
 
-	self.lockCacheLock.Lock()
-	entry, ok := self.lockCache[proxyId]
-	self.lockCacheLock.Unlock()
-	if ok && now.Before(entry.expiry) {
-		return entry
+	result := self.lockCache.get(proxyId, now)
+	if result.expired > 0 {
+		proxyLockCacheExpirationsCounter.Add(float64(result.expired))
 	}
+	proxyLockCacheEntriesGauge.Set(float64(result.size))
+	if result.found {
+		proxyLockCacheHitsCounter.Inc()
+		return result.entry
+	}
+	proxyLockCacheMissesCounter.Inc()
 
 	proxyDeviceConfig := model.GetProxyDeviceConfig(self.ctx, proxyId)
 
-	entry = proxyLockEntry{
+	entry := proxyLockEntry{
 		found:  proxyDeviceConfig != nil,
 		expiry: now.Add(proxyLockCacheTtl),
 	}
@@ -321,11 +454,15 @@ func (self *ProxyDeviceManager) proxyLock(proxyId server.Id) proxyLockEntry {
 		entry.lockSubnets = proxyDeviceConfig.LockSubnets
 	}
 
-	self.lockCacheLock.Lock()
-	self.lockCache[proxyId] = entry
-	self.lockCacheLock.Unlock()
-
-	return entry
+	result = self.lockCache.put(proxyId, entry, now)
+	if result.expired > 0 {
+		proxyLockCacheExpirationsCounter.Add(float64(result.expired))
+	}
+	if result.evicted > 0 {
+		proxyLockCacheEvictionsCounter.Add(float64(result.evicted))
+	}
+	proxyLockCacheEntriesGauge.Set(float64(result.size))
+	return result.entry
 }
 
 // subnetContains reports whether addr falls inside subnet, normalizing v4-mapped-v6.
@@ -398,8 +535,51 @@ func (self *ProxyDeviceManager) DeviceCount() int {
 	return len(self.proxyDevices)
 }
 
+// Requests manager shutdown and starts asynchronous ownership cleanup. This
+// remains safe from a device callback; external owners use CloseAndWait.
 func (self *ProxyDeviceManager) Close() {
-	self.cancel()
+	self.lifecycleLock.Lock()
+	if !self.closed {
+		self.closed = true
+		self.cancel()
+	}
+	self.lifecycleLock.Unlock()
+
+	self.joinOnce.Do(func() {
+		go func() {
+			self.openWorkers.Wait()
+			self.deviceWorkers.Wait()
+			// Prevent a test-only direct lazy lookup from constructing an owned
+			// session after all admitted production opens have drained.
+			self.networkSpaceOnce.Do(func() {})
+			if self.ownsNetworkSpace && self.networkSpace != nil {
+				self.networkSpaceCloser(self.networkSpace)
+			}
+			close(self.closeDone)
+		}()
+	})
+}
+
+// Joins every admitted open and device worker before releasing the shared
+// NetworkSpace. External process owners use this; callbacks may use Close.
+func (self *ProxyDeviceManager) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	select {
+	case <-self.closeDone:
+		return nil
+	default:
+	}
+	select {
+	case <-self.closeDone:
+		return nil
+	case <-ctx.Done():
+		select {
+		case <-self.closeDone:
+			return nil
+		default:
+			return ctx.Err()
+		}
+	}
 }
 
 type proxyDeviceState struct {
@@ -430,6 +610,7 @@ func DefaultProxyDeviceSettingsWithBufferSize(bufferSize int) *ProxyDeviceSettin
 		Mtu:                    connect.DefaultMtu,
 		ProxyDeviceIdleTimeout: 90 * time.Minute,
 		SequenceBufferSize:     bufferSize,
+		MemoryTargetByteCount:  defaultProxyDeviceMemoryTargetByteCount,
 	}
 }
 
@@ -440,11 +621,15 @@ type ProxyDeviceSettings struct {
 	Mtu                           int
 	ProxyDeviceIdleTimeout        time.Duration
 	SequenceBufferSize            int
+	// MemoryTargetByteCount is the one SDK DeviceLocal target from which DNS,
+	// mux, transfer, P2P, and carrier budgets are derived.
+	MemoryTargetByteCount model.ByteCount
 	// DisableWindowIdentityPersistence turns off the window identity store
 	// (PROXYDRAIN1.md §3.5); a recreated device then mints fresh window
 	// client ids, orphaning established inner flows (the pre-persistence
 	// behavior).
 	DisableWindowIdentityPersistence bool
+	windowIdentityGate               *windowIdentityRestoreGate
 }
 
 type ProxyDevice struct {
@@ -456,6 +641,10 @@ type ProxyDevice struct {
 	proxyDeviceConfig *model.ProxyDeviceConfig
 
 	deviceLocal *sdk.DeviceLocal
+	// deviceState is the lifecycle/readiness surface used by selection and
+	// readiness. Production points it at deviceLocal; tests replace it with an
+	// exact transition source.
+	deviceState proxyDeviceStateSource
 	tun         *connect.Tun
 	settings    *ProxyDeviceSettings
 
@@ -470,22 +659,21 @@ type ProxyDevice struct {
 	// per-device lock and — crucially — is never serialized under the wg proxy's
 	// single global state lock.
 	lastActivityNanos atomic.Int64
-	// set once the egress window has been satisfied at least once. A device that
-	// was ready and has since lost its window is dead and must be recreated; a
-	// device that has never been ready is still warming up and is kept.
-	everReady atomic.Bool
-
-	// stateLock guards only the receive-mode fields below (swapped rarely, via
-	// SetReceive), not the activity/liveness state above.
+	// stateLock guards only the receive-attachment fields below (swapped rarely),
+	// not the activity/liveness state above.
 	stateLock      sync.Mutex
 	receiveMonitor *connect.Monitor
 	receiveNotify  chan struct{}
 	receive        chan []byte
+	receiveAddr    netip.Addr
 
 	// Nil in production. Ownership tests replace the final asynchronous sends
 	// while retaining the same borrowed-to-owned copy boundary.
 	sendOwnedPacketForTest  func([]byte) bool
 	sendOwnedPacketsForTest func([][]byte) int
+	// Stops a forced-full receive delivery immediately before its blocking
+	// handoff, allowing a deterministic backpressure regression test.
+	receiveBackpressureForTest func()
 }
 
 func NewProxyDeviceWithDefaults(
@@ -515,32 +703,7 @@ func NewProxyDevice(
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	deviceLocalSettings := sdk.DefaultDeviceLocalSettings()
-	// embedded devices must be silent: this host runs thousands of clients
-	deviceLocalSettings.DisableLogging = true
-	// per hosted device memory target. Hosted devices never provide
-	// (AllowProvider is forced off by NewPlatformDeviceLocal, and
-	// HostedIncompatible below), so the sdk folds the provider share into
-	// the client share: 32 MB lands as ~3.2 MB dns + ~28.8 MB client
-	// transfer. Bounds each hosted device independently; the process message
-	// pools are sized separately (sdk.SetMemoryLimit).
-	deviceLocalSettings.MemoryTargetByteCount = 32 * 1024 * 1024
-	// persist the window client identities so a recreated device (deploy
-	// restart) reuses them against the same providers, keeping established
-	// inner flows resumable (PROXYDRAIN1.md §3.5)
-	if !settings.DisableWindowIdentityPersistence {
-		deviceLocalSettings.MultiClientIdentityStore = newWindowIdentityStore(ctx, proxyDeviceConfig.ProxyId)
-	}
-	// hosted devices must never route traffic locally or provide: local egress
-	// would leave the proxy host's real interface (datacenter LAN, loopback,
-	// metadata endpoint). This hard-guards route-local/provide setters on the
-	// device and, together with the connectBlockActionOverrides strip, makes a
-	// local route override impossible — defense in depth alongside the rpc-layer
-	// DisableHostedIncompatible guard installed by StartHostedRpc.
-	// It also hard-limits direct mode off (`MultiClientSettings.OverrideAllowDirect` = false):
-	// a direct connection would leak that the client is hosted, and where it is
-	// hosted, via the host addresses in the direct connection setup.
-	deviceLocalSettings.HostedIncompatible = true
+	deviceLocalSettings := newProxyDeviceLocalSettings(ctx, proxyDeviceConfig, settings)
 	deviceLocal, err := sdk.NewPlatformDeviceLocal(
 		nil,
 		networkSpace,
@@ -607,7 +770,7 @@ func NewProxyDevice(
 	if err != nil {
 		// release in the same order as `Close`
 		cancel()
-		deviceLocal.Close()
+		_ = deviceLocal.CloseAndWait(context.Background())
 		return nil, err
 	}
 
@@ -626,6 +789,7 @@ func NewProxyDevice(
 		instanceId:        proxyDeviceConfig.InstanceId,
 		proxyDeviceConfig: proxyDeviceConfig,
 		deviceLocal:       deviceLocal,
+		deviceState:       deviceLocal,
 		tun:               tun,
 		settings:          settings,
 		receiveMonitor:    connect.NewMonitor(),
@@ -637,6 +801,48 @@ func NewProxyDevice(
 	glog.Infof("[pd]using api=%s connect=%s\n", networkSpace.GetApiUrl(), networkSpace.GetPlatformUrl())
 
 	return proxyDevice, nil
+}
+
+// newProxyDeviceLocalSettings builds the immutable hosted-device policy used
+// by every server/proxy device. HostedIncompatible pins the SDK carrier to H1
+// and blocks Auto, H3, DNS, direct, local-route, and provider reconfiguration.
+func newProxyDeviceLocalSettings(
+	ctx context.Context,
+	proxyDeviceConfig *model.ProxyDeviceConfig,
+	proxyDeviceSettings *ProxyDeviceSettings,
+) *sdk.DeviceLocalSettings {
+	deviceLocalSettings := sdk.DefaultDeviceLocalSettings()
+	// embedded devices must be silent: this host runs thousands of clients
+	deviceLocalSettings.DisableLogging = true
+	// The SDK derives every DeviceLocal-owned memory area from this one target,
+	// including the private platform carrier budget. Hosted devices cannot
+	// provide, so their provider share folds into their client transfer share.
+	if proxyDeviceSettings.MemoryTargetByteCount <= 0 {
+		panic("proxy DeviceLocal memory target must be positive")
+	}
+	deviceLocalSettings.MemoryTargetByteCount =
+		proxyDeviceSettings.MemoryTargetByteCount
+	// persist the window client identities so a recreated device (deploy
+	// restart) reuses them against the same providers, keeping established
+	// inner flows resumable (PROXYDRAIN1.md §3.5)
+	if !proxyDeviceSettings.DisableWindowIdentityPersistence {
+		deviceLocalSettings.MultiClientIdentityStore = newWindowIdentityStore(
+			ctx,
+			proxyDeviceConfig.ProxyId,
+			proxyDeviceSettings.windowIdentityGate,
+		)
+	}
+	// hosted devices must never route traffic locally or provide: local egress
+	// would leave the proxy host's real interface (datacenter LAN, loopback,
+	// metadata endpoint). This hard-guards route-local/provide setters on the
+	// device and, together with the connectBlockActionOverrides strip, makes a
+	// local route override impossible — defense in depth alongside the rpc-layer
+	// DisableHostedIncompatible guard installed by StartHostedRpc.
+	// It also hard-limits direct mode off (`MultiClientSettings.OverrideAllowDirect` = false):
+	// a direct connection would leak that the client is hosted, and where it is
+	// hosted, via the host addresses in the direct connection setup.
+	deviceLocalSettings.HostedIncompatible = true
+	return deviceLocalSettings
 }
 
 // PushDeviceRpc serves a device-rpc websocket (relayed from the resident) to
@@ -671,37 +877,13 @@ func (self *ProxyDevice) PushDeviceRpc(ws sdk.DeviceRpcWs) error {
 func (self *ProxyDevice) Run() {
 	defer self.cancel()
 
-	// A callback batch is borrowed for this call. The ordinary proxy mode
-	// injects it into gVisor with one GRO-aware write. The legacy external
-	// receive mode gets nonblocking shared copies; a full consumer is loss,
-	// never head-of-line blocking on the SDK receive pump.
 	receivePacketsCallback := func(
 		source connect.TransferPath,
 		provideMode protocol.ProvideMode,
 		ipPath *connect.IpPath,
 		packets [][]byte,
 	) {
-		if !self.UpdateActivity() {
-			return
-		}
-		receive, _ := self.receiveWithNotify()
-		if receive == nil {
-			_, _ = self.tun.WriteBatch(packets)
-			self.UpdateActivity()
-			return
-		}
-		for _, packet := range packets {
-			sharedPacket := connect.MessagePoolShareReadOnly(packet)
-			select {
-			case <-self.ctx.Done():
-				connect.MessagePoolReturn(sharedPacket)
-				return
-			case receive <- sharedPacket:
-				self.UpdateActivity()
-			default:
-				connect.MessagePoolReturn(sharedPacket)
-			}
-		}
+		self.deliverReturnPackets(packets)
 	}
 	sub := self.deviceLocal.AddReceivePacketsCallback(receivePacketsCallback)
 	defer sub()
@@ -720,6 +902,100 @@ func (self *ProxyDevice) Run() {
 			return
 		}
 		self.deviceLocal.SendPacketsNoCopy(packets[:n])
+	}
+}
+
+// A callback batch is borrowed for this call. Return packets addressed to the
+// WireGuard peer are copied into its receive channel; all other packets stay on
+// the private gVisor Tun used by HTTP and SOCKS. The old global mode switch
+// could only serve one of those paths at a time: any overlapping Tun dial
+// silently stole every WireGuard return packet, while late Tun packets were
+// handed to WireGuard. Destination demultiplexing keeps all paths live.
+func (self *ProxyDevice) deliverReturnPackets(packets [][]byte) {
+	if !self.UpdateActivity() {
+		return
+	}
+	receive, receiveAddr, receiveNotify := self.receiveWithNotify()
+	if receive == nil {
+		_, _ = self.tun.WriteBatch(packets)
+		self.UpdateActivity()
+		return
+	}
+
+	// Flush every Tun run before a WireGuard handoff can wait for capacity.
+	// This keeps a busy process-wide WireGuard queue from delaying HTTP/SOCKS
+	// returns on the same device, without allocating a partition slice.
+	tunStart := -1
+	flushTun := func(end int) {
+		if tunStart < 0 {
+			return
+		}
+		_, _ = self.tun.WriteBatch(packets[tunStart:end])
+		tunStart = -1
+	}
+	for i, packet := range packets {
+		if proxyPacketMatchesReceiveAddress(packet, receiveAddr) {
+			flushTun(i)
+			continue
+		}
+		if tunStart < 0 {
+			tunStart = i
+		}
+	}
+	flushTun(len(packets))
+
+	for _, packet := range packets {
+		if !proxyPacketMatchesReceiveAddress(packet, receiveAddr) {
+			continue
+		}
+		if !self.deliverWireGuardReturn(receive, receiveNotify, packet) {
+			return
+		}
+	}
+	self.UpdateActivity()
+}
+
+// deliverWireGuardReturn preserves the device-side Tun loss model: provider
+// NAT has already consumed upstream TCP bytes and cannot reconstruct a segment
+// dropped here. This callback belongs to one DeviceLocal, so waiting on the
+// fixed process queue propagates bounded backpressure only into that device;
+// cancellation or an attachment change still releases it immediately.
+func observeElapsedSeconds(start time.Time, now func() time.Time, observe func(float64)) {
+	observe(now().Sub(start).Seconds())
+}
+
+func (self *ProxyDevice) deliverWireGuardReturn(receive chan []byte, receiveNotify chan struct{}, packet []byte) bool {
+	sharedPacket := connect.MessagePoolShareReadOnly(packet)
+	select {
+	case <-self.ctx.Done():
+		connect.MessagePoolReturn(sharedPacket)
+		return false
+	case <-receiveNotify:
+		connect.MessagePoolReturn(sharedPacket)
+		return false
+	case receive <- sharedPacket:
+		self.UpdateActivity()
+		return true
+	default:
+	}
+	backpressureStart := time.Now()
+	proxyWireGuardReturnBackpressureCounter.Inc()
+	defer func() {
+		observeElapsedSeconds(backpressureStart, time.Now, proxyWireGuardReturnBackpressureDuration.Observe)
+	}()
+	if self.receiveBackpressureForTest != nil {
+		self.receiveBackpressureForTest()
+	}
+	select {
+	case <-self.ctx.Done():
+		connect.MessagePoolReturn(sharedPacket)
+		return false
+	case <-receiveNotify:
+		connect.MessagePoolReturn(sharedPacket)
+		return false
+	case receive <- sharedPacket:
+		self.UpdateActivity()
+		return true
 	}
 }
 
@@ -767,79 +1043,163 @@ func (self *ProxyDevice) SendBorrowedBatch(packets [][]byte, offset int) int {
 }
 
 func (self *ProxyDevice) SetReceive(receive chan []byte) {
+	self.SetReceiveForAddress(netip.Addr{}, receive)
+}
+
+// SetReceiveForAddress routes return packets for one WireGuard client address
+// to receive without disabling the Tun return path. An invalid address retains
+// SetReceive's legacy all-packets behavior for non-address-aware callers.
+func (self *ProxyDevice) SetReceiveForAddress(receiveAddr netip.Addr, receive chan []byte) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.receive == receive {
-		// already in this mode; avoid monitor churn / waking the receive callback
+	if receive == nil {
+		receiveAddr = netip.Addr{}
+	}
+	if self.receive == receive && self.receiveAddr == receiveAddr {
+		// already attached; avoid monitor churn / waking the receive callback
 		return
 	}
 	self.receiveMonitor.NotifyAll()
 	self.receive = receive
+	self.receiveAddr = receiveAddr
 	self.receiveNotify = self.receiveMonitor.NotifyChannel()
 }
 
-func (self *ProxyDevice) receiveWithNotify() (chan []byte, chan struct{}) {
+func (self *ProxyDevice) receiveWithNotify() (chan []byte, netip.Addr, chan struct{}) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.receive, self.receiveNotify
+	return self.receive, self.receiveAddr, self.receiveNotify
+}
+
+// proxyPacketMatchesReceiveAddress is allocation-free because it runs once per
+// returned packet. IPv4 and IPv6 destination offsets are fixed in their base
+// headers; extension headers do not change the IPv6 destination position.
+func proxyPacketMatchesReceiveAddress(packet []byte, receiveAddr netip.Addr) bool {
+	if !receiveAddr.IsValid() {
+		// Backward-compatible SetReceive means the external consumer owns all
+		// packets. Production WireGuard always supplies its assigned address.
+		return true
+	}
+	if len(packet) == 0 {
+		return false
+	}
+	var destination []byte
+	switch packet[0] >> 4 {
+	case 4:
+		if len(packet) < 20 {
+			return false
+		}
+		destination = packet[16:20]
+	case 6:
+		if len(packet) < 40 {
+			return false
+		}
+		destination = packet[24:40]
+	default:
+		return false
+	}
+	addr, ok := netip.AddrFromSlice(destination)
+	return ok && addr == receiveAddr
 }
 
 func (self *ProxyDevice) Tun() *connect.Tun {
 	return self.tun
 }
 
-// DialContext dials a connection through the device's tun. A tun-based dial
-// means the device is being used as an http/socks proxy, so it first resets any
-// wg "receive" mode (set via SetReceive). A device serves one proxy mode at a
-// time — in practice a device is only ever wg, http, or socks — but resetting
-// the mode on a new call lets the same device be reused if the mode changes,
-// instead of stranding outbound packets on a stale wg receive channel.
+// DialContext dials through the device's private Tun. WireGuard return packets
+// are independently selected by destination address in Run, so starting a Tun
+// connection must not detach or interrupt an active WireGuard peer.
 func (self *ProxyDevice) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
-	self.SetReceive(nil)
 	return self.tun.DialContext(ctx, network, addr)
 }
 
 func (self *ProxyDevice) WaitForReady(ctx context.Context, timeout time.Duration) bool {
-	readyCtx, readyCancel := context.WithCancel(self.ctx)
-	defer readyCancel()
-	go server.HandleError(func() {
-		select {
-		case <-readyCtx.Done():
-		case <-ctx.Done():
-			readyCancel()
-		}
-	})
-
-	windowStatus := self.deviceLocal.GetWindowStatus()
-	if windowStatus.MinSatisfied {
-		return true
-	}
-
-	if timeout == 0 {
+	deviceState := self.proxyDeviceState()
+	if deviceState == nil {
 		return false
 	}
+	if timeout == 0 {
+		windowStatus := deviceState.GetWindowStatus()
+		return windowStatus != nil && windowStatus.MinSatisfied
+	}
 
-	sub := self.deviceLocal.AddWindowStatusChangeListener(&windowStatusChangeListener{
+	var timeoutChannel <-chan time.Time
+	var timer *time.Timer
+	if 0 < timeout {
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutChannel = timer.C
+	}
+	return waitForProxyDeviceReady(
+		ctx,
+		self.ctx,
+		deviceState,
+		timeoutChannel,
+	)
+}
+
+// proxyDeviceWindowStatusSource is the narrow DeviceLocal readiness surface.
+// Keeping the wait independent of the concrete device makes every ordering
+// edge deterministic to test without a live provider window.
+type proxyDeviceWindowStatusSource interface {
+	GetWindowStatus() *sdk.WindowStatus
+	AddWindowStatusChangeListener(sdk.WindowStatusChangeListener) sdk.Sub
+}
+
+// proxyDeviceStateSource distinguishes lifecycle death from a temporarily
+// unsatisfied provider window. Only lifecycle death makes a device unusable;
+// window readiness is observed by WaitForReady while its refill keeps running.
+type proxyDeviceStateSource interface {
+	proxyDeviceWindowStatusSource
+	GetDone() bool
+}
+
+func (self *ProxyDevice) proxyDeviceState() proxyDeviceStateSource {
+	if self.deviceState != nil {
+		return self.deviceState
+	}
+	if self.deviceLocal == nil {
+		return nil
+	}
+	return self.deviceLocal
+}
+
+// waitForProxyDeviceReady subscribes before reading readiness so a transition
+// between those operations is retained by the buffered callback edge. A nil
+// timeout channel waits indefinitely; only readiness returns true.
+func waitForProxyDeviceReady(
+	callerCtx context.Context,
+	deviceCtx context.Context,
+	windowStatusSource proxyDeviceWindowStatusSource,
+	timeoutChannel <-chan time.Time,
+) bool {
+	ready := make(chan struct{}, 1)
+	sub := windowStatusSource.AddWindowStatusChangeListener(&windowStatusChangeListener{
 		callback: func(windowStatus *sdk.WindowStatus) {
-			if windowStatus.MinSatisfied {
-				readyCancel()
+			if windowStatus != nil && windowStatus.MinSatisfied {
+				select {
+				case ready <- struct{}{}:
+				default:
+				}
 			}
 		},
 	})
 	defer sub.Close()
 
-	if 0 < timeout {
-		select {
-		case <-readyCtx.Done():
-			return true
-		case <-time.After(timeout):
-			return false
-		}
-	} else {
-		select {
-		case <-readyCtx.Done():
-			return true
-		}
+	windowStatus := windowStatusSource.GetWindowStatus()
+	if windowStatus != nil && windowStatus.MinSatisfied {
+		return true
+	}
+
+	select {
+	case <-ready:
+		return true
+	case <-deviceCtx.Done():
+		return false
+	case <-callerCtx.Done():
+		return false
+	case <-timeoutChannel:
+		return false
 	}
 }
 
@@ -852,38 +1212,22 @@ func (self *windowStatusChangeListener) WindowStatusChanged(windowStatus *sdk.Wi
 	self.callback(windowStatus)
 }
 
-// Active reports whether the device can still serve traffic and is the gate for
-// reusing an existing device in OpenProxyDevice. The context must be live (not
-// idled out via CancelIfIdle, closed, or torn down), and the device must either
-// still be warming up — it has never reached a satisfied egress window — or
-// currently have a satisfied window.
-//
-// A device that reached ready and has since lost its egress window is NOT active:
-// the egress path was dropped (e.g. the resident moved or the connection idled
-// out and the window collapsed). None of those cancel the device context, so
-// UpdateActivity alone (which only checks the context) would keep handing back a
-// device that can no longer carry traffic — and because each reuse bumps the
-// activity timestamp, the idle timer would never fire to recycle it. Gating
-// reuse on the actual egress window lets OpenProxyDevice recreate the device.
+// Active reports whether both owning lifecycles remain live. Window readiness
+// is deliberately not a liveness gate: quality/rotation/provider loss can make
+// MinSatisfied false temporarily, and the multi-window must keep refilling
+// forever under the same hosted device. Recreating it on the next request
+// cancels that retry machinery and creates the production recreation loop.
 func (self *ProxyDevice) Active() bool {
+	if self.ctx == nil {
+		return false
+	}
 	select {
 	case <-self.ctx.Done():
 		return false
 	default:
 	}
-
-	// the window status is authoritative (DeviceLocal has its own lock). It is
-	// read here rather than cached because a device whose egress collapses does
-	// not always emit a window-status event (e.g. deviceLocal.Close nils the
-	// client), and a stale "satisfied" cache would keep handing back a dead
-	// device. everReady is a sticky atomic so this whole check takes no lock.
-	if self.deviceLocal.GetWindowStatus().MinSatisfied {
-		self.everReady.Store(true)
-		return true
-	}
-	// keep a device that has not yet had a chance to connect; only a device that
-	// was ready and lost its window is treated as dead
-	return !self.everReady.Load()
+	deviceState := self.proxyDeviceState()
+	return deviceState != nil && !deviceState.GetDone()
 }
 
 func (self *ProxyDevice) UpdateActivity() bool {
@@ -922,8 +1266,16 @@ func (self *ProxyDevice) Cancel() {
 }
 
 func (self *ProxyDevice) Close() error {
-	self.cancel()
+	if self.cancel != nil {
+		self.cancel()
+	}
 
-	self.deviceLocal.Close()
-	return self.tun.Close()
+	if self.deviceLocal != nil {
+		_ = self.deviceLocal.CloseAndWait(context.Background())
+	}
+	var closeErr error
+	if self.tun != nil {
+		closeErr = self.tun.Close()
+	}
+	return closeErr
 }

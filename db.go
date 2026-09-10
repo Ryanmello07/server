@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -106,9 +107,10 @@ type safePgPool struct {
 // maintenance pool uses pg_maintenance.yml (direct Postgres, bypassing
 // PgBouncer) and db_maintenance.yml (its own max_connections) — and falls back
 // to the defaults (pg.yml / db.yml) when the pool-specific resource is absent
-// or does not define the size. That fallback keeps tests working (they only
-// redirect pg.yml) and tolerates an empty db_maintenance.yml. The main pool's
-// names ARE the defaults, so its resolution is unchanged.
+// or does not define the size. The test harness redirects both pool resources
+// when a production-shaped profile supplies pg_maintenance.yml, and the
+// fallback still tolerates that resource being absent. The main pool's names
+// ARE the defaults, so its resolution is unchanged.
 func (self *safePgPool) resolveResources() (vaultKeys *SimpleResource, configKeys *SimpleResource) {
 	vaultKeys = Vault.RequireSimpleResource(DefaultPgVaultResourceName)
 	if self.vaultResourceName != DefaultPgVaultResourceName {
@@ -352,42 +354,37 @@ func (self *PgRetry) Error() string {
 // https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
 // https://www.postgresql.org/docs/current/errcodes-appendix.html
 func isTransientError(err error) bool {
-	switch v := err.(type) {
-	case *pgconn.PgError:
-		if pgerrcode.IsIntegrityConstraintViolation(v.Code) {
-			return true
-		}
-		if pgerrcode.IsTransactionRollback(v.Code) {
-			return true
-		}
-		// fmt.Printf("[db]intransient error = %d\n", v.Code)
-		return false
-	case *PgRetry:
-		return true
-	default:
-		return false
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgerrcode.IsIntegrityConstraintViolation(pgErr.Code) ||
+			pgerrcode.IsTransactionRollback(pgErr.Code)
 	}
+	var retryErr *PgRetry
+	if errors.As(err, &retryErr) {
+		return true
+	}
+	return false
 }
 
 func isConnectionError(err error) bool {
-	switch v := err.(type) {
-	case *pgconn.PgError:
-		if pgerrcode.IsConnectionException(v.Code) {
-			// try a new connection
-			return true
-		}
-		return false
-	default:
-		switch err.Error() {
-		// pgconn.connLockError
-		// https://github.com/jackc/pgconn/blob/master/errors.go
-		case "conn closed":
-			// try a new connection
-			return true
-		default:
-			return false
-		}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgerrcode.IsConnectionException(pgErr.Code)
 	}
+	// pgx wraps this sentinel while cleaning its statement cache after a
+	// connection dies; retain the connection retry through those wrappers.
+	if errors.Is(err, pgconn.ErrConnClosed) {
+		return true
+	}
+	// pgx protocol errors wrap the underlying socket failure. In particular,
+	// pgproto3.writeError wraps net.OpError, so inspect the complete chain before
+	// deciding whether the current pooled connection can be reused.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// Retain compatibility with adapters that return only the legacy status.
+	return err.Error() == "conn closed"
 }
 
 // maintenance connection

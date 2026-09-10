@@ -110,6 +110,7 @@ func createPaymentPlan(ctx context.Context, subsidyConfig *SubsidyConfig, dryRun
 	seekerHolderNetworkIds := GetAllSeekerHolders(ctx)
 
 	server.Tx(ctx, func(tx server.PgTx) {
+		configurePaymentPlanTransaction(ctx, tx)
 		if dryRun {
 			// force this transaction to roll back however the callback exits, so
 			// the dry run persists nothing. `paymentPlan` is populated before
@@ -183,6 +184,32 @@ func createPaymentPlan(ctx context.Context, subsidyConfig *SubsidyConfig, dryRun
 	}, server.TxReadCommitted)
 
 	return
+}
+
+// configurePaymentPlanTransaction preserves the outer plan transaction while
+// calculateReliabilityPayoutInTx runs its deliberately separate maintenance
+// transaction. Production sets idle_in_transaction_session_timeout=5min; the
+// reliability recompute can exceed that, during which the outer transaction is
+// intentionally idle. PostgreSQL then closes the outer connection and the
+// otherwise successful bounded plan fails later with pgconn "conn closed".
+//
+// PostgreSQL 18.4 also has a read-stream lookahead bug that can pin every local
+// buffer while the planner scans a temporary relation, producing SQLSTATE
+// 53000 "no empty local buffer available" when effective_io_concurrency is
+// high. PostgreSQL 18.6 fixes the server bug. Until production is upgraded,
+// keep this transaction below the affected lookahead range without reducing
+// I/O concurrency for unrelated sessions.
+//
+// This override is LOCAL to this one transaction. The task itself remains
+// bounded by its MaxTime and each committed plan is bounded by maxDuration, so
+// the global protection remains in force for every other application session.
+type paymentPlanTransactionConfigurer interface {
+	Exec(context.Context, string, ...any) (server.PgTag, error)
+}
+
+func configurePaymentPlanTransaction(ctx context.Context, tx paymentPlanTransactionConfigurer) {
+	server.RaisePgResult(tx.Exec(ctx, `SET LOCAL idle_in_transaction_session_timeout = 0`))
+	server.RaisePgResult(tx.Exec(ctx, `SET LOCAL effective_io_concurrency = 32`))
 }
 
 // computePlanUpperBound restricts a bounded plan (maxDuration > 0) to contracts
@@ -412,6 +439,24 @@ func (self *PaymentPlanner) planPayments() (returnErr error) {
 	return
 }
 
+// paymentPlanSubsidyRangeSQL derives the subsidy epoch from the exact sweep set
+// selected by planPayments. temp_account_payment has already applied the
+// unpaid/safely-canceled predicate and, for bounded plans, the close-time
+// upper bound. Reading transfer_escrow_sweep again would both broaden the
+// epoch to historical paid sweeps and force PostgreSQL to rescan the full
+// sweep history. Duplicate selected rows for one contract do not affect
+// MIN/MAX.
+const paymentPlanSubsidyRangeSQL = `
+	SELECT
+		MIN(transfer_contract.create_time) AS subsidy_start_time,
+		MAX(transfer_contract.close_time) AS subsidy_end_time
+
+	FROM temp_account_payment
+
+	INNER JOIN transfer_contract ON
+		transfer_contract.contract_id = temp_account_payment.contract_id
+`
+
 // this assumes the table `temp_account_payment` exists in the transaction
 func (self *PaymentPlanner) planSubsidyPayments() (returnErr error) {
 	// roll up all the sweeps per payer network, payee network
@@ -533,35 +578,12 @@ func (self *PaymentPlanner) planSubsidyPayments() (returnErr error) {
 		netRevenue += payerSubsidyNetRevenues[payerNetworkId]
 	}
 
-	// the subsidy time range is derived from the swept contracts. Bound it by
-	// the same close-time window as the paid set so the subsidy scale/amount
-	// match the sweeps actually being paid in this bounded plan; otherwise the
-	// subsidy would be sized off the full history while paid over a slice.
-	subsidyRangeBound := ""
-	subsidyRangeArgs := []any{}
-	if self.bounded {
-		subsidyRangeBound = "WHERE transfer_contract.close_time < $1"
-		subsidyRangeArgs = append(subsidyRangeArgs, self.upperBound)
-	}
-
 	// note the aggregates are NULL when no swept contracts exist
 	var subsidyStartTimePtr *time.Time
 	var subsidyEndTimePtr *time.Time
 	result, err = self.tx.Query(
 		self.ctx,
-		fmt.Sprintf(`
-    	SELECT
-            MIN(transfer_contract.create_time) AS subsidy_start_time,
-            MAX(transfer_contract.close_time) AS subsidy_end_time
-
-        FROM transfer_escrow_sweep
-
-        INNER JOIN transfer_contract ON
-        	transfer_contract.contract_id = transfer_escrow_sweep.contract_id
-
-        %s
-        `, subsidyRangeBound),
-		subsidyRangeArgs...,
+		paymentPlanSubsidyRangeSQL,
 	)
 	server.WithPgResult(result, err, func() {
 		if result.Next() {

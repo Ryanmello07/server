@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,42 +33,82 @@ func TestClientDriverProbeMatchmakingUsesPoolIdentityAndQualitySpec(t *testing.T
 		ClientId:                providerId,
 		EstimatedBytesPerSecond: 1024,
 	})
+	helloObserved := make(chan struct{}, 1)
 	observed := make(chan observedMatchmakingProbe, 1)
-	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	idle := make(chan struct{})
+	closed := make(chan struct{})
+	var idleOnce sync.Once
+	var closedOnce sync.Once
+	apiServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/hello" {
+			select {
+			case helloObserved <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if request.Method != http.MethodPost || request.URL.Path != "/network/find-providers2" {
+			http.Error(w, "unexpected matchmaking probe route", http.StatusNotFound)
+			return
+		}
 		value := observedMatchmakingProbe{
 			forwardedFor:  request.Header.Get("X-UR-Forwarded-For"),
 			authorization: request.Header.Get("Authorization"),
 		}
-		if request.URL.Path != "/network/find-providers2" {
-			value.err = fmt.Errorf("path = %q", request.URL.Path)
-		} else if err := json.NewDecoder(request.Body).Decode(&value.args); err != nil {
+		if err := json.NewDecoder(request.Body).Decode(&value.args); err != nil {
 			value.err = fmt.Errorf("decode request: %w", err)
 		}
-		observed <- value
+		select {
+		case observed <- value:
+		default:
+			http.Error(w, "duplicate matchmaking probe", http.StatusConflict)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(&sdk.FindProviders2Result{ProviderStats: providerStats})
 	}))
-	defer apiServer.Close()
+	apiServer.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateIdle:
+			idleOnce.Do(func() { close(idle) })
+		case http.StateClosed:
+			closedOnce.Do(func() { close(closed) })
+		}
+	}
+	apiServer.Start()
+	t.Cleanup(apiServer.Close)
 
 	config := defaultConfig(1, 1, 1, 60)
 	config.Clients.QualityWindowSize = 3
 	locationId := server.NewId()
+	decoyClientId := server.NewId()
 	clientId := server.NewId()
 	driver := &ClientDriver{
 		config:     config,
 		apiUrl:     apiServer.URL,
 		locationId: locationId,
-		pool: []ClientIdentity{{
-			ClientId: clientId,
-			ByJwt:    "matchmaking-probe-jwt",
-		}},
+		pool: []ClientIdentity{
+			{ClientId: decoyClientId, ByJwt: "decoy-matchmaking-probe-jwt"},
+			{ClientId: clientId, ByJwt: "matchmaking-probe-jwt"},
+		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := driver.ProbeMatchmaking(ctx); err != nil {
+	if err := driver.ProbeMatchmaking(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	value := <-observed
+	select {
+	case <-helloObserved:
+	default:
+		t.Fatal("matchmaking probe skipped route hello")
+	}
+	var value observedMatchmakingProbe
+	select {
+	case value = <-observed:
+	case <-ctx.Done():
+		t.Fatal("matchmaking POST was not observed")
+	}
 	if value.err != nil {
 		t.Fatal(value.err)
 	}
@@ -88,10 +130,28 @@ func TestClientDriverProbeMatchmakingUsesPoolIdentityAndQualitySpec(t *testing.T
 	if !strings.Contains(value.authorization, "matchmaking-probe-jwt") {
 		t.Fatalf("authorization did not carry pool identity: %q", value.authorization)
 	}
+	select {
+	case <-idle:
+	case <-time.After(5 * time.Second):
+		t.Fatal("matchmaking probe connection never became idle")
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("matchmaking probe retained its one-shot strategy connection")
+	}
 }
 
 func TestClientDriverProbeMatchmakingRejectsEmptyProviderPool(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if request.Method != http.MethodPost || request.URL.Path != "/network/find-providers2" {
+			http.Error(w, "unexpected matchmaking probe route", http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(&sdk.FindProviders2Result{
 			ProviderStats: sdk.NewFindProvidersProviderList(),
@@ -110,8 +170,108 @@ func TestClientDriverProbeMatchmakingRejectsEmptyProviderPool(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := driver.ProbeMatchmaking(ctx)
+	err := driver.ProbeMatchmaking(ctx, 0)
 	if err == nil || !strings.Contains(err.Error(), "empty provider pool") {
 		t.Fatalf("empty provider pool error = %v", err)
+	}
+}
+
+func TestMatchmakingProbeOffsetsSpanMeasurementWindow(t *testing.T) {
+	durations := []time.Duration{time.Second, 20 * time.Second, 3 * time.Minute}
+	for _, duration := range durations {
+		offsets := matchmakingProbeOffsets(duration)
+		if len(offsets) < 2 || offsets[0] != 0 {
+			t.Errorf("duration %s offsets = %v, want a zero-based multi-probe schedule", duration, offsets)
+			continue
+		}
+		lastOffset := offsets[len(offsets)-1]
+		spanFraction := float64(lastOffset) / float64(duration)
+		if spanFraction < minimumFindProvidersSampleSpanFraction || duration <= lastOffset {
+			t.Errorf(
+				"duration %s last offset %s spans %.6f, want [%.2f, 1)",
+				duration,
+				lastOffset,
+				spanFraction,
+				minimumFindProvidersSampleSpanFraction,
+			)
+		}
+	}
+}
+
+func TestRunMatchmakingProbesUsesCompleteAbsoluteSchedule(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	measureStart := time.Unix(1_000, 0)
+	offsets := matchmakingProbeOffsets(3 * time.Minute)
+	waitTargets := []time.Time{}
+	probeIndexes := []int{}
+	err := runMatchmakingProbes(
+		ctx,
+		measureStart,
+		offsets,
+		0,
+		func(_ context.Context, target time.Time) error {
+			waitTargets = append(waitTargets, target)
+			return nil
+		},
+		func(_ context.Context, probeIndex int) error {
+			probeIndexes = append(probeIndexes, probeIndex)
+			if len(probeIndexes) == len(offsets) {
+				cancel()
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(waitTargets) != len(offsets) || len(probeIndexes) != len(offsets) {
+		t.Fatalf("waits=%d probes=%d, want %d", len(waitTargets), len(probeIndexes), len(offsets))
+	}
+	for index, offset := range offsets {
+		if waitTargets[index] != measureStart.Add(offset) || probeIndexes[index] != index {
+			t.Fatalf(
+				"schedule %d = wait %s probe %d, want wait %s probe %d",
+				index,
+				waitTargets[index],
+				probeIndexes[index],
+				measureStart.Add(offset),
+				index,
+			)
+		}
+	}
+}
+
+func TestRunMatchmakingProbesCancellationJoinsPendingWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	probeCalled := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- runMatchmakingProbes(
+			ctx,
+			time.Unix(1_000, 0),
+			[]time.Duration{10 * time.Second},
+			1,
+			func(waitCtx context.Context, _ time.Time) error {
+				close(entered)
+				<-waitCtx.Done()
+				return waitCtx.Err()
+			},
+			func(_ context.Context, _ int) error {
+				probeCalled <- struct{}{}
+				return nil
+			},
+		)
+	}()
+	<-entered
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probeCalled:
+		t.Fatal("probe ran after cancellation released its pending wait")
+	default:
 	}
 }

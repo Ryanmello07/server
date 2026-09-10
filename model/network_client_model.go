@@ -50,6 +50,14 @@ const MaxClientRoleCount = 32
 const MaxClientRoleLength = 128
 const MaxClientPrincipalLength = 256
 
+// Identifies a missing or deactivated client. Authorization callers use
+// errors.Is to separate this terminal state from infrastructure failures.
+var ErrActiveClientNotFound = errors.New("Client does not exist.")
+
+// Identifies a destination that cannot participate at the contract write
+// boundary. Controllers map this state to a route-specific reliability result.
+var ErrContractDestinationInactive = errors.New("Contract destination is inactive.")
+
 // aligns with `protocol.ProvideMode`
 type ProvideMode = int
 
@@ -120,7 +128,7 @@ func FindActiveClientNetwork(
 			if result.Next() {
 				server.Raise(result.Scan(&networkId))
 			} else {
-				returnErr = fmt.Errorf("Client does not exist.")
+				returnErr = ErrActiveClientNotFound
 			}
 		})
 	})
@@ -145,6 +153,13 @@ type AuthNetworkClientArgs struct {
 	Principal string   `json:"principal,omitempty"`
 
 	ProxyConfig *ProxyConfig `json:"proxy_config,omitempty"`
+
+	// TimeZone is the device's IANA zone (e.g. "America/Los_Angeles"), used
+	// only to place the onboarding campaign's sends in the user's local day.
+	// Optional; never stored on the client.
+	TimeZone string `json:"time_zone,omitempty"`
+	// Locale is the device's BCP 47 locale ("de-DE"); same use, same rules.
+	Locale string `json:"locale,omitempty"`
 }
 
 type ProxyConfig struct {
@@ -782,23 +797,14 @@ func RemoveNetworkClient(
 
 	// important: must check `network_id = session network_id`
 	server.Tx(session.Ctx, func(tx server.PgTx) {
-		tag, err := tx.Exec(
+		rowCount, err := deactivateNetworkClientsInTx(
 			session.Ctx,
-			`
-				UPDATE network_client
-				SET
-					active = false,
-					deactivate_time = $3
-				WHERE
-					client_id = $1 AND
-					network_id = $2
-			`,
-			removeClient.ClientId,
+			tx,
+			[]server.Id{removeClient.ClientId},
 			session.ByJwt.NetworkId,
-			server.NowUtc(),
 		)
 		server.Raise(err)
-		if tag.RowsAffected() != 1 {
+		if rowCount != 1 {
 			removeClientResult = &RemoveNetworkClientResult{
 				Error: &RemoveNetworkClientError{
 					Message: "Client does not exist.",
@@ -819,8 +825,57 @@ func RemoveNetworkClient(
 // no single transaction runs long or holds locks for long.
 const RemoveNetworkClientsBatchCount = 10000
 
-func removeNetworkClientsBatchExec(ctx context.Context, tx server.PgTx, clientIds []server.Id, networkId server.Id) {
-	_, err := tx.Exec(
+func deactivateNetworkClientsInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	clientIds []server.Id,
+	networkId server.Id,
+) (int64, error) {
+	orderedClientIds := slices.Clone(clientIds)
+	slices.SortFunc(orderedClientIds, func(a server.Id, b server.Id) int {
+		return a.Cmp(b)
+	})
+	orderedClientIds = slices.Compact(orderedClientIds)
+
+	lockedClientIds := []server.Id{}
+	result, err := tx.Query(
+		ctx,
+		`
+			/* network_client_deactivation_write_boundary */
+			SELECT client_id
+			FROM network_client
+			WHERE
+				client_id = ANY($1) AND
+				network_id = $2
+			ORDER BY client_id
+			FOR UPDATE
+		`,
+		orderedClientIds,
+		networkId,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer result.Close()
+	for result.Next() {
+		var clientId server.Id
+		if err := result.Scan(&clientId); err != nil {
+			return 0, err
+		}
+		lockedClientIds = append(lockedClientIds, clientId)
+	}
+	if err := result.Err(); err != nil {
+		return 0, err
+	}
+	if len(lockedClientIds) == 0 {
+		return 0, nil
+	}
+
+	// Capture the lifecycle timestamp only after every target row is locked.
+	// A concurrent contract holding FOR SHARE must remain ordered before this
+	// deactivation in both database state and recorded time.
+	deactivateTime := server.NowUtc()
+	tag, err := tx.Exec(
 		ctx,
 		`
 			UPDATE network_client
@@ -831,10 +886,18 @@ func removeNetworkClientsBatchExec(ctx context.Context, tx server.PgTx, clientId
 				client_id = ANY($1) AND
 				network_id = $2
 		`,
-		clientIds,
+		lockedClientIds,
 		networkId,
-		server.NowUtc(),
+		deactivateTime,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func removeNetworkClientsBatchExec(ctx context.Context, tx server.PgTx, clientIds []server.Id, networkId server.Id) {
+	_, err := deactivateNetworkClientsInTx(ctx, tx, clientIds, networkId)
 	server.Raise(err)
 }
 
@@ -1196,9 +1259,65 @@ type NetworkClientConnection struct {
 	ConnectionBlock   string     `json:"connection_block"`
 }
 
+// Builds the wire result with an allocated empty slice. JSON null is not the
+// collection contract and older SDK views dereferenced the generated list.
+func newNetworkClientsResult(clientInfos map[server.Id]*NetworkClientInfo) *NetworkClientsResult {
+	clients := make([]*NetworkClientInfo, 0, len(clientInfos))
+	for _, clientInfo := range clientInfos {
+		clients = append(clients, clientInfo)
+	}
+	return &NetworkClientsResult{Clients: clients}
+}
+
+// networkClientListKind selects which of a network's clients a list returns.
+type networkClientListKind int
+
+const (
+	// the network's devices: top-level clients (no `source_client_id`) that
+	// are not hosted proxy devices
+	networkClientListDevices networkClientListKind = 0
+	// the network's hosted proxy devices: clients with a `proxy_device_config`
+	// row (the "resident proxy" DeviceLocals the proxy host runs), each with
+	// its `proxy_client` credentials
+	networkClientListProxies networkClientListKind = 1
+)
+
+// GetNetworkClients lists the network's devices: every top-level client (no
+// `source_client_id`) that is not a hosted proxy device, with no provide-mode
+// qualification. Child clients never appear, and neither do the "resident
+// proxy" devices the proxy host runs for the network's proxies; those are
+// listed by GetNetworkProxies. This is what the apps' device lists show.
 func GetNetworkClients(session *session.ClientSession) (*NetworkClientsResult, error) {
+	return getNetworkClientList(session, networkClientListDevices)
+}
+
+// GetNetworkProxies lists the network's hosted proxy devices (clients with a
+// `proxy_device_config` row) with their `proxy_client` credentials. Everything
+// else about a row (resident, connections, roles, provide mode) reads the same
+// as GetNetworkClients.
+func GetNetworkProxies(session *session.ClientSession) (*NetworkClientsResult, error) {
+	return getNetworkClientList(session, networkClientListProxies)
+}
+
+func getNetworkClientList(session *session.ClientSession, kind networkClientListKind) (*NetworkClientsResult, error) {
 	var clientsResult *NetworkClientsResult
 	var clientsErr error
+
+	// a hosted proxy device is a client with a `proxy_device_config` row, the
+	// same test the peer registry uses to keep proxies out of the peer list
+	kindFilter := `
+					network_client.source_client_id IS NULL AND
+					NOT EXISTS (
+						SELECT 1 FROM proxy_device_config
+						WHERE proxy_device_config.client_id = network_client.client_id
+					)`
+	if kind == networkClientListProxies {
+		kindFilter = `
+					EXISTS (
+						SELECT 1 FROM proxy_device_config
+						WHERE proxy_device_config.client_id = network_client.client_id
+					)`
+	}
 
 	server.Db(session.Ctx, func(conn server.PgConn) {
 		result, err := conn.Query(
@@ -1226,7 +1345,7 @@ func GetNetworkClients(session *session.ClientSession) (*NetworkClientsResult, e
 					proxy_client.client_id = network_client.client_id
 				WHERE
 					network_client.network_id = $1 AND
-					network_client.active = true
+					network_client.active = true AND`+kindFilter+`
 			`,
 			session.ByJwt.NetworkId,
 			ProvideModePublic,
@@ -1258,7 +1377,8 @@ func GetNetworkClients(session *session.ClientSession) (*NetworkClientsResult, e
 				if deviceSpec_ != nil {
 					clientInfo.DeviceSpec = *deviceSpec_
 				}
-				if proxyClientJson != nil {
+				// the credentials belong to the proxies list only
+				if kind == networkClientListProxies && proxyClientJson != nil {
 					var proxyClient ProxyClient
 					err := json.Unmarshal([]byte(*proxyClientJson), &proxyClient)
 					if err == nil {
@@ -1336,9 +1456,7 @@ func GetNetworkClients(session *session.ClientSession) (*NetworkClientsResult, e
 			}
 		})
 
-		clientsResult = &NetworkClientsResult{
-			Clients: slices.Collect(maps.Values(clientInfos)),
-		}
+		clientsResult = newNetworkClientsResult(clientInfos)
 	})
 
 	if clientsResult != nil && 0 < len(clientsResult.Clients) {
@@ -1535,12 +1653,56 @@ func GetNetworkClientNetwork(ctx context.Context, clientId server.Id) (networkId
 	return
 }
 
-func GetProvideRelationship(ctx context.Context, clientIdA server.Id, clientIdB server.Id) ProvideMode {
-	if clientIdA == clientIdB {
-		return ProvideModeNetwork
-	}
+// NetworkClientLifecycle is the bounded lifecycle class used when diagnosing
+// contract routing. It deliberately excludes client and network identifiers so
+// callers can expose it as a metric label without creating unbounded series or
+// leaking customer identity.
+type NetworkClientLifecycle string
 
-	sameNetwork := false
+const (
+	NetworkClientLifecycleMissing         NetworkClientLifecycle = "missing"
+	NetworkClientLifecycleActiveTop       NetworkClientLifecycle = "active_top"
+	NetworkClientLifecycleInactiveTop     NetworkClientLifecycle = "inactive_top"
+	NetworkClientLifecycleActiveDerived   NetworkClientLifecycle = "active_derived"
+	NetworkClientLifecycleInactiveDerived NetworkClientLifecycle = "inactive_derived"
+)
+
+type ProvideRelationshipDetails struct {
+	Mode                 ProvideMode
+	SourceLifecycle      NetworkClientLifecycle
+	DestinationLifecycle NetworkClientLifecycle
+}
+
+func networkClientLifecycle(active *bool, sourceClientId *server.Id) NetworkClientLifecycle {
+	if active == nil {
+		return NetworkClientLifecycleMissing
+	}
+	if sourceClientId != nil {
+		if *active {
+			return NetworkClientLifecycleActiveDerived
+		}
+		return NetworkClientLifecycleInactiveDerived
+	}
+	if *active {
+		return NetworkClientLifecycleActiveTop
+	}
+	return NetworkClientLifecycleInactiveTop
+}
+
+// GetProvideRelationshipDetails resolves the same relationship as
+// GetProvideRelationship while carrying bounded endpoint lifecycle classes
+// from that exact database snapshot. CreateContract already needs this lookup;
+// returning the extra columns makes missing-origin telemetry causal without an
+// additional query on the failure path.
+func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, clientIdB server.Id) ProvideRelationshipDetails {
+	details := ProvideRelationshipDetails{
+		Mode:                 ProvideModePublic,
+		SourceLifecycle:      NetworkClientLifecycleMissing,
+		DestinationLifecycle: NetworkClientLifecycleMissing,
+	}
+	if clientIdA == clientIdB {
+		details.Mode = ProvideModeNetwork
+	}
 
 	server.Db(ctx, func(conn server.PgConn) {
 		result, err := conn.Query(
@@ -1548,34 +1710,51 @@ func GetProvideRelationship(ctx context.Context, clientIdA server.Id, clientIdB 
 			`
 			SELECT
 				a.network_id,
-				b.network_id
-			FROM network_client a
-			INNER JOIN network_client b ON b.client_id = $2
-			WHERE a.client_id = $1
+				a.active,
+				a.source_client_id,
+				b.network_id,
+				b.active,
+				b.source_client_id
+			FROM (VALUES (true)) AS seed(value)
+			LEFT JOIN network_client a ON a.client_id = $1
+			LEFT JOIN network_client b ON b.client_id = $2
 			`,
 			clientIdA,
 			clientIdB,
 		)
 		server.WithPgResult(result, err, func() {
 			if result.Next() {
-				var networkIdA server.Id
-				var networkIdB server.Id
-				server.Raise(result.Scan(&networkIdA, &networkIdB))
-				if networkIdA == networkIdB {
-					sameNetwork = true
+				var networkIdA *server.Id
+				var activeA *bool
+				var sourceClientIdA *server.Id
+				var networkIdB *server.Id
+				var activeB *bool
+				var sourceClientIdB *server.Id
+				server.Raise(result.Scan(
+					&networkIdA,
+					&activeA,
+					&sourceClientIdA,
+					&networkIdB,
+					&activeB,
+					&sourceClientIdB,
+				))
+				details.SourceLifecycle = networkClientLifecycle(activeA, sourceClientIdA)
+				details.DestinationLifecycle = networkClientLifecycle(activeB, sourceClientIdB)
+				if networkIdA != nil && networkIdB != nil && *networkIdA == *networkIdB {
+					details.Mode = ProvideModeNetwork
 				}
 			}
 		})
 	})
 
-	if sameNetwork {
+	return details
+}
+
+func GetProvideRelationship(ctx context.Context, clientIdA server.Id, clientIdB server.Id) ProvideMode {
+	if clientIdA == clientIdB {
 		return ProvideModeNetwork
 	}
-
-	// TODO network and friends-and-family not implemented yet
-	// FIXME these exist in the association model now, can be added
-
-	return ProvideModePublic
+	return GetProvideRelationshipDetails(ctx, clientIdA, clientIdB).Mode
 }
 
 // the roles and identity principal assigned to a client at creation.
@@ -2373,14 +2552,27 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 	for {
 		var batchCount int64
 		server.MaintenanceTx(ctx, func(tx server.PgTx) {
-			tag := server.RaisePgResult(tx.Exec(
+			clientIds := []server.Id{}
+			result, err := tx.Query(
 				ctx,
 				`
-				UPDATE network_client
-				SET active = false, deactivate_time = $2
-				WHERE client_id IN (
+					WITH candidate AS MATERIALIZED (
+						SELECT network_client.client_id
+						FROM network_client
+						LEFT JOIN network_client_connection ON
+							network_client_connection.client_id = network_client.client_id AND
+							network_client_connection.connected = true
+						WHERE
+							network_client.active = true AND
+							network_client.source_client_id IS NULL AND
+							network_client.auth_time < $1 AND
+							network_client_connection.client_id IS NULL
+						ORDER BY network_client.auth_time ASC, network_client.client_id ASC
+						LIMIT $2
+					)
 					SELECT network_client.client_id
 					FROM network_client
+					JOIN candidate ON candidate.client_id = network_client.client_id
 					LEFT JOIN network_client_connection ON
 						network_client_connection.client_id = network_client.client_id AND
 						network_client_connection.connected = true
@@ -2389,13 +2581,36 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 						network_client.source_client_id IS NULL AND
 						network_client.auth_time < $1 AND
 						network_client_connection.client_id IS NULL
-					ORDER BY network_client.auth_time ASC
-					LIMIT $3
-				)
+					ORDER BY network_client.client_id
+					FOR UPDATE OF network_client
 				`,
 				minTopLevelAuthTime.UTC(),
-				server.NowUtc(),
 				markTopLevelBatchCount,
+			)
+			server.WithPgResult(result, err, func() {
+				for result.Next() {
+					var clientId server.Id
+					server.Raise(result.Scan(&clientId))
+					clientIds = append(clientIds, clientId)
+				}
+			})
+			if len(clientIds) == 0 {
+				return
+			}
+
+			// The ordered FOR UPDATE above has completed before this timestamp
+			// is captured, so a lifecycle reader that won the row lock remains
+			// earlier than the deactivation it delayed.
+			deactivateTime := server.NowUtc()
+			tag := server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+					UPDATE network_client
+					SET active = false, deactivate_time = $2
+					WHERE client_id = ANY($1) AND active = true
+				`,
+				clientIds,
+				deactivateTime,
 			))
 			batchCount = tag.RowsAffected()
 		}, server.TxReadCommitted)
@@ -2556,15 +2771,11 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 		}
 	}
 
-	// Sweep per-client redis state for each reaped client_id. Outside the DB tx
-	// since redis isn't transactional with Postgres; a failure just leaves keys
-	// until the next sweep or overwrite.
-	for _, clientId := range reapedClientIds {
-		RemoveClientPublicKey(ctx, clientId)
-		// clear the reaped client's verify egress index entries so a
-		// reassigned ip is never miscredited (sn/VALIDATOR.md §8.2)
-		RemoveVerifyEgressForClient(ctx, clientId)
-	}
+	// Sweep per-client redis state outside the DB transaction. Plain pipelines
+	// auto-route these unrelated client hash slots, while bounded chunks avoid
+	// the old several-serialized-round-trips-per-id tail (which stretched a
+	// large production reap beyond 95 minutes after all PG bands were empty).
+	removeReapedClientRedisState(ctx, reapedClientIds)
 
 	// (cascade) the dependent tables are all keyed by the reaped ids, so the
 	// cascades below are targeted deletes on those ids (chunked to bound
@@ -2615,15 +2826,83 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 // cascade delete statement.
 const removeCascadeChunkCount = 10000
 
+// Redis cleanup keys span arbitrary cluster slots. Keep each plain pipeline
+// bounded while amortizing one Redis health check / network round trip over a
+// meaningful cohort. Every queued operation below is idempotent, so the
+// cluster client's documented pipeline retry behavior is safe.
+const removeRedisCleanupChunkCount = 1000
+
+func forEachReapedClientRedisChunk(clientIds []server.Id, cleanup func([]server.Id)) {
+	for chunk := range slices.Chunk(clientIds, removeRedisCleanupChunkCount) {
+		cleanup(chunk)
+	}
+}
+
+func removeReapedClientRedisState(ctx context.Context, clientIds []server.Id) {
+	forEachReapedClientRedisChunk(clientIds, func(chunk []server.Id) {
+		server.Redis(ctx, func(r server.RedisClient) {
+			reverseCmds := make([]*redis.MapStringStringCmd, len(chunk))
+			_, err := r.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for i, clientId := range chunk {
+					pipe.Del(ctx, clientPublicKeyRedisKey(clientId))
+					reverseCmds[i] = pipe.HGetAll(ctx, verifyClientEgressKey(clientId))
+				}
+				return nil
+			})
+			server.Raise(err)
+
+			forwardEntryCount := 0
+			_, err = r.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for i, clientId := range chunk {
+					entries, err := reverseCmds[i].Result()
+					server.Raise(err)
+					for egressHashHex := range entries {
+						// Atomic compare-delete: a recycled address may already
+						// belong to another client, which must not be clobbered.
+						server.RedisRemoveIfEqual(pipe, ctx, verifyEgressKeyFromHex(egressHashHex), []byte(clientId.String()))
+						forwardEntryCount++
+					}
+				}
+				return nil
+			})
+			if 0 < forwardEntryCount {
+				server.Raise(err)
+			}
+
+			// Only discard the reverse evidence after every conditional forward
+			// delete has succeeded. Cross-slot pipeline execution is not globally
+			// ordered; separating the waves keeps a partial cluster failure
+			// retryable instead of orphaning an undeleted forward entry.
+			eligibleMembers := make([]any, len(chunk))
+			_, err = r.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for i, clientId := range chunk {
+					pipe.Del(ctx, verifyClientEgressKey(clientId))
+					eligibleMembers[i] = clientId.String()
+				}
+				pipe.SRem(ctx, verifyEligibleKey, eligibleMembers...)
+				return nil
+			})
+			server.Raise(err)
+		})
+	})
+}
+
 type releasedProxyEgress struct {
 	ClientID server.Id
 	IPv4     *int64
 }
 
 func clearReleasedProxyEgress(ctx context.Context, released []releasedProxyEgress) {
+	cleared := map[server.Id]bool{}
 	for _, item := range released {
-		if item.IPv4 != nil {
-			ClearVerifyEgress(ctx, item.ClientID, IntToIpv4(*item.IPv4), DefaultVerifySettings())
+		if item.IPv4 != nil && !cleared[item.ClientID] {
+			// The HMAC key is deliberately unavailable in the model cleanup
+			// layer. The reverse index is authoritative and lets release remove
+			// every keyed entry for this client without guessing a namespace.
+			// Any surviving direct connection is fail-closed briefly and restores
+			// its observed egress on its next bounded refresh.
+			RemoveVerifyEgressForClient(ctx, item.ClientID)
+			cleared[item.ClientID] = true
 		}
 	}
 }
@@ -2659,8 +2938,13 @@ func removeProxyDeviceConfigsForClientIds(ctx context.Context, clientIds []serve
 	}
 
 	server.Redis(ctx, func(r server.RedisClient) {
-		for _, proxyId := range removedProxyIds {
-			err := r.Del(ctx, proxyDeviceConfigKey(proxyId)).Err()
+		for chunk := range slices.Chunk(removedProxyIds, removeRedisCleanupChunkCount) {
+			_, err := r.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for _, proxyId := range chunk {
+					pipe.Del(ctx, proxyDeviceConfigKey(proxyId))
+				}
+				return nil
+			})
 			server.Raise(err)
 		}
 	})
@@ -2715,7 +2999,7 @@ func removeProxyClientData(ctx context.Context, proxyIds []server.Id) {
 // removeProvideKeysForClientIds deletes the provide keys of the given clients
 // and their redis mirrors (provide modes and per-mode secret keys).
 func removeProvideKeysForClientIds(ctx context.Context, clientIds []server.Id) {
-	for chunk := range slices.Chunk(clientIds, removeCascadeChunkCount) {
+	for chunk := range slices.Chunk(clientIds, removeRedisCleanupChunkCount) {
 		clientProvideModes := map[server.Id][]ProvideMode{}
 		server.MaintenanceTx(ctx, func(tx server.PgTx) {
 			// reset in case the tx is retried on a transient error
@@ -2741,15 +3025,16 @@ func removeProvideKeysForClientIds(ctx context.Context, clientIds []server.Id) {
 		}, server.TxReadCommitted)
 
 		server.Redis(ctx, func(r server.RedisClient) {
-			for clientId, provideModes := range clientProvideModes {
-				pipe := r.TxPipeline()
-				pipe.Del(ctx, provideModesKey(clientId))
-				for _, provideMode := range provideModes {
-					pipe.Del(ctx, provideModeSecretKeyKey(clientId, provideMode))
+			_, err := r.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for clientId, provideModes := range clientProvideModes {
+					pipe.Del(ctx, provideModesKey(clientId))
+					for _, provideMode := range provideModes {
+						pipe.Del(ctx, provideModeSecretKeyKey(clientId, provideMode))
+					}
 				}
-				_, err := pipe.Exec(ctx)
-				server.Raise(err)
-			}
+				return nil
+			})
+			server.Raise(err)
 		})
 	}
 }
@@ -3257,30 +3542,25 @@ func HeartbeatNetworkClientHandler(ctx context.Context, handlerId server.Id) (re
 }
 
 func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
+	disconnectTime := server.NowUtc()
 	server.MaintenanceTx(ctx, func(tx server.PgTx) {
-		handlerIds := []server.Id{}
-
-		result, err := tx.Query(
+		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
-				SELECT
-					handler_id
-				FROM network_client_handler
+				DELETE FROM network_client_handler
 				WHERE
 					heartbeat_time < $1
 			`,
 			minTime.UTC(),
-		)
-		server.WithPgResult(result, err, func() {
-			for result.Next() {
-				var handlerId server.Id
-				server.Raise(result.Scan(&handlerId))
-				handlerIds = append(handlerIds, handlerId)
-			}
-		})
+		))
 
-		server.CreateTempTableInTx(ctx, tx, "temp_handler_ids(handler_id uuid)", handlerIds...)
-
+		// A handler row and its connections deliberately have no foreign key:
+		// handlers are ephemeral, while connection history is retained. That
+		// means a process loss, an old cleanup implementation, or a connect that
+		// races handler deletion can leave an open row whose handler is already
+		// gone. Selecting only expired handler ids can never discover that row.
+		// Sweep the durable invariant after the delete so every such connection
+		// is repaired, including orphans left by an earlier taskworker.
 		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
@@ -3288,22 +3568,16 @@ func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
 				SET
 					connected = false,
 					disconnect_time = $1
-				FROM temp_handler_ids
 				WHERE
-					temp_handler_ids.handler_id = network_client_connection.handler_id
-
+					network_client_connection.connected = true AND
+					NOT EXISTS (
+						SELECT 1
+						FROM network_client_handler
+						WHERE
+							network_client_handler.handler_id = network_client_connection.handler_id
+					)
 			`,
-			server.NowUtc(),
-		))
-
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-				DELETE FROM network_client_handler
-				USING temp_handler_ids
-				WHERE
-					temp_handler_ids.handler_id = network_client_handler.handler_id
-			`,
+			disconnectTime,
 		))
 	})
 }

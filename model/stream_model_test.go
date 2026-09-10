@@ -5,6 +5,7 @@ import (
 	"fmt"
 	mathrand "math/rand"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,7 +28,7 @@ func TestStreamHopListenerCloseAndWaitJoinsAdmittedCallback(t *testing.T) {
 		callbackReturned := make(chan struct{})
 		var releaseOnce sync.Once
 		defer releaseOnce.Do(func() { close(releaseCallback) })
-		listener := NewStreamHopListener(
+		listener := newStreamHopListener(
 			testCtx,
 			server.NewId(),
 			func(*StreamHopEvent) {
@@ -37,6 +38,7 @@ func TestStreamHopListenerCloseAndWaitJoinsAdmittedCallback(t *testing.T) {
 			},
 			time.Hour,
 			0,
+			GetStreamHops,
 		)
 		listener.afterCloseWaitForTest = func() {
 			select {
@@ -141,6 +143,201 @@ func TestStreamHop(t *testing.T) {
 	connect.AssertEqual(t, hop.Path(), path)
 }
 
+// Reproduces Redis stream state that outlived removed one-shot clients. The
+// reconnecting snapshot omits both inactive hop orientations while retaining
+// an active client without a live connection row.
+func TestStreamHopListenerPrunesInactiveAdjacentClients(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		networkId := server.NewId()
+		Testing_CreateNetwork(ctx, networkId, fmt.Sprintf("stream-active-%s", networkId), server.NewId())
+
+		orderedClientIds := []server.Id{server.NewId(), server.NewId(), server.NewId()}
+		slices.SortFunc(orderedClientIds, func(a server.Id, b server.Id) int { return a.Cmp(b) })
+		lowerInactiveId := orderedClientIds[0]
+		clientId := orderedClientIds[1]
+		upperInactiveId := orderedClientIds[2]
+		activeDisconnectedId := server.NewId()
+		for _, id := range []server.Id{lowerInactiveId, clientId, upperInactiveId, activeDisconnectedId} {
+			Testing_CreateDevice(ctx, networkId, server.NewId(), id, "", "")
+		}
+
+		lowerContractId := server.NewId()
+		upperContractId := server.NewId()
+		activeContractId := server.NewId()
+		lowerStreamId := AddToStream(ctx, lowerContractId, lowerInactiveId, clientId, nil)
+		upperStreamId := AddToStream(ctx, upperContractId, clientId, upperInactiveId, nil)
+		activeStreamId := AddToStream(ctx, activeContractId, clientId, activeDisconnectedId, nil)
+		defer func() {
+			RemoveFromStream(ctx, lowerContractId)
+			RemoveFromStream(ctx, upperContractId)
+			RemoveFromStream(ctx, activeContractId)
+		}()
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE network_client SET active = false WHERE client_id = ANY($1::uuid[])`,
+				[]string{lowerInactiveId.String(), upperInactiveId.String()},
+			))
+		})
+
+		var connectionCount int
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`SELECT count(*) FROM network_client_connection WHERE client_id = $1`,
+				activeDisconnectedId,
+			)
+			server.WithPgResult(result, err, func() {
+				if !result.Next() {
+					t.Fatal("missing connection count")
+				}
+				server.Raise(result.Scan(&connectionCount))
+			})
+		})
+		if connectionCount != 0 {
+			t.Fatalf("active client has %d connection rows, want none", connectionCount)
+		}
+
+		eventIdBefore, hopsBefore := GetStreamHops(ctx, clientId)
+		if len(hopsBefore) != 3 {
+			t.Fatalf("cached stream hops before listener = %d, want 3", len(hopsBefore))
+		}
+
+		events := make(chan *StreamHopEvent, 1)
+		listener := NewStreamHopListener(
+			ctx,
+			clientId,
+			func(event *StreamHopEvent) { events <- event },
+			time.Hour,
+			0,
+		)
+		listener.Resync()
+		var initialEvent *StreamHopEvent
+		select {
+		case initialEvent = <-events:
+		case <-ctx.Done():
+			listener.CloseAndWait()
+			t.Fatalf("stream listener did not publish its initial snapshot: %v", ctx.Err())
+		}
+		listener.CloseAndWait()
+
+		if len(initialEvent.StreamHops) != 1 {
+			t.Fatalf("initial active stream hops = %d, want 1", len(initialEvent.StreamHops))
+		}
+		if got := initialEvent.StreamHops[0].StreamId(); got != activeStreamId {
+			t.Fatalf("initial stream id = %s, want active disconnected stream %s", got, activeStreamId)
+		}
+		for _, staleStreamId := range []server.Id{lowerStreamId, upperStreamId} {
+			if initialEvent.StreamHops[0].StreamId() == staleStreamId {
+				t.Fatalf("initial snapshot retained inactive stream %s", staleStreamId)
+			}
+		}
+
+		eventIdAfter, hopsAfter := GetStreamHops(ctx, clientId)
+		if eventIdAfter <= eventIdBefore {
+			t.Fatalf("stream event id after prune = %d, want greater than %d", eventIdAfter, eventIdBefore)
+		}
+		if len(hopsAfter) != 1 || !hopsAfter[initialEvent.StreamHops[0]] {
+			t.Fatalf("cached stream hops after prune = %v, want initial active hop", hopsAfter)
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE network_client SET active = false WHERE client_id = $1`,
+				clientId,
+			))
+		})
+		finalEventId, finalHops := GetActiveStreamHops(ctx, clientId)
+		if len(finalHops) != 0 {
+			t.Fatalf("inactive owner stream hops = %v, want empty", finalHops)
+		}
+		if finalEventId != eventIdAfter {
+			t.Fatalf("inactive owner snapshot event id = %d, want pre-prune %d", finalEventId, eventIdAfter)
+		}
+		if currentEventId := GetStreamEventId(ctx, clientId); currentEventId <= finalEventId {
+			t.Fatalf("inactive owner current event id = %d, want greater than returned %d", currentEventId, finalEventId)
+		}
+	})
+}
+
+// Forces a stale writer to re-add a removed hop at the prune boundary. The
+// filtered call remains bounded and returns the older version so the next
+// listener tick cannot miss the concurrent write.
+func TestActiveStreamHopsBoundsConcurrentStaleReAdd(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		networkId := server.NewId()
+		Testing_CreateNetwork(ctx, networkId, fmt.Sprintf("stream-readd-%s", networkId), server.NewId())
+		clientId := server.NewId()
+		inactiveId := server.NewId()
+		for _, id := range []server.Id{clientId, inactiveId} {
+			Testing_CreateDevice(ctx, networkId, server.NewId(), id, "", "")
+		}
+		contractId := server.NewId()
+		AddToStream(ctx, contractId, clientId, inactiveId, nil)
+		defer RemoveFromStream(ctx, contractId)
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE network_client SET active = false WHERE client_id = $1`,
+				inactiveId,
+			))
+		})
+		_, rawHops := GetStreamHops(ctx, clientId)
+		if len(rawHops) != 1 {
+			t.Fatalf("raw stream hops = %d, want 1", len(rawHops))
+		}
+		var staleStreamHop StreamHop
+		for streamHop := range rawHops {
+			staleStreamHop = streamHop
+		}
+
+		hookCalls := 0
+		filteredEventId, filteredHops := getActiveStreamHops(ctx, clientId, func() {
+			hookCalls++
+			server.Redis(ctx, func(r server.RedisClient) {
+				pipe := r.TxPipeline()
+				pipe.SAdd(ctx, clientStreamHopsKey(clientId), staleStreamHop.Bytes())
+				pipe.Incr(ctx, clientEventIdKey(clientId))
+				pipe.Expire(ctx, clientStreamHopsKey(clientId), 8*time.Hour)
+				pipe.Expire(ctx, clientEventIdKey(clientId), clientEventIdTtl)
+				_, err := pipe.Exec(ctx)
+				server.Raise(err)
+			})
+		})
+		if hookCalls != 1 {
+			t.Fatalf("post-prune hook calls = %d, want 1", hookCalls)
+		}
+		if len(filteredHops) != 0 {
+			t.Fatalf("filtered stream hops = %v, want none", filteredHops)
+		}
+		if currentEventId := GetStreamEventId(ctx, clientId); currentEventId <= filteredEventId {
+			t.Fatalf("current event id = %d, want greater than returned %d", currentEventId, filteredEventId)
+		}
+		_, rawHops = GetStreamHops(ctx, clientId)
+		if !rawHops[staleStreamHop] {
+			t.Fatal("concurrent stale re-add was not installed")
+		}
+
+		_, filteredHops = GetActiveStreamHops(ctx, clientId)
+		if len(filteredHops) != 0 {
+			t.Fatalf("second filtered stream hops = %v, want none", filteredHops)
+		}
+		_, rawHops = GetStreamHops(ctx, clientId)
+		if len(rawHops) != 0 {
+			t.Fatalf("raw stream hops after convergence = %v, want none", rawHops)
+		}
+	})
+}
+
 func TestStream(t *testing.T) {
 	// in parallel add and remove contracts from a shared set of paths that include a client id
 	// ensure that the final state for the client id matches the state accumulated from the events
@@ -213,7 +410,7 @@ func TestStream(t *testing.T) {
 				fmt.Printf("-")
 			},
 		)
-		l := NewStreamHopListener(ctx, clientId, c.Event, 200*time.Millisecond, 5)
+		l := newStreamHopListener(ctx, clientId, c.Event, 200*time.Millisecond, 5, GetStreamHops)
 		defer l.CloseAndWait()
 
 		var wg sync.WaitGroup
@@ -296,7 +493,7 @@ func TestStream(t *testing.T) {
 				removeCount.Add(1)
 			},
 		)
-		l2 := NewStreamHopListener(ctx, clientId, c2.Event, 200*time.Millisecond, 5)
+		l2 := newStreamHopListener(ctx, clientId, c2.Event, 200*time.Millisecond, 5, GetStreamHops)
 		defer l2.CloseAndWait()
 
 		// cover a full listener poll cycle (5s) so the assertion does not
@@ -474,7 +671,7 @@ func TestCompanionStreamCloseLifecycle(t *testing.T) {
 			func(hop StreamHop) {},
 			func(hop StreamHop) {},
 		)
-		l := NewStreamHopListener(ctx, intermediaryId, c.Event, 200*time.Millisecond, 5)
+		l := newStreamHopListener(ctx, intermediaryId, c.Event, 200*time.Millisecond, 5, GetStreamHops)
 		defer l.CloseAndWait()
 
 		originContractId := server.NewId()
@@ -545,12 +742,13 @@ func TestStreamHopCorrectiveReadRepairsMissedExpiry(t *testing.T) {
 		eventIdBefore := GetStreamEventId(ctx, hopClientId)
 
 		events := make(chan *StreamHopEvent, 8)
-		listener := NewStreamHopListener(
+		listener := newStreamHopListener(
 			ctx,
 			hopClientId,
 			func(event *StreamHopEvent) { events <- event },
 			100*time.Millisecond,
 			1,
+			GetStreamHops,
 		)
 		defer listener.CloseAndWait()
 		listener.Resync()
@@ -595,26 +793,66 @@ func TestExpireLeakedStreamKeys(t *testing.T) {
 		_, healthyKey, found := GetStream(ctx, healthyContractId)
 		connect.AssertEqual(t, found, true)
 
-		// a leaked stream id key: reproduce the pre-fix state, an EXPIRE of
-		// the 8h ttl in nanoseconds
-		leakedKey := streamIdKey(newStreamKey(server.NewId(), server.NewId(), nil))
+		// Reproduce the pre-fix state: EXPIRE received the 8h ttl in
+		// nanoseconds. Use fixed IDs containing NULs so this test proves SCAN
+		// -> PTTL -> EXPIRE preserves binary Redis keys. A shell variable does
+		// not, and can turn a valid key into a different hash slot and a false
+		// MOVED.
+		leakedStreamKey := newStreamKey(
+			server.Id{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+			server.Id{16, 0, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31},
+			nil,
+		)
+		currentLeakedKey := streamIdKey(leakedStreamKey)
+		// Cast to []byte to reproduce the historical formatter. Formatting
+		// streamKey directly would call its diagnostic String method instead.
+		legacyLeakedKey := fmt.Sprintf("{%s}s_sk_cs", []byte(leakedStreamKey))
+		durationOverflowLeakedKey := fmt.Sprintf("{%s}s_sk_sid", []byte(leakedStreamKey))
+		unrelatedKey := fmt.Sprintf("{%s}nonsense_sk_cache", []byte(leakedStreamKey))
+		connect.AssertEqual(t, strings.IndexByte(currentLeakedKey, 0) >= 0, true)
+		connect.AssertEqual(t, strings.IndexByte(legacyLeakedKey, 0) >= 0, true)
+		connect.AssertEqual(t, isStreamTTLKey(currentLeakedKey), true)
+		connect.AssertEqual(t, isStreamTTLKey(legacyLeakedKey), true)
+		connect.AssertEqual(t, isStreamTTLKey(durationOverflowLeakedKey), true)
+		connect.AssertEqual(t, isStreamTTLKey(unrelatedKey), false)
 		server.Redis(ctx, func(r server.RedisClient) {
-			connect.AssertEqual(t, r.Set(ctx, leakedKey, server.NewId().Bytes(), 0).Err(), nil)
-			connect.AssertEqual(t, r.Do(ctx, "EXPIRE", leakedKey, int64(8*time.Hour/time.Nanosecond)).Err(), nil)
-			leakedTtl, err := r.TTL(ctx, leakedKey).Result()
+			for _, key := range []string{currentLeakedKey, legacyLeakedKey, unrelatedKey} {
+				connect.AssertEqual(t, r.Set(ctx, key, server.NewId().Bytes(), 0).Err(), nil)
+				connect.AssertEqual(t, r.Do(ctx, "EXPIRE", key, int64(8*time.Hour/time.Nanosecond)).Err(), nil)
+				leakedTTL, err := r.TTL(ctx, key).Result()
+				connect.AssertEqual(t, err, nil)
+				connect.AssertEqual(t, 8*time.Hour < leakedTTL, true)
+			}
+
+			// 18,446,744,073,710 milliseconds is roughly 584 years and
+			// wraps to less than one millisecond when go-redis's typed PTTL
+			// helper multiplies it into a time.Duration. The cleanup must use
+			// the raw Redis integer or it silently leaves this leaked key.
+			const overflowTTLMillis int64 = 18_446_744_073_710
+			connect.AssertEqual(t, r.Set(ctx, durationOverflowLeakedKey, server.NewId().Bytes(), 0).Err(), nil)
+			connect.AssertEqual(t, r.Do(ctx, "PEXPIRE", durationOverflowLeakedKey, overflowTTLMillis).Err(), nil)
+			rawTTLMillis, err := r.Do(ctx, "PTTL", durationOverflowLeakedKey).Int64()
 			connect.AssertEqual(t, err, nil)
-			connect.AssertEqual(t, 8*time.Hour < leakedTtl, true)
+			connect.AssertEqual(t, (8*time.Hour).Milliseconds() < rawTTLMillis, true)
+			overflowedTTL, err := r.PTTL(ctx, durationOverflowLeakedKey).Result()
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, overflowedTTL <= 8*time.Hour, true)
 		})
 
 		scannedCount, fixedCount, err := ExpireLeakedStreamKeys(ctx)
 		connect.AssertEqual(t, err, nil)
-		connect.AssertEqual(t, 2 <= scannedCount, true)
-		connect.AssertEqual(t, 1 <= fixedCount, true)
+		connect.AssertEqual(t, 4 <= scannedCount, true)
+		connect.AssertEqual(t, 3 <= fixedCount, true)
 
 		server.Redis(ctx, func(r server.RedisClient) {
-			leakedTtl, err := r.TTL(ctx, leakedKey).Result()
+			for _, key := range []string{currentLeakedKey, legacyLeakedKey, durationOverflowLeakedKey} {
+				leakedTTLMillis, err := r.Do(ctx, "PTTL", key).Int64()
+				connect.AssertEqual(t, err, nil)
+				connect.AssertEqual(t, 0 < leakedTTLMillis && leakedTTLMillis <= (8*time.Hour).Milliseconds(), true)
+			}
+			unrelatedTTLMillis, err := r.Do(ctx, "PTTL", unrelatedKey).Int64()
 			connect.AssertEqual(t, err, nil)
-			connect.AssertEqual(t, 0 < leakedTtl && leakedTtl <= 8*time.Hour, true)
+			connect.AssertEqual(t, (8*time.Hour).Milliseconds() < unrelatedTTLMillis, true)
 
 			healthyTtl, err := r.TTL(ctx, streamIdKey(healthyKey)).Result()
 			connect.AssertEqual(t, err, nil)
@@ -640,7 +878,7 @@ func TestStreamHopFlushRecovery(t *testing.T) {
 			func(hop StreamHop) {},
 			func(hop StreamHop) {},
 		)
-		l := NewStreamHopListener(ctx, clientId, c.Event, 200*time.Millisecond, 5)
+		l := newStreamHopListener(ctx, clientId, c.Event, 200*time.Millisecond, 5, GetStreamHops)
 		defer l.CloseAndWait()
 
 		// a hop involving clientId; the listener syncs it

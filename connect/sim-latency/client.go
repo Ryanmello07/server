@@ -134,6 +134,12 @@ const (
 	// window so a low arrival rate cannot turn the last pool slots cold again.
 	warmClientTCPIdleTimeout = 24 * time.Hour
 
+	// Matchmaking is immutable benchmark traffic. Long runs sample at least
+	// every ten seconds; short runs still receive ten evenly spaced probes so
+	// the scorer can require observations across 90% of every measured window.
+	matchmakingProbeMaximumInterval  = 10 * time.Second
+	matchmakingProbeMinimumIntervals = 10
+
 	resultCSVHeader = "t_start_ms,client,path,depth,status,bytes,ttfb_ms,total_ms,bytes_per_s"
 )
 
@@ -328,15 +334,17 @@ func warmClientPoolError(ctx context.Context, established int, requested int) er
 	return fmt.Errorf("established %d/%d warm clients", established, requested)
 }
 
-// Make one real quality-ranked discovery call under a pool identity. Warm
-// clients discover before measurement and may not need a replacement during a
-// short window, so this supplies a deterministic in-window audit sample while
-// exercising the same submitted matchmaking implementation.
-func (self *ClientDriver) ProbeMatchmaking(ctx context.Context) error {
+// Makes one real quality-ranked discovery call under a deterministically
+// rotated pool identity. Scheduled calls exercise the submitted matchmaking
+// implementation throughout the measured window even while tunnels stay warm.
+func (self *ClientDriver) ProbeMatchmaking(ctx context.Context, probeIndex int) error {
 	if len(self.pool) == 0 {
 		return errors.New("matchmaking probe has no client identity")
 	}
-	identity := self.pool[0]
+	if probeIndex < 0 {
+		return errors.New("matchmaking probe index is negative")
+	}
+	identity := self.pool[probeIndex%len(self.pool)]
 	extraHeaders := http.Header{}
 	extraHeaders.Set("X-UR-Forwarded-For", self.clientForwardedFor(identity.ClientId))
 	clientStrategySettings := connect.DefaultClientStrategySettings()
@@ -345,8 +353,11 @@ func (self *ClientDriver) ProbeMatchmaking(ctx context.Context) error {
 	clientStrategySettings.EnableResilient = false
 	clientStrategySettings.ExtraHeaders = extraHeaders
 	clientStrategy := connect.NewClientStrategy(ctx, clientStrategySettings)
+	defer clientStrategy.Close()
 	api := sdk.NewApi(ctx, clientStrategy, self.apiUrl)
-	defer api.Close()
+	defer func() {
+		_ = api.CloseAndWait(context.Background())
+	}()
 	api.SetByJwt(identity.ByJwt)
 
 	locationId, err := sdk.ParseId(self.locationId.String())
@@ -377,6 +388,68 @@ func (self *ClientDriver) ProbeMatchmaking(ctx context.Context) error {
 	if result == nil || result.ProviderStats == nil || result.ProviderStats.Len() == 0 {
 		return errors.New("matchmaking probe returned an empty provider pool")
 	}
+	return nil
+}
+
+// Returns a fixed, half-open schedule whose final call begins at or beyond
+// 90% of the measurement duration. Absolute offsets prevent call latency from
+// accumulating as schedule drift.
+func matchmakingProbeOffsets(duration time.Duration) []time.Duration {
+	if duration <= 0 {
+		return nil
+	}
+	interval := duration / matchmakingProbeMinimumIntervals
+	if matchmakingProbeMaximumInterval < interval {
+		interval = matchmakingProbeMaximumInterval
+	}
+	if interval <= 0 {
+		return nil
+	}
+	offsets := []time.Duration{}
+	for offset := time.Duration(0); offset < duration; offset += interval {
+		offsets = append(offsets, offset)
+	}
+	return offsets
+}
+
+// Runs absolute-offset probes until cancellation. waitUntil is injected so
+// cancellation and complete-schedule behavior have deterministic tests rather
+// than depending on sleeps or scheduler timing.
+func runMatchmakingProbes(
+	ctx context.Context,
+	measureStart time.Time,
+	offsets []time.Duration,
+	firstProbeIndex int,
+	waitUntil func(context.Context, time.Time) error,
+	probe func(context.Context, int) error,
+) error {
+	if firstProbeIndex < 0 || waitUntil == nil || probe == nil {
+		return errors.New("matchmaking probe schedule is invalid")
+	}
+	previousOffset := -time.Nanosecond
+	for offsetIndex, offset := range offsets {
+		if offset < 0 || offset <= previousOffset {
+			return errors.New("matchmaking probe offsets are not strictly increasing")
+		}
+		previousOffset = offset
+		if ctx.Err() != nil {
+			return nil
+		}
+		probeIndex := firstProbeIndex + offsetIndex
+		if err := waitUntil(ctx, measureStart.Add(offset)); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("wait for matchmaking probe %d: %w", probeIndex, err)
+		}
+		if err := probe(ctx, probeIndex); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("matchmaking probe %d: %w", probeIndex, err)
+		}
+	}
+	<-ctx.Done()
 	return nil
 }
 
@@ -587,6 +660,7 @@ func (self *ClientDriver) Run() error {
 			}
 			arrivals := r.poisson(meanPerSecond)
 			for i := 0; i < arrivals; i += 1 {
+				crawlIndex := next
 				client := self.clients[next%len(self.clients)]
 				next += 1
 				self.active.Add(1)
@@ -594,7 +668,7 @@ func (self *ClientDriver) Run() error {
 					defer self.active.Done()
 					crawlCtx, cancel := context.WithTimeout(self.ctx, self.requestTimeout)
 					defer cancel()
-					self.crawl(crawlCtx, client.label, client.httpClient)
+					self.crawl(crawlCtx, client.label, client.httpClient, crawlIndex)
 				})
 			}
 		}
@@ -764,6 +838,12 @@ func warmupRequestAttempt(
 	return complete && ready()
 }
 
+// Targets the fixed unscored site page so a workload seed's root size cannot
+// alter provider-path establishment.
+func warmupRequestUrl(siteAddr string) string {
+	return fmt.Sprintf("http://%s%s", siteAddr, siteWarmupPath)
+}
+
 // Proves every measured lane with a bounded request cohort, then requires the
 // complete quality window. The post-request readiness check closes the race
 // where a provider starts draining while its last response is in flight.
@@ -774,7 +854,7 @@ func (self *ClientDriver) warmupTunnel(
 ) bool {
 	warmupCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	requestUrl := fmt.Sprintf("http://%s/", self.siteAddr)
+	requestUrl := warmupRequestUrl(self.siteAddr)
 	qualityWindowSize := self.qualityWindowSize()
 	for warmupCtx.Err() == nil {
 		attemptCtx, cancelAttempt := context.WithTimeout(warmupCtx, warmupCohortTimeout)
@@ -822,7 +902,7 @@ func (self *ClientDriver) qualityWindowSize() int {
 // It fully unwinds on ctx cancel: queued-but-unconsumed jobs are balanced so
 // the closer goroutine's pending.Wait() always completes (it used to leak one
 // goroutine per timed-out crawl — thousands over a long run).
-func (self *ClientDriver) crawl(ctx context.Context, clientLabel string, httpClient *http.Client) {
+func (self *ClientDriver) crawl(ctx context.Context, clientLabel string, httpClient *http.Client, crawlIndex int) {
 	type job struct {
 		path  string
 		depth int
@@ -873,7 +953,10 @@ func (self *ClientDriver) crawl(ctx context.Context, clientLabel string, httpCli
 		}()
 	}
 
-	submit("/", 0)
+	// The monotonically assigned index is identical in paired runs because the
+	// arrival process is seeded. It gives each crawl an independent, repeatable
+	// site tree instead of reusing one root-depth draw for the whole workload.
+	submit(fmt.Sprintf("/?crawl=%d", crawlIndex), 0)
 
 	// close jobs once all pending work drains
 	closerDone := make(chan struct{})

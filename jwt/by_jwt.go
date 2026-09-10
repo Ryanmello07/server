@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -32,6 +33,12 @@ var byJwtTlsKeyPaths = sync.OnceValue(func() []string {
 	jwt := server.Vault.RequireSimpleResource("jwt.yml")
 	return jwt.RequireStringList("tls_key_paths")
 })
+
+// Successful key discovery is operational context, not an error signal.
+// Keep every supported private-key encoding on the same severity path.
+func logLoadedPrivateKey(keyType string, path string) {
+	glog.Infof("[jwt]loaded %s key %q\n", keyType, path)
+}
 
 const (
 	// Reverted from 24h to 30 days by team decision.
@@ -85,16 +92,16 @@ var byPrivateKeys = sync.OnceValue(func() []crypto.PrivateKey {
 
 				keyPathErrs := []error{}
 				if key, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
-					glog.Errorf("[jwt]loaded ec key \"%s\"\n", path)
+					logLoadedPrivateKey("ec", path)
 					keys = append(keys, key)
 				} else {
 					if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
-						glog.Errorf("[jwt]loaded pkcs8 key \"%s\"\n", path)
+						logLoadedPrivateKey("pkcs8", path)
 						keys = append(keys, key)
 					} else {
 						keyPathErrs = append(keyPathErrs, err)
 						if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-							glog.Errorf("[jwt]loaded pkcs1 key \"%s\"\n", path)
+							logLoadedPrivateKey("pkcs1", path)
 							keys = append(keys, key)
 						} else {
 							keyPathErrs = append(keyPathErrs, err)
@@ -112,6 +119,27 @@ var byPrivateKeys = sync.OnceValue(func() []crypto.PrivateKey {
 	}
 	return keys
 })
+
+// DerivedKeys returns one 32-byte HMAC key per loaded signing key, bound to a
+// purpose label, for signed tokens that must not need a vault secret of their own
+// (the onboarding landing/feedback tokens). Sign with the first; verify against
+// each, so a token outlives a key rotation exactly as a jwt does. The derivation
+// is HMAC-SHA256 over the purpose keyed by the private key's PKCS#8 encoding, so
+// the private key itself never leaves this package.
+func DerivedKeys(purpose string) [][]byte {
+	keys := byPrivateKeys()
+	derived := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		der, err := x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			continue
+		}
+		mac := hmac.New(sha256.New, der)
+		mac.Write([]byte(purpose))
+		derived = append(derived, mac.Sum(nil))
+	}
+	return derived
+}
 
 func byRsaSigningKey() *rsa.PrivateKey {
 	for _, key := range byPrivateKeys() {

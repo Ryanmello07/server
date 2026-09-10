@@ -237,7 +237,11 @@ func clientReliabilityStatsShard(clientId server.Id) int {
 
 const clientReliabilityPackedFieldLength = 32 + 16 + 16 + 1
 
-// redis SET of block numbers that have pending (un-drained) counters
+// Legacy redis SET of block numbers that have pending counters. New writers
+// do not touch this fixed-slot key: the rollup derives its bounded candidate
+// range from the durable pg high-water mark and the hash TTL. Keep the name
+// only so a new rollup can remove markers left by older writers during the
+// taskworker-first rolling transition.
 const clientReliabilityBlocksKey = "client_reliability_stats_blocks"
 
 // memory backstop for the per-block counters; in normal operation the rollup
@@ -330,7 +334,6 @@ func RecordClientReliabilityStatsRange(
 		shard := clientReliabilityStatsShard(clientId)
 
 		server.Redis(ctx, func(r server.RedisClient) {
-			blockNumberStrs := []interface{}{}
 			for blockNumber := startBlockNumber; blockNumber <= endBlockNumber; blockNumber += 1 {
 				statsKey := clientReliabilityStatsKey(blockNumber, shard)
 				// every command targets the same hash key (one slot), so
@@ -347,16 +350,34 @@ func RecordClientReliabilityStatsRange(
 					pipe.Expire(ctx, statsKey, clientReliabilityStatsRedisTtl)
 					return nil
 				})
-				blockNumberStrs = append(blockNumberStrs, strconv.FormatInt(blockNumber, 10))
-			}
-			// the blocks set is a different key (different slot), so it must be
-			// separate commands, not part of the transactions above
-			if 0 < len(blockNumberStrs) {
-				r.SAdd(ctx, clientReliabilityBlocksKey, blockNumberStrs...)
-				r.Expire(ctx, clientReliabilityBlocksKey, clientReliabilityStatsRedisTtl)
 			}
 		})
 	})
+}
+
+// clientReliabilityRollupBlockNumbers returns only blocks that can still have
+// live Redis hashes. The pg high-water mark normally makes this a one- or
+// two-block range. After an extended rollup outage, the TTL bound prevents a
+// years-old high-water mark from turning one recovery run into an unbounded
+// scan; hashes outside this window are already gone and correctly remain an
+// uncovered reliability gap.
+func clientReliabilityRollupBlockNumbers(currentBlockNumber, maxDrainedBlock int64, hasHighWater bool) []int64 {
+	maxFinalBlockNumber := currentBlockNumber - 2
+	retainedBlockCount := int64(clientReliabilityStatsRedisTtl / ReliabilityBlockDuration)
+	// Include one boundary block because a write near the end of its minute
+	// can remain live after the block's start is one full TTL old.
+	minBlockNumber := currentBlockNumber - retainedBlockCount - 1
+	if hasHighWater && minBlockNumber < maxDrainedBlock+1 {
+		minBlockNumber = maxDrainedBlock + 1
+	}
+	if maxFinalBlockNumber < minBlockNumber {
+		return nil
+	}
+	blockNumbers := make([]int64, 0, maxFinalBlockNumber-minBlockNumber+1)
+	for blockNumber := minBlockNumber; blockNumber <= maxFinalBlockNumber; blockNumber++ {
+		blockNumbers = append(blockNumbers, blockNumber)
+	}
+	return blockNumbers
 }
 
 // RollupClientReliabilityStats drains closed per-block redis counters into
@@ -372,31 +393,8 @@ func RollupClientReliabilityStats(ctx context.Context, now time.Time) {
 	// previous block
 	maxFinalBlockNumber := currentBlockNumber - 2
 
-	// raise on error rather than treating "cannot list" as "nothing pending":
-	// advancing the high-water mark past blocks that are still buffered in
-	// redis would make the score windows silently skip them
-	var blockNumberStrs []string
-	server.Redis(ctx, func(r server.RedisClient) {
-		var err error
-		blockNumberStrs, err = r.SMembers(ctx, clientReliabilityBlocksKey).Result()
-		server.Raise(err)
-	})
-
-	blockNumbers := []int64{}
-	for _, blockNumberStr := range blockNumberStrs {
-		blockNumber, err := strconv.ParseInt(blockNumberStr, 10, 64)
-		if err != nil {
-			server.Redis(ctx, func(r server.RedisClient) {
-				r.SRem(ctx, clientReliabilityBlocksKey, blockNumberStr)
-			})
-			continue
-		}
-		if blockNumber <= maxFinalBlockNumber {
-			blockNumbers = append(blockNumbers, blockNumber)
-		}
-	}
-	// ascending so pg fills in block order
-	slices.Sort(blockNumbers)
+	maxDrainedBlock, hasHighWater := clientReliabilityMaxDrainedBlock(ctx)
+	blockNumbers := clientReliabilityRollupBlockNumbers(currentBlockNumber, maxDrainedBlock, hasHighWater)
 
 	// chunked hscan instead of a whole-hash hgetall: a drained block is final
 	// (no writers), so the scan is a consistent read, and no single command
@@ -434,6 +432,11 @@ func RollupClientReliabilityStats(ctx context.Context, now time.Time) {
 				hscanAll(r, statsKey, fields)
 			}
 		})
+		if len(fields) == 0 {
+			// No hash survived for this block. Do not mark it covered: this is
+			// either a genuinely idle minute or a TTL-expired outage gap.
+			continue
+		}
 
 		upsertClientReliabilityStatsBlock(ctx, blockNumber, fields)
 
@@ -450,6 +453,8 @@ func RollupClientReliabilityStats(ctx context.Context, now time.Time) {
 			for _, statsKey := range statsKeys {
 				r.Del(ctx, statsKey)
 			}
+			// Transition cleanup only. Current writers never add this marker,
+			// so after one TTL this fixed-slot key disappears permanently.
 			r.SRem(ctx, clientReliabilityBlocksKey, strconv.FormatInt(blockNumber, 10))
 		})
 	}
@@ -906,10 +911,12 @@ const ReliabilityBlockDegradedFraction = 0.95
 const reliabilityDegradedMinBlockCount = 10
 const reliabilityDegradedMinMedian = 20
 
-// block health is a property of the block, not of the window being scored, so
-// the median is taken over a fixed neighborhood rather than the score window:
-// the shortest lookback (`ClientLookbacks[0]`) is only a handful of blocks
-// wide and could never establish a median of its own.
+// Block health is a property of the block, not of the window being scored.
+// Classify each candidate against the fixed trailing neighborhood ending at
+// that candidate (including the candidate), rather than one median selected by
+// the caller's moving score window. Looking only backward makes the result
+// immutable once the sequential rollup has recorded a block: asking about the
+// same block through a later or longer lookback cannot change its answer.
 //
 // KNOWN LIMITATION (do not "fix" by lengthening this window -- it was tried at
 // 24h on 2026-07-15 and made things worse): a LOCAL median tracks gradual and
@@ -939,36 +946,34 @@ func reliabilityDegradedBlocks(ctx context.Context, tx server.PgTx, minBlockNumb
 	// exists to prevent
 	degradedBlockNumbers = []int64{}
 
-	medianMinBlockNumber := min(minBlockNumber, maxBlockNumber-reliabilityDegradedMedianBlockCount)
-
 	result, err := tx.Query(
 		ctx,
 		`
-		WITH neighborhood AS (
-			SELECT block_number, valid_client_count
-			FROM client_reliability_block
-			WHERE $1 <= block_number AND block_number < $3
-		), stat AS (
+		SELECT candidate.block_number
+		FROM client_reliability_block candidate
+		CROSS JOIN LATERAL (
 			SELECT
 				COUNT(*) AS block_count,
-				percentile_cont(0.5) WITHIN GROUP (ORDER BY valid_client_count) AS median_valid_client_count
-			FROM neighborhood
-		)
-		SELECT neighborhood.block_number
-		FROM neighborhood, stat
+				percentile_cont(0.5) WITHIN GROUP (ORDER BY neighborhood.valid_client_count) AS median_valid_client_count
+			FROM client_reliability_block neighborhood
+			WHERE
+				candidate.block_number - ($6::bigint - 1) <= neighborhood.block_number AND
+				neighborhood.block_number <= candidate.block_number
+		) stat
 		WHERE
-			$2 <= neighborhood.block_number AND
+			$1 <= candidate.block_number AND
+			candidate.block_number < $2 AND
 			$4 <= stat.block_count AND
 			$5 <= stat.median_valid_client_count AND
-			neighborhood.valid_client_count < $6 * stat.median_valid_client_count
-		ORDER BY neighborhood.block_number
+			candidate.valid_client_count < $3 * stat.median_valid_client_count
+		ORDER BY candidate.block_number
 		`,
-		medianMinBlockNumber,
 		minBlockNumber,
 		maxBlockNumber,
+		ReliabilityBlockDegradedFraction,
 		reliabilityDegradedMinBlockCount,
 		reliabilityDegradedMinMedian,
-		ReliabilityBlockDegradedFraction,
+		reliabilityDegradedMedianBlockCount,
 	)
 	server.WithPgResult(result, err, func() {
 		for result.Next() {
@@ -1051,21 +1056,57 @@ func ClientReliabilityRollupSynced(ctx context.Context, now time.Time) (synced b
 // rolling add-on-entry / subtract-on-exit cancels exactly except for float
 // associativity AND except when a block's degraded classification shifts after
 // it entered the window (the classification depends on a reference median that
-// evolves). With the INCLUDE-covered partition index a full recompute is cheap
-// (~10s unloaded on prod, was 23 min), so it runs once per task cycle.
+// evolves).
 //
-// The value is deliberately sandwiched between the intra-cycle gap and the
-// task cadence: UpdateReliabilities invokes the running maintenance TWICE per
-// 30-minute cycle (once from the network-window entry point, once from the
-// client-scores entry point, minutes apart). At 20 minutes of blocks, the
-// cycle's FIRST entry point re-anchors (30m since the last anchor >= 20m) and
-// the SECOND sees a few-block delta and takes the equivalence-proven rolling
-// path instead of redoing the full pass -- under load the redundant second
-// recompute was measured at ~10 minutes per cycle. If a cycle runs so slowly
-// that the intra-cycle gap exceeds 20 minutes, the second entry point
-// recomputes too, which is the safe fallback. Drift exposure is bounded by
-// one intra-cycle rolling step (a few blocks) per cycle.
-var ReliabilityRunningRecomputeBlocks = int64(20 * time.Minute / ReliabilityBlockDuration)
+// Re-anchor every four hours. UpdateReliabilities runs every 30 minutes, so a
+// 20-minute threshold forced a full scan on every cycle. On 2026-08-30 that
+// repeatedly scanned the 3.16B-row client_reliability history; the 7-day
+// statement has a modest median but an observed 12,392-second tail, and one
+// attempt hit its exact 7,200-second task deadline. The task now checkpoints
+// each lookback in its own transaction, so a slow later lookback cannot roll
+// back completed earlier work. Optional cadence re-anchors are also deferred
+// while a long VACUUM or concurrent index build is already consuming the
+// maintenance path. Missing state, a degraded-classification schema change,
+// and a backward window still re-anchor immediately because there is no
+// correct rolling alternative.
+var ReliabilityRunningRecomputeBlocks = int64(4 * time.Hour / ReliabilityBlockDuration)
+
+// Version 1 classifies each block against its own immutable trailing
+// neighborhood. Version 0 running sums were built with a median that depended
+// on the caller's whole moving lookback: when that median adapted after a
+// sustained fleet drop, blocks omitted from the numerator silently re-entered
+// the denominator. The durable version makes the first current-code pass
+// re-anchor rather than rolling that corrupt state forward.
+const reliabilityDegradedClassificationVersion = 1
+
+// A maintenance operation that has already run this long is established work,
+// not a momentary catalog sample. Starting the optional multi-partition
+// reliability re-anchor beside it creates avoidable I/O contention and an old
+// MVCC horizon. The normal rolling path remains exact and lets the next
+// half-hour cycle reconsider the anchor.
+const reliabilityRunningMaintenanceDeferralAfter = 5 * time.Minute
+
+// The UpdateReliabilities evaluator has a two-hour MaxTime, but that client-side
+// context disappears during an abrupt host loss. PostgreSQL can continue a
+// compute-heavy statement without reading the dead socket, retain its
+// transaction, and block the replacement task after the five-minute lease is
+// reclaimed. Keep the same ceiling inside each checkpoint transaction so the
+// server eventually cancels and rolls back an orphan even when no worker
+// remains to send a cancel request. SET LOCAL keeps unrelated maintenance and
+// later pooled sessions unchanged.
+const reliabilityRunningCheckpointStatementTimeout = 2 * time.Hour
+
+type reliabilityRunningCheckpointConfigurer interface {
+	Exec(context.Context, string, ...any) (server.PgTag, error)
+}
+
+func configureReliabilityRunningCheckpoint(ctx context.Context, tx reliabilityRunningCheckpointConfigurer) {
+	server.RaisePgResult(tx.Exec(
+		ctx,
+		`SELECT set_config('statement_timeout', $1, true)`,
+		strconv.FormatInt(reliabilityRunningCheckpointStatementTimeout.Milliseconds(), 10)+"ms",
+	))
+}
 
 // reliabilityRunningLookback pairs a lookback_index with its window width.
 type reliabilityRunningLookback struct {
@@ -1088,17 +1129,105 @@ func reliabilityRunningLookbacks() []reliabilityRunningLookback {
 }
 
 type reliabilityRunningWindow struct {
-	minBlockNumber     int64
-	maxBlockNumber     int64
-	lastRecomputeBlock int64
-	exists             bool
+	minBlockNumber                          int64
+	maxBlockNumber                          int64
+	lastRecomputeBlock                      int64
+	degradedClassificationVersion           int
+	degradedClassificationWriteTokenPresent bool
+	degradedClassificationGuardPresent      bool
+	exists                                  bool
+}
+
+func reliabilityRunningNeedsRecompute(
+	prev reliabilityRunningWindow,
+	newMin int64,
+	newMax int64,
+	periodicReanchorAllowed bool,
+) (recompute bool, deferred bool) {
+	// Bootstrap, a classification-generation transition (version, token, or
+	// database guard), and backwards movement cannot be represented as an
+	// entering / leaving delta, so maintenance pressure must never suppress
+	// these repairs.
+	if !prev.exists ||
+		prev.degradedClassificationVersion != reliabilityDegradedClassificationVersion ||
+		!prev.degradedClassificationWriteTokenPresent ||
+		!prev.degradedClassificationGuardPresent ||
+		newMax < prev.maxBlockNumber ||
+		newMin < prev.minBlockNumber {
+		return true, false
+	}
+	if ReliabilityRunningRecomputeBlocks <= newMax-prev.lastRecomputeBlock {
+		if periodicReanchorAllowed {
+			return true, false
+		}
+		return false, true
+	}
+	return false, false
+}
+
+// reliabilityRunningPeriodicReanchorAllowed keeps an optional full-window
+// scan from starting beside VACUUM or index-build work. Index builds block as
+// soon as they enter the progress view: even a new concurrent build can reach
+// its old-snapshot wait before the full-window scan finishes. The five-minute
+// floor excludes tiny routine vacuums only; bootstrap and backwards-window
+// repairs bypass this result in reliabilityRunningNeedsRecompute.
+func reliabilityRunningPeriodicReanchorAllowed(ctx context.Context, tx server.PgTx) (allowed bool) {
+	var establishedVacuum bool
+	var indexBuild bool
+	result, err := tx.Query(
+		ctx,
+		`
+		SELECT
+			EXISTS (
+			SELECT 1
+			FROM pg_stat_progress_vacuum p
+			JOIN pg_stat_activity a USING (pid)
+			WHERE a.query_start <= clock_timestamp() - make_interval(secs => $1)
+			),
+			EXISTS (
+			SELECT 1
+			FROM pg_stat_progress_create_index p
+			)
+		`,
+		int64(reliabilityRunningMaintenanceDeferralAfter/time.Second),
+	)
+	server.WithPgResult(result, err, func() {
+		if result.Next() {
+			server.Raise(result.Scan(&establishedVacuum, &indexBuild))
+		}
+	})
+	allowed = reliabilityRunningReanchorAllowedForMaintenance(establishedVacuum, indexBuild)
+	return
+}
+
+// A concurrent index build must win immediately because its final validation
+// waits for snapshots that predate the build. Brief vacuums retain the grace
+// period applied by the catalog query.
+func reliabilityRunningReanchorAllowedForMaintenance(establishedVacuum bool, indexBuild bool) bool {
+	return !establishedVacuum && !indexBuild
 }
 
 func readReliabilityRunningWindow(ctx context.Context, tx server.PgTx, lookbackIndex int) (w reliabilityRunningWindow) {
 	result, err := tx.Query(
 		ctx,
 		`
-		SELECT min_block_number, max_block_number, last_recompute_block
+		SELECT
+			min_block_number,
+			max_block_number,
+			last_recompute_block,
+			degraded_classification_version,
+			degraded_classification_write_token IS NOT NULL,
+			EXISTS (
+				SELECT 1
+				FROM pg_trigger t
+				JOIN pg_proc p ON p.oid = t.tgfoid
+				WHERE
+					t.tgrelid = 'client_reliability_running_window'::regclass AND
+					t.tgname = 'client_reliability_running_window_classification_guard' AND
+					p.proname = 'client_reliability_running_window_classification_guard' AND
+					t.tgenabled IN ('O', 'A') AND
+					NOT t.tgisinternal
+			)
 		FROM client_reliability_running_window
 		WHERE lookback_index = $1
 		`,
@@ -1106,7 +1235,14 @@ func readReliabilityRunningWindow(ctx context.Context, tx server.PgTx, lookbackI
 	)
 	server.WithPgResult(result, err, func() {
 		if result.Next() {
-			server.Raise(result.Scan(&w.minBlockNumber, &w.maxBlockNumber, &w.lastRecomputeBlock))
+			server.Raise(result.Scan(
+				&w.minBlockNumber,
+				&w.maxBlockNumber,
+				&w.lastRecomputeBlock,
+				&w.degradedClassificationVersion,
+				&w.degradedClassificationWriteTokenPresent,
+				&w.degradedClassificationGuardPresent,
+			))
 			w.exists = true
 		}
 	})
@@ -1125,19 +1261,27 @@ func writeReliabilityRunningWindow(
 		ctx,
 		`
 		INSERT INTO client_reliability_running_window (
-			lookback_index, min_block_number, max_block_number, last_recompute_block
+			lookback_index,
+			min_block_number,
+			max_block_number,
+			last_recompute_block,
+			degraded_classification_version,
+			degraded_classification_write_token
 		)
-		VALUES ($1, $2, $3, $4)
+		VALUES ($1, $2, $3, $4, $5, gen_random_uuid())
 		ON CONFLICT (lookback_index) DO UPDATE
 		SET
 			min_block_number = EXCLUDED.min_block_number,
 			max_block_number = EXCLUDED.max_block_number,
-			last_recompute_block = EXCLUDED.last_recompute_block
+			last_recompute_block = EXCLUDED.last_recompute_block,
+			degraded_classification_version = EXCLUDED.degraded_classification_version,
+			degraded_classification_write_token = EXCLUDED.degraded_classification_write_token
 		`,
 		lookbackIndex,
 		minBlockNumber,
 		maxBlockNumber,
 		lastRecomputeBlock,
+		reliabilityDegradedClassificationVersion,
 	))
 }
 
@@ -1185,67 +1329,60 @@ const reliabilityRunningAggSql = `
 	GROUP BY network_id, client_id
 `
 
-// UpdateClientReliabilityRunningInTx advances the running per-(client, lookback)
-// reliability sums to the window ending at maxTime, for every lookback in
-// reliabilityRunningLookbacks (the #1 client-score windows and the #3 network
-// window). Each window is either FULLY RECOMPUTED (no prior row, the ~4h
-// recompute cadence elapsed, or the window slid backward) or ROLLED forward by
-// adding the blocks that entered [prevMax, newMax) and subtracting the blocks
-// that left [prevMin, newMin). The score writers (#1/#3) read the resulting
-// sums, normalize by the effective block count, and join the query-time
-// location. Callers run this first, in the same tx as the score write.
-//
-// This is idempotent for a fixed maxTime: a second call sees prevMax==newMax and
-// prevMin==newMin, so the entering/leaving ranges are empty and nothing changes.
-func UpdateClientReliabilityRunningInTx(tx server.PgTx, ctx context.Context, maxTime time.Time) {
-	// end every window at the redis-rollup high-water mark (the SAME shift the
-	// score queries use), computed once and applied to all lookbacks so they
-	// share one max block.
-	baseMaxBlockNumber := (maxTime.UTC().UnixMilli() / int64(ReliabilityBlockDuration/time.Millisecond)) + 1
-	shift := reliabilityRollupBlockShift(ctx, tx, baseMaxBlockNumber)
-	newMax := baseMaxBlockNumber - shift
+func updateClientReliabilityRunningLookbackAtBoundsInTx(
+	tx server.PgTx,
+	ctx context.Context,
+	lb reliabilityRunningLookback,
+	newMin int64,
+	newMax int64,
+	periodicReanchorAllowed bool,
+) {
+	prev := readReliabilityRunningWindow(ctx, tx, lb.lookbackIndex)
+	recompute, deferred := reliabilityRunningNeedsRecompute(
+		prev,
+		newMin,
+		newMax,
+		periodicReanchorAllowed,
+	)
+	if deferred {
+		glog.Infof(
+			"[ncr]defer optional running-window re-anchor for lookback %d while established VACUUM/REINDEX work is active; rolling [%d,%d) -> [%d,%d)\n",
+			lb.lookbackIndex,
+			prev.minBlockNumber,
+			prev.maxBlockNumber,
+			newMin,
+			newMax,
+		)
+	}
 
-	for _, lb := range reliabilityRunningLookbacks() {
-		newMin := maxTime.Add(-lb.lookback).UTC().UnixMilli()/int64(ReliabilityBlockDuration/time.Millisecond) - shift
-
-		prev := readReliabilityRunningWindow(ctx, tx, lb.lookbackIndex)
-
-		// recompute when there is nothing to roll from, the recompute cadence has
-		// elapsed, or the window moved backward (a transient the incremental diff
-		// cannot represent). Otherwise roll the window forward.
-		recompute := !prev.exists ||
-			ReliabilityRunningRecomputeBlocks <= newMax-prev.lastRecomputeBlock ||
-			newMax < prev.maxBlockNumber ||
-			newMin < prev.minBlockNumber
-
-		if recompute {
-			degradedBlockNumbers := reliabilityDegradedBlocks(ctx, tx, newMin, newMax)
-			server.RaisePgResult(tx.Exec(
-				ctx,
-				`DELETE FROM client_reliability_running WHERE lookback_index = $1`,
-				lb.lookbackIndex,
-			))
-			server.RaisePgResult(tx.Exec(
-				ctx,
-				`
+	if recompute {
+		degradedBlockNumbers := reliabilityDegradedBlocks(ctx, tx, newMin, newMax)
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`DELETE FROM client_reliability_running WHERE lookback_index = $1`,
+			lb.lookbackIndex,
+		))
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
 				INSERT INTO client_reliability_running (
 					client_id, lookback_index, network_id, independent_sum, reliability_sum
 				)
 				SELECT agg.client_id, $4, agg.network_id, agg.ind, agg.rel
 				FROM (`+reliabilityRunningAggSql+`) agg
 				`,
-				newMin,
-				newMax,
-				degradedBlockNumbers,
-				lb.lookbackIndex,
-			))
-			writeReliabilityRunningWindow(ctx, tx, lb.lookbackIndex, newMin, newMax, newMax)
-		} else {
-			// ADD the blocks that entered the window: [prevMax, newMax).
-			enteringDegraded := reliabilityDegradedBlocks(ctx, tx, prev.maxBlockNumber, newMax)
-			server.RaisePgResult(tx.Exec(
-				ctx,
-				`
+			newMin,
+			newMax,
+			degradedBlockNumbers,
+			lb.lookbackIndex,
+		))
+		writeReliabilityRunningWindow(ctx, tx, lb.lookbackIndex, newMin, newMax, newMax)
+	} else {
+		// ADD the blocks that entered the window: [prevMax, newMax).
+		enteringDegraded := reliabilityDegradedBlocks(ctx, tx, prev.maxBlockNumber, newMax)
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
 				INSERT INTO client_reliability_running (
 					client_id, lookback_index, network_id, independent_sum, reliability_sum
 				)
@@ -1257,19 +1394,19 @@ func UpdateClientReliabilityRunningInTx(tx server.PgTx, ctx context.Context, max
 					reliability_sum = client_reliability_running.reliability_sum + EXCLUDED.reliability_sum,
 					network_id = EXCLUDED.network_id
 				`,
-				prev.maxBlockNumber,
-				newMax,
-				enteringDegraded,
-				lb.lookbackIndex,
-			))
+			prev.maxBlockNumber,
+			newMax,
+			enteringDegraded,
+			lb.lookbackIndex,
+		))
 
-			// SUBTRACT the blocks that left the window: [prevMin, newMin). The
-			// UPDATE only touches existing rows, which is correct: a leaving
-			// block's clients were added when that block entered.
-			leavingDegraded := reliabilityDegradedBlocks(ctx, tx, prev.minBlockNumber, newMin)
-			server.RaisePgResult(tx.Exec(
-				ctx,
-				`
+		// SUBTRACT the blocks that left the window: [prevMin, newMin). The
+		// UPDATE only touches existing rows, which is correct: a leaving
+		// block's clients were added when that block entered.
+		leavingDegraded := reliabilityDegradedBlocks(ctx, tx, prev.minBlockNumber, newMin)
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`
 				UPDATE client_reliability_running r
 				SET
 					independent_sum = r.independent_sum - agg.ind,
@@ -1277,24 +1414,91 @@ func UpdateClientReliabilityRunningInTx(tx server.PgTx, ctx context.Context, max
 				FROM (`+reliabilityRunningAggSql+`) agg
 				WHERE r.client_id = agg.client_id AND r.lookback_index = $4
 				`,
-				prev.minBlockNumber,
-				newMin,
-				leavingDegraded,
-				lb.lookbackIndex,
-			))
+			prev.minBlockNumber,
+			newMin,
+			leavingDegraded,
+			lb.lookbackIndex,
+		))
 
-			// drop clients that have fully left the window. independent_sum is a
-			// sum of integer counts carried as float, so a fully-departed client
-			// is exactly 0.0; the 0.5 epsilon guards float dust.
-			server.RaisePgResult(tx.Exec(
+		// drop clients that have fully left the window. independent_sum is a
+		// sum of integer counts carried as float, so a fully-departed client
+		// is exactly 0.0; the 0.5 epsilon guards float dust.
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`DELETE FROM client_reliability_running WHERE lookback_index = $1 AND independent_sum < 0.5`,
+			lb.lookbackIndex,
+		))
+
+		writeReliabilityRunningWindow(ctx, tx, lb.lookbackIndex, newMin, newMax, prev.lastRecomputeBlock)
+	}
+}
+
+// UpdateClientReliabilityRunningInTx advances the running per-(client,
+// lookback) reliability sums to the window ending at maxTime. It is retained
+// for score writers that need the running rows and score rows in one atomic
+// transaction. The recurring task first calls the checkpointed wrapper below;
+// this in-transaction pass is then idempotent for the same maxTime.
+func UpdateClientReliabilityRunningInTx(tx server.PgTx, ctx context.Context, maxTime time.Time) {
+	// End every window at the redis-rollup high-water mark (the SAME shift the
+	// score queries use), computed once and applied to all lookbacks so they
+	// share one max block.
+	baseMaxBlockNumber := (maxTime.UTC().UnixMilli() / int64(ReliabilityBlockDuration/time.Millisecond)) + 1
+	shift := reliabilityRollupBlockShift(ctx, tx, baseMaxBlockNumber)
+	newMax := baseMaxBlockNumber - shift
+	periodicReanchorAllowed := reliabilityRunningPeriodicReanchorAllowed(ctx, tx)
+
+	for _, lb := range reliabilityRunningLookbacks() {
+		newMin := maxTime.Add(-lb.lookback).UTC().UnixMilli()/int64(ReliabilityBlockDuration/time.Millisecond) - shift
+		updateClientReliabilityRunningLookbackAtBoundsInTx(
+			tx,
+			ctx,
+			lb,
+			newMin,
+			newMax,
+			periodicReanchorAllowed,
+		)
+	}
+}
+
+// updateClientReliabilityRunningCheckpointed advances each lookback in a
+// separate transaction. A task deadline or connection loss during a later
+// lookback therefore preserves every earlier marker and aggregate; the retry
+// rolls those completed windows instead of repeating their full scans.
+// afterCommit is an internal failure-injection seam used by the deterministic
+// transaction-boundary test.
+func updateClientReliabilityRunningCheckpointed(
+	ctx context.Context,
+	maxTime time.Time,
+	lookbacks []reliabilityRunningLookback,
+	afterCommit func(reliabilityRunningLookback),
+) {
+	for _, lb := range lookbacks {
+		server.MaintenanceTx(ctx, func(tx server.PgTx) {
+			configureReliabilityRunningCheckpoint(ctx, tx)
+			baseMaxBlockNumber := (maxTime.UTC().UnixMilli() / int64(ReliabilityBlockDuration/time.Millisecond)) + 1
+			shift := reliabilityRollupBlockShift(ctx, tx, baseMaxBlockNumber)
+			newMax := baseMaxBlockNumber - shift
+			newMin := maxTime.Add(-lb.lookback).UTC().UnixMilli()/int64(ReliabilityBlockDuration/time.Millisecond) - shift
+			updateClientReliabilityRunningLookbackAtBoundsInTx(
+				tx,
 				ctx,
-				`DELETE FROM client_reliability_running WHERE lookback_index = $1 AND independent_sum < 0.5`,
-				lb.lookbackIndex,
-			))
-
-			writeReliabilityRunningWindow(ctx, tx, lb.lookbackIndex, newMin, newMax, prev.lastRecomputeBlock)
+				lb,
+				newMin,
+				newMax,
+				reliabilityRunningPeriodicReanchorAllowed(ctx, tx),
+			)
+		}, server.TxReadCommitted)
+		if afterCommit != nil {
+			afterCommit(lb)
 		}
 	}
+}
+
+// UpdateClientReliabilityRunningCheckpointed is the recurring-task entry
+// point. Keep score writers on UpdateClientReliabilityRunningInTx so callers
+// outside the task retain their existing atomic behavior.
+func UpdateClientReliabilityRunningCheckpointed(ctx context.Context, maxTime time.Time) {
+	updateClientReliabilityRunningCheckpointed(ctx, maxTime, reliabilityRunningLookbacks(), nil)
 }
 
 // this should run regulalry to keep the client scores up to date
@@ -2131,6 +2335,7 @@ type cityRegionCountry struct {
 
 type clientLocationReliability struct {
 	networkId server.Id
+	connected bool
 	locations map[cityRegionCountry]int
 
 	clientAddressHashes map[[32]byte]int
@@ -2155,8 +2360,9 @@ func (self *clientLocationReliability) Values() []any {
 	// [9] min_relative_latency_ms
 	// [10] has_speed_test
 	// [11] has_latency_test
+	// [12] connected
 
-	values := make([]any, 12)
+	values := make([]any, 13)
 
 	values[0] = self.networkId
 
@@ -2194,6 +2400,7 @@ func (self *clientLocationReliability) Values() []any {
 
 	values[10] = 0 < len(self.allBytesPerSecond)
 	values[11] = 0 < len(self.allRelativeLatencyMillis)
+	values[12] = self.connected
 
 	return values
 }
@@ -2238,6 +2445,7 @@ func UpdateClientLocationReliabilities(ctx context.Context, minTime time.Time, m
 // a valid client will have one connected location and one connected address hash
 func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, minTime time.Time, maxTime time.Time) {
 	updateBlockNumber := maxTime.UTC().UnixMilli() / int64(ReliabilityBlockDuration/time.Millisecond)
+	minHandlerHeartbeatTime := server.NowUtc().Add(-2 * NetworkClientHandlerHeartbeatTimeout)
 
 	// old entries are not deleted on each update, but the connected status is updated
 	// - connected clients are updated, and the valid state is reset to match the latest
@@ -2269,6 +2477,10 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 		INNER JOIN network_client ON
 			network_client.client_id = network_client_connection.client_id 
 
+		INNER JOIN network_client_handler ON
+			network_client_handler.handler_id = network_client_connection.handler_id AND
+			network_client_handler.heartbeat_time >= $1
+
 		INNER JOIN network_client_location ON
 			network_client_location.connection_id = network_client_connection.connection_id
 
@@ -2281,6 +2493,7 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 		WHERE
 			network_client_connection.connected = true
 		`,
+		minHandlerHeartbeatTime,
 	)
 	server.WithPgResult(result, err, func() {
 		for result.Next() {
@@ -2316,6 +2529,7 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 			r, ok := clientLocationReliabilities[clientId]
 			if !ok {
 				r = &clientLocationReliability{
+					connected:                true,
 					locations:                map[cityRegionCountry]int{},
 					clientAddressHashes:      map[[32]byte]int{},
 					netTypeScores:            map[int]int{},
@@ -2425,6 +2639,7 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 			if !ok {
 				r = &clientLocationReliability{
 					networkId:                networkId,
+					connected:                false,
 					locations:                map[cityRegionCountry]int{},
 					clientAddressHashes:      map[[32]byte]int{},
 					netTypeScores:            map[int]int{},
@@ -2469,8 +2684,9 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 	            max_net_type_score_speed smallint,
 	            max_bytes_per_second bigint,
 	            min_relative_latency_ms integer,
-	            has_speed_test bool,
-	            has_latency_test bool 
+			    has_speed_test bool,
+			    has_latency_test bool,
+			    connected bool
 	        )
 	    `,
 		clientLocationReliabilities,
@@ -2505,7 +2721,7 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 	        country_location_id,
 	        client_address_hash_count,
 	        location_count,
-	        true AS connected,
+	        connected,
 	        max_net_type_score,
 	        max_net_type_score_speed,
 	        max_bytes_per_second,
@@ -2523,7 +2739,7 @@ func UpdateClientLocationReliabilitiesInTx(tx server.PgTx, ctx context.Context, 
 	        country_location_id = EXCLUDED.country_location_id,
 	        client_address_hash_count = EXCLUDED.client_address_hash_count,
 	        location_count = EXCLUDED.location_count,
-	        connected = true,
+	        connected = EXCLUDED.connected,
 	        max_net_type_score = EXCLUDED.max_net_type_score,
 	        max_net_type_score_speed = EXCLUDED.max_net_type_score_speed,
 	        max_bytes_per_second = EXCLUDED.max_bytes_per_second,

@@ -104,14 +104,15 @@ type fullTunPath struct {
 	bridgeWaitGroup sync.WaitGroup
 	bridgeStarted   bool
 
-	measurementLock         sync.Mutex
-	preparedCarrierStart    *perfvarCarrierBoundary
-	carrierMeasurementStart *perfvarCarrierBoundary
-	carrierMeasurementEnd   *perfvarCarrierBoundary
-	activePackFailureFloor  *perfvarPackFailureCounts
-	carrierFencePackets     int
-	readinessAppFence       atomic.Bool
-	readinessObservation    fullTunRouteReadinessObservation
+	measurementLock                   sync.Mutex
+	preparedCarrierStart              *perfvarCarrierBoundary
+	carrierMeasurementStart           *perfvarCarrierBoundary
+	carrierMeasurementEnd             *perfvarCarrierBoundary
+	activePackFailureFloor            *perfvarPackFailureCounts
+	allowProviderDatagramPackFailures bool
+	carrierFencePackets               int
+	readinessAppFence                 atomic.Bool
+	readinessObservation              fullTunRouteReadinessObservation
 	// Nil test seams can hold or drop an exact terminal-marker attempt.
 	beforeUdpTerminalMarkerForTest      func(context.Context, bool, int) error
 	afterUdpTerminalCarrierForTest      func(context.Context, bool, int) error
@@ -692,14 +693,47 @@ func (self *fullTunPath) setActivePackFailureFloor(boundary perfvarCarrierBounda
 }
 
 // Ownership-only tests and setup joins may run without an active measurement.
-func (self *fullTunPath) activePackFailureFloorSnapshot() (*perfvarPackFailureCounts, bool) {
+func (self *fullTunPath) activePackFailureFloorSnapshot() (
+	*perfvarPackFailureCounts,
+	bool,
+	bool,
+) {
 	self.measurementLock.Lock()
 	defer self.measurementLock.Unlock()
 	if self.activePackFailureFloor == nil {
-		return nil, false
+		return nil, false, self.allowProviderDatagramPackFailures
 	}
 	packFailureFloor := *self.activePackFailureFloor
-	return &packFailureFloor, true
+	return &packFailureFloor, true, self.allowProviderDatagramPackFailures
+}
+
+// A successful boundary accounts every failure through that exact carrier
+// end. Later enclosing boundaries must validate only newer failures instead
+// of reclassifying already accepted probe loss after its narrow scope exits.
+func (self *fullTunPath) advanceActivePackFailureFloor(
+	expected perfvarPackFailureCounts,
+	next perfvarPackFailureCounts,
+) bool {
+	self.measurementLock.Lock()
+	defer self.measurementLock.Unlock()
+	if self.activePackFailureFloor == nil ||
+		*self.activePackFailureFloor != expected {
+		return false
+	}
+	packFailureFloor := next
+	self.activePackFailureFloor = &packFailureFloor
+	return true
+}
+
+// Latency-under-load explicitly measures lossy UDP probes while a TCP bulk
+// transfer owns the same route. Only that helper may account provider datagram
+// Pack refusals through its attempt/failure sample contract.
+func (self *fullTunPath) setAllowProviderDatagramPackFailures(allow bool) bool {
+	self.measurementLock.Lock()
+	defer self.measurementLock.Unlock()
+	previous := self.allowProviderDatagramPackFailures
+	self.allowProviderDatagramPackFailures = allow
+	return previous
 }
 
 // The performance observer consumes a workload-specific start at most once.
@@ -841,6 +875,7 @@ func waitForCurrentGeneratedDeviceClient(
 type fullTunRouteReadinessObservation struct {
 	Budget                 time.Duration
 	DialDuration           time.Duration
+	DialRetryCount         int
 	WarmupDuration         time.Duration
 	WriteDuration          time.Duration
 	ReadDuration           time.Duration
@@ -849,6 +884,34 @@ type fullTunRouteReadinessObservation struct {
 	ServerResponseDuration time.Duration
 	ServerStage            int32
 	TotalDuration          time.Duration
+}
+
+// A race-instrumented route can finish its forward half after gVisor's
+// intrinsic SYN budget but before the outer readiness budget expires. Server
+// acceptance proves that construction succeeded, so one fresh dial may use the
+// now-published route while retaining the original absolute context deadline.
+func dialFullTunReadiness(
+	ctx context.Context,
+	allowAcceptedRetry bool,
+	serverStage *atomic.Int32,
+	dial func(context.Context) (net.Conn, error),
+) (net.Conn, int, error) {
+	connection, err := dial(ctx)
+	if err == nil {
+		return connection, 0, nil
+	}
+	if !allowAcceptedRetry || serverStage.Load() == 0 || ctx.Err() != nil {
+		return nil, 0, err
+	}
+	retryConnection, retryErr := dial(ctx)
+	if retryErr != nil {
+		return nil, 1, fmt.Errorf(
+			"retry readiness dial after accepted attempt (first error: %v): %w",
+			err,
+			retryErr,
+		)
+	}
+	return retryConnection, 1, nil
 }
 
 const p2pProbeTraceEventCapacity = 512
@@ -1604,18 +1667,26 @@ func (self *platformSendRouteController) observeDestinationId(destinationId clie
 	})
 }
 
-// The platform callback only publishes immutable route ownership and returns.
+// Connection publication stays asynchronous so setup callbacks never wait on
+// RouteManager rematching. Disconnection is the physical channel owner's final
+// retirement barrier: it must remove and join every mirrored writer before the
+// PlatformTransport worker performs its last queue drain.
 func (self *platformSendRouteController) observe(
 	transport clientconnect.Transport,
 	route clientconnect.Route,
 	connected bool,
 ) {
-	self.publish(platformSendRouteEvent{
+	event := platformSendRouteEvent{
 		kind:      platformSendRouteEventPlatformRoute,
 		transport: transport,
 		route:     route,
 		connected: connected,
-	})
+	}
+	if connected {
+		self.publish(event)
+	} else {
+		self.publishAndWait(event)
+	}
 }
 
 // P2P callbacks publish only complete send-route identities. The worker keeps
@@ -2557,8 +2628,8 @@ func TestPlatformSendRouteControllerRejectsUnversionedGenerationRegression(t *te
 	}
 }
 
-// Every production callback returns after queue admission even while route
-// application is held at an exact worker barrier.
+// Non-retirement production callbacks return after queue admission even while
+// route application is held at an exact worker barrier.
 func TestPlatformSendRouteControllerCallbacksReturnWhileApplyBlocked(t *testing.T) {
 	controller := newPlatformSendRouteController(clientconnect.NewId())
 	defer closePlatformSendRouteController(t, controller)
@@ -2605,6 +2676,54 @@ func TestPlatformSendRouteControllerCallbacksReturnWhileApplyBlocked(t *testing.
 	close(releaseApply)
 	if !controller.waitForIdle() {
 		t.Fatal("controller closed before callback fence")
+	}
+}
+
+// A disconnected platform callback owns the physical route's last drain. It
+// cannot return while a mirrored RouteManager can still admit another pooled
+// message into that route after the drain.
+func TestPlatformSendRouteControllerDisconnectWaitsForRouteRetirement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	destinationId := clientconnect.NewId()
+	controller := newPlatformSendRouteController(destinationId)
+	defer closePlatformSendRouteController(t, controller)
+	routeManager := clientconnect.NewRouteManager(ctx, "platform disconnect retirement")
+	controller.setRouteManager(routeManager)
+	writer := routeManager.OpenMultiRouteWriter(clientconnect.DestinationId(destinationId))
+	defer routeManager.CloseMultiRouteWriter(writer)
+	transport := clientconnect.NewSendGatewayTransport()
+	route := make(clientconnect.Route, 1)
+	controller.observe(transport, route, true)
+	if !controller.waitForIdle() {
+		t.Fatal("controller closed before connected route fence")
+	}
+
+	applyEntered := make(chan struct{})
+	releaseApply := make(chan struct{})
+	var releaseApplyOnce sync.Once
+	defer releaseApplyOnce.Do(func() { close(releaseApply) })
+	controller.beforeEventApplyForTest = func(event platformSendRouteEvent) {
+		if event.kind == platformSendRouteEventPlatformRoute && !event.connected {
+			close(applyEntered)
+			<-releaseApply
+		}
+	}
+	callbackReturned := make(chan struct{})
+	go func() {
+		controller.observe(transport, route, false)
+		close(callbackReturned)
+	}()
+	waitForPlatformRouteControllerSignal(t, applyEntered, "disconnect did not reach route retirement")
+	select {
+	case <-callbackReturned:
+		t.Fatal("disconnect callback returned before mirrored route retirement")
+	default:
+	}
+	releaseApplyOnce.Do(func() { close(releaseApply) })
+	waitForPlatformRouteControllerSignal(t, callbackReturned, "disconnect did not return after route retirement")
+	if routes := writer.GetActiveRoutes(); len(routes) != 0 {
+		t.Fatalf("active routes after disconnect=%d, want 0", len(routes))
 	}
 }
 
@@ -2927,14 +3046,77 @@ func fullTunRaceInstrumentationAllowance() time.Duration {
 	return 2 * fullTunMinimumDirectionalWorkloadTimeout()
 }
 
-// Platform settings retain production defaults while placing H3 on the TUN.
+// The API strategy is an inner route-construction boundary. Leaving its
+// production 15-second deadlines unchanged under race instrumentation abandons
+// a valid AuthNetworkClient response before the generated platform can form.
+func TestRouteClientStrategySettingsBoundRaceControlRequests(t *testing.T) {
+	settings := routeClientStrategySettings()
+	defaults := clientconnect.DefaultClientStrategySettings()
+	if !perfvarRaceEnabled {
+		if settings.RequestTimeout != defaults.RequestTimeout ||
+			settings.ConnectTimeout != defaults.ConnectTimeout ||
+			settings.TlsTimeout != defaults.TlsTimeout ||
+			settings.HandshakeTimeout != defaults.HandshakeTimeout {
+			t.Fatalf(
+				"ordinary route strategy=%s/%s/%s/%s, want defaults=%s/%s/%s/%s",
+				settings.RequestTimeout,
+				settings.ConnectTimeout,
+				settings.TlsTimeout,
+				settings.HandshakeTimeout,
+				defaults.RequestTimeout,
+				defaults.ConnectTimeout,
+				defaults.TlsTimeout,
+				defaults.HandshakeTimeout,
+			)
+		}
+		return
+	}
+	allowance := fullTunRaceInstrumentationAllowance()
+	if settings.RequestTimeout < allowance ||
+		settings.ConnectTimeout < allowance ||
+		settings.TlsTimeout < allowance ||
+		settings.HandshakeTimeout < allowance {
+		t.Fatalf(
+			"race route strategy=%s/%s/%s/%s, want each at least %s",
+			settings.RequestTimeout,
+			settings.ConnectTimeout,
+			settings.TlsTimeout,
+			settings.HandshakeTimeout,
+			allowance,
+		)
+	}
+}
+
+// A full-TUN endpoint clones the production transport-budget capacity because
+// PERFVAR hosts independent device and provider processes in one test process.
+// Replacement transports still share their endpoint-local budget.
+func newFullTunEndpointPlatformBudget() *clientconnect.PlatformTransportBudget {
+	defaults := clientconnect.DefaultPlatformTransportBudget().Stats()
+	return clientconnect.NewPlatformTransportBudget(
+		defaults.TotalByteCount,
+		defaults.MaxTransportCount,
+	)
+}
+
+// Platform settings place H3 on the TUN. The Auto correctness candidate makes
+// H1 and H3 equal-priority routes explicitly; production Auto deliberately
+// treats H3 as a fallback and therefore does not keep both routes live.
 func fullTunPlatformSettings(
 	h3Port int,
+	platformMode clientconnect.TransportMode,
 	tun *clientconnect.Tun,
 	receiveStats *clientconnect.PlatformTransportReceiveStats,
+	platformBudget *clientconnect.PlatformTransportBudget,
 ) *clientconnect.PlatformTransportSettings {
 	settings := clientconnect.DefaultPlatformTransportSettings()
+	if platformMode == clientconnect.TransportModeAuto {
+		settings.ModePreferences = map[clientconnect.TransportMode]int{
+			clientconnect.TransportModeH1: 1,
+			clientconnect.TransportModeH3: 1,
+		}
+	}
 	settings.ReceiveStats = receiveStats
+	settings.PlatformTransportBudget = platformBudget
 	if allowance := fullTunRaceInstrumentationAllowance(); 0 < allowance {
 		settings.HttpConnectTimeout = max(settings.HttpConnectTimeout, allowance)
 		settings.WsHandshakeTimeout = max(settings.WsHandshakeTimeout, allowance)
@@ -2956,6 +3138,49 @@ func fullTunPlatformSettings(
 		})
 	}
 	return settings
+}
+
+// Simulated endpoints must not consume each other's carrier working sets.
+func TestFullTunPlatformSettingsUseIndependentEndpointBudgets(t *testing.T) {
+	deviceBudget := newFullTunEndpointPlatformBudget()
+	providerBudget := newFullTunEndpointPlatformBudget()
+	deviceSettings := fullTunPlatformSettings(
+		0,
+		clientconnect.TransportModeAuto,
+		nil,
+		nil,
+		deviceBudget,
+	)
+	providerSettings := fullTunPlatformSettings(
+		0,
+		clientconnect.TransportModeAuto,
+		nil,
+		nil,
+		providerBudget,
+	)
+	if deviceSettings.PlatformTransportBudget == providerSettings.PlatformTransportBudget {
+		t.Fatal("independent full-TUN endpoints shared one platform transport budget")
+	}
+	for name, settings := range map[string]*clientconnect.PlatformTransportSettings{
+		"device":   deviceSettings,
+		"provider": providerSettings,
+	} {
+		workingSet := settings.H1BudgetByteCount + settings.H3BudgetByteCount
+		if total := settings.PlatformTransportBudget.Stats().TotalByteCount; total < workingSet {
+			t.Errorf("%s platform budget=%d, below Auto working set=%d", name, total, workingSet)
+		}
+		if h1Priority, h3Priority := settings.ModePreferences[clientconnect.TransportModeH1], settings.ModePreferences[clientconnect.TransportModeH3]; h1Priority == 0 || h1Priority != h3Priority {
+			t.Errorf(
+				"%s Auto priorities H1=%d H3=%d, want equal nonzero priorities",
+				name,
+				h1Priority,
+				h3Priority,
+			)
+		}
+		if _, ok := settings.ModePreferences[clientconnect.TransportModeH3Dns]; ok {
+			t.Errorf("%s Auto preferences unexpectedly enabled H3 DNS", name)
+		}
+	}
 }
 
 // Client settings select exactly one production P2P data plane when requested.
@@ -3096,6 +3321,17 @@ func fullTunMultiClientSettings(path *fullTunPath) *clientconnect.MultiClientSet
 			settings.WindowExpandTimeout,
 			allowance,
 		)
+		// The outcome watchdog starts with the same expansion attempt. It must
+		// not rebuild that window while the race-instrumented candidate is still
+		// inside the valid construction boundary above.
+		settings.WindowOutcomeDeadline = max(
+			settings.WindowOutcomeDeadline,
+			allowance,
+		)
+		settings.WindowOutcomeRebuildDeadline = max(
+			settings.WindowOutcomeRebuildDeadline,
+			allowance,
+		)
 		settings.StatsWindowMaxUnhealthyDuration = max(
 			settings.StatsWindowMaxUnhealthyDuration,
 			allowance,
@@ -3111,6 +3347,20 @@ func fullTunMultiClientSettings(path *fullTunPath) *clientconnect.MultiClientSet
 		settings.SendStallTimeout = max(settings.SendStallTimeout, allowance)
 	}
 	return settings
+}
+
+// A race-instrumented gVisor SYN can consume half of the fixture's readiness
+// window. Spread redundant attempts across that window so they do not inherit
+// nearly identical retransmission schedules and expire together.
+func applyFullTunApplicationDialSettings(
+	settings *clientconnect.TunSettings,
+	path *fullTunPath,
+) {
+	settings.DialTimeout = fullTunRouteReadinessTimeout(path)
+	if !perfvarRaceEnabled || settings.DialRace <= 1 {
+		return
+	}
+	settings.DialRaceTimeout = settings.DialTimeout / time.Duration(settings.DialRace)
 }
 
 // The complete fixture uses one fixed provider to keep route attribution exact.
@@ -3437,10 +3687,13 @@ func tryNewFullTunPathWithTopologyHooks(
 	if err := afterStage(fullTunConstructionStageProviderClient); err != nil {
 		return nil, err
 	}
+	providerPlatformBudget := newFullTunEndpointPlatformBudget()
 	providerPlatformSettings := fullTunPlatformSettings(
 		environment.providerH3Port,
+		platformMode,
 		providerTun,
 		path.providerPlatformReceiveStats,
+		providerPlatformBudget,
 	)
 	providerPlatformSettings.H3DatagramStats = path.providerH3DatagramStats
 	if hooks != nil && hooks.configureProviderPlatformSettings != nil {
@@ -3584,11 +3837,14 @@ func tryNewFullTunPathWithTopologyHooks(
 	}
 	generatorSettings := clientconnect.DefaultApiMultiClientGeneratorSettings()
 	generatorSettings.PlatformTransportMode = platformMode
+	devicePlatformBudget := newFullTunEndpointPlatformBudget()
 	generatorSettings.PlatformTransportSettingsGenerator = func() *clientconnect.PlatformTransportSettings {
 		settings := fullTunPlatformSettings(
 			environment.h3Port,
+			platformMode,
 			deviceCarrierTun,
 			path.devicePlatformReceiveStats,
+			devicePlatformBudget,
 		)
 		settings.H3DatagramStats = path.deviceH3DatagramStats
 		if hooks != nil && hooks.configureDevicePlatformSettings != nil {
@@ -3662,7 +3918,7 @@ func tryNewFullTunPathWithTopologyHooks(
 		route:       route,
 		p2pHopCount: p2pHopCount,
 	}
-	appSettings.DialTimeout = fullTunRouteReadinessTimeout(readinessPath)
+	applyFullTunApplicationDialSettings(appSettings, readinessPath)
 	applyTunResourceProfile(appSettings, resources)
 	appTun, err := clientconnect.CreateTun(ctx, appSettings)
 	if err != nil {
@@ -3959,9 +4215,21 @@ func probeFullTunPath(
 	observation.Budget = probeTimeout
 	dialStartTime := time.Now()
 	dialCtx, dialCancel := context.WithTimeout(ctx, probeTimeout)
-	connection, err := path.appTun.DialContext(dialCtx, "tcp", listener.Addr().String())
+	connection, dialRetryCount, err := dialFullTunReadiness(
+		dialCtx,
+		perfvarRaceEnabled,
+		&serverStage,
+		func(attemptCtx context.Context) (net.Conn, error) {
+			return path.appTun.DialContext(
+				attemptCtx,
+				"tcp",
+				listener.Addr().String(),
+			)
+		},
+	)
 	dialCancel()
 	observation.DialDuration = time.Since(dialStartTime)
+	observation.DialRetryCount = dialRetryCount
 	if err != nil {
 		return failure("dial readiness path", err)
 	}
@@ -4402,13 +4670,15 @@ func (self *fullTunPath) closeAndWait(ctx context.Context) error {
 		}
 	}
 	if self.multiClient != nil {
-		self.multiClient.Close()
-		complete(fullTunConstructionResourceMultiClient, nil)
+		complete(
+			fullTunConstructionResourceMultiClient,
+			self.multiClient.CloseAndWait(ctx),
+		)
 	}
 	if self.apiGenerator != nil {
 		complete(
 			fullTunConstructionResourceApiGenerator,
-			self.apiGenerator.CloseTransportCreationAndWait(ctx),
+			self.apiGenerator.CloseAndWait(ctx),
 		)
 	}
 	if self.deviceTransports != nil {
@@ -4422,8 +4692,10 @@ func (self *fullTunPath) closeAndWait(ctx context.Context) error {
 		complete(fullTunConstructionResourceProviderRemoteNat, nil)
 	}
 	if self.providerLocalNat != nil {
-		self.providerLocalNat.Close()
-		complete(fullTunConstructionResourceProviderLocalNat, nil)
+		complete(
+			fullTunConstructionResourceProviderLocalNat,
+			self.providerLocalNat.CloseAndWait(ctx),
+		)
 	}
 	if self.providerClient != nil {
 		complete(
@@ -4688,18 +4960,26 @@ func (self *fullTunPath) joinSourcePackCarrierBoundary(
 	)
 }
 
-// A measured interval rejects only terminal failures newer than its exact
-// workload-local start. Setup candidate failures remain before the floor.
+// A measured interval rejects terminal failures newer than its exact
+// workload-local start unless the Pack's caller identified an enclosing TCP
+// state that retains the exact bytes or can regenerate the control packet.
+// Setup candidate failures remain before the floor; UDP outside an explicitly
+// lossy probe, public callbacks, and unclassified failures remain fatal.
 func (self *fullTunPath) validateMeasuredPackFailures(
 	carrierEnd perfvarCarrierBoundary,
 ) error {
-	packFailureFloor, active := self.activePackFailureFloorSnapshot()
+	packFailureFloor, active, allowProviderDatagramFailures :=
+		self.activePackFailureFloorSnapshot()
 	if !active {
 		return nil
 	}
 	packFailures := carrierEnd.packFailures
 	if packFailures.deviceFailureCount < packFailureFloor.deviceFailureCount ||
-		packFailures.providerFailureCount < packFailureFloor.providerFailureCount {
+		packFailures.providerFailureCount < packFailureFloor.providerFailureCount ||
+		packFailures.providerRecoverableFailureCount <
+			packFailureFloor.providerRecoverableFailureCount ||
+		packFailures.providerDatagramFailureCount <
+			packFailureFloor.providerDatagramFailureCount {
 		return fmt.Errorf(
 			"Pack failure counters moved backward: start=%+v end=%+v",
 			*packFailureFloor,
@@ -4710,7 +4990,37 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 		packFailureFloor.deviceFailureCount
 	providerFailureCount := packFailures.providerFailureCount -
 		packFailureFloor.providerFailureCount
-	if deviceFailureCount == 0 && providerFailureCount == 0 {
+	providerRecoverableFailureCount :=
+		packFailures.providerRecoverableFailureCount -
+			packFailureFloor.providerRecoverableFailureCount
+	providerDatagramFailureCount :=
+		packFailures.providerDatagramFailureCount -
+			packFailureFloor.providerDatagramFailureCount
+	providerAllowedFailureCount := providerRecoverableFailureCount
+	if allowProviderDatagramFailures {
+		providerAllowedFailureCount += providerDatagramFailureCount
+	}
+	if providerFailureCount < providerAllowedFailureCount {
+		return fmt.Errorf(
+			"provider allowed Pack failures exceeded all failures: total=%d recoverable=%d datagram=%d allow-datagram=%t start=%+v end=%+v",
+			providerFailureCount,
+			providerRecoverableFailureCount,
+			providerDatagramFailureCount,
+			allowProviderDatagramFailures,
+			*packFailureFloor,
+			packFailures,
+		)
+	}
+	providerUnrecoverableFailureCount :=
+		providerFailureCount - providerAllowedFailureCount
+	if deviceFailureCount == 0 && providerUnrecoverableFailureCount == 0 {
+		if !self.advanceActivePackFailureFloor(*packFailureFloor, packFailures) {
+			return fmt.Errorf(
+				"Pack failure floor changed while validating: start=%+v end=%+v",
+				*packFailureFloor,
+				packFailures,
+			)
+		}
 		return nil
 	}
 	deviceFailureSamples := []clientconnect.SendPackLifecycleObservation{}
@@ -4722,9 +5032,13 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 		providerFailureSamples = self.providerPackSends.workloadFailureSnapshot()
 	}
 	return fmt.Errorf(
-		"measured Pack terminal failures device=%d provider=%d start=%+v end=%+v lifetime-device-samples=%+v lifetime-provider-samples=%+v",
+		"measured Pack terminal failures device=%d provider=%d provider-recoverable=%d provider-datagram=%d allow-provider-datagram=%t provider-unrecoverable=%d start=%+v end=%+v lifetime-device-samples=%+v lifetime-provider-samples=%+v",
 		deviceFailureCount,
 		providerFailureCount,
+		providerRecoverableFailureCount,
+		providerDatagramFailureCount,
+		allowProviderDatagramFailures,
+		providerUnrecoverableFailureCount,
 		*packFailureFloor,
 		packFailures,
 		deviceFailureSamples,
@@ -5109,6 +5423,39 @@ func fullTunRouteReadinessTimeout(path *fullTunPath) time.Duration {
 		fullTunDirectionalWorkloadTimeout(path, false, fullTunProbePayloadByteCount)
 }
 
+// The production-shaped two-second stagger remains intact normally. Under the
+// detector, each redundant attempt owns a distinct portion of the enlarged
+// absolute deadline instead of exhausting the same intrinsic SYN window.
+func TestFullTunApplicationDialSettingsDistributeRaceAttempts(t *testing.T) {
+	path := &fullTunPath{
+		environment: &routeEnvironment{
+			profile: initialNetworkProfiles(20260811)["clean-lan"],
+		},
+		route:       fullTunRouteP2pFast,
+		p2pHopCount: 1,
+	}
+	settings := clientconnect.DefaultTunSettings()
+	defaults := clientconnect.DefaultTunSettings()
+	applyFullTunApplicationDialSettings(settings, path)
+	readinessTimeout := fullTunRouteReadinessTimeout(path)
+	if settings.DialTimeout != readinessTimeout {
+		t.Fatalf("application dial timeout=%s, want readiness=%s", settings.DialTimeout, readinessTimeout)
+	}
+	wantStagger := defaults.DialRaceTimeout
+	if perfvarRaceEnabled {
+		wantStagger = readinessTimeout / time.Duration(settings.DialRace)
+	}
+	if settings.DialRace != defaults.DialRace || settings.DialRaceTimeout != wantStagger {
+		t.Fatalf(
+			"application dial race=%d stagger=%s, want race=%d stagger=%s",
+			settings.DialRace,
+			settings.DialRaceTimeout,
+			defaults.DialRace,
+			wantStagger,
+		)
+	}
+}
+
 // The race runtime gets enough liveness headroom to complete a valid route
 // probe, while ordinary correctness runs retain the production watchdogs.
 func TestFullTunMultiClientSettingsBoundRaceConstruction(t *testing.T) {
@@ -5124,12 +5471,20 @@ func TestFullTunMultiClientSettingsBoundRaceConstruction(t *testing.T) {
 	clientSettings := fullTunClientSettings(fullTunRouteP2pFast, nil, nil, nil, 0)
 	clientDefaults := clientconnect.DefaultClientSettings()
 	p2pSettings := clientSettings.StreamManagerSettings.StreamBufferSettings.P2pTransportSettings
-	platformSettings := fullTunPlatformSettings(0, nil, nil)
+	platformSettings := fullTunPlatformSettings(
+		0,
+		clientconnect.TransportModeH1,
+		nil,
+		nil,
+		newFullTunEndpointPlatformBudget(),
+	)
 	platformDefaults := clientconnect.DefaultPlatformTransportSettings()
 	if !perfvarRaceEnabled {
 		if settings.SendStallTimeout != defaults.SendStallTimeout ||
 			settings.BlackholeReceiveTimeout != defaults.BlackholeReceiveTimeout ||
 			settings.WindowExpandTimeout != defaults.WindowExpandTimeout ||
+			settings.WindowOutcomeDeadline != defaults.WindowOutcomeDeadline ||
+			settings.WindowOutcomeRebuildDeadline != defaults.WindowOutcomeRebuildDeadline ||
 			clientSettings.ReadTimeout != clientDefaults.ReadTimeout ||
 			clientSettings.BufferTimeout != clientDefaults.BufferTimeout ||
 			clientSettings.ControlPingTimeout != 10*time.Second ||
@@ -5137,10 +5492,12 @@ func TestFullTunMultiClientSettingsBoundRaceConstruction(t *testing.T) {
 			platformSettings.ReadTimeout != platformDefaults.ReadTimeout ||
 			platformSettings.InactiveDrainTimeout != platformDefaults.InactiveDrainTimeout {
 			t.Fatalf(
-				"ordinary route settings multi=%s/%s/%s client=%s/%s/%s platform=%s/%s/%s",
+				"ordinary route settings multi=%s/%s/%s/%s/%s client=%s/%s/%s platform=%s/%s/%s",
 				settings.SendStallTimeout,
 				settings.BlackholeReceiveTimeout,
 				settings.WindowExpandTimeout,
+				settings.WindowOutcomeDeadline,
+				settings.WindowOutcomeRebuildDeadline,
 				clientSettings.ReadTimeout,
 				clientSettings.BufferTimeout,
 				clientSettings.ControlPingTimeout,
@@ -5160,6 +5517,8 @@ func TestFullTunMultiClientSettingsBoundRaceConstruction(t *testing.T) {
 		settings.BlackholeConnectTimeout < allowance ||
 		settings.WindowGeneratorTimeout < allowance ||
 		settings.WindowExpandTimeout < allowance ||
+		settings.WindowOutcomeDeadline < allowance ||
+		settings.WindowOutcomeRebuildDeadline < allowance ||
 		settings.StatsWindowMaxUnhealthyDuration < allowance ||
 		settings.SendStallTimeout < allowance ||
 		clientSettings.ReadTimeout < fixedAllowance ||
@@ -5184,7 +5543,7 @@ func TestFullTunMultiClientSettingsBoundRaceConstruction(t *testing.T) {
 		platformSettings.ReadTimeout < fixedAllowance ||
 		platformSettings.InactiveDrainTimeout < fixedAllowance {
 		t.Fatalf(
-			"race route settings multi=%s/%s/%s/%s/%s/%s/%s/%s/%s client=%s/%s/%s send=%s/%s receive=%s/%s/%s/%s forward=%s p2p=%s/%s/%s/%s/%s webrtc=%s/%s/%s platform=%s/%s/%s, want path allowance=%s fixed allowance=%s and receive disabled",
+			"race route settings multi=%s/%s/%s/%s/%s/%s/%s/%s/%s/%s/%s client=%s/%s/%s send=%s/%s receive=%s/%s/%s/%s forward=%s p2p=%s/%s/%s/%s/%s webrtc=%s/%s/%s platform=%s/%s/%s, want path allowance=%s fixed allowance=%s and receive disabled",
 			settings.PingTimeout,
 			settings.AckTimeout,
 			settings.BlackholeTimeout,
@@ -5192,6 +5551,8 @@ func TestFullTunMultiClientSettingsBoundRaceConstruction(t *testing.T) {
 			settings.BlackholeConnectTimeout,
 			settings.WindowGeneratorTimeout,
 			settings.WindowExpandTimeout,
+			settings.WindowOutcomeDeadline,
+			settings.WindowOutcomeRebuildDeadline,
 			settings.StatsWindowMaxUnhealthyDuration,
 			settings.SendStallTimeout,
 			clientSettings.ReadTimeout,
@@ -6655,57 +7016,51 @@ func TestFullTunWarmedTCPRouteCorrectness(t *testing.T) {
 		defer cancel()
 		profile := initialNetworkProfiles(4003)["clean-lan"]
 		for _, route := range []fullTunRoute{fullTunRouteExchangeH1, fullTunRouteP2pFast} {
-			enableNetworkPeers := route == fullTunRouteP2pFast
-			environment := newRouteEnvironmentWithNetworkPeers(
-				ctx,
-				t,
-				profile,
-				enableNetworkPeers,
-			)
-			path := newFullTunPath(ctx, t, environment, route)
-			for _, direction := range []perfvarDirection{
-				perfvarDirectionUpload,
-				perfvarDirectionDownload,
-			} {
-				scenario := perfvarScenario{
-					Route:                 route,
-					Profile:               profile,
-					ProviderAccessProfile: profile,
-					Workload:              perfvarWorkloadTCPWarmed,
-					Direction:             direction,
-					Topology:              perfvarTopologyOneHop,
-					Resource:              perfvarResourceDefault,
-					PayloadByteCount:      128 * 1024,
-					FlowCount:             1,
+			func() {
+				enableNetworkPeers := route == fullTunRouteP2pFast
+				environment := newRouteEnvironmentWithNetworkPeers(
+					ctx,
+					t,
+					profile,
+					enableNetworkPeers,
+				)
+				defer environment.close()
+				path := newFullTunPath(ctx, t, environment, route)
+				defer path.close()
+				for _, direction := range []perfvarDirection{
+					perfvarDirectionUpload,
+					perfvarDirectionDownload,
+				} {
+					scenario := perfvarScenario{
+						Route:                 route,
+						Profile:               profile,
+						ProviderAccessProfile: profile,
+						Workload:              perfvarWorkloadTCPWarmed,
+						Direction:             direction,
+						Topology:              perfvarTopologyOneHop,
+						Resource:              perfvarResourceDefault,
+						PayloadByteCount:      128 * 1024,
+						FlowCount:             1,
+					}
+					scenario.WarmupByteCount = perfvarDirectionalBandwidthDelayByteCount(scenario)
+					result, err := measurePerfvarFullTun(ctx, path, scenario)
+					if err != nil {
+						t.Fatalf("%s/%s warmed TCP: %v", route, direction, err)
+					}
+					if result.WarmupByteCount != scenario.WarmupByteCount ||
+						result.WarmupDuration <= 0 ||
+						result.UsefulByteCount != scenario.PayloadByteCount ||
+						result.ContentHash != deterministicPayloadHash(scenario.PayloadByteCount) {
+						t.Fatalf("%s/%s warmed result=%+v scenario=%+v", route, direction, result, scenario)
+					}
+					if path.takeCarrierMeasurementStart() == nil {
+						t.Fatalf("%s/%s did not publish a measured carrier boundary", route, direction)
+					}
 				}
-				scenario.WarmupByteCount = perfvarDirectionalBandwidthDelayByteCount(scenario)
-				result, err := measurePerfvarFullTun(ctx, path, scenario)
-				if err != nil {
-					path.close()
-					environment.close()
-					t.Fatalf("%s/%s warmed TCP: %v", route, direction, err)
+				if err := path.verifyRoute(); err != nil {
+					t.Fatal(err)
 				}
-				if result.WarmupByteCount != scenario.WarmupByteCount ||
-					result.WarmupDuration <= 0 ||
-					result.UsefulByteCount != scenario.PayloadByteCount ||
-					result.ContentHash != deterministicPayloadHash(scenario.PayloadByteCount) {
-					path.close()
-					environment.close()
-					t.Fatalf("%s/%s warmed result=%+v scenario=%+v", route, direction, result, scenario)
-				}
-				if path.takeCarrierMeasurementStart() == nil {
-					path.close()
-					environment.close()
-					t.Fatalf("%s/%s did not publish a measured carrier boundary", route, direction)
-				}
-			}
-			if err := path.verifyRoute(); err != nil {
-				path.close()
-				environment.close()
-				t.Fatal(err)
-			}
-			path.close()
-			environment.close()
+			}()
 		}
 	})
 }

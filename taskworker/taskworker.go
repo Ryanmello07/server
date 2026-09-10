@@ -9,6 +9,7 @@ import (
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/onboarding"
 	"github.com/urnetwork/server/session"
 	"github.com/urnetwork/server/stats"
 	"github.com/urnetwork/server/task"
@@ -38,7 +39,11 @@ func InitTasks(ctx context.Context) {
 		// work.ScheduleWarmEmail(clientSession, tx)
 		work.ScheduleExportStats(clientSession, tx)
 		work.ScheduleExportProvidersMap(clientSession, tx)
+		work.ScheduleBackfillClock(clientSession, tx, server.NowUtc())
+		work.ScheduleWebSearchAnalytics(clientSession, tx)
 		work.ScheduleRemoveExpiredAuthCodes(clientSession, tx)
+		controller.ScheduleAppleOfferCodeTopUp(clientSession, tx, server.NowUtc().Add(1*time.Hour))
+		controller.ScheduleOnboardingResultsRollup(clientSession, tx, onboarding.NextRollupAt(server.NowUtc()))
 		work.SchedulePayout(clientSession, tx)
 		work.ScheduleProcessPendingPayouts(clientSession, tx)
 		work.ScheduleCancelHungAccountPayments(clientSession, tx)
@@ -58,6 +63,7 @@ func InitTasks(ctx context.Context) {
 		controller.ScheduleRefreshFreeTransferBalances(clientSession, tx)
 		controller.ScheduleRefreshProTransferBalances(clientSession, tx)
 		controller.ScheduleRefreshReferralTransferBalances(clientSession, tx)
+		controller.ScheduleRebuildPointsLeaderboard(clientSession, tx)
 		work.ScheduleSetMissingConnectionLocations(clientSession, tx)
 		work.ScheduleRemoveLocationLookupResults(clientSession, tx)
 		work.ScheduleRemoveCompletedContracts(clientSession, tx)
@@ -70,6 +76,7 @@ func InitTasks(ctx context.Context) {
 		work.ScheduleRemoveExpiredProviderEgressLocations(clientSession, tx)
 		work.ScheduleProberBootstrap(clientSession, tx)
 		work.ScheduleRefreshGeolocationSourcePins(clientSession, tx)
+		work.ScheduleProviderEgressProbeTasks(clientSession, tx)
 		work.ScheduleRemoveExpiredBulkClientRemovalQuota(clientSession, tx)
 		work.ScheduleRemoveOldAuditNetworkEvents(clientSession, tx)
 		work.ScheduleRemoveOldAuditEvents(clientSession, tx)
@@ -103,6 +110,12 @@ func InitTasks(ctx context.Context) {
 			if removedCount := task.RemovePendingTasksForFunctionInTx(ctx, tx, functionName); 0 < removedCount {
 				glog.Infof("[taskworker]reaped %d pending tasks for removed target %s\n", removedCount, functionName)
 			}
+		}
+		if removedCount := work.RemoveDisabledVerifyTasks(ctx, tx); 0 < removedCount {
+			glog.Infof("[taskworker]reaped %d pending verification tasks while the subnet is disabled\n", removedCount)
+		}
+		if removedCount := work.RemoveDisabledProviderEgressProbeTasks(ctx, tx); 0 < removedCount {
+			glog.Infof("[taskworker]reaped %d pending provider egress probe tasks while probing is disabled\n", removedCount)
 		}
 	})
 
@@ -144,6 +157,11 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 		task.NewTaskTargetWithPost(
 			work.ExportProvidersMap,
 			work.ExportProvidersMapPost,
+		),
+		task.NewTaskTarget(work.BackfillClock),
+		task.NewTaskTargetWithPost(
+			work.WebSearchAnalytics,
+			work.WebSearchAnalyticsPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.RemoveExpiredAuthCodes,
@@ -219,6 +237,11 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			"bringyour.com/bringyour/controller.RefreshFreeTransferBalances",
 		),
 		task.NewTaskTargetWithPost(
+			controller.RebuildPointsLeaderboard,
+			controller.RebuildPointsLeaderboardPost,
+			"bringyour.com/bringyour/controller.RebuildPointsLeaderboard",
+		),
+		task.NewTaskTargetWithPost(
 			controller.RefreshProTransferBalances,
 			controller.RefreshProTransferBalancesPost,
 			"bringyour.com/bringyour/controller.RefreshProTransferBalances",
@@ -284,6 +307,10 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.RefreshGeolocationSourcePinsPost,
 		),
 		task.NewTaskTargetWithPost(
+			work.ProviderEgressProbe,
+			work.ProviderEgressProbePost,
+		),
+		task.NewTaskTargetWithPost(
 			work.RemoveExpiredBulkClientRemovalQuota,
 			work.RemoveExpiredBulkClientRemovalQuotaPost,
 		),
@@ -346,6 +373,22 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 		task.NewTaskTargetWithPost(
 			controller.RemoveProductUpdates,
 			controller.RemoveProductUpdatesPost,
+		),
+		// the onboarding email campaign: one task per network and step, and the
+		// daily App Store one-time offer code top-up
+		task.NewTaskTargetWithPost(
+			controller.OnboardingCampaignStep,
+			controller.OnboardingCampaignStepPost,
+		),
+		task.NewTaskTargetWithPost(
+			controller.AppleOfferCodeTopUp,
+			controller.AppleOfferCodeTopUpPost,
+		),
+		// the nightly onboarding results rollup (02:00 UTC): outcome events,
+		// the trial backstop, onboarding_results_daily, guardrails
+		task.NewTaskTargetWithPost(
+			controller.OnboardingResultsRollup,
+			controller.OnboardingResultsRollupPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.UpdateClientLocations,

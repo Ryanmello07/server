@@ -1013,6 +1013,26 @@ func TestFindProviders2ProviderLocation(t *testing.T) {
 	})
 }
 
+func TestFindProvidersProviderCarriesFreshSessionSelectionMetadata(t *testing.T) {
+	clientId := server.NewId()
+	score := &ClientScore{
+		ClientId:              clientId,
+		Tiers:                 map[string]int{RankModeQuality: 0},
+		MaxBytesPerSecond:     5_000_000,
+		HasSpeedTest:          true,
+		NetworkOnly:           true,
+		ReputationFailedNames: "bloomberg",
+	}
+	provider := findProvidersProviderFromClientScore(score, RankModeQuality, nil)
+	connect.AssertEqual(t, provider.ClientId, clientId)
+	connect.AssertEqual(t, provider.Tier, 0)
+	connect.AssertEqual(t, provider.EstimatedBytesPerSecond, ByteCount(5_000_000))
+	connect.AssertEqual(t, provider.HasEstimatedBytesPerSecond, true)
+	connect.AssertEqual(t, provider.NetworkOnly, true)
+	connect.AssertEqual(t, provider.ReputationFailedNames, "bloomberg")
+	connect.AssertEqual(t, provider.Location, nil)
+}
+
 // FindProviders2 gates providers on reliability minimums (0.99 independent
 // reliability weight on the hour lookback). The reliability sink is
 // asynchronous: the announce hot path buffers per-block counters in redis and
@@ -1377,6 +1397,16 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 				base,
 				perfectStats(),
 			)
+		}
+		// AddClientReliabilityStatsRange is the direct pg fixture path, so it
+		// intentionally does not maintain the block-health table owned by the
+		// redis drain. Seed the established healthy baseline that a running
+		// production rollup has before exercising the deploy collapse. Without
+		// it, the first deploy candidate has fewer than the minimum ten prior
+		// observations and is deliberately left unclassified.
+		baseBlockNumber := reliabilityBlockNumber(base)
+		for blockNumber := baseBlockNumber - reliabilityDegradedMinBlockCount + 1; blockNumber <= baseBlockNumber; blockNumber += 1 {
+			recordClientReliabilityBlockHealth(ctx, blockNumber)
 		}
 		RollupClientReliabilityStats(ctx, base)
 
@@ -2366,6 +2396,18 @@ func TestFindProviders2NetworkOnlyProviderVisibleOnlyToItsOwnNetwork(t *testing.
 		networkOnlyClientId := connectProvider(networkOnlyNetworkId, "0.0.0.2:0", map[ProvideMode][]byte{
 			ProvideModeNetwork: []byte("network-secret"),
 		})
+		// The low-rate external observer found this provider healthy overall but
+		// rejected by Bloomberg. Selection must publish both independent facts:
+		// same-network eligibility and the domain-specific reputation result.
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId:              networkOnlyClientId,
+			MeasuredAt:            server.NowUtc(),
+			OKCount:               131,
+			Total:                 131,
+			ReputationOK:          2,
+			ReputationTotal:       3,
+			ReputationFailedNames: "bloomberg",
+		})
 
 		UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
 		UpdateClientReliabilityScores(ctx, server.NowUtc(), true)
@@ -2373,7 +2415,7 @@ func TestFindProviders2NetworkOnlyProviderVisibleOnlyToItsOwnNetwork(t *testing.
 		err := UpdateClientScores(ctx, time.Hour, 1)
 		connect.AssertEqual(t, err, nil)
 
-		findFrom := func(networkId server.Id, name string) map[server.Id]bool {
+		findFrom := func(networkId server.Id, name string) map[server.Id]*FindProvidersProvider {
 			clientSession := session.Testing_CreateClientSession(
 				ctx,
 				jwt.NewByJwt(networkId, server.NewId(), name, false, false),
@@ -2389,23 +2431,26 @@ func TestFindProviders2NetworkOnlyProviderVisibleOnlyToItsOwnNetwork(t *testing.
 				clientSession,
 			)
 			connect.AssertEqual(t, err, nil)
-			found := map[server.Id]bool{}
+			found := map[server.Id]*FindProvidersProvider{}
 			for _, provider := range res.Providers {
-				found[provider.ClientId] = true
+				found[provider.ClientId] = provider
 			}
 			return found
 		}
 
 		// the network-only provider's own network sees both
 		sameNetwork := findFrom(networkOnlyNetworkId, "same-network")
-		connect.AssertEqual(t, sameNetwork[publicClientId], true)
-		connect.AssertEqual(t, sameNetwork[networkOnlyClientId], true)
+		connect.AssertEqual(t, sameNetwork[publicClientId] != nil, true)
+		networkProvider := sameNetwork[networkOnlyClientId]
+		connect.AssertEqual(t, networkProvider != nil, true)
+		connect.AssertEqual(t, networkProvider.NetworkOnly, true)
+		connect.AssertEqual(t, networkProvider.ReputationFailedNames, "bloomberg")
 
 		// a stranger sees only the Public one. handing them the network-only
 		// provider would produce a `CreateContract` NoPermission rejection.
 		otherNetwork := findFrom(server.NewId(), "other-network")
-		connect.AssertEqual(t, otherNetwork[publicClientId], true)
-		connect.AssertEqual(t, otherNetwork[networkOnlyClientId], false)
+		connect.AssertEqual(t, otherNetwork[publicClientId] != nil, true)
+		connect.AssertEqual(t, otherNetwork[networkOnlyClientId] != nil, false)
 	})
 }
 
@@ -2657,6 +2702,158 @@ func TestUpdateClientScoresPoolExcludesStreamOnlyAndKeylessProviders(t *testing.
 			streamOnlyClientId,
 			keylessClientId,
 		)
+	})
+}
+
+// Derived window clients and inactive top-level clients can hold Network
+// provide keys, but neither is provider supply. Publishing either one feeds a
+// consumer's own short-lived connection identities back into provider
+// selection and amplifies replacement churn.
+func TestUpdateClientScoresExcludesDerivedAndInactiveClients(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		t.Cleanup(server.Config.PushSimpleResource(
+			providerConfigResourceName,
+			[]byte("enable_egress_test: false\n"),
+		))
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Provider City",
+			Region:       "Provider Region",
+			Country:      "Provider Country",
+			CountryCode:  "pc",
+		}
+		CreateLocation(ctx, city)
+		group := &LocationGroup{
+			Name:              "Top-level Providers",
+			Promoted:          true,
+			MemberLocationIds: []server.Id{city.LocationId},
+		}
+		CreateLocationGroup(ctx, group)
+		handlerId := CreateNetworkClientHandler(ctx)
+
+		connectCandidate := func(clientId server.Id, clientAddress string) {
+			connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, clientAddress, handlerId)
+			connect.AssertEqual(t, err, nil)
+			err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
+			connect.AssertEqual(t, err, nil)
+			SetProvide(ctx, clientId, map[ProvideMode][]byte{
+				ProvideModePublic:  []byte("public-secret"),
+				ProvideModeNetwork: []byte("network-secret"),
+			})
+			server.Tx(ctx, func(tx server.PgTx) {
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`INSERT INTO network_client_latency (connection_id, latency_ms, sample_count) VALUES ($1, 30, 1)`,
+					connectionId,
+				))
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`INSERT INTO network_client_speed (connection_id, bytes_per_second, sample_count) VALUES ($1, $2, 1)`,
+					connectionId,
+					100*1024*1024,
+				))
+			})
+		}
+
+		activeNetworkId := server.NewId()
+		activeClientId := server.NewId()
+		Testing_CreateDevice(ctx, activeNetworkId, server.NewId(), activeClientId, "", "")
+		connectCandidate(activeClientId, "10.40.0.1:20000")
+
+		childNetworkId := server.NewId()
+		childDeviceId := server.NewId()
+		parentClientId := server.NewId()
+		childClientId := server.NewId()
+		Testing_CreateDevice(ctx, childNetworkId, childDeviceId, parentClientId, "", "")
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+				INSERT INTO network_client (
+					client_id,
+					network_id,
+					device_id,
+					description,
+					create_time,
+					auth_time,
+					source_client_id
+				)
+				VALUES ($1, $2, $3, '', now(), now(), $4)
+				`,
+				childClientId,
+				childNetworkId,
+				childDeviceId,
+				parentClientId,
+			))
+		})
+		connectCandidate(childClientId, "10.40.0.2:20000")
+
+		inactiveNetworkId := server.NewId()
+		inactiveClientId := server.NewId()
+		Testing_CreateDevice(ctx, inactiveNetworkId, server.NewId(), inactiveClientId, "", "")
+		connectCandidate(inactiveClientId, "10.40.0.3:20000")
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE network_client SET active = false WHERE client_id = $1`,
+				inactiveClientId,
+			))
+		})
+
+		now := server.NowUtc()
+		UpdateClientLocationReliabilities(ctx, now.Add(-time.Hour), now)
+		err := UpdateClientScores(ctx, time.Hour, 1)
+		connect.AssertEqual(t, err, nil)
+		eligibilityReady, err := clientScoreProviderEligibilityReady(ctx)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, eligibilityReady, true)
+
+		for _, source := range []struct {
+			name             string
+			locationIds      map[server.Id]bool
+			locationGroupIds map[server.Id]bool
+		}{
+			{name: "location", locationIds: map[server.Id]bool{city.LocationId: true}, locationGroupIds: map[server.Id]bool{}},
+			{name: "location group", locationIds: map[server.Id]bool{}, locationGroupIds: map[server.Id]bool{group.LocationGroupId: true}},
+		} {
+			clientScores, err := loadClientScores(
+				true,
+				RankModeQuality,
+				ctx,
+				source.locationIds,
+				source.locationGroupIds,
+				server.Id{},
+				100,
+			)
+			connect.AssertEqual(t, err, nil)
+			if _, ok := clientScores[activeClientId]; !ok {
+				t.Errorf("%s cache is missing active top-level provider %s", source.name, activeClientId)
+			}
+			for label, clientId := range map[string]server.Id{
+				"derived":                    childClientId,
+				"inactive":                   inactiveClientId,
+				"parent without provide key": parentClientId,
+			} {
+				if _, ok := clientScores[clientId]; ok {
+					t.Errorf("%s cache published %s client %s as provider supply", source.name, label, clientId)
+				}
+			}
+		}
+
+		err = UpdateClientLocations(ctx, time.Hour)
+		connect.AssertEqual(t, err, nil)
+		clientLocations, err := loadClientLocations(
+			ctx,
+			map[server.Id]bool{city.CountryLocationId: true},
+		)
+		connect.AssertEqual(t, err, nil)
+		clientLocation, ok := clientLocations[city.CountryLocationId]
+		if !ok {
+			t.Fatalf("public location %s was not published", city.CountryLocationId)
+		}
+		connect.AssertEqual(t, clientLocation.ClientCount, 1)
 	})
 }
 
@@ -2979,6 +3176,89 @@ func TestUpdateClientScoresDoesNotRequireEgressHealthWhenDisabled(t *testing.T) 
 		}
 		if _, ok := clientScores[neverMeasured]; !ok {
 			t.Fatal("a never-measured provider was gated while enable_egress_test=false")
+		}
+	})
+}
+
+// Disabling broad egress qualification must not disable a current, explicit
+// blackhole verdict. The broad sweep is allowed to be absent during rollout;
+// a provider the fast check just proved dark is not unknown.
+func TestUpdateClientScoresExcludesCurrentBlackholeWhenEgressTestDisabled(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		t.Cleanup(server.Config.PushSimpleResource(
+			providerConfigResourceName,
+			[]byte("enable_egress_test: false\n"),
+		))
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		clientIds := testing_connectQualifyingProviders(ctx, t, city, 2)
+		availableClientId, blackholedClientId := clientIds[0], clientIds[1]
+		SetProviderBlackholeCheck(ctx, &ProviderBlackholeCheck{
+			ClientId:  blackholedClientId,
+			CheckedAt: server.NowUtc(),
+			OK:        false,
+			Failure:   "all_destinations_failed",
+		})
+
+		err := UpdateClientScores(ctx, time.Hour, 1)
+		connect.AssertEqual(t, err, nil)
+
+		clientScores := testing_selectableClientScores(ctx, t, city, false)
+		if _, ok := clientScores[availableClientId]; !ok {
+			t.Fatal("a provider without a blackhole verdict was removed while broad egress qualification was disabled")
+		}
+		if _, ok := clientScores[blackholedClientId]; ok {
+			t.Fatal("a provider with a current blackhole verdict remained selectable while broad egress qualification was disabled")
+		}
+	})
+}
+
+// Broad percentage qualification can be disabled during rollout, but a fresh
+// authenticated-TLS failure is conclusive: the provider returned an identity
+// that did not authenticate the requested destination. It must not be diluted
+// by its otherwise passing score or published by the disabled-gate path.
+func TestUpdateClientScoresExcludesTLSAuthenticationFailureWhenEgressTestDisabled(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		t.Cleanup(server.Config.PushSimpleResource(
+			providerConfigResourceName,
+			[]byte("enable_egress_test: false\n"),
+		))
+
+		city := &Location{
+			LocationType: LocationTypeCity,
+			City:         "Palo Alto",
+			Region:       "California",
+			Country:      "United States",
+			CountryCode:  "us",
+		}
+		CreateLocation(ctx, city)
+
+		clientIds := testing_connectQualifyingProviders(ctx, t, city, 2)
+		availableClientId, interceptedClientId := clientIds[0], clientIds[1]
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: interceptedClientId, MeasuredAt: server.NowUtc(),
+			OKCount: 130, Total: 131, TLSAuthenticationFailure: true,
+		})
+
+		err := UpdateClientScores(ctx, time.Hour, 1)
+		connect.AssertEqual(t, err, nil)
+
+		clientScores := testing_selectableClientScores(ctx, t, city, false)
+		if _, ok := clientScores[availableClientId]; !ok {
+			t.Fatal("a provider without a hard egress failure was removed")
+		}
+		if _, ok := clientScores[interceptedClientId]; ok {
+			t.Fatal("a TLS-intercepting provider remained selectable while broad egress qualification was disabled")
 		}
 	})
 }
@@ -3689,6 +3969,101 @@ func TestUpdateClientLocationsCountIsUngatedWhenEgressTestDisabled(t *testing.T)
 		clientLocations, err := loadClientLocations(ctx, map[server.Id]bool{countryId: true})
 		assert.Equal(t, err, nil)
 		assert.Equal(t, clientLocations[countryId].ClientCount, 2)
+	})
+}
+
+func TestUpdateClientLocationsExcludesCurrentBlackholeWhenEgressTestDisabled(t *testing.T) {
+	(&server.TestEnv{ApplyDbMigrations: true}).Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		t.Cleanup(server.Config.PushSimpleResource(
+			providerConfigResourceName,
+			[]byte("enable_egress_test: false\n"),
+		))
+
+		networkId := server.NewId()
+		countryId := server.NewId()
+		availableClientId := server.NewId()
+		blackholedClientId := server.NewId()
+		for _, clientId := range []server.Id{availableClientId, blackholedClientId} {
+			Testing_CreateProviderAtLocation(ctx, networkId, clientId, countryId, "US")
+		}
+		SetProviderBlackholeCheck(ctx, &ProviderBlackholeCheck{
+			ClientId:  blackholedClientId,
+			CheckedAt: server.NowUtc(),
+			OK:        false,
+			Failure:   "all_destinations_failed",
+		})
+
+		UpdateClientLocations(ctx, time.Hour)
+
+		clientLocations, err := loadClientLocations(ctx, map[server.Id]bool{countryId: true})
+		assert.Equal(t, err, nil)
+		assert.Equal(t, clientLocations[countryId].ClientCount, 1)
+	})
+}
+
+func TestUpdateClientLocationsExcludesTLSAuthenticationFailureWhenEgressTestDisabled(t *testing.T) {
+	(&server.TestEnv{ApplyDbMigrations: true}).Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		t.Cleanup(server.Config.PushSimpleResource(
+			providerConfigResourceName,
+			[]byte("enable_egress_test: false\n"),
+		))
+
+		networkId := server.NewId()
+		countryId := server.NewId()
+		availableClientId := server.NewId()
+		interceptedClientId := server.NewId()
+		for _, clientId := range []server.Id{availableClientId, interceptedClientId} {
+			Testing_CreateProviderAtLocation(ctx, networkId, clientId, countryId, "US")
+		}
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: interceptedClientId, MeasuredAt: server.NowUtc(),
+			OKCount: 130, Total: 131, TLSAuthenticationFailure: true,
+		})
+
+		UpdateClientLocations(ctx, time.Hour)
+
+		clientLocations, err := loadClientLocations(ctx, map[server.Id]bool{countryId: true})
+		assert.Equal(t, err, nil)
+		assert.Equal(t, clientLocations[countryId].ClientCount, 1)
+	})
+}
+
+// A gated pass that counts nothing is retried without broad health/location
+// evidence. That safety fallback must still preserve an explicit blackhole
+// verdict instead of resurrecting the provider it just removed.
+func TestUpdateClientLocationsUngatedFallbackDoesNotRestoreCurrentBlackhole(t *testing.T) {
+	(&server.TestEnv{ApplyDbMigrations: true}).Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		testing_enableProviderEgressTest(t)
+
+		networkId := server.NewId()
+		countryId := server.NewId()
+		blackholedClientId := server.NewId()
+		Testing_CreateProviderAtLocation(ctx, networkId, blackholedClientId, countryId, "US")
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: blackholedClientId, OKCount: 131, Total: 131,
+			MeasuredAt: server.NowUtc(),
+		})
+		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			ClientId: blackholedClientId, CountryCode: "US",
+			Verdict: "verified", ObservedAt: server.NowUtc(),
+		})
+		SetProviderBlackholeCheck(ctx, &ProviderBlackholeCheck{
+			ClientId:  blackholedClientId,
+			CheckedAt: server.NowUtc(),
+			OK:        false,
+			Failure:   "all_destinations_failed",
+		})
+
+		UpdateClientLocations(ctx, time.Hour)
+
+		clientLocations, err := loadClientLocations(ctx, map[server.Id]bool{countryId: true})
+		assert.Equal(t, err, nil)
+		if location, ok := clientLocations[countryId]; ok && 0 < location.ClientCount {
+			t.Fatalf("ungated safety fallback restored %d blackholed providers", location.ClientCount)
+		}
 	})
 }
 

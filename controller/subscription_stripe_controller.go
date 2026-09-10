@@ -114,6 +114,24 @@ type StripeEventCheckoutCompleteObject struct {
 	PaymentStatus     string                                `json:"payment_status"`
 	ClientReferenceId string                                `json:"client_reference_id"`
 	Subscription      string                                `json:"subscription"`
+	// set by /pay/data/checkout (apply_to_network, network_id, network_name, item_id)
+	Metadata map[string]string `json:"metadata"`
+}
+
+// stripeAppliedNetworkName is the network a buy-data checkout was made FOR, from
+// the session metadata; empty for every other checkout. The network id itself
+// still comes from client_reference_id, which is what the fulfilment uses.
+func stripeAppliedNetworkName(checkoutComplete *StripeEventCheckoutCompleteObject) string {
+	if checkoutComplete.Metadata == nil {
+		return ""
+	}
+	if checkoutComplete.Metadata[payDataMetadataApplyToNetwork] != payDataMetadataApplyYes {
+		return ""
+	}
+	if checkoutComplete.ClientReferenceId == "" {
+		return ""
+	}
+	return checkoutComplete.Metadata[payDataMetadataNetworkName]
 }
 
 type StripeEventInvoiceObject struct {
@@ -266,7 +284,7 @@ func StripeWebhook(
 			return nil, fmt.Errorf("failed to parse invoice: %v", err)
 		}
 
-		return stripeHandleInvoicePaid(
+		return stripeHandleInvoicePaidWithOnboarding(
 			&invoiceObject,
 			clientSession,
 		)
@@ -312,6 +330,41 @@ func StripeWebhook(
 		}
 
 		return stripeHandleDisputeCreated(&disputeObject, clientSession)
+
+	} else if stripeWebhook.Type == "setup_intent.succeeded" && stripeWebhook.Data != nil {
+
+		/**
+		 * the payment sheet's card is attached: finalize the regional price
+		 * tier from the card's billing country before the trial ends and
+		 * credit the held trial invoice (onboarding_stripe_controller.go)
+		 */
+
+		glog.Infof("type: setup_intent.succeeded")
+
+		return stripeHandleSetupIntentSucceeded(stripeWebhook.Data.Object, clientSession)
+
+	} else if stripeWebhook.Type == "payment_method.attached" && stripeWebhook.Data != nil {
+
+		glog.Infof("type: payment_method.attached")
+
+		return stripeHandlePaymentMethodAttached(stripeWebhook.Data.Object, clientSession)
+
+	} else if stripeWebhook.Type == "customer.updated" && stripeWebhook.Data != nil {
+
+		glog.Infof("type: customer.updated")
+
+		return stripeHandleCustomerUpdated(stripeWebhook.Data.Object, clientSession)
+
+	} else if stripeWebhook.Type == "customer.subscription.deleted" && stripeWebhook.Data != nil {
+
+		/**
+		 * the onboarding trial outcome: a subscription deleted within its
+		 * trial is trial.cancelled (onboarding_stripe_controller.go)
+		 */
+
+		glog.Infof("type: customer.subscription.deleted")
+
+		return stripeHandleSubscriptionDeleted(stripeWebhook.Data.Object, clientSession)
 
 	}
 	// else IGNORE the event and answer 200. This is load-bearing: the endpoint
@@ -383,12 +436,20 @@ func stripeHandleCheckoutSessionCompleted(
 		return nil, errors.New("missing purchase email to send balance code")
 	}
 
+	// a buy-data checkout made FOR a network: the credit lands there and the
+	// email says so, instead of offering a code
+	appliedNetworkName := ""
+	if redeemNetworkId != nil {
+		appliedNetworkName = stripeAppliedNetworkName(checkoutComplete)
+	}
+
 	if err := stripeFulfillCheckoutLineItems(
 		clientSession.Ctx,
 		stripeSessionId,
 		lineItems.Data,
 		purchaseEmail,
 		redeemNetworkId,
+		appliedNetworkName,
 	); err != nil {
 		return nil, err
 	}
@@ -431,6 +492,7 @@ func stripeFulfillCheckoutLineItems(
 	lineItems []*StripeLineItem,
 	purchaseEmail string,
 	redeemNetworkId *server.Id,
+	appliedNetworkName string,
 ) error {
 	skus := stripeSkusFunc()
 	for lineIndex, lineItem := range lineItems {
@@ -467,40 +529,19 @@ func stripeFulfillCheckoutLineItems(
 
 				glog.Infof("[sub]create balance code: %s %s\n", purchaseEmail, string(stripeItemJsonBytes))
 
-				if sku.Special == "" {
-					err = CreateBalanceCode(
-						ctx,
-						quantity*sku.BalanceByteCount(),
-						model.Pro().DataCodeDuration,
-						netRevenue,
-						stripeCheckoutPurchaseEventId(stripeSessionId, lineIndex),
-						string(stripeItemJsonBytes),
-						purchaseEmail,
-						redeemNetworkId,
-					)
-					if err != nil {
-						return err
-					}
-				} else if sku.Special == SpecialCompany {
-					if purchaseEmail == "" {
-						// the company template is delivered by email only -- there is
-						// no network to credit directly
-						return fmt.Errorf("Stripe company sku %s requires a purchase email", stripeSku)
-					}
-					awsMessageSender := GetAWSMessageSender()
-					// company shared data
-					err := awsMessageSender.SendAccountMessageTemplate(
-						purchaseEmail,
-						&SubscriptionTransferBalanceCompanyTemplate{
-							BalanceByteCount: sku.BalanceByteCount(),
-						},
-						SenderEmail(EnvEmailConfig().CompanySenderEmail),
-					)
-					if err != nil {
-						return err
-					}
-				} else {
-					return fmt.Errorf("Stripe unknown special (%s) for sku: %s", sku.Special, stripeSku)
+				err = createBalanceCode(
+					ctx,
+					quantity*sku.BalanceByteCount(),
+					model.Pro().DataCodeDuration,
+					netRevenue,
+					stripeCheckoutPurchaseEventId(stripeSessionId, lineIndex),
+					string(stripeItemJsonBytes),
+					purchaseEmail,
+					redeemNetworkId,
+					appliedNetworkName,
+				)
+				if err != nil {
+					return err
 				}
 
 			}
@@ -761,6 +802,12 @@ func stripeCreditInvoicePaid(
 ) (credited bool, returnErr error) {
 
 	server.Tx(ctx, func(tx server.PgTx) {
+		credited = false
+		returnErr = nil
+		if err := model.LockPaymentNetworkInTx(tx, ctx, networkId); err != nil {
+			returnErr = err
+			return
+		}
 
 		ledgerTag := server.RaisePgResult(tx.Exec(
 			ctx,
@@ -813,7 +860,7 @@ func stripeCreditInvoicePaid(
 		)
 
 		credited = true
-	})
+	}, server.TxReadCommitted)
 
 	if returnErr != nil {
 		return false, returnErr
@@ -1135,6 +1182,10 @@ func stripeHandleRefund(
 			"[sub]%s %s (charge %s): action=%s ended=%d\n",
 			eventType, refundId, chargeId, eventAction, len(endedNetworkIds),
 		)
+		if ledgerNetworkId != nil {
+			// the onboarding refund outcome (cents to dollars)
+			RecordRefund(ctx, *ledgerNetworkId, model.OnboardingStoreStripe, float64(amount)/100)
+		}
 	}
 	return nil
 }
@@ -1364,26 +1415,24 @@ func StripeCreateCustomerPortal(
 }
 
 func UnsubscribeStripe(session *session.ClientSession) error {
-
-	var subscriptionRenewals []struct {
-		TransactionId string
-		EndTime       time.Time
-	}
+	invoiceIds := []string{}
 	var queryErr error
 
 	server.Tx(session.Ctx, func(tx server.PgTx) {
+		invoiceIds = nil
+		queryErr = nil
 
 		// query if network has active stripe subscriptions
 		result, err := tx.Query(
 			session.Ctx,
 			`
-			SELECT transaction_id, end_time
+			SELECT DISTINCT transaction_id
 			FROM subscription_renewal
 			WHERE
 				network_id = $1
 				AND market = $2
 				AND end_time > $3
-			ORDER BY end_time DESC
+			ORDER BY transaction_id
 			`,
 			session.ByJwt.NetworkId,
 			model.SubscriptionMarketStripe,
@@ -1398,131 +1447,67 @@ func UnsubscribeStripe(session *session.ClientSession) error {
 
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
-
-				var txId string
-				var endTime time.Time
-
-				err := result.Scan(&txId, &endTime)
+				var invoiceId string
+				err := result.Scan(&invoiceId)
 				if err != nil {
 					glog.Errorf("[unsubscribe] Failed to scan subscription renewal: %v", err)
 					queryErr = err
-					continue
+					return
 				}
-
-				subscriptionRenewals = append(subscriptionRenewals, struct {
-					TransactionId string
-					EndTime       time.Time
-				}{
-					TransactionId: txId,
-					EndTime:       endTime,
-				})
-
+				invoiceIds = append(invoiceIds, invoiceId)
 			}
 		})
-
 	})
 
 	if queryErr != nil {
 		return fmt.Errorf("[unsubscribe] failed to query subscription renewals: %w", queryErr)
 	}
 
-	if len(subscriptionRenewals) == 0 {
+	customerId := ""
+	stripeCustomerId, err := model.GetStripeCustomer(session)
+	if err != nil {
+		return fmt.Errorf("[unsubscribe] failed to query Stripe customer: %w", err)
+	}
+	if stripeCustomerId != nil {
+		customerId = *stripeCustomerId
+	}
+	deletions, err := stripeDiscoverDeletionSubscriptions(
+		session.Ctx,
+		session.ByJwt.NetworkId,
+		customerId,
+		invoiceIds,
+	)
+	if err != nil {
+		return fmt.Errorf("[unsubscribe] failed to discover Stripe subscriptions: %w", err)
+	}
+
+	closeRenewal := func(invoiceId string) error {
+		var updateErr error
+		server.Tx(session.Ctx, func(tx server.PgTx) {
+			_, updateErr = tx.Exec(
+				session.Ctx,
+				`
+					UPDATE subscription_renewal
+					SET end_time = now()
+					WHERE network_id = $1
+						AND market = $2
+						AND transaction_id = $3
+						AND end_time > now()
+				`,
+				session.ByJwt.NetworkId,
+				model.SubscriptionMarketStripe,
+				invoiceId,
+			)
+		})
+		if updateErr != nil {
+			glog.Errorf("[unsubscribe] Failed to close Stripe subscription renewal: %v", updateErr)
+			return fmt.Errorf("[unsubscribe] failed to close Stripe renewal: %w", updateErr)
+		}
 		return nil
 	}
-
-	stripe.Key = stripeApiToken()
-
-	for _, renewal := range subscriptionRenewals {
-
-		invoiceId := renewal.TransactionId
-		if invoiceId == "" {
-			glog.Infof("[unsubscribe] Subscription renewal with empty transaction id, skipping")
-			continue
-		}
-
-		// Get invoice details with expanded subscription info
-		url := fmt.Sprintf("%s/v1/invoices/%s?expand[]=subscription&expand[]=customer", stripeApiBaseUrl, invoiceId)
-		fullInvoice, err := server.HttpGetRequireStatusOk[*StripeInvoiceExpanded](
-			session.Ctx,
-			url,
-			func(header http.Header) {
-				header.Add("Authorization", fmt.Sprintf("Bearer %s", stripeApiTokenFunc()))
-			},
-			server.ResponseJsonObject[*StripeInvoiceExpanded],
-		)
-
-		if err != nil {
-			glog.Errorf("[unsubscribe] Failed to fetch invoice %s: %v", invoiceId, err)
-			continue
-		}
-
-		// Extract subscription ID
-		var subscriptionId string
-		if fullInvoice.Subscription != nil && fullInvoice.Subscription.ID != "" {
-			subscriptionId = fullInvoice.Subscription.ID
-		}
-
-		if subscriptionId == "" {
-			glog.Errorf("[unsubscribe] No subscription ID found for invoice %s", invoiceId)
-			continue
-		}
-
-		// Cancel the subscription
-		glog.Infof("[unsubscribe] Canceling Stripe subscription %s for network %s", subscriptionId, session.ByJwt.NetworkId)
-
-		cancelUrl := fmt.Sprintf("%s/v1/subscriptions/%s", stripeApiBaseUrl, subscriptionId)
-
-		req, err := http.NewRequestWithContext(session.Ctx, "DELETE", cancelUrl, nil)
-		if err != nil {
-			glog.Errorf("[unsubscribe] Failed to create cancel request for subscription %s: %v", subscriptionId, err)
-			continue
-		}
-
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", stripeApiTokenFunc()))
-
-		httpClient := server.DefaultHttpClient()
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			glog.Errorf("[unsubscribe] Failed to cancel Stripe subscription %s: %v", subscriptionId, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			glog.Errorf("[unsubscribe] Stripe API returned error status %d for subscription %s", resp.StatusCode, subscriptionId)
-			continue
-		}
-
-		glog.Infof("[unsubscribe] Successfully canceled Stripe subscription %s", subscriptionId)
-
+	if err := stripeCancelDeletionSubscriptions(session.Ctx, deletions, closeRenewal); err != nil {
+		return fmt.Errorf("[unsubscribe] failed to cancel Stripe subscriptions: %w", err)
 	}
-
-	// set subscription_renewal end time as now for all active subscriptions
-	// to prevent transfer balance from being unnecessarily added
-	server.Tx(session.Ctx, func(tx server.PgTx) {
-
-		_, err := tx.Exec(
-			session.Ctx,
-			`
-			UPDATE subscription_renewal
-			SET end_time = $1
-			WHERE
-				network_id = $2
-				AND market = $3
-				AND end_time > $4
-			`,
-			server.NowUtc(),
-			session.ByJwt.NetworkId,
-			model.SubscriptionMarketStripe,
-			server.NowUtc(),
-		)
-
-		if err != nil {
-			glog.Errorf("[unsubscribe] Failed to update subscription_renewal end times: %v", err)
-		}
-
-	})
-
 	return nil
 }
 
@@ -1567,6 +1552,11 @@ const (
 
 type StripeCreateCheckoutSessionArgs struct {
 	ItemId string `json:"item_id"`
+	// the store's storefront country, when the caller knows it; resolves the
+	// regional price tier for the Pro items (else the Stripe billing country,
+	// else the client ip as an estimate; the charged tier is finalized from the
+	// card's billing country once it is attached)
+	StorefrontCountry string `json:"storefront_country,omitempty"`
 	// "hosted" (default) or "embedded". Defaults to hosted so existing callers, which
 	// only ever read checkout_url, keep working unchanged.
 	UiMode string `json:"ui_mode,omitempty"`
@@ -1608,6 +1598,38 @@ func stripeCheckoutError(message string) *StripeCreateCheckoutSessionResult {
 	}
 }
 
+// stripeDataPackLineItems builds the one line item of a data pack checkout: priced
+// from pro.yml and attached to the EXISTING Stripe product -- so
+// checkout.session.completed can still look the sku up by product id and know how
+// much data to grant. Shared by the signed-in checkout and /pay/data/checkout so
+// both sell exactly the same thing. A non-empty errMessage is customer-facing.
+func stripeDataPackLineItems(itemId string) (lineItems []*stripe.CheckoutSessionLineItemParams, errMessage string) {
+	byteCount, ok := stripeDataPackByteCount(itemId)
+	if !ok {
+		return nil, "Unknown item."
+	}
+	productId, ok := stripeProductForByteCount(byteCount)
+	if !ok {
+		glog.Errorf("[stripe]no product configured for data pack %s\n", itemId)
+		return nil, "That data pack is not available."
+	}
+	priceUsd, ok := stripeDataPackPriceUsd(byteCount)
+	if !ok || priceUsd <= 0 {
+		glog.Errorf("[stripe]no price in pro.yml for data pack %s\n", itemId)
+		return nil, "That data pack is not available."
+	}
+	return []*stripe.CheckoutSessionLineItemParams{
+		{
+			PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+				Currency:   stripe.String(string(stripe.CurrencyUSD)),
+				Product:    stripe.String(productId),
+				UnitAmount: stripe.Int64(int64(math.Round(priceUsd * 100))),
+			},
+			Quantity: stripe.Int64(1),
+		},
+	}, ""
+}
+
 // stripeDataPackByteCount maps a data item id to the amount it grants, from pro.yml.
 func stripeDataPackByteCount(itemId string) (model.ByteCount, bool) {
 	switch itemId {
@@ -1621,10 +1643,10 @@ func stripeDataPackByteCount(itemId string) (model.ByteCount, bool) {
 
 // stripeProductForByteCount finds the Stripe product configured for a data amount, so
 // the fulfilment webhook (which looks a sku up by product id) can tell how much data
-// was bought. Company and supporter skus are not data packs.
+// was bought. The supporter sku is not a data pack.
 func stripeProductForByteCount(byteCount model.ByteCount) (string, bool) {
 	for productId, sku := range stripeSkus() {
-		if sku.Supporter || sku.Special != "" {
+		if sku.Supporter {
 			continue
 		}
 		if sku.BalanceByteCount() == byteCount {
@@ -1718,6 +1740,15 @@ func stripeCheckoutApplyUiMode(
 // The session carries client_reference_id = networkId. That is how BOTH webhooks find
 // the network to fulfil (stripeHandleInvoicePaid for Pro, and the checkout-complete
 // handler for data packs). Removing it would take the money and deliver nothing.
+// StripeSubscriptionTrialDays is the free trial the YEARLY Stripe Pro
+// subscription starts with, in days; the monthly plan has no trial. It is the
+// ONE number for the trial across the products sold through this endpoint; the
+// offers configured elsewhere must match it: the Android app's FREE_TRIAL_DAYS
+// and the yearly Stripe payment link it opens, the Play Console yearly offer,
+// and the App Store yearly introductory offer (which only allows fixed
+// durations, so iOS shows the nearest one StoreKit reports).
+const StripeSubscriptionTrialDays = 14
+
 func StripeCreateCheckoutSession(
 	args *StripeCreateCheckoutSessionArgs,
 	clientSession *session.ClientSession,
@@ -1758,15 +1789,14 @@ func StripeCreateCheckoutSession(
 	switch args.ItemId {
 
 	case StripeItemProMonthly, StripeItemProYearly:
-		prices := stripeSubscriptionPrices()
-		priceId := prices.Monthly
-		if args.ItemId == StripeItemProYearly {
-			priceId = prices.Yearly
-		}
-		if priceId == "" {
-			glog.Errorf("[stripe]no subscription price configured for %s\n", args.ItemId)
+		// the caller's regional tier price, and the welcome-offer coupon when
+		// the offer is redeemable (yearly only)
+		priceId, discounts, onboardingMetadata, err := stripeCheckoutTierAndDiscount(args.ItemId, args.StorefrontCountry, clientSession)
+		if err != nil || priceId == "" {
+			glog.Errorf("[stripe]no subscription price configured for %s: %v\n", args.ItemId, err)
 			return stripeCheckoutError("That plan is not available."), nil
 		}
+		params.Discounts = discounts
 
 		params.Mode = stripe.String(string(stripe.CheckoutSessionModeSubscription))
 		params.LineItems = []*stripe.CheckoutSessionLineItemParams{
@@ -1789,35 +1819,23 @@ func StripeCreateCheckoutSession(
 				"network_id": networkId.String(),
 			},
 		}
+		for key, value := range onboardingMetadata {
+			params.SubscriptionData.Metadata[key] = value
+		}
+		// only the yearly plan starts with the free trial (the web app, windows
+		// and linux sell Pro through these sessions)
+		if args.ItemId == StripeItemProYearly {
+			params.SubscriptionData.TrialPeriodDays = stripe.Int64(StripeSubscriptionTrialDays)
+		}
 
 	case StripeItemData1Tib, StripeItemData10Tib:
-		byteCount, _ := stripeDataPackByteCount(args.ItemId)
-
-		productId, ok := stripeProductForByteCount(byteCount)
-		if !ok {
-			glog.Errorf("[stripe]no product configured for data pack %s\n", args.ItemId)
-			return stripeCheckoutError("That data pack is not available."), nil
+		lineItems, errMessage := stripeDataPackLineItems(args.ItemId)
+		if errMessage != "" {
+			return stripeCheckoutError(errMessage), nil
 		}
-		priceUsd, ok := stripeDataPackPriceUsd(byteCount)
-		if !ok || priceUsd <= 0 {
-			glog.Errorf("[stripe]no price in pro.yml for data pack %s\n", args.ItemId)
-			return stripeCheckoutError("That data pack is not available."), nil
-		}
-
-		// a one-time payment, priced from pro.yml and attached to the EXISTING Stripe
-		// product -- so checkout.session.completed can still look the sku up by product
-		// id and know how much data to grant
+		// a one-time payment
 		params.Mode = stripe.String(string(stripe.CheckoutSessionModePayment))
-		params.LineItems = []*stripe.CheckoutSessionLineItemParams{
-			{
-				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
-					Currency:   stripe.String(string(stripe.CurrencyUSD)),
-					Product:    stripe.String(productId),
-					UnitAmount: stripe.Int64(int64(math.Round(priceUsd * 100))),
-				},
-				Quantity: stripe.Int64(1),
-			},
-		}
+		params.LineItems = lineItems
 
 	default:
 		return stripeCheckoutError("Unknown item."), nil
