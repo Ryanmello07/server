@@ -1,28 +1,32 @@
-# connect derives every client's location from the address it sees on the
-# websocket. It only trusts a forwarded address when BOTH X-Forwarded-For and
-# X-Forwarded-Source-Port are present (connect/transport.go:220-227) -- that
-# pair is what the warp load balancer sends. Caddy sets X-Forwarded-For on its
-# own, but not the port, so connect fell through to r.RemoteAddr and saw
-# Caddy's container address (172.18.x.x) for every client. A private address
-# has no mmdb entry, so GuessLocationType returned "Unknown location type",
-# no network_client_location row was written, and no provider ever reached
-# network_client_location_reliability -- which silently emptied the provider
-# location list.
+# Both api and connect derive every client's address from the ingress, and
+# getting it wrong is not a cosmetic problem. connect turns that address into
+# the client's location: a private address has no mmdb entry, so
+# GuessLocationType returns "Unknown location type", no network_client_location
+# row is written, no provider reaches network_client_location_reliability, and
+# the provider location list silently empties. api feeds the same address to
+# rate limiting and the ARIN foreign-provider score, so one shared address
+# means the entire deployment shares a single signup budget.
 #
-# Sending the source port restores the pair, and with it the real client
-# address. api needs it too: the same address feeds rate limiting and the
-# ARIN foreign-provider score, both of which would otherwise see one shared
-# proxy address for the entire deployment.
+# The contract is now a single header, set by the ingress -- see the
+# (client_address) snippet below.
 (client_address) {
-	# connect trusts X-UR-Forwarded-For ahead of everything else
-	# (connect/transport.go:220) and the api derives the session client address
-	# from the same value. A proxy passes client headers through verbatim, so
-	# with Caddy as the sole ingress any client could send this header and pin
-	# itself to an address of its choosing -- forging its provider location and
-	# evading the per-address rate limits. Strip it on the way in; only the
-	# warp load balancer is entitled to set it, and it is not in this path.
-	header_up -X-UR-Forwarded-For
-	header_up X-Forwarded-Source-Port {http.request.remote.port}
+	# As of the 2026-09-10 upstream merge, session.ResolveClientAddress reads
+	# exactly ONE header -- X-UR-Forwarded-For -- and deliberately ignores
+	# X-Forwarded-For and X-Forwarded-Source-Port. The ingress is required to
+	# overwrite it with one ip:port pair from the socket it accepted, which is
+	# the same contract the upstream nginx ingress implements
+	# (controller/verify_controller.go:139).
+	#
+	# header_up OVERWRITES rather than appends, and that is what makes this
+	# safe: a client that sends its own X-UR-Forwarded-For has the value
+	# replaced with the address Caddy actually accepted the connection from, so
+	# it cannot forge a location or evade the per-address rate limits.
+	#
+	# Do NOT go back to stripping this header. Stripping left the api with no
+	# forwarded address at all, so every client fell back to Caddy's bridge
+	# address, the whole deployment shared one signup budget, and real users
+	# got 429/503 on their first account.
+	header_up X-UR-Forwarded-For "{http.request.remote}"
 }
 
 api.beta-test.net {
