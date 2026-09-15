@@ -7,6 +7,15 @@ services:
         max-file: "3"
     image: postgres:16
     restart: unless-stopped
+    # Docker defaults /dev/shm to 64MB. Postgres allocates shared memory
+    # segments there for parallel workers, and a parallel index vacuum on the
+    # larger tables asks for a 64MiB segment -- which fails outright:
+    #   ERROR: could not resize shared memory segment ... No space left on device
+    # Found 2026-09-15 with network_client_location_reliability holding 27k live
+    # rows against 3.1M dead ones (11,000% bloat) in a table the provider
+    # location pass rewrites every few seconds. Manual VACUUM failed until run
+    # with PARALLEL 0, and parallel queries hit the same ceiling.
+    shm_size: 1gb
     env_file:
       - ./beta-vault/beta-secrets.env
     # ⚠️ DATA PERSISTENCE: uses a named volume (postgres_data) that survives
