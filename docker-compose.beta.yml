@@ -67,6 +67,10 @@ services:
     restart: no
     environment:
       WARP_ENV: local
+      # Required since the 2026-09-15 upstream merge: server.RequireDomain()
+      # panics when unset, which crash-looped the taskworker on deploy.
+      # This is the suffix the beta hostnames hang off (api.beta-test.net).
+      WARP_DOMAIN: beta-test.net
       WARP_BLOCK: local
       WARP_SERVICE: bringyourctl
       WARP_VERSION: 0.0.0-beta
@@ -95,6 +99,7 @@ services:
     restart: unless-stopped
     environment:
       WARP_ENV: local
+      WARP_DOMAIN: beta-test.net
       WARP_BLOCK: local
       WARP_SERVICE: taskworker
       WARP_VERSION: 0.0.0-beta
@@ -129,6 +134,7 @@ services:
       # forwarded client address readable at all.
       BRINGYOUR_TRUSTED_PROXY_CIDRS: "172.18.0.0/16"
       WARP_ENV: local
+      WARP_DOMAIN: beta-test.net
       WARP_BLOCK: local
       WARP_SERVICE: api
       WARP_VERSION: 0.0.0-beta
@@ -171,6 +177,7 @@ services:
     restart: unless-stopped
     environment:
       WARP_ENV: local
+      WARP_DOMAIN: beta-test.net
       WARP_BLOCK: local
       WARP_SERVICE: connect
       WARP_VERSION: 0.0.0-beta
@@ -253,6 +260,7 @@ services:
       - ./beta-vault/beta-secrets.env
     environment:
       WARP_ENV: local
+      WARP_DOMAIN: beta-test.net
       WARP_BLOCK: local
       WARP_SERVICE: proxy
       WARP_VERSION: 0.0.0-beta
