@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily URnetwork beta database backup
+Documentation=file:/root/urnetwork/server/beta-db-daily-backup.sh
+
+[Timer]
+# 04:30 UTC: after the 03:00 DbMaintenance task has finished and well clear of
+# the hourly provider-egress probe bursts.
+OnCalendar=*-*-* 04:30:00 UTC
+# The host reboots occasionally; a missed window should still produce a backup
+# rather than silently skipping a day.
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

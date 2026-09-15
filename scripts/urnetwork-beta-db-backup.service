@@ -1,0 +1,22 @@
+[Unit]
+# Daily logical backup of the beta database.
+#
+# Nothing scheduled this before 2026-09-15: beta-db-daily-backup.sh existed in
+# the repo but no cron entry or timer invoked it, so the newest dump on the host
+# was whatever a human last took by hand.
+#
+# The script keeps exactly one rolling file. That is deliberate -- the host runs
+# near-full and each dump is ~2.8GB -- so this is a recovery floor, not history.
+Description=URnetwork beta database daily backup
+Documentation=file:/root/urnetwork/server/beta-db-daily-backup.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/urnetwork/server/beta-db-daily-backup.sh
+# pg_dump of a 27GB database is long and I/O heavy; do not let it run forever,
+# and keep it off the CPU that the live api and connect services need.
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=idle
