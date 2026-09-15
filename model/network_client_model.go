@@ -871,24 +871,27 @@ func deactivateNetworkClientsInTx(
 		return 0, nil
 	}
 
-	// Capture the lifecycle timestamp only after every target row is locked.
-	// A concurrent contract holding FOR SHARE must remain ordered before this
-	// deactivation in both database state and recorded time.
-	deactivateTime := server.NowUtc()
+	// Read the primary database clock in the UPDATE only after every target row
+	// is locked. A concurrent contract holding FOR SHARE must remain ordered
+	// before this deactivation in both database state and recorded time, even
+	// when the two API calls run on hosts whose application clocks differ.
 	tag, err := tx.Exec(
 		ctx,
 		`
+			WITH lifecycle_clock AS MATERIALIZED (
+				SELECT clock_timestamp() AT TIME ZONE 'UTC' AS deactivate_time
+			)
 			UPDATE network_client
 			SET
 				active = false,
-				deactivate_time = $3
+				deactivate_time = lifecycle_clock.deactivate_time
+			FROM lifecycle_clock
 			WHERE
-				client_id = ANY($1) AND
-				network_id = $2
+				network_client.client_id = ANY($1) AND
+				network_client.network_id = $2
 		`,
 		lockedClientIds,
 		networkId,
-		deactivateTime,
 	)
 	if err != nil {
 		return 0, err
@@ -1667,10 +1670,24 @@ const (
 	NetworkClientLifecycleInactiveDerived NetworkClientLifecycle = "inactive_derived"
 )
 
+// NetworkClientSourceOwner is a server-derived, bounded owner class for a
+// contract source. It distinguishes the durable egress-prober network from
+// every other known network and keeps incomplete identity state explicit. The
+// value is safe for a metric label because it is never accepted from a client
+// and cannot carry a client, network, device, or application identifier.
+type NetworkClientSourceOwner string
+
+const (
+	NetworkClientSourceOwnerUnknown      NetworkClientSourceOwner = "unknown"
+	NetworkClientSourceOwnerEgressProber NetworkClientSourceOwner = "egress_prober"
+	NetworkClientSourceOwnerOther        NetworkClientSourceOwner = "other"
+)
+
 type ProvideRelationshipDetails struct {
 	Mode                 ProvideMode
 	SourceLifecycle      NetworkClientLifecycle
 	DestinationLifecycle NetworkClientLifecycle
+	SourceOwner          NetworkClientSourceOwner
 }
 
 func networkClientLifecycle(active *bool, sourceClientId *server.Id) NetworkClientLifecycle {
@@ -1690,15 +1707,19 @@ func networkClientLifecycle(active *bool, sourceClientId *server.Id) NetworkClie
 }
 
 // GetProvideRelationshipDetails resolves the same relationship as
-// GetProvideRelationship while carrying bounded endpoint lifecycle classes
-// from that exact database snapshot. CreateContract already needs this lookup;
-// returning the extra columns makes missing-origin telemetry causal without an
-// additional query on the failure path.
+// GetProvideRelationship while carrying bounded endpoint lifecycle and source
+// owner classes from that exact database snapshot. CreateContract already
+// needs this lookup; returning the extra columns makes failure telemetry causal
+// without an additional query on the hot path. Ownership compares the source's
+// network with the durable prober network, so client credential rotation and
+// arbitrarily nested derived clients retain the same bounded owner without
+// exposing either identity.
 func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, clientIdB server.Id) ProvideRelationshipDetails {
 	details := ProvideRelationshipDetails{
 		Mode:                 ProvideModePublic,
 		SourceLifecycle:      NetworkClientLifecycleMissing,
 		DestinationLifecycle: NetworkClientLifecycleMissing,
+		SourceOwner:          NetworkClientSourceOwnerUnknown,
 	}
 	if clientIdA == clientIdB {
 		details.Mode = ProvideModeNetwork
@@ -1714,10 +1735,12 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 				a.source_client_id,
 				b.network_id,
 				b.active,
-				b.source_client_id
+				b.source_client_id,
+				prober.network_id
 			FROM (VALUES (true)) AS seed(value)
 			LEFT JOIN network_client a ON a.client_id = $1
 			LEFT JOIN network_client b ON b.client_id = $2
+			LEFT JOIN prober_identity prober ON prober.singleton
 			`,
 			clientIdA,
 			clientIdB,
@@ -1730,6 +1753,7 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 				var networkIdB *server.Id
 				var activeB *bool
 				var sourceClientIdB *server.Id
+				var proberNetworkId *server.Id
 				server.Raise(result.Scan(
 					&networkIdA,
 					&activeA,
@@ -1737,9 +1761,17 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 					&networkIdB,
 					&activeB,
 					&sourceClientIdB,
+					&proberNetworkId,
 				))
 				details.SourceLifecycle = networkClientLifecycle(activeA, sourceClientIdA)
 				details.DestinationLifecycle = networkClientLifecycle(activeB, sourceClientIdB)
+				if networkIdA != nil && proberNetworkId != nil {
+					if *networkIdA == *proberNetworkId {
+						details.SourceOwner = NetworkClientSourceOwnerEgressProber
+					} else {
+						details.SourceOwner = NetworkClientSourceOwnerOther
+					}
+				}
 				if networkIdA != nil && networkIdB != nil && *networkIdA == *networkIdB {
 					details.Mode = ProvideModeNetwork
 				}
@@ -2317,11 +2349,36 @@ const clientAuthTimeRefreshMinInterval = time.Hour
 // if attempt claim fails, connect to the next (repeat until a successful connection)
 
 // returns a connection_id
+//
+// The connection is recorded as a legacy, family-agnostic transport (intent
+// 0), which the reliability aggregation counts as proof of v4. A
+// family-pinned transport records its declared family through
+// ConnectNetworkClientWithIpFamily.
 func ConnectNetworkClient(
 	ctx context.Context,
 	clientId server.Id,
 	clientAddress string,
 	handlerId server.Id,
+) (
+	connectionId server.Id,
+	clientIp string,
+	clientPort int,
+	clientIpHash [32]byte,
+	err error,
+) {
+	return ConnectNetworkClientWithIpFamily(ctx, clientId, clientAddress, handlerId, 0)
+}
+
+// ConnectNetworkClientWithIpFamily is ConnectNetworkClient with the address
+// family the transport declared it intends to prove: 0 (legacy), 4 or 6. The
+// observed family is derived here from the client address and stored beside
+// the intent; see ConnectionProvenIpFamily for how the pair is judged.
+func ConnectNetworkClientWithIpFamily(
+	ctx context.Context,
+	clientId server.Id,
+	clientAddress string,
+	handlerId server.Id,
+	ipFamilyIntent int,
 ) (
 	connectionId server.Id,
 	clientIp string,
@@ -2339,6 +2396,19 @@ func ConnectNetworkClient(
 		return
 	}
 
+	// ClientIpHash parsed the ip above, so this is always 4 or 6 here
+	ipVersion := 0
+	// the extender this connection arrived through, null when the caller
+	// address is not an active extender address (connect/EXTENDER.md J1)
+	var extenderId *server.Id
+	if addr, parseErr := netip.ParseAddr(clientIp); parseErr == nil {
+		ipVersion = server.IpVersionForAddr(addr)
+		if activeExtenderId, found := ActiveExtenderIdForAddress(addr); found {
+			extenderId = &activeExtenderId
+		}
+	}
+	ipFamilyIntent = normalizeIpFamilyIntent(ipFamilyIntent)
+
 	var expectedLatencyMillis int
 	if ipInfo, err := server.GetIpInfoFromString(clientIp); err == nil {
 		hostLatitude, hostLongitude := server.HostLatituteLongitude()
@@ -2351,9 +2421,9 @@ func ConnectNetworkClient(
 		expectedLatencyMillis = int(2.5*distanceMillis + 0.5)
 	}
 
+	connectTime := server.NowUtc()
 	server.Tx(ctx, func(tx server.PgTx) {
 		connectionId = server.NewId()
-		connectTime := server.NowUtc()
 
 		host, _ := server.Host()
 		service, _ := server.Service()
@@ -2372,9 +2442,12 @@ func ConnectNetworkClient(
 					client_address_hash,
 					client_address_port,
 					handler_id,
-					expected_latency_ms
+					expected_latency_ms,
+					ip_version,
+					ip_family_intent,
+					extender_id
 				)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			`,
 			clientId,
 			connectionId,
@@ -2386,6 +2459,9 @@ func ConnectNetworkClient(
 			clientPort,
 			handlerId,
 			expectedLatencyMillis,
+			ipVersion,
+			ipFamilyIntent,
+			extenderId,
 		))
 
 		// refresh auth_time as a durable last-seen marker. connection rows are
@@ -2431,6 +2507,12 @@ func ConnectNetworkClient(
 			connectTime.Add(-clientAuthTimeRefreshMinInterval),
 		))
 	})
+
+	// the durable connection history for the onboarding results: one
+	// connect.day event per network per UTC day, its own transaction after
+	// the connection is committed, cached per process, never failing this
+	// connect (RecordConnectDay)
+	RecordConnectDay(ctx, clientId, connectTime)
 
 	return
 }
@@ -2598,19 +2680,25 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 				return
 			}
 
-			// The ordered FOR UPDATE above has completed before this timestamp
-			// is captured, so a lifecycle reader that won the row lock remains
-			// earlier than the deactivation it delayed.
-			deactivateTime := server.NowUtc()
+			// The ordered FOR UPDATE above completes before the UPDATE reads the
+			// primary database clock, so a lifecycle reader that won the row lock
+			// remains earlier than the deactivation it delayed even across hosts.
 			tag := server.RaisePgResult(tx.Exec(
 				ctx,
 				`
+					WITH lifecycle_clock AS MATERIALIZED (
+						SELECT clock_timestamp() AT TIME ZONE 'UTC' AS deactivate_time
+					)
 					UPDATE network_client
-					SET active = false, deactivate_time = $2
-					WHERE client_id = ANY($1) AND active = true
+					SET
+						active = false,
+						deactivate_time = lifecycle_clock.deactivate_time
+					FROM lifecycle_clock
+					WHERE
+						network_client.client_id = ANY($1) AND
+						network_client.active = true
 				`,
 				clientIds,
-				deactivateTime,
 			))
 			batchCount = tag.RowsAffected()
 		}, server.TxReadCommitted)

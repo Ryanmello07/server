@@ -26,14 +26,22 @@ Identical canonical patch bytes share one `(round_id, patch_sha256)` result and
 do not consume another noise draw. One score job has a three-hour hard execution
 limit; the adapter must therefore be asynchronous and tolerate an unbounded
 post-close grading window.
+A continuously available host supplies 56 full worst-case three-hour slots
+during a seven-day admission window. The first complete 18-replicate staging
+pass reached scoring in about 2 hours 33 minutes, or roughly 65 theoretical
+slots before scoring and operational overhead. These are planning capacities,
+not admission caps; excess accepted work remains queued through post-close
+grading.
 
 Before production epoch 1, the API can expose a staging era with sequential
 `staging_round` epochs beginning at zero. Its submissions are fee-free and use
 the real retention, cache, FIFO, evaluator, scoring, embargo, and polling paths
 against frozen source epoch zero. A staging round automatically finalizes with
 no winner after close and drain, then publishes each score or typed failure at
-the immutable job status URL. It never enters production ranking, honesty
-review, promotion, or leaderboard state. The first production-round commit
+the immutable job status URL. Its finalized result is also available through
+the opt-in `GET /competition/leaderboard?include_staging=true` view with
+`staging: true` and a null winner. It never enters production ranking, honesty
+review, promotion, or the default production leaderboard. The first production-round commit
 ends the era and atomically cancels queued staging work; it refuses to race a
 running evaluation. The adapter must prefer `active_round` once present and
 persist the returned `staging` boolean.
@@ -53,7 +61,8 @@ returned immutable job id.
 | Submit canonical text patch | `POST /competition/score` |
 | Persist accepted identity | Store `job_id`, `round_id`, `patch_sha256`, and `status_url` atomically |
 | Poll result | `GET /competition/score/{jobId}` using the returned status URL |
-| Publish completed epochs | `GET /competition/leaderboard` |
+| Publish completed production epochs | `GET /competition/leaderboard` |
+| Reconcile completed staging epochs | `GET /competition/leaderboard?include_staging=true` and select `staging: true` |
 | Reproduce after reveal | `GET /competition/round/{roundId}/providers.yml` and authenticate `X-Content-SHA256` |
 
 The adapter must send the exact patch text accepted from the player. It must
@@ -62,10 +71,25 @@ submission under changed bytes, or submit a second identity to bypass a pending
 job. HTTP 429 is backpressure; typed retriable 5xx results retain the same
 identity. Typed submission failures are terminal.
 
+Patch serialization must preserve canonical bytes: UTF-8, LF-only line
+endings, exactly one final LF, no trailing blank line, and lexicographically
+sorted strict unified-diff sections. The server validates but does not repair
+the value. The adapter must read a patch as bytes/text directly into its JSON
+encoder; shell command substitution and trimming helpers are forbidden because
+they can remove the final LF. The byte-level rules and a safe `jq --rawfile`
+example are in `launch/ONBOARDING.md`.
+
 Results remain embargoed while admission is open and while any accepted job is
-queued or running. Polling reports terminal work as outcome-neutral `completed`
-until finalization commits. Staging then publishes outcomes through polling;
-production publishes only its finalized leaderboard. Production rows identify
+queued or running. The legacy polling `state` reports terminal work as
+outcome-neutral `completed` until finalization commits. The additive
+`evaluation_status` distinguishes running work from terminal failure without
+revealing scores; `evaluation_failure` may expose a reviewed code and kind,
+never a raw message, and terminal failures have `retriable: false`. Unknown
+failure codes remain private. These fields require the updated API rollout;
+clients must tolerate their absence while older instances drain.
+Staging then publishes full outcomes through polling and
+the explicit staging-inclusive leaderboard; the default view remains production
+only. Production rows identify
 approved, rejected, and unreviewed honesty status without exposing the private
 review report.
 A winner must be placeable,

@@ -255,8 +255,22 @@ base_identity="$(sudo -n docker run --rm \
     --security-opt no-new-privileges:true \
     "$base_image_id" identity)"
 base_sha="$(jq -er '.base_sha' <<<"$base_identity")"
+base_source_epoch="$(jq -er '.source_epoch' <<<"$base_identity")"
 base_simulator_sha256="$(jq -er '.simulator_sha256' <<<"$base_identity")"
 candidate_simulator_sha256="$(jq -er '.simulator_sha256' <<<"$identity")"
+base_source_record="$(sudo -n docker run --rm \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --entrypoint /opt/urnetwork/bin/sim-latency \
+    "$base_image_id" \
+    source-check --epoch "$base_source_epoch" \
+    --source-config /opt/urnetwork/sim-latency.yml \
+    --repos-root /workspace --json)"
+takeover_margin="$(jq -er \
+    '.significant_improvement_percent / 100 | select(. > 0 and . <= 0.5)' \
+    <<<"$base_source_record")"
 
 sudo -n docker run --rm \
     --network none \
@@ -293,7 +307,7 @@ printf '%s\n' \
     "APEX_PROVIDERS_SHA256=$providers_sha256" \
     'APEX_ARTIFACT_ROOT=/artifacts' \
     'APEX_EVALUATION_ID=container-smoke-preflight' \
-    'APEX_EPOCH=0' \
+    "APEX_EPOCH=$base_source_epoch" \
     "APEX_API_IMAGE_DIGEST=$candidate_image_id" \
     'APEX_HARDWARE_ID=local-container-smoke-not-qualified' \
     "APEX_HOST_QUALIFICATION_SHA256=$qualification_sha256" \
@@ -508,7 +522,7 @@ write_scorer_common_env() {
         "APEX_PROVIDERS_SHA256=$providers_sha256" \
         'APEX_ARTIFACT_ROOT=/artifacts' \
         'APEX_EVALUATION_ID=container-smoke-preflight' \
-        'APEX_EPOCH=0' \
+        "APEX_EPOCH=$base_source_epoch" \
         "APEX_API_IMAGE_DIGEST=$base_image_id" \
         'APEX_HARDWARE_ID=local-container-smoke-not-qualified' \
         "APEX_HOST_QUALIFICATION_SHA256=$qualification_sha256" \
@@ -542,7 +556,7 @@ evaluation_output_dir="$baseline_output"
 write_scorer_common_env
 printf '%s\n' \
     'APEX_ROUND_ID=container-smoke-round' \
-    'APEX_TAKEOVER_MARGIN=0.10' \
+    "APEX_TAKEOVER_MARGIN=$takeover_margin" \
     'APEX_BASELINE_RUNS=/artifacts/container-smoke-preflight/results.csv' \
     'APEX_BASELINE_STDERR=/artifacts/container-smoke-preflight/stderr.log' \
     'APEX_BASELINE_ACCOUNTING=/artifacts/container-smoke-preflight/accounting.json' \
@@ -598,7 +612,13 @@ smoke_stage=score
 active_project="urnetwork-container-smoke-score-${candidate_sha:0:12}"
 compose --profile score up --abort-on-container-exit --exit-code-from scorer >&2
 sudo -n jq -e '.score_schema == 1 and .placeable == true and
-       ([.gates[] | .passed] | all)' "$score_output/score.json" >/dev/null
+       ([.gates[] | .passed] | all) and
+       .significance.method == "one-sided-welch-t" and
+       .significance.alpha == 0.05 and
+       .significance.replicate_count == 1 and
+       .significance.statistically_significant == false and
+       .significance.recommended_next_epoch_takeover_margin_supported == false' \
+    "$score_output/score.json" >/dev/null
 compose --profile score down --volumes --remove-orphans >&2
 active_project=""
 verify_local_sources_unchanged

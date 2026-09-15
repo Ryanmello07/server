@@ -34,7 +34,11 @@ var (
 // one-tap button stands for.
 type TokenClaims struct {
 	NetworkId server.Id `json:"n"`
-	Step      string    `json:"s"`
+	// Step is the template family used to choose the landing destination.
+	// FlowStep is the actual E1-E5 campaign position. They are deliberately
+	// separate: E3 and E5 can use the same template.
+	Step     string `json:"s"`
+	FlowStep string `json:"f,omitempty"`
 	// unix seconds
 	ExpiresAt int64  `json:"e"`
 	Rating    int    `json:"r,omitempty"`
@@ -48,7 +52,8 @@ func (c *TokenClaims) Expiry() time.Time {
 
 // SignToken encodes and signs claims with one key: base64url(json) "." base64url(hmac-sha256).
 func SignToken(key []byte, claims *TokenClaims) (string, error) {
-	if claims == nil || claims.NetworkId == (server.Id{}) || strings.TrimSpace(claims.Step) == "" {
+	if claims == nil || claims.NetworkId == (server.Id{}) || strings.TrimSpace(claims.Step) == "" ||
+		(claims.FlowStep != "" && !IsFlowStep(claims.FlowStep)) {
 		return "", ErrTokenInvalid
 	}
 	payload, err := json.Marshal(claims)
@@ -65,19 +70,20 @@ func sign(key []byte, body string) []byte {
 	return mac.Sum(nil)
 }
 
-// ParseToken verifies a token against each key in turn and checks its expiry.
+// Verifies a canonical base64url token against each key and checks its expiry.
 // ErrTokenExpired carries the parsed claims alongside, so a landing page can
 // still route an expired link without attributing it.
 func ParseToken(keys [][]byte, token string, now time.Time) (*TokenClaims, error) {
 	token = strings.TrimSpace(token)
-	if token == "" || MaxTokenLength < len(token) {
+	// Strict decoding rejects unused bits, but still ignores embedded newlines.
+	if token == "" || MaxTokenLength < len(token) || strings.ContainsAny(token, "\r\n") {
 		return nil, ErrTokenInvalid
 	}
 	body, signature, ok := strings.Cut(token, ".")
 	if !ok || body == "" || signature == "" {
 		return nil, ErrTokenInvalid
 	}
-	signatureBytes, err := base64.RawURLEncoding.DecodeString(signature)
+	signatureBytes, err := base64.RawURLEncoding.Strict().DecodeString(signature)
 	if err != nil {
 		return nil, ErrTokenInvalid
 	}
@@ -91,7 +97,7 @@ func ParseToken(keys [][]byte, token string, now time.Time) (*TokenClaims, error
 	if !verified {
 		return nil, ErrTokenInvalid
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(body)
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(body)
 	if err != nil {
 		return nil, ErrTokenInvalid
 	}
@@ -99,13 +105,30 @@ func ParseToken(keys [][]byte, token string, now time.Time) (*TokenClaims, error
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return nil, ErrTokenInvalid
 	}
-	if claims.NetworkId == (server.Id{}) || strings.TrimSpace(claims.Step) == "" {
+	if claims.NetworkId == (server.Id{}) || strings.TrimSpace(claims.Step) == "" ||
+		(claims.FlowStep != "" && !IsFlowStep(claims.FlowStep)) {
 		return nil, ErrTokenInvalid
 	}
 	if claims.ExpiresAt <= 0 || !now.Before(claims.Expiry()) {
 		return &claims, ErrTokenExpired
 	}
 	return &claims, nil
+}
+
+// IsFlowStep reports whether step is one of the five durable campaign
+// positions. Keep this closed so analytics labels cannot grow without bound.
+func IsFlowStep(step string) bool {
+	switch step {
+	case StepE1, StepE2, StepE3, StepE4, StepE5:
+		return true
+	default:
+		return false
+	}
+}
+
+// FlowSteps returns the ordered, bounded flow-step vocabulary.
+func FlowSteps() []string {
+	return []string{StepE1, StepE2, StepE3, StepE4, StepE5}
 }
 
 // NewToken signs claims with the deployment's current key.

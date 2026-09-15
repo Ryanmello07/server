@@ -27,6 +27,7 @@ package controller
 //     every entry point checks it.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
@@ -961,17 +962,18 @@ func (self *CoreStClient) buildTransactionAttempt(
 	}
 	chainId := new(big.Int).SetUint64(intent.ChainId)
 
-	callCtx, cancel := context.WithTimeout(ctx, stCallTimeout)
-	defer cancel()
 	if gasLimit != 0 {
 		// intrinsic gas was selected by the cancellation payload
 	} else if previous != nil {
 		gasLimit = previous.GasLimit
-	} else {
-		estimated, err := client.EstimateGas(callCtx, ethereum.CallMsg{From: from, To: &to, Data: calldata})
-		if err != nil {
-			return nil, fmt.Errorf("st: estimate gas: %w", err)
-		}
+	}
+	estimate := gasLimit == 0 && previous == nil
+	prepared, err := readStTransactionFeePreparation(ctx, client, from, to, calldata, estimate, previous != nil && previous.GasPrice != nil)
+	if err != nil {
+		return nil, err
+	}
+	if estimate {
+		estimated := prepared.estimatedGas
 		// A stable 20% margin avoids a replacement changing gas limit because
 		// unrelated state shifted between attempts.
 		if estimated > ^uint64(0)/6*5 {
@@ -980,20 +982,12 @@ func (self *CoreStClient) buildTransactionAttempt(
 		gasLimit = estimated + (estimated+4)/5
 	}
 
-	header, err := client.HeaderByNumber(callCtx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("st: latest fee header: %w", err)
-	}
 	var unsigned *types.Transaction
 	attempt := &model.StTransactionAttempt{
 		IntentId: intent.IntentId, Attempt: intent.AttemptCount + 1, Kind: kind, GasLimit: gasLimit,
 	}
-	useLegacy := header.BaseFee == nil || (previous != nil && previous.GasPrice != nil)
-	if useLegacy {
-		price, err := client.SuggestGasPrice(callCtx)
-		if err != nil {
-			return nil, fmt.Errorf("st: suggest gas price: %w", err)
-		}
+	if prepared.legacy {
+		price := prepared.fee
 		if previous != nil {
 			price = stReplacementFee(previous.GasPrice, price)
 		}
@@ -1003,11 +997,8 @@ func (self *CoreStClient) buildTransactionAttempt(
 			Value: new(big.Int), Data: append([]byte(nil), calldata...),
 		})
 	} else {
-		tip, err := client.SuggestGasTipCap(callCtx)
-		if err != nil {
-			return nil, fmt.Errorf("st: suggest gas tip: %w", err)
-		}
-		fee := new(big.Int).Mul(header.BaseFee, big.NewInt(2))
+		tip := prepared.fee
+		fee := new(big.Int).Mul(prepared.header.BaseFee, big.NewInt(2))
 		fee.Add(fee, tip)
 		if previous != nil {
 			tip = stReplacementFee(previous.GasTipCap, tip)
@@ -1283,9 +1274,82 @@ func (self *CoreStClient) runTransactionIntent(
 	}
 }
 
+// A close that expired at a finalized block cannot become valid again. Retire
+// its nonce through the ordinary cancellation transaction so a later defer can
+// proceed without discarding the original intent or any signed attempt.
+func (self *CoreStClient) expiredCloseIntent(ctx context.Context, intent *model.StTransactionIntent, finalized uint64) (bool, error) {
+	if self.coordinator == nil || intent.DeploymentKey != self.cfg.DeploymentKey() ||
+		!strings.EqualFold(intent.ToAddress, self.cfg.ContractAddress.Hex()) || len(intent.Calldata) != 68 {
+		return false, nil
+	}
+	epoch := new(big.Int).SetBytes(intent.Calldata[4:36])
+	noID := new(big.Int).SetBytes(intent.Calldata[36:68])
+	if !bytes.Equal(intent.Calldata, self.coordinator.PackCloseOperatorEpoch(epoch, noID)) {
+		return false, nil
+	}
+	if !epoch.IsUint64() || !noID.IsUint64() {
+		return false, errors.New("st: close intent epoch/operator exceeds supported range")
+	}
+	logicalKey, err := stTransactionLogicalKey(self.cfg, fmt.Sprintf("close:%d:%d", epoch.Uint64(), noID.Uint64()))
+	if err != nil || intent.LogicalKey != logicalKey || !strings.EqualFold(intent.CalldataHash, crypto.Keccak256Hash(intent.Calldata).Hex()) {
+		return false, errors.New("st: close intent has inconsistent immutable operation identity")
+	}
+	policy, err := stViewAtBlock(self, ctx, self.cfg.ContractAddress, finalized, self.coordinator.PackPolicyAt(epoch), self.coordinator.UnpackPolicyAt)
+	if err != nil {
+		return false, fmt.Errorf("st: close intent epoch policy: %w", err)
+	}
+	end, err := stViewAtBlock(self, ctx, self.cfg.ContractAddress, finalized, self.coordinator.PackEpochEndBlock(epoch), self.coordinator.UnpackEpochEndBlock)
+	if err != nil {
+		return false, fmt.Errorf("st: close intent epoch end: %w", err)
+	}
+	if end == nil || !end.IsUint64() || end.Uint64() > math.MaxUint64-policy.CloseGraceBlocks {
+		return false, errors.New("st: close intent deadline exceeds supported range")
+	}
+	deadline := end.Uint64() + policy.CloseGraceBlocks
+	if finalized <= deadline {
+		return false, nil
+	}
+	glog.Infof("[st]cancel expired close intent %s nonce %d epoch %d operator %d finalized_block %d close_deadline %d", intent.IntentKey, intent.Nonce, epoch.Uint64(), noID.Uint64(), finalized, deadline)
+	return true, nil
+}
+
+// An unsigned deposit whose encoded deadline has finalized cannot execute in a
+// later epoch. Keep its immutable intent and consume its EVM nonce through the
+// existing real cancellation path; the coordinator deposit nonce is untouched.
+func (self *CoreStClient) expiredUnsignedDepositIntent(intent *model.StTransactionIntent, attempts []*model.StTransactionAttempt, from common.Address, finalized uint64) (bool, error) {
+	if self.cfg == nil || self.coordinator == nil || self.cfg.DepositKey == nil || intent == nil ||
+		intent.Status != model.StTxPrepared || intent.AttemptCount != 0 || intent.CurrentTxHash != nil || len(attempts) != 0 ||
+		intent.Profile != self.cfg.Profile || intent.DeploymentId != self.cfg.DeploymentId || intent.DeploymentKey != self.cfg.DeploymentKey() || intent.ChainId != self.cfg.ChainId ||
+		!strings.EqualFold(intent.GenesisHash, "0x"+hex.EncodeToString(self.cfg.GenesisHash[:])) ||
+		from != crypto.PubkeyToAddress(self.cfg.DepositKey.PublicKey) || !strings.EqualFold(intent.FromAddress, from.Hex()) ||
+		!strings.EqualFold(intent.ToAddress, self.cfg.ContractAddress.Hex()) || len(intent.Calldata) != 132 {
+		return false, nil
+	}
+	noID := new(big.Int).SetBytes(intent.Calldata[4:36])
+	amount := new(big.Int).SetBytes(intent.Calldata[36:68])
+	nonce := new(big.Int).SetBytes(intent.Calldata[68:100])
+	deadline := new(big.Int).SetBytes(intent.Calldata[100:132])
+	if !noID.IsUint64() || noID.Uint64() != self.cfg.NoId || amount.Sign() <= 0 || !deadline.IsUint64() || deadline.Sign() == 0 {
+		return false, nil
+	}
+	canonical, err := self.coordinator.TryPackDeposit(noID, amount, nonce, deadline.Uint64())
+	if err != nil || !bytes.Equal(intent.Calldata, canonical) {
+		return false, nil
+	}
+	if !strings.EqualFold(intent.CalldataHash, crypto.Keccak256Hash(intent.Calldata).Hex()) {
+		return false, errors.New("st: unsigned deposit intent has inconsistent immutable calldata hash")
+	}
+	if finalized <= deadline.Uint64() {
+		return false, nil
+	}
+	glog.Infof("[st]cancel expired unsigned deposit intent %s nonce %d operator %d amount %s deposit_nonce %s finalized_block %d deposit_deadline %d", intent.IntentKey, intent.Nonce, noID.Uint64(), amount, nonce, finalized, deadline.Uint64())
+	return true, nil
+}
+
 // Drains every lower account nonce before a new operation can reserve one. An
-// active-deployment intent resumes its exact stored business transaction; a
-// stale coordinator is retired only by a same-nonce self-transaction.
+// active-deployment intent resumes its exact stored business transaction;
+// expired closes, unsigned deposits and stale coordinators use a same-nonce
+// self-transaction.
 func (self *CoreStClient) reconcileAccountIntents(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -1347,11 +1411,20 @@ func (self *CoreStClient) reconcileAccountIntents(
 		}
 
 		stale := intent.DeploymentKey != self.cfg.DeploymentKey()
+		expiredClose, err := self.expiredCloseIntent(ctx, intent, finalized.Number)
+		if err != nil {
+			return err
+		}
+		expiredDeposit, err := self.expiredUnsignedDepositIntent(intent, attempts, from, finalized.Number)
+		if err != nil {
+			return err
+		}
+		cancelIntent := stale || expiredClose || expiredDeposit
 		desiredKind := model.StTxAttemptExecution
-		if stale {
+		if cancelIntent {
 			desiredKind = model.StTxAttemptCancellation
 		}
-		_, runErr := self.runTransactionIntent(ctx, client, key, intent, desiredKind, stale)
+		_, runErr := self.runTransactionIntent(ctx, client, key, intent, desiredKind, cancelIntent)
 		if runErr != nil && !stale {
 			return runErr
 		}
@@ -3382,6 +3455,19 @@ func StDepositForEpoch(ctx context.Context, epoch uint64, overrideRao *big.Int) 
 		publishId := model.AddStPublish(ctx, cfg.DeploymentKey(), epoch, model.StPublishKindDeposit)
 		stResolvePublish(ctx, publishId, outcome)
 		return outcome, nil
+	}
+
+	if core, ok := client.(*CoreStClient); ok {
+		if err := core.preflightDepositRuntimeMinimum(ctx, amount); err != nil {
+			outcome := &StPublishOutcome{
+				Status: model.StPublishStatusFailed,
+				Reason: err.Error(),
+				Retry:  !errors.Is(err, errStDepositBelowRuntimeMinimum),
+			}
+			publishId := model.AddStPublish(ctx, cfg.DeploymentKey(), epoch, model.StPublishKindDeposit)
+			stResolvePublish(ctx, publishId, outcome)
+			return outcome, nil
+		}
 	}
 
 	// STAGE: move alpha into this NO's unique coordinator-owned deposit

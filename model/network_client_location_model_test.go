@@ -20,6 +20,16 @@ import (
 	"github.com/urnetwork/server/session"
 )
 
+// Provider-search tests use the portable fixture's documentation subnet. The
+// caller address participates in geolocation even when the provider address is
+// already stored, so the generic 0.0.0.0 test session would require the real
+// MMDB and make these otherwise synthetic model tests host-dependent.
+func testingCreateProviderSearchSession(ctx context.Context, byJwt *jwt.ByJwt) *session.ClientSession {
+	clientSession := session.Testing_CreateClientSession(ctx, byJwt)
+	clientSession.ClientAddress = "192.0.2.1:0"
+	return clientSession
+}
+
 func TestAddDefaultLocations(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
@@ -143,7 +153,7 @@ func TestBestAvailableProviders(t *testing.T) {
 		guestMode := false
 		isPro := false
 
-		clientSessionA := session.Testing_CreateClientSession(
+		clientSessionA := testingCreateProviderSearchSession(
 			ctx,
 			jwt.NewByJwt(networkIdA, userIdA, "a", guestMode, isPro),
 		)
@@ -163,7 +173,7 @@ func TestBestAvailableProviders(t *testing.T) {
 		connectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			"0.0.0.0:0",
+			"192.0.2.1:0",
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -289,7 +299,7 @@ func TestFindProviders2WithExclude(t *testing.T) {
 			guestMode := false
 			isPro := false
 
-			clientSession := session.Testing_CreateClientSession(
+			clientSession := testingCreateProviderSearchSession(
 				ctx,
 				jwt.NewByJwt(
 					networkId,
@@ -318,7 +328,7 @@ func TestFindProviders2WithExclude(t *testing.T) {
 				ctx,
 				clientId,
 				// use a unique ip per connection
-				fmt.Sprintf("0.0.0.%d:0", i),
+				fmt.Sprintf("192.0.2.%d:0", i),
 				handlerId,
 			)
 			connect.AssertEqual(t, err, nil)
@@ -510,7 +520,7 @@ func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
 		guestMode := false
 		isPro := false
 
-		clientSession := session.Testing_CreateClientSession(
+		clientSession := testingCreateProviderSearchSession(
 			ctx,
 			jwt.NewByJwt(networkId, userId, "a", guestMode, isPro),
 		)
@@ -530,7 +540,7 @@ func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
 		connectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			"0.0.0.0:0",
+			"192.0.2.1:0",
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -678,6 +688,7 @@ func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
 				locationGroupIds,
 				server.Id{},
 				100,
+				[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 			)
 			connect.AssertEqual(t, err, nil)
 			connect.AssertEqual(t, len(clientScoresNoMatch), 1)
@@ -700,6 +711,7 @@ func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
 				locationGroupIds,
 				usLocationId,
 				100,
+				[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 			)
 			connect.AssertEqual(t, err, nil)
 			connect.AssertEqual(t, clientScoresNoMatch, clientScoresUs)
@@ -715,6 +727,7 @@ func TestClientLocationScoreCacheRoundTrip(t *testing.T) {
 				locationGroupIds,
 				usLocationId,
 				100,
+				[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 			)
 			connect.AssertEqual(t, err, nil)
 			connect.AssertEqual(t, len(clientScoresStrict), 0)
@@ -882,7 +895,7 @@ func TestFindProviders2ProviderLocation(t *testing.T) {
 		guestMode := false
 		isPro := false
 
-		clientSession := session.Testing_CreateClientSession(
+		clientSession := testingCreateProviderSearchSession(
 			ctx,
 			jwt.NewByJwt(networkId, userId, "a", guestMode, isPro),
 		)
@@ -897,20 +910,6 @@ func TestFindProviders2ProviderLocation(t *testing.T) {
 			"",
 			"",
 		)
-
-		handlerId := CreateNetworkClientHandler(ctx)
-		connectionId, _, _, _, err := ConnectNetworkClient(
-			ctx,
-			clientId,
-			"0.0.0.0:0",
-			handlerId,
-		)
-		connect.AssertEqual(t, err, nil)
-
-		secretKeys := map[ProvideMode][]byte{
-			ProvideModePublic: make([]byte, 32),
-		}
-		SetProvide(ctx, clientId, secretKeys)
 
 		city := &Location{
 			LocationType: LocationTypeCity,
@@ -933,6 +932,23 @@ func TestFindProviders2ProviderLocation(t *testing.T) {
 			},
 		}
 		CreateLocationGroup(ctx, createLocationGroup)
+
+		// Create the complete synthetic location chain before the documentation-
+		// subnet connection initializes the process location caches. The test is
+		// about the provider's cached location payload, not cache warmup ordering.
+		handlerId := CreateNetworkClientHandler(ctx)
+		connectionId, _, _, _, err := ConnectNetworkClient(
+			ctx,
+			clientId,
+			"192.0.2.1:0",
+			handlerId,
+		)
+		connect.AssertEqual(t, err, nil)
+
+		secretKeys := map[ProvideMode][]byte{
+			ProvideModePublic: make([]byte, 32),
+		}
+		SetProvide(ctx, clientId, secretKeys)
 
 		SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
 
@@ -1080,7 +1096,7 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 
 		for i := range n {
 			networkId := server.NewId()
-			clientSession := session.Testing_CreateClientSession(
+			clientSession := testingCreateProviderSearchSession(
 				ctx,
 				jwt.NewByJwt(networkId, server.NewId(), fmt.Sprintf("network%d", i), false, false),
 			)
@@ -1092,7 +1108,7 @@ func TestFindProviders2ReliabilityFlushLag(t *testing.T) {
 			connectionId, _, _, _, err := ConnectNetworkClient(
 				ctx,
 				clientId,
-				fmt.Sprintf("0.0.0.%d:0", i),
+				fmt.Sprintf("192.0.2.%d:0", i),
 				handlerId,
 			)
 			connect.AssertEqual(t, err, nil)
@@ -1301,7 +1317,7 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 
 		for i := range n {
 			networkId := server.NewId()
-			clientSession := session.Testing_CreateClientSession(
+			clientSession := testingCreateProviderSearchSession(
 				ctx,
 				jwt.NewByJwt(networkId, server.NewId(), fmt.Sprintf("network%d", i), false, false),
 			)
@@ -1313,7 +1329,7 @@ func TestFindProviders2ReliabilityDeployGap(t *testing.T) {
 			connectionId, _, _, _, err := ConnectNetworkClient(
 				ctx,
 				clientId,
-				fmt.Sprintf("0.0.%d.%d:0", i/256, i%256),
+				fmt.Sprintf("192.0.2.%d:0", i),
 				handlerId,
 			)
 			connect.AssertEqual(t, err, nil)
@@ -1514,7 +1530,7 @@ func TestUpdateClientLocationsCountsClientsWithoutReliabilityScores(t *testing.T
 		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
 
 		handlerId := CreateNetworkClientHandler(ctx)
-		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:0", handlerId)
 		connect.AssertEqual(t, err, nil)
 
 		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
@@ -1626,7 +1642,7 @@ func TestUpdateClientScoresCountsClientsWithoutReliabilityScores(t *testing.T) {
 		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
 
 		handlerId := CreateNetworkClientHandler(ctx)
-		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:0", handlerId)
 		connect.AssertEqual(t, err, nil)
 
 		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
@@ -1713,7 +1729,7 @@ func TestSetConnectionLocationToleratesCountryOnlyLocation(t *testing.T) {
 		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
 
 		handlerId := CreateNetworkClientHandler(ctx)
-		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:0", handlerId)
 		connect.AssertEqual(t, err, nil)
 
 		// this call panicked before the fix; now it must succeed and store
@@ -1764,7 +1780,7 @@ func TestUpdateClientLocationsCountsOnlyPublicProviders(t *testing.T) {
 			networkId := server.NewId()
 			clientId := server.NewId()
 			Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
-			connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+			connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:0", handlerId)
 			connect.AssertEqual(t, err, nil)
 			err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
 			connect.AssertEqual(t, err, nil)
@@ -1905,6 +1921,7 @@ func TestUpdateClientScoresCountsOnlyPublicProviders(t *testing.T) {
 			map[server.Id]bool{},
 			server.Id{},
 			100,
+			[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 		)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, len(clientScores), 2)
@@ -2002,6 +2019,7 @@ func TestUpdateClientScoresGroupCarriesNetworkProvidersTagged(t *testing.T) {
 			},
 			server.Id{},
 			100,
+			[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 		)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, len(clientScores), 2)
@@ -2023,6 +2041,7 @@ func TestUpdateClientScoresGroupCarriesNetworkProvidersTagged(t *testing.T) {
 			map[server.Id]bool{networkOnlyGroup.LocationGroupId: true},
 			server.Id{},
 			100,
+			[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 		)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, len(networkOnlyGroupClientScores), 1)
@@ -2049,7 +2068,7 @@ func connectPublicAndNetworkOnlyProviders(
 		networkId := server.NewId()
 		clientId := server.NewId()
 		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
-		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:0", handlerId)
 		connect.AssertEqual(t, err, nil)
 		err = SetConnectionLocation(ctx, connectionId, location.LocationId, &ConnectionLocationScores{})
 		connect.AssertEqual(t, err, nil)
@@ -2177,6 +2196,7 @@ func TestUpdateClientScoresRollsCityProviderUpToRegionAndCountry(t *testing.T) {
 				map[server.Id]bool{},
 				server.Id{},
 				100,
+				[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 			)
 			connect.AssertEqual(t, err, nil)
 			return clientScores
@@ -2291,8 +2311,8 @@ func createCountryOnlyAndCityProviders(ctx context.Context, t testing.TB) (
 		return clientId
 	}
 
-	countryOnlyClientId = connectPublicProvider(countryOnlyCity, "0.0.0.1:0")
-	cityClientId = connectPublicProvider(city, "0.0.0.2:0")
+	countryOnlyClientId = connectPublicProvider(countryOnlyCity, "192.0.2.1:0")
+	cityClientId = connectPublicProvider(city, "192.0.2.2:0")
 
 	// collapse the first provider to country granularity
 	server.Tx(ctx, func(tx server.PgTx) {
@@ -2387,13 +2407,13 @@ func TestFindProviders2NetworkOnlyProviderVisibleOnlyToItsOwnNetwork(t *testing.
 		}
 
 		publicNetworkId := server.NewId()
-		publicClientId := connectProvider(publicNetworkId, "0.0.0.1:0", map[ProvideMode][]byte{
+		publicClientId := connectProvider(publicNetworkId, "192.0.2.1:0", map[ProvideMode][]byte{
 			ProvideModePublic:  []byte("public-secret"),
 			ProvideModeNetwork: []byte("network-secret"),
 		})
 
 		networkOnlyNetworkId := server.NewId()
-		networkOnlyClientId := connectProvider(networkOnlyNetworkId, "0.0.0.2:0", map[ProvideMode][]byte{
+		networkOnlyClientId := connectProvider(networkOnlyNetworkId, "192.0.2.2:0", map[ProvideMode][]byte{
 			ProvideModeNetwork: []byte("network-secret"),
 		})
 		// The low-rate external observer found this provider healthy overall but
@@ -2416,7 +2436,7 @@ func TestFindProviders2NetworkOnlyProviderVisibleOnlyToItsOwnNetwork(t *testing.
 		connect.AssertEqual(t, err, nil)
 
 		findFrom := func(networkId server.Id, name string) map[server.Id]*FindProvidersProvider {
-			clientSession := session.Testing_CreateClientSession(
+			clientSession := testingCreateProviderSearchSession(
 				ctx,
 				jwt.NewByJwt(networkId, server.NewId(), name, false, false),
 			)
@@ -2484,13 +2504,13 @@ func TestLoadLocationStablesHonoursForceMinimum(t *testing.T) {
 		clientId := server.NewId()
 		Testing_CreateDevice(ctx, networkId, server.NewId(), clientId, "", "")
 
-		clientSession := session.Testing_CreateClientSession(
+		clientSession := testingCreateProviderSearchSession(
 			ctx,
 			jwt.NewByJwt(networkId, userId, "a", false, false),
 		)
 
 		handlerId := CreateNetworkClientHandler(ctx)
-		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "0.0.0.1:0", handlerId)
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:0", handlerId)
 		connect.AssertEqual(t, err, nil)
 
 		err = SetConnectionLocation(ctx, connectionId, city.LocationId, &ConnectionLocationScores{})
@@ -2589,7 +2609,7 @@ func connectProvidersOfEveryProvideMode(ctx context.Context, t testing.TB, locat
 		connectionId, _, _, clientAddressHash, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			fmt.Sprintf("0.0.0.%d:0", i),
+			fmt.Sprintf("192.0.2.%d:0", i),
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -2691,6 +2711,7 @@ func TestUpdateClientScoresPoolExcludesStreamOnlyAndKeylessProviders(t *testing.
 			map[server.Id]bool{},
 			server.Id{},
 			100,
+			[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 		)
 		connect.AssertEqual(t, err, nil)
 
@@ -2760,7 +2781,7 @@ func TestUpdateClientScoresExcludesDerivedAndInactiveClients(t *testing.T) {
 		activeNetworkId := server.NewId()
 		activeClientId := server.NewId()
 		Testing_CreateDevice(ctx, activeNetworkId, server.NewId(), activeClientId, "", "")
-		connectCandidate(activeClientId, "10.40.0.1:20000")
+		connectCandidate(activeClientId, "192.0.2.41:20000")
 
 		childNetworkId := server.NewId()
 		childDeviceId := server.NewId()
@@ -2788,12 +2809,12 @@ func TestUpdateClientScoresExcludesDerivedAndInactiveClients(t *testing.T) {
 				parentClientId,
 			))
 		})
-		connectCandidate(childClientId, "10.40.0.2:20000")
+		connectCandidate(childClientId, "192.0.2.42:20000")
 
 		inactiveNetworkId := server.NewId()
 		inactiveClientId := server.NewId()
 		Testing_CreateDevice(ctx, inactiveNetworkId, server.NewId(), inactiveClientId, "", "")
-		connectCandidate(inactiveClientId, "10.40.0.3:20000")
+		connectCandidate(inactiveClientId, "192.0.2.43:20000")
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(
 				ctx,
@@ -2826,6 +2847,7 @@ func TestUpdateClientScoresExcludesDerivedAndInactiveClients(t *testing.T) {
 				source.locationGroupIds,
 				server.Id{},
 				100,
+				[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 			)
 			connect.AssertEqual(t, err, nil)
 			if _, ok := clientScores[activeClientId]; !ok {
@@ -2904,6 +2926,7 @@ func TestUpdateClientScoresGroupPoolExcludesStreamOnlyAndKeylessProviders(t *tes
 			map[server.Id]bool{group.LocationGroupId: true},
 			server.Id{},
 			100,
+			[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 		)
 		connect.AssertEqual(t, err, nil)
 
@@ -3072,7 +3095,7 @@ func testing_connectQualifyingProviders(
 		connectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			fmt.Sprintf("0.0.0.%d:0", i+1),
+			fmt.Sprintf("192.0.2.%d:0", i+1),
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -3125,6 +3148,7 @@ func testing_selectableClientScores(
 		map[server.Id]bool{},
 		server.Id{},
 		100,
+		[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
 	)
 	connect.AssertEqual(t, err, nil)
 	return clientScores
@@ -4091,7 +4115,7 @@ func TestFindProviders2ClientIdBypassesHealthGate(t *testing.T) {
 			ClientId: unhealthy, OKCount: 0, Total: 131, MeasuredAt: server.NowUtc(),
 		})
 
-		clientSession := session.Testing_CreateClientSession(
+		clientSession := testingCreateProviderSearchSession(
 			ctx,
 			jwt.NewByJwt(networkId, server.NewId(), "test", false, false),
 		)

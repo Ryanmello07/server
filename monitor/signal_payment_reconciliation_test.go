@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -59,18 +60,67 @@ func TestPaymentReconciliationFindsPerStoreSkipErrorAndStaleWatermark(t *testing
 	if errorAlert.Target != "google" || errorAlert.Severity != SeverityPage {
 		t.Fatalf("unexpected store-error alert: %+v", errorAlert)
 	}
-	watermarks := 0
+	watermarks := map[string]Alert{}
 	for _, alert := range alerts {
 		if alert.Class == "payment-reconciliation-watermark-stale" {
-			watermarks++
+			watermarks[alert.Target] = alert
 		}
 	}
-	if watermarks != 2 {
-		t.Fatalf("stale watermark alerts = %d, want 2: %+v", watermarks, alerts)
+	if len(watermarks) != 2 {
+		t.Fatalf("stale watermark alerts = %d, want 2: %+v", len(watermarks), alerts)
+	}
+	missingWatermark := watermarks["apple"]
+	if missingWatermark.Severity != SeverityPage {
+		t.Fatalf("missing watermark severity = %q, want page: %+v", missingWatermark.Severity, missingWatermark)
+	}
+	staleWatermark := watermarks["google"]
+	if staleWatermark.Severity != SeverityWarn {
+		t.Fatalf("four-hour watermark severity = %q, want warn: %+v", staleWatermark.Severity, staleWatermark)
+	}
+	for _, expected := range []string{
+		"payment-reconciliation-watermark-stale",
+		"never force the watermark forward",
+		"zero skip/error events through two hourly runs",
+	} {
+		if !strings.Contains(missingWatermark.Markdown(), expected) {
+			t.Fatalf("watermark alert omits %q:\n%s", expected, missingWatermark.Markdown())
+		}
 	}
 	for _, secret := range []string{"synthetic-provider-token", "synthetic-transaction-id", "synthetic-account-id"} {
 		requireAlertOmits(t, skipped, secret)
 		requireAlertOmits(t, errorAlert, secret)
+		requireAlertOmits(t, missingWatermark, secret)
+	}
+}
+
+func TestPaymentReconciliationCatalogNamesWatermarkClass(t *testing.T) {
+	catalogBytes, err := os.ReadFile("SIGNALS.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := string(catalogBytes)
+	start := strings.Index(catalog, "### 2.21 Payment reconciliation liveness and repair audit")
+	end := strings.Index(catalog, "### 2.22 Durable payment and entitlement failures")
+	if start < 0 || end <= start {
+		t.Fatal("payment reconciliation catalog section boundaries are missing")
+	}
+	section := strings.Join(strings.Fields(catalog[start:end]), " ")
+	for _, expected := range []string{
+		"`payment-reconciliation-watermark-stale`",
+		"`payment-reconciliation-credit-unfulfillable`",
+		"more than three hours old",
+		"more than six hours old or absent",
+		"never force the watermark forward",
+		"two natural hourly runs",
+		"distinct provider evidence",
+		"does not pin the Stripe watermark",
+		"audit append is the only retained handle",
+		"keeps the watermark fixed",
+		"Successfully completed repair audit inserts remain best effort",
+	} {
+		if !strings.Contains(section, expected) {
+			t.Errorf("SIGNALS.md §2.21 omits %q", expected)
+		}
 	}
 }
 
@@ -177,6 +227,72 @@ func TestPaymentReconciliationSpecializesStripeEndedLifecycleGap(t *testing.T) {
 	requireAlertOmits(t, alert, "synthetic-run-id", "synthetic-account-id", "synthetic-transaction-id")
 }
 
+func TestPaymentReconciliationSurfacesDeletedStripeDestinationOncePerEvidence(t *testing.T) {
+	source := paymentReconciliationSourceWithUnfulfillable(
+		[]Row{
+			{"apple", "600", "600", "0", "0", "600", "1", "0", "0"},
+			{"google", "600", "600", "0", "0", "600", "1", "0", "0"},
+			{"solana", "600", "600", "0", "0", "600", "1", "0", "0"},
+			{"stripe", "600", "600", "0", "0", "600", "1", "0", "0"},
+		},
+		nil,
+		[]Row{{"1", "3", "3", "0", "120"}},
+	)
+	alerts, err := NewPaymentReconciliationSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("unfulfillable alerts = %d, want 1: %+v", len(alerts), alerts)
+	}
+	alert := requireAlertClass(t, alerts, "payment-reconciliation-credit-unfulfillable")
+	if alert.Target != "stripe" || alert.Frame != "action=credit_unfulfillable" || alert.Severity != SeverityPage {
+		t.Fatalf("unexpected unfulfillable alert identity: %+v", alert)
+	}
+	rendered := alert.Markdown()
+	for _, expected := range []string{
+		"1 paid invoice destination(s)",
+		"distinct_evidence_24h=1 observations_24h=3 distinct_runs_24h=3",
+		"deleted before the ledger-gated credit",
+		"not a provider-listing failure",
+		"does not pin the store watermark",
+		"explicit authorized disposition",
+		"Do not recreate or retarget the deleted network",
+		"repeated overlap audit",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("unfulfillable alert omits %q:\n%s", expected, rendered)
+		}
+	}
+	requireAlertOmits(
+		t,
+		alert,
+		"in_synthetic_private_2099",
+		"synthetic-network-id",
+		"synthetic-run-id",
+		"synthetic-provider-token",
+	)
+	if !strings.Contains(paymentReconciliationUnfulfillableQuery, "count(DISTINCT evidence)") ||
+		!strings.Contains(paymentReconciliationUnfulfillableQuery, "action = 'credit_unfulfillable'") {
+		t.Fatal("unfulfillable query does not aggregate distinct terminal evidence")
+	}
+}
+
+func TestPaymentReconciliationRejectsMalformedUnfulfillableAggregate(t *testing.T) {
+	for _, rows := range [][]pgRow{
+		nil,
+		{{"0", "0", "0", "0", "0"}},
+		{{"1", "3", "3", "1", "120"}},
+		{{"4", "3", "1", "0", "120"}},
+		{{"1", "3", "4", "0", "120"}},
+		{{"1", "3", "3", "0", "-1"}},
+	} {
+		if finding, err := paymentReconciliationUnfulfillableFinding(rows); err == nil || finding != nil {
+			t.Fatalf("malformed unfulfillable aggregate accepted: rows=%v finding=%+v", rows, finding)
+		}
+	}
+}
+
 func TestPaymentReconciliationRejectsIncompleteOrUnknownAggregate(t *testing.T) {
 	tests := []struct {
 		name string
@@ -213,12 +329,22 @@ func TestPaymentReconciliationRejectsIncompleteOrUnknownAggregate(t *testing.T) 
 }
 
 func paymentReconciliationSource(health []Row, repairs []Row) *syntheticSource {
+	return paymentReconciliationSourceWithUnfulfillable(
+		health,
+		repairs,
+		[]Row{{"0", "0", "0", "0", "-1"}},
+	)
+}
+
+func paymentReconciliationSourceWithUnfulfillable(health []Row, repairs []Row, unfulfillable []Row) *syntheticSource {
 	return &syntheticSource{postgresFn: func(query string) ([]Row, error) {
 		switch {
 		case strings.Contains(query, "monitor-signal-2.21-payment-reconciliation-health"):
 			return health, nil
 		case strings.Contains(query, "monitor-signal-2.21-payment-reconciliation-repairs"):
 			return repairs, nil
+		case strings.Contains(query, "monitor-signal-2.21-payment-reconciliation-unfulfillable"):
+			return unfulfillable, nil
 		default:
 			return nil, nil
 		}

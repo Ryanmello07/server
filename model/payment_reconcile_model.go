@@ -16,10 +16,11 @@ import (
 )
 
 // The reconciliation audit actions. Every run writes at least a heartbeat;
-// every repair, skip, and per-object failure is its own row. A dry run
-// (bringyourctl payments reconcile --dry-run) records the would_ forms
-// instead of repairing: same evidence and details the real repair would
-// carry, tagged dry_run = true.
+// every repair, skip, terminal exception, and per-object failure is its own
+// row. A dry run (bringyourctl payments reconcile --dry-run) records the
+// would_ forms instead of repairing; non-mutating terminal observations keep
+// their action. Both carry the same bounded evidence/details as the real pass
+// and are tagged dry_run = true.
 const (
 	PaymentReconcileActionCredited               = "credited"
 	PaymentReconcileActionEnded                  = "ended"
@@ -30,6 +31,10 @@ const (
 	PaymentReconcileActionSkippedStore           = "skipped_store"
 	PaymentReconcileActionHeartbeat              = "heartbeat"
 	PaymentReconcileActionError                  = "error"
+	// Stripe listed a paid invoice whose destination was deleted before the
+	// ledger-gated credit. This is a durable operator-disposition event, not a
+	// provider/listing error and not a successful credit.
+	PaymentReconcileActionCreditUnfulfillable = "credit_unfulfillable"
 )
 
 // Webhook-written operator events (UPGRADE.md §2 S7/S11) that join the
@@ -551,6 +556,53 @@ func EndReconciledEntitlementForPurchaseToken(
 	return
 }
 
+// EndReconciledEntitlementForNetworkPurchaseToken is the scheduled-poll form
+// of the Play end operation. Both pieces of durable task ownership must match:
+// a token copied onto another network's task can never end that network, and a
+// network with more than one Play purchase loses only the terminal purchase.
+// The active-row predicates make redelivery idempotent. The pro cache is
+// refreshed only after the transaction commits an end.
+func EndReconciledEntitlementForNetworkPurchaseToken(
+	ctx context.Context,
+	networkId server.Id,
+	market SubscriptionMarket,
+	purchaseToken string,
+	now time.Time,
+) (ended bool, err error) {
+	if purchaseToken == "" {
+		// an empty scope must never mean "every purchase on the network"
+		return false, nil
+	}
+	server.Tx(ctx, func(tx server.PgTx) {
+		// Tx may retry after a transient serialization error; never retain an
+		// aborted attempt's outcome in the named return values.
+		ended = false
+		err = nil
+		if err = LockPlaySubscriptionPurchaseInTx(
+			tx,
+			ctx,
+			networkId,
+			purchaseToken,
+		); err != nil {
+			return
+		}
+		ended = 0 < len(endReconciledEntitlementInTx(
+			tx,
+			ctx,
+			&networkId,
+			market,
+			nil,
+			purchaseToken,
+			now,
+		))
+	}, server.TxReadCommitted)
+
+	if ended {
+		UpdateProNetwork(ctx, networkId)
+	}
+	return
+}
+
 // endReconciledEntitlementInTx is the shared core: it ends -- AT now, never
 // retroactively -- the market's active supporter renewals matching the scope
 // (networkId nil-able; transactionIds nil = no transaction filter;
@@ -630,10 +682,12 @@ func endReconciledEntitlementInTx(
 			  AND pro
 			  AND end_time = ANY($3::timestamp[])
 			  AND end_time > $2
+			  AND ($4::varchar = '' OR purchase_token = $4)
 			`,
 			endedNetworkId,
 			now,
 			endTimes,
+			purchaseToken,
 		))
 		endedNetworkIds = append(endedNetworkIds, endedNetworkId)
 	}

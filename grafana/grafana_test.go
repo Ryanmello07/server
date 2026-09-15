@@ -40,6 +40,7 @@ type testPanel struct {
 	Description string `json:"description"`
 	FieldConfig struct {
 		Defaults struct {
+			Unit       string `json:"unit"`
 			Thresholds struct {
 				Steps []struct {
 					Color string   `json:"color"`
@@ -64,6 +65,7 @@ type testPanel struct {
 		Y int `json:"y"`
 	} `json:"gridPos"`
 	Options struct {
+		Content       string `json:"content"`
 		ReduceOptions struct {
 			Calcs []string `json:"calcs"`
 		} `json:"reduceOptions"`
@@ -233,7 +235,6 @@ func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
 		"urnetwork_backup_archive_in_progress",
 		"urnetwork_backup_archive_storage_bytes",
 		"urnetwork_backup_archive_volume_free_bytes",
-		`host="planetoid"`,
 		`archive="pg"`,
 		`archive="redis"`,
 		`archive="github-urnetwork"`,
@@ -286,9 +287,31 @@ func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
 		panel := dashboardPanelById(dashboard, panelID)
 		if panel == nil || len(panel.Targets) != 1 ||
 			!strings.Contains(panel.Targets[0].Expr, "topk(1") ||
+			!strings.Contains(panel.Targets[0].Expr, "max_over_time(") ||
+			!strings.Contains(panel.Targets[0].Expr, "[30d]") ||
 			!strings.Contains(panel.Targets[0].Expr, "* 1000") {
-			t.Errorf("latest stored archive panel %d is missing or does not select the newest generation", panelID)
+			t.Errorf("historical archive panel %d is missing or does not select the bounded last-known generation", panelID)
+			continue
 		}
+		if !strings.Contains(strings.ToLower(panel.Title+" "+panel.Description), "historical") ||
+			!strings.Contains(strings.ToLower(panel.Description), "stale") ||
+			!strings.Contains(strings.ToLower(panel.Description), "fail-closed") {
+			t.Errorf("historical archive panel %d does not disclose stale/non-health semantics", panelID)
+		}
+	}
+
+	telemetryLastSeen := dashboardPanelById(dashboard, 16)
+	if telemetryLastSeen == nil || len(telemetryLastSeen.Targets) != 1 {
+		t.Fatal("backup host telemetry last-seen panel is missing")
+	}
+	for _, required := range []string{"node_uname_info", "timestamp(", "max_over_time(", "[30d:]", "* 1000"} {
+		if !strings.Contains(telemetryLastSeen.Targets[0].Expr, required) {
+			t.Errorf("backup host telemetry last-seen query omits %q: %s", required, telemetryLastSeen.Targets[0].Expr)
+		}
+	}
+	if !strings.Contains(strings.ToLower(telemetryLastSeen.Description), "diagnostic only") ||
+		!strings.Contains(strings.ToLower(telemetryLastSeen.Description), "fail-closed") {
+		t.Error("backup host telemetry last-seen panel could be mistaken for current health")
 	}
 
 	storage := dashboardPanelById(dashboard, 15)
@@ -427,6 +450,519 @@ func TestDefaultDashboardDocumentsAreValid(t *testing.T) {
 		if slices.Contains(dashboard.Tags, PublicTag) && len(dashboard.Templating.List) != 0 {
 			t.Errorf("public dashboard %s uses template variables, which Grafana public dashboards do not support", entry.Name())
 		}
+	}
+}
+
+func TestOnboardingDashboardUsesFreshPrivacySafeEmailTracker(t *testing.T) {
+	dashboard := readTestDashboard(t, "onboarding.json")
+	if dashboard.Title != "urnetwork / onboarding" {
+		t.Fatalf("onboarding dashboard title = %q", dashboard.Title)
+	}
+	raw, err := dashboardsFs.ReadFile("dashboards/onboarding.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(raw)
+	for _, required := range []string{
+		"urnetwork_onboarding_email_tracker_networks",
+		"urnetwork_onboarding_email_tracker_snapshot_timestamp_seconds",
+		"/admin/onboarding/email-tracker",
+		"attribution_ambiguous",
+		"landing_clicked", "app_opened", "connected", "widget_added",
+		"feedback_submitted", "pro_started", "bounced", "unsubscribed", "complained",
+	} {
+		if !strings.Contains(document, required) {
+			t.Errorf("onboarding dashboard lacks %q", required)
+		}
+	}
+	for _, expression := range dashboardExpressions(dashboard) {
+		if !strings.Contains(expression, "urnetwork_onboarding_email_tracker_networks") {
+			continue
+		}
+		if !strings.Contains(expression, "topk(1,") ||
+			!strings.Contains(expression, "email_tracker_snapshot_timestamp_seconds") ||
+			!strings.Contains(expression, "time() - 1200") {
+			t.Errorf("email tracker query does not select one fresh taskworker snapshot: %s", expression)
+		}
+		for _, forbidden := range []string{"network_id", "message_id", "user_auth", "vector(0)"} {
+			if strings.Contains(expression, forbidden) {
+				t.Errorf("email tracker query contains forbidden %q: %s", forbidden, expression)
+			}
+		}
+	}
+}
+
+func TestSubscriptionsDashboardUsesFreshPrivacySafeLedgerSnapshot(t *testing.T) {
+	dashboard := readTestDashboard(t, "subscriptions.json")
+	if dashboard.Uid != "urnetwork-subscriptions" || dashboard.Title != "urnetwork / subscriptions" {
+		t.Fatalf("subscriptions dashboard identity = %q / %q", dashboard.Uid, dashboard.Title)
+	}
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("subscriptions dashboard must remain authenticated")
+	}
+
+	documentBytes, err := dashboardsFs.ReadFile("dashboards/subscriptions.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(documentBytes)
+	for _, required := range []string{
+		`"query": "24h,7d,30d"`,
+		"upgrades / new paid accounts",
+		"current paid accounts by store",
+		"paid subscriber engagement by store",
+		"observed churn: expiry or cancellation",
+		"provider-confirmed terminal events",
+		"reconciliation repairs",
+		"data packs fulfilled",
+		"data-pack bytes fulfilled",
+		"Raw cancellation intent is not durably available",
+		"never renders an invented cancellation-intent zero",
+	} {
+		if !strings.Contains(document, required) {
+			t.Errorf("subscriptions dashboard lacks %q", required)
+		}
+	}
+	for _, metric := range []string{
+		"urnetwork_subscription_active_accounts",
+		"urnetwork_subscription_new_paid_accounts",
+		"urnetwork_subscription_engaged_accounts",
+		"urnetwork_subscription_churned_accounts",
+		"urnetwork_subscription_reconciliation_events",
+		"urnetwork_subscription_reconciliation_source_timestamp_seconds",
+		"urnetwork_subscription_data_pack_fulfillments",
+		"urnetwork_subscription_data_pack_bytes",
+		"urnetwork_subscription_snapshot_timestamp_seconds",
+	} {
+		if !strings.Contains(document, metric) {
+			t.Errorf("subscriptions dashboard does not cover %s", metric)
+		}
+	}
+	if !strings.Contains(document, "Google Play / Android") {
+		t.Error("subscriptions dashboard does not name the google series as Google Play / Android")
+	}
+
+	expressions := dashboardExpressions(dashboard)
+	if len(expressions) == 0 {
+		t.Fatal("subscriptions dashboard has no Prometheus queries")
+	}
+	for _, expression := range expressions {
+		for _, contract := range []string{
+			"urnetwork_subscription_snapshot_timestamp_seconds",
+			"topk(1,",
+			`service="taskworker"`,
+			"time() - 1200",
+			"time() + 30",
+		} {
+			if !strings.Contains(expression, contract) {
+				t.Errorf("subscription query omits fresh single-snapshot contract %q: %s", contract, expression)
+			}
+		}
+		for _, forbidden := range []string{
+			"vector(0)", "network_id", "user_id", "client_id", "purchase_event_id",
+			"transaction_id", "invoice", "purchase_token", "email", "users_24h",
+		} {
+			if strings.Contains(expression, forbidden) {
+				t.Errorf("subscription query contains forbidden %q: %s", forbidden, expression)
+			}
+		}
+	}
+
+	// Every business series is joined to the exact identity labels selected by
+	// the fleet-wide snapshot. Snapshot age itself starts from that selector.
+	for _, expression := range expressions {
+		withoutSnapshot := strings.ReplaceAll(expression, "urnetwork_subscription_snapshot_timestamp_seconds", "")
+		if strings.Contains(withoutSnapshot, "urnetwork_subscription_") &&
+			!strings.Contains(expression, "and on(env,service,block,host,instance)") {
+			t.Errorf("subscription query is not tied to one publisher identity: %s", expression)
+		}
+	}
+
+	active := dashboardPanelById(dashboard, 8)
+	engagement := dashboardPanelById(dashboard, 9)
+	upgrades := dashboardPanelById(dashboard, 21)
+	churn := dashboardPanelById(dashboard, 11)
+	if active == nil || len(active.Targets) != 1 ||
+		!strings.Contains(active.Targets[0].Expr, `store=~"apple|google|stripe|solana"`) {
+		t.Fatal("subscriptions dashboard lacks the bounded four-store active view")
+	}
+	if upgrades == nil || len(upgrades.Targets) != 1 ||
+		!strings.Contains(upgrades.Targets[0].Expr, `store=~"apple|google|stripe|solana"`) ||
+		!strings.Contains(upgrades.Targets[0].Expr, `window="$window"`) {
+		t.Fatal("subscriptions dashboard lacks the bounded four-store upgrade view")
+	}
+	upgradeTotal := dashboardPanelById(dashboard, 6)
+	if upgradeTotal == nil || len(upgradeTotal.Targets) != 1 ||
+		!strings.Contains(upgradeTotal.Targets[0].Expr, `store="deduplicated"`) {
+		t.Fatal("subscriptions dashboard lacks the first-ever deduplicated upgrade total")
+	}
+	for _, panel := range []*testPanel{engagement, churn} {
+		if panel == nil || len(panel.Targets) != 1 ||
+			!strings.Contains(panel.Targets[0].Expr, `store=~"apple|google|stripe|solana|deduplicated"`) ||
+			!strings.Contains(panel.Targets[0].Expr, `window="$window"`) {
+			t.Fatal("subscriptions dashboard lacks a bounded store/window account view")
+		}
+	}
+
+	terminal := dashboardPanelById(dashboard, 13)
+	repairs := dashboardPanelById(dashboard, 14)
+	for _, panel := range []*testPanel{terminal, repairs} {
+		if panel == nil || len(panel.Targets) != 1 {
+			t.Fatal("subscriptions reconciliation panel is missing")
+		}
+		expression := panel.Targets[0].Expr
+		for _, required := range []string{
+			`store="all"`,
+			`store=~"apple|google|stripe|solana"`,
+			"time() - 9000",
+			"time() - 10800",
+			"and on(env,service,block,host,instance,store)",
+		} {
+			if !strings.Contains(expression, required) {
+				t.Errorf("reconciliation panel %q omits source gate %q: %s", panel.Title, required, expression)
+			}
+		}
+	}
+	if !strings.Contains(terminal.Targets[0].Expr, `action=~"ended|refunded|disputed|revoked"`) {
+		t.Errorf("terminal event panel has an unbounded or incomplete action set: %s", terminal.Targets[0].Expr)
+	}
+	if !strings.Contains(repairs.Targets[0].Expr, `action=~"credited|ended|entitlement_repaired"`) {
+		t.Errorf("repair panel has an unbounded or incomplete action set: %s", repairs.Targets[0].Expr)
+	}
+
+	for _, panelID := range []int{17, 18} {
+		panel := dashboardPanelById(dashboard, panelID)
+		if panel == nil || len(panel.Targets) != 1 ||
+			!strings.Contains(panel.Targets[0].Expr, `source=~"balance_code|direct_balance|deduplicated"`) ||
+			!strings.Contains(panel.Targets[0].Expr, `window="$window"`) {
+			t.Errorf("data-pack panel %d lacks the bounded deduplicated source/window contract", panelID)
+		}
+	}
+
+	cancellation := dashboardPanelById(dashboard, 12)
+	if cancellation == nil || cancellation.Type != "text" ||
+		!strings.Contains(cancellation.Options.Content, "not durably available") ||
+		!strings.Contains(cancellation.Options.Content, "never renders") {
+		t.Fatal("subscriptions dashboard must explicitly disclose unavailable cancellation-intent attribution")
+	}
+}
+
+// Preserves bounded metric coverage, query scope, and actionable capacity context.
+func TestProxyDashboardCoversBoundedServiceTrafficAndCapacity(t *testing.T) {
+	dashboard := readTestDashboard(t, "proxy.json")
+	if dashboard.Uid != "urnetwork-proxy" || dashboard.Title != "urnetwork / proxy" {
+		t.Fatalf("proxy dashboard identity = %q / %q", dashboard.Uid, dashboard.Title)
+	}
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("proxy dashboard must remain authenticated")
+	}
+
+	documentBytes, err := dashboardsFs.ReadFile("dashboards/proxy.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(documentBytes)
+	for _, required := range []string{
+		"client-boundary relay bytes / s",
+		"admissions by protocol and outcome",
+		"bounded HTTP / SOCKS library events / s",
+		"WireGuard packets / s by direction and outcome",
+		"WireGuard queue drops and receiver failures / s",
+		"aggregate devices, peers, prewarm, and lifecycle",
+		"platform transport byte capacity",
+		"WireGuard return backpressure",
+		"caller-lock cache occupancy",
+		"control and device-RPC HTTP outcomes",
+		"process CPU, memory, goroutines, and file descriptors",
+		"Missing or stale telemetry remains no-data",
+	} {
+		if !strings.Contains(document, required) {
+			t.Errorf("proxy dashboard lacks %q", required)
+		}
+	}
+	for _, metric := range []string{
+		"urnetwork_proxy_ready",
+		"urnetwork_proxy_drain_active_remaining",
+		"urnetwork_proxy_ingress_admissions_total",
+		"urnetwork_proxy_sessions_total",
+		"urnetwork_proxy_session_duration_seconds",
+		"urnetwork_proxy_sessions_active",
+		"urnetwork_proxy_session_bytes_total",
+		"urnetwork_proxy_ingress_events_total",
+		"urnetwork_proxy_ingress_active",
+		"urnetwork_proxy_session_interval_max_seconds",
+		"urnetwork_proxy_session_interval_max_timestamp_seconds",
+		"urnetwork_proxy_wireguard_packets_total",
+		"urnetwork_proxy_wireguard_bytes_total",
+		"urnetwork_proxy_devices_live",
+		"urnetwork_proxy_prewarmed_devices",
+		"urnetwork_proxy_wg_peers",
+		"urnetwork_proxy_device_memory_tracked_used_bytes",
+		"urnetwork_proxy_platform_transports_pending_h1",
+		"urnetwork_proxy_platform_transport_slot_full_pending_h1_devices",
+		"urnetwork_proxy_platform_transport_h3_preemptions_total",
+		"urnetwork_proxy_platform_transport_slot_full_pending_h1_h3_preemptions_total",
+		"urnetwork_proxy_wireguard_return_backpressure_total",
+		"urnetwork_proxy_lock_cache_entries",
+		"urnetwork_http_requests_total",
+		"urnetwork_pg_pool_connections",
+		"process_resident_memory_bytes",
+	} {
+		if !strings.Contains(document, metric) {
+			t.Errorf("proxy dashboard does not cover %s", metric)
+		}
+	}
+
+	expressions := dashboardExpressions(dashboard)
+	if len(expressions) == 0 {
+		t.Fatal("proxy dashboard has no Prometheus queries")
+	}
+	for _, expression := range expressions {
+		for _, required := range []string{
+			`env="$env"`, `service="proxy"`, `block=~"$block"`,
+			`host=~"$host"`, `instance!=""`,
+		} {
+			if !strings.Contains(expression, required) {
+				t.Errorf("proxy query omits scope %q: %s", required, expression)
+			}
+		}
+		for _, forbidden := range []string{
+			"vector(0)", "proxy_id", "client_id", "device_id", "user_id",
+			"remote_addr", "destination=", "credential=", "error_text",
+		} {
+			if strings.Contains(expression, forbidden) {
+				t.Errorf("proxy query contains forbidden %q: %s", forbidden, expression)
+			}
+		}
+	}
+
+	maximum := dashboardPanelById(dashboard, 9)
+	if maximum == nil || len(maximum.Targets) != 1 {
+		t.Fatal("proxy fresh maximum panel is missing")
+	}
+	for _, required := range []string{
+		"urnetwork_proxy_session_interval_max_timestamp_seconds",
+		"and on (env, service, block, host, instance, protocol)",
+		"time() - 120", "time() + 30",
+	} {
+		if !strings.Contains(maximum.Targets[0].Expr, required) {
+			t.Errorf("proxy maximum omits freshness contract %q: %s", required, maximum.Targets[0].Expr)
+		}
+	}
+	directional := dashboardPanelById(dashboard, 12)
+	if directional == nil || len(directional.Targets) != 1 ||
+		!strings.Contains(directional.Targets[0].Expr, "sum by (direction, outcome)") {
+		t.Fatal("proxy dashboard does not preserve WireGuard direction and outcome")
+	}
+	rpc := dashboardPanelById(dashboard, 22)
+	if rpc == nil || len(rpc.Targets) != 1 ||
+		!strings.Contains(rpc.Targets[0].Expr, "sum by (route, status, outcome)") {
+		t.Fatal("proxy dashboard does not preserve bounded control/RPC route outcomes")
+	}
+}
+
+func TestMcpDashboardCoversBoundedCallsFetchAndCapacity(t *testing.T) {
+	dashboard := readTestDashboard(t, "mcp.json")
+	if dashboard.Uid != "urnetwork-mcp" || dashboard.Title != "urnetwork / mcp" {
+		t.Fatalf("MCP dashboard identity = %q / %q", dashboard.Uid, dashboard.Title)
+	}
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("MCP dashboard must remain authenticated")
+	}
+
+	documentBytes, err := dashboardsFs.ReadFile("dashboards/mcp.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(documentBytes)
+	for _, required := range []string{
+		"protocol calls by method, tool, and outcome",
+		"HTTP authentication and transport outcomes",
+		"tool input and output bytes / s",
+		"providerLocations output / s",
+		"fetch resource outputs / s",
+		"active authenticated callers (process-local)",
+		"fetch concurrency and capacity",
+		"fetch gate waiters and admission outcomes",
+		"fetch result, HTTP status, and continuation classes",
+		"PostgreSQL acquire and lifecycle pressure",
+		"HTTP drain outcomes",
+		"Missing or stale telemetry remains no-data",
+	} {
+		if !strings.Contains(document, required) {
+			t.Errorf("MCP dashboard lacks %q", required)
+		}
+	}
+	for _, metric := range []string{
+		"urnetwork_mcp_ready",
+		"urnetwork_mcp_calls_total",
+		"urnetwork_mcp_call_duration_seconds",
+		"urnetwork_mcp_calls_inflight",
+		"urnetwork_mcp_call_interval_max_seconds",
+		"urnetwork_mcp_call_interval_max_timestamp_seconds",
+		"urnetwork_mcp_tool_bytes_total",
+		"urnetwork_mcp_tool_items_total",
+		"urnetwork_mcp_active_callers",
+		"urnetwork_mcp_fetch_concurrency",
+		"urnetwork_mcp_fetch_waiters",
+		"urnetwork_mcp_fetch_wait_duration_seconds",
+		"urnetwork_mcp_fetch_admissions_total",
+		"urnetwork_mcp_fetch_results_total",
+		"urnetwork_http_requests_total",
+		"urnetwork_http_request_bytes_total",
+		"urnetwork_http_response_bytes_total",
+		"urnetwork_http_request_duration_seconds",
+		"urnetwork_http_server_draining",
+		"urnetwork_pg_pool_connections",
+		"process_resident_memory_bytes",
+	} {
+		if !strings.Contains(document, metric) {
+			t.Errorf("MCP dashboard does not cover %s", metric)
+		}
+	}
+
+	expressions := dashboardExpressions(dashboard)
+	if len(expressions) == 0 {
+		t.Fatal("MCP dashboard has no Prometheus queries")
+	}
+	for _, expression := range expressions {
+		for _, required := range []string{
+			`env="$env"`, `service="mcp"`, `block=~"$block"`,
+			`host=~"$host"`, `instance!=""`,
+		} {
+			if !strings.Contains(expression, required) {
+				t.Errorf("MCP query omits scope %q: %s", required, expression)
+			}
+		}
+		for _, forbidden := range []string{
+			"vector(0)", "user_id", "client_id", "network_id", "proxy_id",
+			"remote_addr", "url=", "identity=", "error_text", "error_message",
+		} {
+			if strings.Contains(expression, forbidden) {
+				t.Errorf("MCP query contains forbidden %q: %s", forbidden, expression)
+			}
+		}
+	}
+
+	maximum := dashboardPanelById(dashboard, 11)
+	if maximum == nil || len(maximum.Targets) != 1 {
+		t.Fatal("MCP fresh maximum panel is missing")
+	}
+	for _, required := range []string{
+		"urnetwork_mcp_call_interval_max_timestamp_seconds",
+		"and on (env, service, block, host, instance, method, tool)",
+		"time() - 120", "time() + 30",
+	} {
+		if !strings.Contains(maximum.Targets[0].Expr, required) {
+			t.Errorf("MCP maximum omits freshness contract %q: %s", required, maximum.Targets[0].Expr)
+		}
+	}
+	callers := dashboardPanelById(dashboard, 15)
+	if callers == nil || len(callers.Targets) != 1 ||
+		!strings.Contains(callers.Targets[0].Expr, "max by (window)") ||
+		strings.Contains(callers.Targets[0].Expr, "sum by (window)") {
+		t.Fatal("MCP dashboard invents a fleet-distinct caller count")
+	}
+	concurrency := dashboardPanelById(dashboard, 16)
+	if concurrency == nil || len(concurrency.Targets) != 1 ||
+		!strings.Contains(concurrency.Targets[0].Expr, `scope=~"global_active|global_capacity|per_identity_active|per_identity_capacity|active_identities"`) {
+		t.Fatal("MCP dashboard lacks the bounded fetch concurrency scope set")
+	}
+	fetch := dashboardPanelById(dashboard, 19)
+	if fetch == nil || len(fetch.Targets) != 1 {
+		t.Fatal("MCP fetch-result panel is missing")
+	}
+	for _, dimension := range []string{"outcome", "status_class", "truncated", "continuation", "payment"} {
+		if !strings.Contains(fetch.Targets[0].Expr, dimension) {
+			t.Errorf("MCP fetch-result panel omits %s: %s", dimension, fetch.Targets[0].Expr)
+		}
+	}
+}
+
+func TestServiceDurationDashboardsUseSumCountAndFreshMaximumWithoutBuckets(t *testing.T) {
+	tests := []struct {
+		file            string
+		durationMetrics []string
+		maximumMetrics  []string
+	}{
+		{
+			file:            "api.json",
+			durationMetrics: []string{"urnetwork_http_request_duration_seconds"},
+			maximumMetrics:  []string{"urnetwork_http_request_interval_max_timestamp_seconds"},
+		},
+		{
+			file:            "taskworker.json",
+			durationMetrics: []string{"urnetwork_taskworker_execution_duration_seconds"},
+			maximumMetrics:  []string{"urnetwork_taskworker_execution_interval_max_timestamp_seconds"},
+		},
+		{
+			file: "proxy.json",
+			durationMetrics: []string{
+				"urnetwork_proxy_session_duration_seconds",
+				"urnetwork_http_request_duration_seconds",
+			},
+			maximumMetrics: []string{
+				"urnetwork_proxy_session_interval_max_timestamp_seconds",
+				"urnetwork_http_request_interval_max_timestamp_seconds",
+			},
+		},
+		{
+			file: "mcp.json",
+			durationMetrics: []string{
+				"urnetwork_http_request_duration_seconds",
+				"urnetwork_mcp_call_duration_seconds",
+				"urnetwork_mcp_fetch_wait_duration_seconds",
+			},
+			maximumMetrics: []string{
+				"urnetwork_http_request_interval_max_timestamp_seconds",
+				"urnetwork_mcp_call_interval_max_timestamp_seconds",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.file, func(t *testing.T) {
+			dashboard := readTestDashboard(t, test.file)
+			documentBytes, err := dashboardsFs.ReadFile("dashboards/" + test.file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			document := string(documentBytes)
+			for _, metric := range test.durationMetrics {
+				for _, suffix := range []string{"_sum", "_count"} {
+					if !strings.Contains(document, metric+suffix) {
+						t.Errorf("%s omits %s%s", test.file, metric, suffix)
+					}
+				}
+				if strings.Contains(document, metric+"_bucket") {
+					t.Errorf("%s still queries cardinality-multiplying buckets for %s", test.file, metric)
+				}
+			}
+			for _, timestampMetric := range test.maximumMetrics {
+				found := false
+				for _, expression := range dashboardExpressions(dashboard) {
+					if !strings.Contains(expression, timestampMetric) {
+						continue
+					}
+					found = true
+					for _, required := range []string{"and on (", "time() - 120", "time() + 30"} {
+						if !strings.Contains(expression, required) {
+							t.Errorf("%s maximum %s omits %q: %s", test.file, timestampMetric, required, expression)
+						}
+					}
+				}
+				if !found {
+					t.Errorf("%s omits maximum timestamp %s", test.file, timestampMetric)
+				}
+			}
+		})
+	}
+
+	proxyBytes, err := dashboardsFs.ReadFile("dashboards/proxy.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(proxyBytes), "urnetwork_proxy_wireguard_return_backpressure_seconds_bucket") {
+		t.Fatal("targeted duration reduction removed the low-cardinality WireGuard histogram control")
 	}
 }
 
@@ -666,11 +1202,40 @@ var networkMeasurementMetrics = []string{
 	"urnetwork_stats_block_miners_claimed",
 	"urnetwork_stats_prev_block_miner_claims_alpha",
 	"urnetwork_stats_prev_block_miners_claimed",
+	"urnetwork_stats_online_extenders",
 }
 
 // the labeled operator network measurements, read with max by (labels)
 var networkLabeledMeasurementMetrics = []string{
 	"urnetwork_stats_online_providers_by_country",
+	"urnetwork_stats_online_extenders_by_country",
+	"urnetwork_stats_online_providers_by_ip_family",
+	"urnetwork_stats_online_extenders_by_ip_family",
+}
+
+// the operator network measurements that stay internal
+// (connect/EXTENDER.md M4). they are replicated by every taskworker like the
+// public ones, so they are read the same way — with max and the env selector —
+// but they are never admitted to publicSafeMetrics: how much of the network's
+// contract volume flows through extenders, and how much of it is disputed, is
+// operator business. the providers dashboard is where they live
+var internalMeasurementMetrics = []string{
+	"urnetwork_stats_open_contracts",
+	"urnetwork_stats_contracts_24h",
+	"urnetwork_stats_open_contracts_with_extender",
+	"urnetwork_stats_contracts_with_extender_24h",
+	"urnetwork_stats_open_disputes",
+	"urnetwork_stats_disputes_24h",
+}
+
+// the population measurements the providers dashboard shows beside them
+var providersDashboardPopulationMetrics = []string{
+	"urnetwork_stats_online_providers",
+	"urnetwork_stats_online_extenders",
+	"urnetwork_stats_online_providers_by_ip_family",
+	"urnetwork_stats_online_extenders_by_ip_family",
+	"urnetwork_stats_online_providers_by_country",
+	"urnetwork_stats_online_extenders_by_country",
 }
 
 // the only metrics a public (no login) dashboard may query. everything
@@ -798,35 +1363,236 @@ func TestPublicDashboardsQueryOnlyPublicSafeMetrics(t *testing.T) {
 // query of the per-country gauge, placed by looking the ISO country code up
 // in grafana's bundled country gazetteer. the collector exports the code
 // upper case to match the gazetteer keys
-func TestPublicNetworkStatsProviderMap(t *testing.T) {
-	dashboard := readTestDashboard(t, "public-traffic.json")
-	var maps []testPanel
-	for _, panel := range dashboard.Panels {
-		if panel.Type == "geomap" {
-			maps = append(maps, panel)
-		}
+//
+// The extender map (connect/EXTENDER.md M5) is the same shape over the
+// extender gauge, so the structure is asserted once and applied to each.
+func assertPublicCountryGeomap(
+	t *testing.T,
+	dashboard testDashboard,
+	id int,
+	title string,
+	expression string,
+) {
+	t.Helper()
+	geomap := dashboardPanelById(dashboard, id)
+	if geomap == nil || geomap.Type != "geomap" {
+		t.Fatalf("public country map panel %d is missing", id)
 	}
-	if len(maps) != 1 {
-		t.Fatalf("public network stats has %d geomap panels, want 1", len(maps))
+	if geomap.Title != title {
+		t.Errorf("country map %d title = %q, want %q", id, geomap.Title, title)
 	}
-	geomap := maps[0]
 	if len(geomap.Targets) != 1 {
-		t.Fatalf("provider map has %d targets, want 1", len(geomap.Targets))
+		t.Fatalf("country map %q has %d targets, want 1", title, len(geomap.Targets))
 	}
 	target := geomap.Targets[0]
-	if target.Expr != "max by (country_code, country) (urnetwork_stats_online_providers_by_country)" {
-		t.Errorf("provider map query = %q", target.Expr)
+	if target.Expr != expression {
+		t.Errorf("country map %q query = %q, want %q", title, target.Expr, expression)
 	}
 	if !target.Instant || target.Format != "table" {
-		t.Error("provider map must be an instant table query so the country code is a lookup field")
+		t.Errorf("country map %q must be an instant table query so the country code is a lookup field", title)
 	}
 	if len(geomap.Options.Layers) != 1 {
-		t.Fatalf("provider map has %d layers, want 1", len(geomap.Options.Layers))
+		t.Fatalf("country map %q has %d layers, want 1", title, len(geomap.Options.Layers))
 	}
 	layer := geomap.Options.Layers[0]
 	if layer.Type != "markers" || layer.Location.Mode != "lookup" || layer.Location.Lookup != "country_code" || layer.Location.Gazetteer != "public/gazetteer/countries.json" {
-		t.Errorf("provider map layer = %+v", layer)
+		t.Errorf("country map %q layer = %+v", title, layer)
 	}
+}
+
+func TestPublicNetworkStatsProviderMap(t *testing.T) {
+	dashboard := readTestDashboard(t, "public-traffic.json")
+	// the provider map and the extender map, and nothing else: another
+	// geomap would be another population published per country
+	maps := 0
+	for _, panel := range dashboard.Panels {
+		if panel.Type == "geomap" {
+			maps += 1
+		}
+	}
+	if maps != 2 {
+		t.Fatalf("public network stats has %d geomap panels, want 2", maps)
+	}
+	assertPublicCountryGeomap(
+		t,
+		dashboard,
+		33,
+		"providers by country",
+		"max by (country_code, country) (urnetwork_stats_online_providers_by_country)",
+	)
+}
+
+// The public extender row (connect/EXTENDER.md M5): the extender population
+// with its map and its top countries, and the two family breakdowns, each
+// read with max and without a template variable, which is what a grafana
+// public dashboard can execute.
+func TestPublicNetworkStatsExtenderRow(t *testing.T) {
+	dashboard := readTestDashboard(t, "public-traffic.json")
+
+	row := dashboardPanelById(dashboard, 60)
+	if row == nil || row.Type != "row" || row.Title != "extender network" {
+		t.Fatal("the public extender network row is missing")
+	}
+	providerRow := dashboardPanelById(dashboard, 10)
+	if providerRow == nil || providerRow.GridPos.Y >= row.GridPos.Y {
+		t.Fatal("the extender row must follow the provider network row")
+	}
+
+	// the map, the same markers layer shape as the provider map over the
+	// extender gauge
+	assertPublicCountryGeomap(
+		t,
+		dashboard,
+		71,
+		"extenders by country",
+		"max by (country_code, country) (urnetwork_stats_online_extenders_by_country)",
+	)
+
+	// every panel of the row, by id, with the query it must carry
+	rowPanels := map[int]struct {
+		panelType  string
+		title      string
+		expression string
+	}{
+		61: {"stat", "online extenders", "max(urnetwork_stats_online_extenders)"},
+		62: {"timeseries", "online extenders", "max(urnetwork_stats_online_extenders)"},
+		63: {"stat", "providers IPv4", `max(urnetwork_stats_online_providers_by_ip_family{ip_family="ipv4"})`},
+		64: {"stat", "providers IPv6", `max(urnetwork_stats_online_providers_by_ip_family{ip_family="ipv6"})`},
+		65: {"stat", "providers dual-stack", `max(urnetwork_stats_online_providers_by_ip_family{ip_family="dualstack"})`},
+		66: {"stat", "extenders IPv4", `max(urnetwork_stats_online_extenders_by_ip_family{ip_family="ipv4"})`},
+		67: {"stat", "extenders IPv6", `max(urnetwork_stats_online_extenders_by_ip_family{ip_family="ipv6"})`},
+		68: {"stat", "extenders dual-stack", `max(urnetwork_stats_online_extenders_by_ip_family{ip_family="dualstack"})`},
+		69: {"timeseries", "providers by ip family", "max by (ip_family) (urnetwork_stats_online_providers_by_ip_family)"},
+		70: {"timeseries", "extenders by ip family", "max by (ip_family) (urnetwork_stats_online_extenders_by_ip_family)"},
+		72: {"bargauge", "top extender countries", "sort_desc(topk(15, max by (country) (urnetwork_stats_online_extenders_by_country)))"},
+	}
+	for id, want := range rowPanels {
+		panel := dashboardPanelById(dashboard, id)
+		if panel == nil {
+			t.Errorf("extender row panel %d (%s) is missing", id, want.title)
+			continue
+		}
+		if panel.Type != want.panelType || panel.Title != want.title {
+			t.Errorf("extender row panel %d = %s %q, want %s %q", id, panel.Type, panel.Title, want.panelType, want.title)
+		}
+		if len(panel.Targets) != 1 || panel.Targets[0].Expr != want.expression {
+			t.Errorf("extender row panel %d query = %+v, want %q", id, panel.Targets, want.expression)
+		}
+	}
+
+	// the whole row, the map and the two stacked family series included, is
+	// read with max and carries no template variable
+	for id := 60; id <= 72; id += 1 {
+		panel := dashboardPanelById(dashboard, id)
+		if panel == nil {
+			continue
+		}
+		for _, target := range panel.Targets {
+			if strings.Contains(target.Expr, "$env") {
+				t.Errorf("extender row panel %d uses a template variable: %s", id, target.Expr)
+			}
+			for _, metric := range metricNamePattern.FindAllString(target.Expr, -1) {
+				assertReplicaSafeReads(t, "public extender row", target.Expr, metric, "")
+			}
+		}
+	}
+
+	// both family gauges are on the row, so the two populations are shown on
+	// the same terms
+	joined := strings.Join(dashboardExpressions(dashboard), "\n")
+	for _, metric := range []string{
+		"urnetwork_stats_online_extenders",
+		"urnetwork_stats_online_extenders_by_country",
+		"urnetwork_stats_online_providers_by_ip_family",
+		"urnetwork_stats_online_extenders_by_ip_family",
+	} {
+		if len(metricOccurrences(joined, metric)) == 0 {
+			t.Errorf("the public dashboard does not read %s", metric)
+		}
+	}
+}
+
+// The internal providers dashboard (connect/EXTENDER.md M6). The six contract
+// gauges live only here, so this is the test that keeps them off a public
+// dashboard and on an internal one at the same time.
+func TestProvidersDashboardPinsInternalMeasurements(t *testing.T) {
+	dashboard := readTestDashboard(t, "providers.json")
+	if dashboard.Uid != "urnetwork-providers" || dashboard.Title != "urnetwork / providers" {
+		t.Fatalf("providers dashboard identity = %q / %q", dashboard.Uid, dashboard.Title)
+	}
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("the providers dashboard must remain authenticated")
+	}
+
+	// one variable, the env, from a gauge this dashboard reads. no block or
+	// host variable: every gauge is replicated by every taskworker and read
+	// with max, so a fleet breakout would only split one measurement
+	if len(dashboard.Templating.List) != 1 {
+		t.Fatalf("providers dashboard has %d template variables, want only env", len(dashboard.Templating.List))
+	}
+	variable, ok := dashboard.Templating.List[0].(map[string]any)
+	if !ok || variable["name"] != "env" {
+		t.Fatalf("providers dashboard variable = %+v, want env", dashboard.Templating.List[0])
+	}
+	if variable["query"] != "label_values(urnetwork_stats_online_providers, env)" {
+		t.Errorf("providers env variable query = %v", variable["query"])
+	}
+
+	expressions := dashboardExpressions(dashboard)
+	if len(expressions) == 0 {
+		t.Fatal("providers dashboard has no queries")
+	}
+	joined := strings.Join(expressions, "\n")
+	for _, metric := range append(
+		slices.Clone(internalMeasurementMetrics),
+		providersDashboardPopulationMetrics...,
+	) {
+		if len(metricOccurrences(joined, metric)) == 0 {
+			t.Errorf("providers dashboard is missing %s", metric)
+		}
+	}
+	// every read is max-wrapped and env-scoped. the selector is the prefix
+	// rather than the whole matcher because the per-family stats select their
+	// family beside the env; a matcher list continues with a comma or closes
+	// with a brace, so `{env="$env"` still pins the env as the first matcher
+	for _, expression := range expressions {
+		for _, metric := range metricNamePattern.FindAllString(expression, -1) {
+			assertReplicaSafeReads(t, "providers dashboard", expression, metric, `{env="$env"`)
+		}
+	}
+
+	// the contract gauges are internal: admitting one to publicSafeMetrics is
+	// a publication decision, and this is where it would have to be made
+	for _, metric := range internalMeasurementMetrics {
+		if slices.Contains(publicSafeMetrics, metric) {
+			t.Errorf("%s is an internal contract measurement and must not be public-safe", metric)
+		}
+	}
+	for _, entry := range mustReadDashboardDir(t) {
+		other := readTestDashboard(t, entry)
+		if !slices.Contains(other.Tags, PublicTag) {
+			continue
+		}
+		otherJoined := strings.Join(dashboardExpressions(other), "\n")
+		for _, metric := range internalMeasurementMetrics {
+			if len(metricOccurrences(otherJoined, metric)) != 0 {
+				t.Errorf("public dashboard %s reads the internal measurement %s", entry, metric)
+			}
+		}
+	}
+}
+
+func mustReadDashboardDir(t *testing.T) []string {
+	t.Helper()
+	entries, err := dashboardsFs.ReadDir("dashboards")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 func TestExchangeTrafficDashboardsUseLiveIoWithoutDoubleCounting(t *testing.T) {
@@ -866,6 +1632,45 @@ func TestExchangeTrafficDashboardsUseLiveIoWithoutDoubleCounting(t *testing.T) {
 	}
 }
 
+// Keeps carrier rates, instantaneous queue occupancy, and wait duration distinct.
+func TestConnectH3DashboardPreservesMetricUnitsAndScope(t *testing.T) {
+	dashboard := readTestDashboard(t, "connect.json")
+	for _, expected := range []struct {
+		panelId int
+		metric  string
+		unit    string
+		rate    bool
+	}{
+		{panelId: 14, metric: "urnetwork_connect_h3_datagram_events_total", unit: "ops", rate: true},
+		{panelId: 15, metric: "urnetwork_connect_h3_datagram_bytes_total", unit: "Bps", rate: true},
+		{panelId: 16, metric: "urnetwork_connect_h3_hybrid_stream_queue_messages", unit: "short"},
+		{panelId: 17, metric: "urnetwork_connect_h3_hybrid_stream_queue_bytes", unit: "bytes"},
+		{panelId: 18, metric: "urnetwork_connect_h3_hybrid_stream_queue_wait_seconds_total", unit: "s", rate: true},
+	} {
+		panel := dashboardPanelById(dashboard, expected.panelId)
+		if panel == nil || len(panel.Targets) != 1 {
+			t.Fatalf("carrier panel %d is missing its query", expected.panelId)
+		}
+		if panel.FieldConfig.Defaults.Unit != expected.unit {
+			t.Errorf("carrier panel %d unit = %q, want %q", expected.panelId, panel.FieldConfig.Defaults.Unit, expected.unit)
+		}
+		expression := panel.Targets[0].Expr
+		for _, required := range []string{expected.metric, `env="$env"`, `block=~"$block"`, `host=~"$host"`, `instance!=""`} {
+			if !strings.Contains(expression, required) {
+				t.Errorf("carrier panel %d query omits %q", expected.panelId, required)
+			}
+		}
+		if strings.Contains(expression, "rate(") != expected.rate {
+			t.Errorf("carrier panel %d has the wrong counter/gauge treatment", expected.panelId)
+		}
+	}
+	wait := dashboardPanelById(dashboard, 18)
+	if !strings.Contains(wait.Targets[0].Expr, `/ sum(rate(urnetwork_connect_h3_datagram_events_total{`) ||
+		!strings.Contains(wait.Targets[0].Expr, `event="hybrid_stream_queue_wait"`) {
+		t.Fatal("mean queue wait must divide duration by the matching wait-event count")
+	}
+}
+
 func TestAdmissionCacheAndSourcePanelsUseActionableQueries(t *testing.T) {
 	signalExpressions := dashboardExpressions(readTestDashboard(t, "signals.json"))
 	for _, expression := range []string{
@@ -899,6 +1704,41 @@ func TestAdmissionCacheAndSourcePanelsUseActionableQueries(t *testing.T) {
 	}
 }
 
+// The capability gauge identifies each freshly observed worker that emits a
+// bounded pre-POST admission event; missing workers must remain no-data.
+func TestCircleAdmissionDashboardPreservesPerWorkerCapability(t *testing.T) {
+	dashboard := readTestDashboard(t, "signals.json")
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("worker admission capability must remain authenticated")
+	}
+	var capabilityPanel *testPanel
+	for panelIndex := range dashboard.Panels {
+		panel := &dashboard.Panels[panelIndex]
+		if panel.Title == "Circle transfer admission event capability by worker" {
+			capabilityPanel = panel
+			break
+		}
+	}
+	if capabilityPanel == nil || len(capabilityPanel.Targets) != 1 {
+		t.Fatal("signals dashboard is missing a dedicated Circle admission capability panel")
+	}
+	const metric = `urnetwork_circle_transfer_admission_observable_info{env="$env",service="taskworker",instance!=""}`
+	wantQuery := metric + ` and on (env, service, block, host, instance) (timestamp(` + metric + `) >= time() - 90)`
+	target := capabilityPanel.Targets[0]
+	if target.Expr != wantQuery || target.LegendFormat != "{{host}} / {{block}} / {{instance}}" {
+		t.Errorf("Circle admission capability loses fresh per-worker gauge semantics: %+v", target)
+	}
+	if capabilityPanel.Type != "timeseries" || capabilityPanel.FieldConfig.Defaults.Unit != "short" ||
+		target.Instant || target.Range != nil && !*target.Range {
+		t.Error("Circle admission capability must be a unitless gauge time series")
+	}
+	for _, part := range []string{"1", "pre-POST", "90 seconds", "no-data", "§2.14"} {
+		if !strings.Contains(capabilityPanel.Description, part) {
+			t.Errorf("Circle admission capability does not explain %q", part)
+		}
+	}
+}
+
 // registeredApplicationMetrics inventories prometheus option literals in the
 // production Go sources. The stats collector creates its gauges through
 // small wrappers (newStatsGauge, newStatsGaugeVec), so their string-literal
@@ -918,6 +1758,10 @@ func registeredApplicationMetrics(t *testing.T) []string {
 	}
 
 	err := filepath.WalkDir("..", func(path string, entry fs.DirEntry, walkErr error) error {
+		// The local metric inventory shares RUN-ALL's source ownership boundary.
+		if slices.Contains([]string{"../proxy/acceptance", "../proxy/cmd/acceptance-main"}, filepath.ToSlash(path)) {
+			return filepath.SkipDir
+		}
 		if walkErr != nil {
 			if strings.HasPrefix(
 				filepath.ToSlash(path),
@@ -946,6 +1790,11 @@ func registeredApplicationMetrics(t *testing.T) []string {
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			if call, ok := node.(*ast.CallExpr); ok {
+				if function, ok := call.Fun.(*ast.SelectorExpr); ok && function.Sel.Name == "NewDesc" && 0 < len(call.Args) {
+					if name, ok := stringLiteral(call.Args[0]); ok && strings.HasPrefix(name, "urnetwork_") {
+						metrics[name] = true
+					}
+				}
 				if function, ok := call.Fun.(*ast.Ident); ok && (function.Name == "newStatsGauge" || function.Name == "newStatsGaugeVec") && 0 < len(call.Args) {
 					if name, ok := stringLiteral(call.Args[0]); ok {
 						metrics["urnetwork_stats_"+name] = true
@@ -1004,6 +1853,30 @@ func registeredApplicationMetrics(t *testing.T) []string {
 	return names
 }
 
+// Keeps custom collector descriptors in the same inventory as direct gauges.
+func TestProxyMemoryDescriptorsRemainInMetricInventory(t *testing.T) {
+	metrics := registeredApplicationMetrics(t)
+	for _, name := range []string{
+		"urnetwork_proxy_devices_live",
+		"urnetwork_proxy_device_memory_target_bytes",
+		"urnetwork_proxy_device_memory_tracked_used_bytes",
+		"urnetwork_proxy_platform_transport_budget_bytes",
+		"urnetwork_proxy_platform_transport_used_bytes",
+		"urnetwork_proxy_platform_transports_max",
+		"urnetwork_proxy_platform_transports_used",
+		"urnetwork_proxy_platform_transports_pending_h1",
+		"urnetwork_proxy_platform_transports_pending_h1_bytes",
+		"urnetwork_proxy_platform_transport_slot_full_pending_h1_devices",
+		"urnetwork_proxy_platform_transport_h3_preemptions_total",
+		"urnetwork_proxy_platform_transport_slot_full_pending_h1_h3_preemptions_total",
+	} {
+		if !slices.Contains(metrics, name) {
+			t.Errorf("custom collector descriptor %s is absent from the metric inventory", name)
+		}
+	}
+}
+
+// Requires each application family to have an authenticated dashboard query.
 func TestInternalDashboardsCoverEveryApplicationMetric(t *testing.T) {
 	entries, err := dashboardsFs.ReadDir("dashboards")
 	if err != nil {
@@ -1032,6 +1905,57 @@ func TestInternalDashboardsCoverEveryApplicationMetric(t *testing.T) {
 	}
 }
 
+// Each phase belongs to one worker process. Gauges stay instantaneous, counters
+// use reset-aware rates, and the panels explain overlapping spans and work units.
+func TestTaskworkerScorePhaseDashboardPreservesWorkerAndPhaseSemantics(t *testing.T) {
+	dashboard := readTestDashboard(t, "taskworker.json")
+	if slices.Contains(dashboard.Tags, PublicTag) {
+		t.Fatal("worker phase diagnostics must remain authenticated")
+	}
+	const selector = `{env="$env",service="taskworker",block=~"$block",host=~"$host",instance!=""}`
+	for _, c := range []struct {
+		suffix           string
+		rate             bool
+		unit             string
+		descriptionParts []string
+	}{
+		{suffix: "active", unit: "short", descriptionParts: []string{"parent", "target_map", "gob_encode", "cache_write"}},
+		{suffix: "duration_seconds_total", rate: true, unit: "short", descriptionParts: []string{"completed", "wall", "child", "CPU"}},
+		{suffix: "exits_total", rate: true, unit: "short", descriptionParts: []string{"error", "panic", "success"}},
+		{suffix: "work_items_total", rate: true, unit: "short", descriptionParts: []string{"source_load", "target_export", "target_map", "gob_encode", "cache_write", "attempt"}},
+		{suffix: "work_bytes_total", rate: true, unit: "Bps", descriptionParts: []string{"key", "value", "attempt", "heap"}},
+	} {
+		metric := "urnetwork_update_client_scores_phase_" + c.suffix
+		wantExpression := metric + selector
+		if c.rate {
+			wantExpression = "rate(" + wantExpression + "[$__rate_interval])"
+		}
+		found := false
+		for _, panel := range dashboard.Panels {
+			for _, target := range panel.Targets {
+				if !strings.Contains(target.Expr, metric) {
+					continue
+				}
+				found = true
+				if target.Expr != wantExpression || target.LegendFormat != "{{host}} {{block}} {{instance}} {{phase}}" {
+					t.Errorf("phase metric %s loses scoped worker/phase identity or counter semantics: %+v", metric, target)
+				}
+				if panel.Type != "timeseries" || len(panel.Targets) != 1 || panel.FieldConfig.Defaults.Unit != c.unit || target.Instant || target.Range != nil && !*target.Range {
+					t.Errorf("phase metric %s needs a dedicated %s time series", metric, c.unit)
+				}
+				for _, part := range c.descriptionParts {
+					if !strings.Contains(panel.Description, part) {
+						t.Errorf("phase metric %s does not explain %q", metric, part)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("taskworker dashboard is missing phase metric %s", metric)
+		}
+	}
+}
+
 // The lossless failure total identifies the alerting cause, while this bounded
 // breakdown distinguishes request shapes without exposing client identifiers.
 func TestMissingOriginDetailsHaveActionableDashboardQuery(t *testing.T) {
@@ -1056,11 +1980,11 @@ func TestMissingOriginDetailsHaveActionableDashboardQuery(t *testing.T) {
 		t.Fatalf("signals dashboard panel %q lacks the missing-origin detail query", wantTitle)
 	}
 
-	wantQuery := `sum by (request_companion, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_missing_origin_details_total{env="$env",instance!=""}[$__rate_interval])) * 60`
+	wantQuery := `sum by (request_companion, sender_role, source_owner, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_missing_origin_details_total{env="$env",instance!=""}[$__rate_interval])) * 60`
 	if detailsTarget.Expr != wantQuery {
 		t.Errorf("missing-origin detail query = %q, want %q", detailsTarget.Expr, wantQuery)
 	}
-	wantLegend := "missing origin request_companion={{request_companion}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}"
+	wantLegend := "missing origin request_companion={{request_companion}} sender={{sender_role}} owner={{source_owner}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}"
 	if detailsTarget.LegendFormat != wantLegend {
 		t.Errorf("missing-origin detail legend = %q, want %q", detailsTarget.LegendFormat, wantLegend)
 	}
@@ -1072,15 +1996,27 @@ func TestMissingOriginDetailsHaveActionableDashboardQuery(t *testing.T) {
 func TestInactiveDestinationDetailsHaveActionableDashboardQuery(t *testing.T) {
 	dashboard := readTestDashboard(t, "signals.json")
 	wantTitle := "\u00a74 contract failures + origin/destination details / min (lossless)"
-	var targets []testTarget
-	for _, panel := range dashboard.Panels {
-		if panel.Title == wantTitle {
-			targets = panel.Targets
+	var detailsPanel *testPanel
+	for panelIndex := range dashboard.Panels {
+		if dashboard.Panels[panelIndex].Title == wantTitle {
+			detailsPanel = &dashboard.Panels[panelIndex]
 			break
 		}
 	}
-	if targets == nil {
+	if detailsPanel == nil {
 		t.Fatalf("signals dashboard lacks panel %q", wantTitle)
+	}
+	targets := detailsPanel.Targets
+	for _, want := range []string{
+		"source_owner=egress_prober|other|unknown",
+		"authenticated source network",
+		"durable prober network",
+		"not accepted from the request",
+		"missing source_owner during rollout is unattributed",
+	} {
+		if !strings.Contains(detailsPanel.Description, want) {
+			t.Errorf("inactive-destination panel description omits %q: %s", want, detailsPanel.Description)
+		}
 	}
 	tests := []struct {
 		metric string
@@ -1094,8 +2030,8 @@ func TestInactiveDestinationDetailsHaveActionableDashboardQuery(t *testing.T) {
 		},
 		{
 			metric: "urnetwork_connect_inactive_destination_details_total",
-			query:  `sum by (request_companion, sender_role, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_inactive_destination_details_total{env="$env",instance!=""}[$__rate_interval])) * 60`,
-			legend: "inactive destination request_companion={{request_companion}} sender_role={{sender_role}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}",
+			query:  `sum by (request_companion, sender_role, source_owner, resolution, relationship, source_lifecycle, destination_lifecycle) (rate(urnetwork_connect_inactive_destination_details_total{env="$env",instance!=""}[$__rate_interval])) * 60`,
+			legend: "inactive destination request_companion={{request_companion}} sender_role={{sender_role}} source_owner={{source_owner}} resolution={{resolution}} relationship={{relationship}} source={{source_lifecycle}} destination={{destination_lifecycle}}",
 		},
 	}
 	for _, test := range tests {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -24,6 +25,56 @@ func TestSubtensorSignalHealthySyntheticNodes(t *testing.T) {
 	}
 	if len(alerts) != 0 {
 		t.Fatalf("healthy Subtensor produced alerts: %+v", alerts)
+	}
+}
+
+func TestSubtensorSignalDistinguishesStaleConvergenceFromActivelySyncingLag(t *testing.T) {
+	for _, syncing := range []bool{false, true} {
+		observation := healthySubtensorObservation()
+		archive := &observation.Nodes[0]
+		archive.FirstHead = blockHex(7_909_798)
+		archive.SecondHead = blockHex(7_909_800)
+		archive.Direct.Head = archive.FirstHead
+		archive.Gateway.Head = archive.SecondHead
+		archive.Direct.Sync.CurrentBlock = 7_909_800
+		archive.Direct.Sync.HighestBlock = 7_909_800
+		archive.Direct.Health.IsSyncing = syncing
+		wantClass, wrongClass := "subtensor-stale-convergence", "subtensor-sync-lag"
+		if syncing {
+			wantClass, wrongClass = wrongClass, wantClass
+		}
+		alerts, err := runSyntheticSubtensor(t, observation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alert := requireAlertClass(t, alerts, wantClass)
+		if alert.Frame != "archive" || alert.Severity != SeverityWarn || alert.Sustain != 1 || !strings.Contains(alert.Observed, "lag=200") || !strings.Contains(alert.Markdown(), "SIGNALS.md §17.2") {
+			t.Fatalf("sync state did not select its exact bounded lag identity: syncing=%t", syncing)
+		}
+		for _, other := range alerts {
+			if other.Class == wrongClass {
+				t.Errorf("syncing=%t emitted the opposite lag discriminator", syncing)
+			}
+		}
+	}
+}
+
+func TestSubtensorSignalNearHeadCompletedSyncIsHealthy(t *testing.T) {
+	observation := healthySubtensorObservation()
+	archive := &observation.Nodes[0]
+	archive.FirstHead = blockHex(7_909_872)
+	archive.SecondHead = blockHex(7_909_874)
+	archive.Direct.Head = archive.FirstHead
+	archive.Gateway.Head = archive.SecondHead
+	archive.Direct.Sync.CurrentBlock = 7_909_874
+	archive.Direct.Sync.HighestBlock = 7_910_000
+	archive.Direct.Health.IsSyncing = false
+	alerts, err := runSyntheticSubtensor(t, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 0 {
+		t.Fatalf("completed sync in the near-head band produced %d alerts", len(alerts))
 	}
 }
 
@@ -61,14 +112,111 @@ func TestSubtensorSignalDetectsWarpFallbackAndArchiveLag(t *testing.T) {
 	if lightnode.Sustain != 1 {
 		t.Fatalf("lightnode fallback sustain = %d", lightnode.Sustain)
 	}
-	if !strings.Contains(lightnode.Action, "run-subtensor-lightnode.sh") ||
-		!strings.Contains(lightnode.Action, "recreate only subtensor-lightnode") ||
-		!strings.Contains(lightnode.Action, "Do not run the full run-subtensor.sh") {
+	if !strings.Contains(lightnode.Action, "canonical xops/main/ansible/run-subtensor.sh") ||
+		!strings.Contains(lightnode.Action, "remove only that failed container") ||
+		!strings.Contains(lightnode.Action, "retain the archive container identity") {
 		t.Fatalf("lightnode action is not root-cause specific: %s", lightnode.Action)
+	}
+	if strings.Contains(lightnode.Action, "run-subtensor-lightnode.sh") {
+		t.Fatalf("lightnode action retained removed runner: %s", lightnode.Action)
 	}
 	if !strings.Contains(lightnode.Verify, "unchanged archive container ID/start time") ||
 		!strings.Contains(lightnode.Verify, "live /data mount") {
 		t.Fatalf("lightnode verification does not preserve the archive boundary: %s", lightnode.Verify)
+	}
+}
+
+func TestSubtensorSignalDoesNotInferCurrentRuntimeWhenPublicHeadIsUnavailable(t *testing.T) {
+	observation := healthySubtensorObservation()
+	observation.Public.Head = ""
+	observation.Public.Errors["head"] = "synthetic reference unavailable"
+	observation.Public.Runtime.SpecVersion = 455
+
+	archive := &observation.Nodes[0]
+	archive.Direct.Runtime.SpecVersion = 443
+	archive.Direct.Health.IsSyncing = true
+	archive.Direct.Sync.HighestBlock = 8_120_000
+
+	lightnode := &observation.Nodes[1]
+	lightnode.Direct.Runtime.SpecVersion = 443
+	lightnode.Direct.Health = subtensorHealth{Peers: 0, IsSyncing: false}
+	lightnode.Direct.Sync.HighestBlock = lightnode.Direct.Sync.CurrentBlock
+
+	alerts, err := runSyntheticSubtensorAtRuntime(t, observation, 455)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility := requireAlertClass(t, alerts, "cannot-observe")
+	if !strings.Contains(visibility.Target, "subtensor-public-reference") || visibility.Sustain != 2 {
+		t.Fatalf("public-head visibility finding = %+v", visibility)
+	}
+	archiveLag := requireAlertClass(t, alerts, "subtensor-sync-lag")
+	if archiveLag.Frame != "archive" || !strings.Contains(archiveLag.Observed, "target_head=8120000") {
+		t.Fatalf("archive target control = %+v", archiveLag)
+	}
+	peers := requireAlertClass(t, alerts, "subtensor-peers")
+	if peers.Frame != "lightnode" || !strings.Contains(peers.Observed, "is_syncing=false") {
+		t.Fatalf("peer-loss control = %+v", peers)
+	}
+	for _, alert := range alerts {
+		if alert.Class == "subtensor-identity" && alert.Frame == "lightnode-current-runtime" {
+			t.Fatalf("unobservable convergence applied the current-runtime pin: %+v", alert)
+		}
+	}
+}
+
+func TestSubtensorSignalDoesNotMixHistoricalRuntimeWithSecondHeadConvergence(t *testing.T) {
+	observation := healthySubtensorObservation()
+	observation.Public.Head = blockHex(8_120_000)
+	observation.Public.Runtime.SpecVersion = 455
+	for i := range observation.Nodes {
+		observation.Nodes[i].Direct.Runtime.SpecVersion = 455
+	}
+
+	lightnode := &observation.Nodes[1]
+	lightnode.FirstHead = blockHex(7_910_000)
+	lightnode.SecondHead = blockHex(8_119_999)
+	lightnode.Direct.Head = lightnode.FirstHead
+	lightnode.Direct.Runtime.SpecVersion = 443
+	lightnode.Direct.Sync = subtensorSyncState{
+		CurrentBlock: 7_910_000,
+		HighestBlock: 8_120_000,
+	}
+	lightnode.Gateway.Head = lightnode.SecondHead
+
+	alerts, err := runSyntheticSubtensorAtRuntime(t, observation, 455)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, alert := range alerts {
+		if alert.Class == "subtensor-identity" && alert.Frame == "lightnode-current-runtime" {
+			t.Fatalf("first-sample historical runtime was applied to the converged second head: %+v", alert)
+		}
+	}
+}
+
+func TestSubtensorSignalChecksCurrentRuntimeAfterStableConvergence(t *testing.T) {
+	observation := healthySubtensorObservation()
+	observation.Public.Runtime.SpecVersion = 455
+	for i := range observation.Nodes {
+		observation.Nodes[i].Direct.Runtime.SpecVersion = 455
+	}
+	lightnode := &observation.Nodes[1]
+	lightnode.Direct.Runtime.SpecVersion = 443
+	lightnode.Direct.EVMChainID = "0xsynthetic-mismatch"
+
+	alerts, err := runSyntheticSubtensorAtRuntime(t, observation, 455)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := requireAlertClass(t, alerts, "subtensor-identity")
+	if identity.Frame != "lightnode-current-runtime" {
+		t.Fatalf("stable current-runtime identity frame = %+v", identity)
+	}
+	for _, want := range []string{"specVersion=443 expected=455", `evm_chain_id="0xsynthetic-mismatch" expected="0x3b1"`} {
+		if !strings.Contains(identity.Observed, want) {
+			t.Fatalf("stable current-runtime identity missing %q: %+v", want, identity)
+		}
 	}
 }
 
@@ -186,11 +334,16 @@ func TestSubtensorSignalDistinguishesProgressedWarpResume(t *testing.T) {
 		"starting_block=6413262",
 		"Do not reset this progressing generation",
 		"full-host lightnode-preservation guard",
+		"canonical xops/main/ansible/run-subtensor.sh",
+		"record and preserve the failed lightnode identity",
 		"same live /data generation",
 	} {
 		if !strings.Contains(resume.Markdown(), want) {
 			t.Fatalf("warp resume alert missing %q:\n%s", want, resume.Markdown())
 		}
+	}
+	if strings.Contains(resume.Action, "run-subtensor-lightnode.sh") {
+		t.Fatalf("warp resume action retained removed runner: %s", resume.Action)
 	}
 	for _, alert := range alerts {
 		if alert.Class == "subtensor-warp-fallback" {
@@ -266,22 +419,31 @@ func TestSubtensorSignalDetectsHistoricalWarpCheckpointFailure(t *testing.T) {
 		"v448",
 		"add2b31a19ccf650ad50d79e8ba2668e6494f56f",
 		"0876234316a3b9107ce1eb0781b04ae55f5df89e",
-		"run-subtensor-lightnode.sh",
+		"canonical xops/main/ansible/run-subtensor.sh",
 	} {
 		if !strings.Contains(checkpoint.Markdown(), want) {
 			t.Fatalf("checkpoint alert missing %q:\n%s", want, checkpoint.Markdown())
 		}
+	}
+	if strings.Contains(checkpoint.Action, "run-subtensor-lightnode.sh") {
+		t.Fatalf("checkpoint action retained removed runner: %s", checkpoint.Action)
 	}
 	drift := requireAlertClass(t, alerts, "subtensor-deployment-drift")
 	if !strings.Contains(drift.Observed, "subtensor-lightnode-warp-v2") ||
 		!strings.Contains(drift.Observed, "subtensor-lightnode-warp-v3") {
 		t.Fatalf("deployment drift lost generation identity: %+v", drift)
 	}
+	if !strings.Contains(drift.Action, "canonical xops/main/ansible/run-subtensor.sh") ||
+		strings.Contains(drift.Action, "run-subtensor-lightnode.sh") {
+		t.Fatalf("deployment drift action does not use the sole canonical runner: %s", drift.Action)
+	}
 }
 
 func TestSubtensorSignalCollectsContainerStartupDiscriminators(t *testing.T) {
 	for _, want := range []string{
 		`["sudo", "-n", "/usr/local/sbin/subtensor-monitor", name]`,
+		`SUBTENSOR_HELPER_TIMEOUT_SECONDS = 30`,
+		`timeout=SUBTENSOR_HELPER_TIMEOUT_SECONDS`,
 		`result = json.loads(output)`,
 		`"container_error"`,
 	} {
@@ -311,6 +473,155 @@ func TestSubtensorSignalDetectsZeroPeersAndFrozenHead(t *testing.T) {
 	}
 }
 
+func TestSubtensorSignalKeepsOlderHelperAsCannotObserve(t *testing.T) {
+	observation := healthySubtensorObservation()
+	observation.Nodes[1].PeerDiagnostics = nil
+
+	alerts, err := runSyntheticSubtensor(t, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility := requireAlertClass(t, alerts, "cannot-observe")
+	if visibility.Target != "chain.example.test/lightnode/peer-diagnostics" ||
+		!strings.Contains(visibility.Observed, "error_class="+observationErrorClassContractMismatch) {
+		t.Fatalf("older helper did not retain an exact visibility boundary: %+v", visibility)
+	}
+	requireAlertOmits(t, visibility, "installed helper predates")
+}
+
+func TestSubtensorSignalLocalizesLitep2pNotificationFailureAgainstArchive(t *testing.T) {
+	observation := healthySubtensorObservation()
+	archive := &observation.Nodes[0]
+	archive.PeerDiagnostics.Metrics.BlockAnnounceOpenedTotal = 2_136
+	archive.PeerDiagnostics.Metrics.BlockAnnounceClosedTotal = 2_125
+	archive.PeerDiagnostics.Metrics.SyncRequestClosedTotal = 5
+
+	lightnode := &observation.Nodes[1]
+	lightnode.Direct.Health.Peers = 0
+	lightnode.Direct.Health.IsSyncing = false
+	lightnode.FirstHead = lightnode.SecondHead
+	lightnode.Direct.Head = lightnode.SecondHead
+	lightnode.Gateway.Head = lightnode.SecondHead
+	lightnode.PeerDiagnostics.Metrics.BlockAnnounceOpenedTotal = 13_897
+	lightnode.PeerDiagnostics.Metrics.BlockAnnounceClosedTotal = 13_897
+	lightnode.PeerDiagnostics.Metrics.RawDistinctOpenedTotal = 647_163
+	lightnode.PeerDiagnostics.Metrics.RawDistinctClosedTotal = 647_099
+	lightnode.PeerDiagnostics.Metrics.SyncRequestSuccessTotal = 39_930
+	lightnode.PeerDiagnostics.Metrics.SyncRequestClosedTotal = 9_477
+	lightnode.PeerDiagnostics.Metrics.PendingHandshakeFailureTotal = 7
+	lightnode.PeerDiagnostics.Metrics.PendingTransportFailureTotal = 13
+	// Historical tail alternatives must not outrank affirmative current-state
+	// metrics because the line-bounded tail is not event-time correlated.
+	lightnode.PeerDiagnostics.Log.Outcomes.DatabaseOrImportRejection = 2
+	lightnode.PeerDiagnostics.Log.Outcomes.ChainOrForkRejection = 3
+
+	alerts, err := runSyntheticSubtensor(t, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := requireAlertClass(t, alerts, "subtensor-peers")
+	if peer.Frame != "lightnode" ||
+		!strings.Contains(peer.Mechanism, "litep2p notification negotiation or peerset reconnect") ||
+		!strings.Contains(peer.Mechanism, "advancing, peer-connected archive") {
+		t.Fatalf("peer failure was not localized against archive: %+v", peer)
+	}
+	for want := range map[string]bool{
+		"block_announce_opened=13897": true,
+		"block_announce_closed=13897": true,
+		"raw_distinct_live=64":        true,
+		"sync_closed=9477":            true,
+		"archive_control=healthy":     true,
+		"block_announce_live=11":      true,
+	} {
+		if !strings.Contains(peer.Evidence, want) {
+			t.Fatalf("peer evidence missing %q: %s", want, peer.Evidence)
+		}
+	}
+	if !strings.Contains(peer.Action, "do not restart, reset") {
+		t.Fatalf("peer action lost preservation boundary: %s", peer.Action)
+	}
+	if !strings.Contains(peer.Mechanism, "no event-time correlation") ||
+		!strings.Contains(peer.Action, "timestamped bounded discriminator") {
+		t.Fatalf("peer alert promoted an uncorrelated log alternative: %+v", peer)
+	}
+	progress := requireAlertClass(t, alerts, "subtensor-progress")
+	if !strings.Contains(progress.Mechanism, "litep2p notification negotiation or peerset reconnect") ||
+		progress.Evidence != peer.Evidence {
+		t.Fatalf("static-head alert did not retain the peer discriminator: %+v", progress)
+	}
+}
+
+func TestSubtensorSignalSeparatesPeerRejectionAndContainerPathOutcomes(t *testing.T) {
+	tests := []struct {
+		name              string
+		alter             func(*subtensorPeerDiagnostics)
+		wantMechanism     string
+		dontWantMechanism string
+	}{
+		{
+			name: "database import rejection",
+			alter: func(diagnostics *subtensorPeerDiagnostics) {
+				diagnostics.Log.Outcomes.DatabaseOrImportRejection = 2
+			},
+			wantMechanism: "database/import rejection class",
+		},
+		{
+			name: "chain fork rejection",
+			alter: func(diagnostics *subtensorPeerDiagnostics) {
+				diagnostics.Log.Outcomes.ChainOrForkRejection = 3
+			},
+			wantMechanism: "chain/fork or block-announcement rejection class",
+		},
+		{
+			name: "container dns",
+			alter: func(diagnostics *subtensorPeerDiagnostics) {
+				diagnostics.ContainerDNSStatus = "timeout"
+			},
+			wantMechanism: "failing before a bootnode transport",
+		},
+		{
+			name: "bootnode tcp",
+			alter: func(diagnostics *subtensorPeerDiagnostics) {
+				diagnostics.BootnodeTCPStatus = "failed"
+			},
+			wantMechanism: "below notification negotiation and above name resolution",
+		},
+		{
+			name: "bootnode unconfigured",
+			alter: func(diagnostics *subtensorPeerDiagnostics) {
+				diagnostics.ContainerDNSStatus = "unconfigured"
+				diagnostics.BootnodeTCPStatus = "unconfigured"
+			},
+			wantMechanism:     "configuration/observation boundary",
+			dontWantMechanism: "cannot resolve",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observation := healthySubtensorObservation()
+			node := &observation.Nodes[1]
+			node.Direct.Health.Peers = 0
+			test.alter(node.PeerDiagnostics)
+			alerts, err := runSyntheticSubtensor(t, observation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := requireAlertClass(t, alerts, "subtensor-peers")
+			if !strings.Contains(peer.Mechanism, test.wantMechanism) {
+				t.Fatalf("mechanism=%q, want %q", peer.Mechanism, test.wantMechanism)
+			}
+			if test.dontWantMechanism != "" && strings.Contains(peer.Mechanism, test.dontWantMechanism) {
+				t.Fatalf("mechanism=%q unexpectedly contains %q", peer.Mechanism, test.dontWantMechanism)
+			}
+			if strings.Contains(test.name, "rejection") &&
+				(!strings.Contains(peer.Mechanism, "not event-time correlated") ||
+					!strings.Contains(peer.Action, "timestamped")) {
+				t.Fatalf("log-only outcome was not conservative: %+v", peer)
+			}
+		})
+	}
+}
+
 func TestSubtensorSignalDetectsGatewayAndIdentityProblems(t *testing.T) {
 	observation := healthySubtensorObservation()
 	observation.Nodes[0].GatewayHTTP = 0
@@ -336,7 +647,7 @@ func TestSubtensorSignalClassifiesPublicRuntimeAhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	alert := requireAlertClass(t, alerts, "subtensor-runtime-ahead")
-	if alert.Severity != SeverityPage || alert.Target != "snow" || alert.Frame != "public-reference" || alert.Sustain != 1 {
+	if alert.Severity != SeverityPage || alert.Target != "chain.example.test" || alert.Frame != "public-reference" || alert.Sustain != 1 {
 		t.Fatalf("runtime-ahead alert framing = %+v", alert)
 	}
 	for _, want := range []string{
@@ -473,7 +784,7 @@ func TestSubtensorSignalTurnsMalformedObservationIntoVisibilityAlert(t *testing.
 
 func TestSubtensorSignalRequiresExplicitHostConfiguration(t *testing.T) {
 	settings := syntheticSettings(&syntheticSource{})
-	settings.Hosts = append(settings.Hosts, HostSettings{Name: "snow", Roles: []string{"subtensor"}})
+	settings.Hosts = append(settings.Hosts, HostSettings{Name: "chain.example.test", Roles: []string{"subtensor"}})
 	alerts, err := NewSubtensorSignal().Run(context.Background(), settings)
 	if err != nil {
 		t.Fatal(err)
@@ -495,7 +806,7 @@ func runSyntheticSubtensorAtRuntime(t *testing.T, observation subtensorObservati
 		t.Fatal(err)
 	}
 	source := &syntheticSource{hostFn: func(host HostSettings, command string) (string, error) {
-		if host.Name != "snow" || host.Subtensor == nil {
+		if host.Name != "chain.example.test" || host.Subtensor == nil {
 			return "", fmt.Errorf("unexpected host settings: %+v", host)
 		}
 		if !strings.Contains(command, subtensorMarker) {
@@ -515,7 +826,7 @@ func runSyntheticSubtensorAtRuntime(t *testing.T, observation subtensorObservati
 func subtensorSyntheticSettings(source SignalSource) SignalSettings {
 	settings := syntheticSettings(source)
 	settings.Hosts = append(settings.Hosts, HostSettings{
-		Name: "snow", OverlayAddress: "172.28.208.185", Roles: []string{"subtensor"},
+		Name: "chain.example.test", OverlayAddress: "192.0.2.88", Roles: []string{"subtensor"},
 		Subtensor: &SubtensorHostSettings{
 			PublicRPCURL:               "https://reference.example",
 			ExpectedChain:              "Bittensor",
@@ -584,6 +895,22 @@ func healthySubtensorNode(name, syncMode string, rpcPort, gatewayPort int, first
 	return subtensorNodeObservation{
 		Name: name, SyncMode: syncMode, RPCPort: rpcPort, GatewayPort: gatewayPort,
 		Direct: direct, Gateway: gateway, FirstHead: blockHex(first), SecondHead: blockHex(second), GatewayHTTP: 200,
+		PeerDiagnostics: healthySubtensorPeerDiagnostics(),
+	}
+}
+
+func healthySubtensorPeerDiagnostics() *subtensorPeerDiagnostics {
+	return &subtensorPeerDiagnostics{
+		Version: 1, ContainerDNSStatus: "ok", BootnodeTCPStatus: "ok", MetricsStatus: "ok",
+		Log: subtensorPeerLogDiagnostics{
+			Scope: "current-process-tail", EventTimeCorrelated: false,
+			TailLimit: 5000, LinesScanned: 120,
+		},
+		Metrics: subtensorPeerMetrics{
+			BlockAnnounceOpenedTotal: 20, BlockAnnounceClosedTotal: 12,
+			RawDistinctOpenedTotal: 30, RawDistinctClosedTotal: 20,
+			SyncRequestSuccessTotal: 100,
+		},
 	}
 }
 
@@ -597,3 +924,125 @@ func healthySubtensorRPC(head int64) subtensorRPCObservation {
 }
 
 func blockHex(block int64) string { return fmt.Sprintf("0x%x", block) }
+
+// Complete synthetic observations exercise the existing Signal and cadence
+// gate without executing the native RPC/helper script or adding product state.
+func subtensorProgressPauseTestAlerts(t *testing.T, first, second int64, peers int64) Alerts {
+	t.Helper()
+	now := time.Date(2099, 4, 5, 6, 7, 8, 0, time.UTC)
+	settings := subtensorSyntheticSettings(nil)
+	settings.Now = func() time.Time { return now }
+	observation := healthySubtensorObservation()
+	configuredHosts := []HostSettings{}
+	for index := range settings.Hosts {
+		if configured := settings.Hosts[index].Subtensor; configured != nil {
+			configured.PublicRPCURL = "https://reference.example.test"
+			configured.ExpectedChain = "synthetic-chain"
+			configured.ExpectedSpecName = "synthetic-subtensor"
+			configured.ExpectedSpecVersion = 77
+			configured.ExpectedTransactionVersion = 8
+			configured.ExpectedEVMChainID = "0x7b"
+			configuredHosts = append(configuredHosts, settings.Hosts[index])
+		}
+	}
+	settings.Hosts = configuredHosts
+	qualifyRPC := func(rpc *subtensorRPCObservation, head int64) {
+		rpc.Chain = "synthetic-chain"
+		rpc.Runtime = subtensorRuntimeVersion{SpecName: "synthetic-subtensor", SpecVersion: 77, TransactionVersion: 8}
+		rpc.EVMChainID = "0x7b"
+		rpc.Head = blockHex(head)
+	}
+	qualifyRPC(&observation.Public, first+16)
+	for index := range observation.Nodes {
+		node := &observation.Nodes[index]
+		nodeFirst, nodeSecond := first-3, first-2
+		nodePeers := int64(3)
+		if node.Name == "lightnode" {
+			nodeFirst, nodeSecond, nodePeers = first, second, peers
+		}
+		node.FirstHead, node.SecondHead = blockHex(nodeFirst), blockHex(nodeSecond)
+		node.ContainerStarted = now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+		qualifyRPC(&node.Direct, nodeFirst)
+		qualifyRPC(&node.Gateway, nodeSecond)
+		node.Direct.Health = subtensorHealth{Peers: nodePeers}
+		node.Direct.Sync = subtensorSyncState{StartingBlock: 100, CurrentBlock: nodeSecond, HighestBlock: first + 16}
+	}
+	encoded, err := json.Marshal(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.Source = &syntheticSource{hostFn: func(configured HostSettings, command string) (string, error) {
+		if configured.Name != "chain.example.test" || !strings.Contains(command, subtensorMarker) {
+			return "", errors.New("unsupported synthetic progress command")
+		}
+		return string(encoded), nil
+	}}
+	alerts, err := NewSubtensorSignal().Run(context.Background(), settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return alerts
+}
+
+func TestSubtensorProgressRepeatedPauseEscalationNarration(t *testing.T) {
+	signal := NewSubtensorSignal()
+	gate := newCadenceAlertGate()
+	var page Alert
+	for cadence := 0; cadence < 5; cadence++ {
+		head := int64(1000 + 11*cadence)
+		progress := requireAlertClass(t, subtensorProgressPauseTestAlerts(t, head, head, 3), "subtensor-progress")
+		ready := gate.filter(signal, Alerts{progress})
+		if cadence == 4 {
+			page = requireAlertClass(t, ready, "subtensor-progress")
+		}
+	}
+	if page.Severity != SeverityPage || page.Sustain != 3 || page.PageSustain != 5 {
+		t.Fatal("repeated bounded pauses changed the existing five-cadence escalation")
+	}
+	for _, want := range []string{"repeated bounded pauses", "not proof of continuous", "reference advancement"} {
+		if !strings.Contains(page.Markdown(), want) {
+			t.Errorf("bounded-pause narration lacks required qualification: %s", want)
+		}
+	}
+	if strings.Contains(page.Baseline, "while the public chain advances") {
+		t.Error("a single public reference read was narrated as proved advancement during the sample")
+	}
+}
+
+func TestSubtensorProgressTrueFlatAndAdvancingResetControls(t *testing.T) {
+	signal := NewSubtensorSignal()
+	gate := newCadenceAlertGate()
+	for cadence := 0; cadence < 5; cadence++ {
+		progress := requireAlertClass(t, subtensorProgressPauseTestAlerts(t, 1200, 1200, 3), "subtensor-progress")
+		ready := gate.filter(signal, Alerts{progress})
+		if cadence == 4 && requireAlertClass(t, ready, "subtensor-progress").Severity != SeverityPage {
+			t.Fatal("true-flat control lost its existing page threshold")
+		}
+	}
+	advancing := subtensorProgressPauseTestAlerts(t, 1200, 1201, 3)
+	for _, alert := range advancing {
+		if alert.Class == "subtensor-progress" {
+			t.Fatal("one advancing within-run sample retained progress failure")
+		}
+	}
+	gate.filter(signal, advancing)
+	for cadence := 0; cadence < 3; cadence++ {
+		progress := requireAlertClass(t, subtensorProgressPauseTestAlerts(t, 1201, 1201, 3), "subtensor-progress")
+		ready := gate.filter(signal, Alerts{progress})
+		if cadence < 2 && len(ready) != 0 {
+			t.Fatal("advancing/reset control retained the prior progress streak")
+		}
+		if cadence == 2 && requireAlertClass(t, ready, "subtensor-progress").Severity != SeverityWarn {
+			t.Fatal("post-reset warning did not restart at the existing three-cadence threshold")
+		}
+	}
+}
+
+func TestSubtensorProgressPeerLossContextUnchanged(t *testing.T) {
+	alerts := subtensorProgressPauseTestAlerts(t, 1400, 1400, 0)
+	progress := requireAlertClass(t, alerts, "subtensor-progress")
+	peer := requireAlertClass(t, alerts, "subtensor-peers")
+	if !strings.Contains(progress.Mechanism, "co-resident with complete peer loss") || progress.Sustain != 3 || progress.PageSustain != 5 || peer.Sustain != 3 || peer.PageSustain != 5 {
+		t.Fatal("bounded narration correction changed independently observed peer-loss context or escalation")
+	}
+}

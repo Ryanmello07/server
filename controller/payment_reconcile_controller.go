@@ -434,13 +434,19 @@ type paymentReconcileRun struct {
 	emailFallbackEvents []*model.PaymentReconciliationEvent
 }
 
+func paymentReconcileStoreCanAdvanceWatermark(complete bool, dryRun bool, errorsBefore int, errorsAfter int) bool {
+	return complete && !dryRun && errorsAfter == errorsBefore
+}
+
+var addPaymentReconciliationEvent = model.AddPaymentReconciliationEvent
+
 func (self *paymentReconcileRun) record(
 	store string,
 	action string,
 	networkId *server.Id,
 	evidence string,
 	details map[string]any,
-) {
+) bool {
 	switch action {
 	case model.PaymentReconcileActionCredited, model.PaymentReconcileActionWouldCredit:
 		self.credited += 1
@@ -458,7 +464,7 @@ func (self *paymentReconcileRun) record(
 		self.skipped = append(self.skipped, store)
 		self.storeResult(store).Skipped = true
 	}
-	if err := model.AddPaymentReconciliationEvent(self.clientSession.Ctx, &model.PaymentReconciliationEvent{
+	if err := addPaymentReconciliationEvent(self.clientSession.Ctx, &model.PaymentReconciliationEvent{
 		RunId:     self.runId,
 		Store:     store,
 		NetworkId: networkId,
@@ -469,6 +475,28 @@ func (self *paymentReconcileRun) record(
 	}); err != nil {
 		// the audit trail must never turn a completed repair into a failed run
 		glog.Errorf("[reconcile]could not record %s/%s event: %s\n", store, action, err)
+		return false
+	}
+	return true
+}
+
+// recordCreditUnfulfillable is the narrow exception to record's best-effort
+// contract. This event is the only durable handle for a paid invoice that the
+// lifecycle lock refused to credit. If it is not persisted, count a store
+// error so the watermark stays fixed and the ordinary overlap retries it.
+// Completed credits/ends/metadata repairs retain their existing best-effort
+// audit behavior: their durable business writes must not be re-executed merely
+// because the secondary audit insert failed.
+func (self *paymentReconcileRun) recordCreditUnfulfillable(store string, evidence string) {
+	if !self.record(
+		store,
+		model.PaymentReconcileActionCreditUnfulfillable,
+		nil,
+		evidence,
+		map[string]any{"reason": "destination_deleted", "leg": "credit"},
+	) {
+		self.errors += 1
+		self.storeResult(store).Errors += 1
 	}
 }
 
@@ -574,6 +602,13 @@ func (self *paymentReconcileRun) storeResult(store string) *PaymentReconcileStor
 		self.storeResults[store] = summary
 	}
 	return summary
+}
+
+func (self *paymentReconcileRun) storeErrorCount(store string) int {
+	if summary := self.storeResults[store]; summary != nil {
+		return summary.Errors
+	}
+	return 0
 }
 
 func (self *paymentReconcileRun) storeDetail(store string) map[string]any {
@@ -733,6 +768,7 @@ func runPaymentReconciliation(
 
 		run.budget = paymentReconcileApiBudget
 		since := run.sinceWatermark(storeReconcile.store)
+		storeErrorsBefore := run.storeErrorCount(storeReconcile.store)
 
 		// one store's failure -- error or panic -- never stops the others
 		func() {
@@ -759,7 +795,12 @@ func runPaymentReconciliation(
 					"",
 					map[string]any{"error": err.Error()},
 				)
-			} else if complete && !run.dryRun {
+			} else if paymentReconcileStoreCanAdvanceWatermark(
+				complete,
+				run.dryRun,
+				storeErrorsBefore,
+				run.storeErrorCount(storeReconcile.store),
+			) {
 				// the next run's listing starts here (minus the overlap
 				// backoff); a dry run never advances the watermark -- the
 				// un-eaten window is what the later real run reconciles
@@ -922,6 +963,13 @@ func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 				if id, err := server.ParseId(fullInvoice.Subscription.Metadata["network_id"]); err == nil {
 					networkId = &id
 				}
+				if networkId != nil && !model.NetworkExists(ctx, *networkId) {
+					// Match the real credit's lifecycle-lock refusal without
+					// consuming its ledger or pretending a different destination
+					// would receive the paid invoice.
+					run.recordCreditUnfulfillable(store, invoice.Id)
+					continue
+				}
 				run.record(
 					store,
 					model.PaymentReconcileActionWouldCredit,
@@ -938,6 +986,14 @@ func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 			// stripe_invoice ledger gate, so a racing late webhook delivery for
 			// the same invoice credits exactly once between the two of them
 			if _, err := stripeHandleInvoicePaid(invoice, run.clientSession); err != nil {
+				if errors.Is(err, model.ErrPaymentNetworkNotFound) {
+					// The paid invoice is real, but the named destination no
+					// longer exists. Keep that terminal business exception
+					// durable without classing it as an adapter failure that pins
+					// the entire Stripe listing watermark.
+					run.recordCreditUnfulfillable(store, invoice.Id)
+					continue
+				}
 				run.record(
 					store,
 					model.PaymentReconcileActionError,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,10 @@ func TestMissingOriginSignalSyntheticFallbackFromNormalBeforeDetailRollout(t *te
 		"original wire bit",
 		"active top-level providers",
 		"maximum client-window lifetime",
+		"Connect commit ec34ce1",
+		"Connect commit 55daddb",
+		"source_owner=other excludes that singleton but does not identify an application",
+		"still-installed older client can reconnect",
 		"provider return paths and same-network peers",
 		"§2.20 reports zero successful contracts",
 		"server commit c8dfe570",
@@ -44,15 +49,76 @@ func TestMissingOriginSignalSyntheticFallbackFromNormalBeforeDetailRollout(t *te
 	}
 }
 
+func TestMissingOriginSignalDocumentationContract(t *testing.T) {
+	catalogBytes, err := os.ReadFile("SIGNALS.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := string(catalogBytes)
+	sectionStart := strings.Index(catalog, "### 2.17 Missing companion-origin contract rate")
+	sectionEnd := strings.Index(catalog, "### 2.18 Stale contract destination rejection")
+	if sectionStart < 0 || sectionEnd <= sectionStart {
+		t.Fatal("SIGNALS.md does not contain a bounded §2.17 section")
+	}
+	section := strings.Join(strings.Fields(catalog[sectionStart:sectionEnd]), " ")
+	for _, want := range []string{
+		"Selected/discovery windows additionally require `ec34ce1`",
+		"Provider-return source owners additionally require `55daddb`",
+		"`source_owner=egress_prober` selects only the server-owned singleton",
+		"`source_owner=other` excludes that singleton but does not identify a product, application, device, or artifact",
+		"A complete older-schema cohort is retained as `unattributed`, never folded into `other`",
+		"A still-installed older client can reconnect and create another legacy window indefinitely",
+		"elapsed time alone is not artifact convergence",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("SIGNALS.md §2.17 missing %q:\n%s", want, section)
+		}
+	}
+}
+
+// Pin the rolling-rate trigger separately from sustained recovery verification.
+func TestMissingOriginSignalDocumentationRollingSampleTrigger(t *testing.T) {
+	catalogBytes, err := os.ReadFile("SIGNALS.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summaryRow string
+	for _, line := range strings.Split(string(catalogBytes), "\n") {
+		if strings.HasPrefix(line, "| missing-origin-rate |") {
+			if summaryRow != "" {
+				t.Fatal("SIGNALS.md repeats the missing-origin-rate summary row")
+			}
+			summaryRow = strings.Join(strings.Fields(line), " ")
+		}
+	}
+	if summaryRow == "" {
+		t.Fatal("SIGNALS.md is missing the missing-origin-rate summary row")
+	}
+	for _, want := range []string{
+		"> 500/min on one validated rolling-[5m] sample",
+		"WARN/Sustain1",
+		"two comparable complete five-minute windows are recovery verification, not extra trigger sustain",
+	} {
+		if !strings.Contains(summaryRow, want) {
+			t.Fatalf("missing-origin summary omits %q: %s", want, summaryRow)
+		}
+	}
+	if strings.Contains(summaryRow, "> 500/min for 5 min") {
+		t.Fatalf("missing-origin summary retained an extra sustain gate: %s", summaryRow)
+	}
+}
+
 func TestMissingOriginSignalSyntheticCompleteDetailedCohorts(t *testing.T) {
 	now := time.Date(2026, 9, 2, 15, 37, 0, 0, time.UTC)
 	payload := missingOriginFixtureWithDetailsJSON(t, now, 1411.325, []missingOriginDetailFixture{
 		{
+			senderRole: "server", sourceOwner: "egress_prober",
 			resolution: "stream_fallback", relationship: "network",
 			sourceLifecycle: "active_top", destinationLifecycle: "active_derived",
 			rate: 1200,
 		},
 		{
+			senderRole: "client", sourceOwner: "other",
 			resolution: "stream_fallback", relationship: "public",
 			sourceLifecycle: "active_top", destinationLifecycle: "active_top",
 			rate: 211.325,
@@ -70,6 +136,12 @@ func TestMissingOriginSignalSyntheticCompleteDetailedCohorts(t *testing.T) {
 		"detail_status=complete",
 		"detail_series=2",
 		"detail_rate_per_minute=1411.325",
+		"sender_server_rate_per_minute=1200.000",
+		"sender_client_rate_per_minute=211.325",
+		"source_owner_egress_prober_rate_per_minute=1200.000",
+		"source_owner_other_rate_per_minute=211.325",
+		"dominant_sender_role=server",
+		"dominant_source_owner=egress_prober",
 		"dominant_resolution=stream_fallback",
 		"dominant_relationship=network",
 		"dominant_source_lifecycle=active_top",
@@ -78,10 +150,47 @@ func TestMissingOriginSignalSyntheticCompleteDetailedCohorts(t *testing.T) {
 		"fixed vocabulary",
 		"summed detail rate reconciles",
 		"not an endpoint identity",
+		"not accepted from the request",
+		"source_owner=egress_prober identifies only the server-owned singleton",
+		"No metric label proves client artifact adoption",
 	} {
 		if !strings.Contains(alert.Markdown(), want) {
 			t.Fatalf("complete-detail alert missing %q:\n%s", want, alert.Markdown())
 		}
+	}
+}
+
+func TestMissingOriginSignalSyntheticLegacyDetailStaysUnattributed(t *testing.T) {
+	now := time.Date(2026, 9, 13, 19, 40, 0, 0, time.UTC)
+	payload := missingOriginFixtureWithDetailsJSON(t, now, 900, []missingOriginDetailFixture{{
+		omitAttribution: true,
+		resolution:      "stream_fallback", relationship: "public",
+		sourceLifecycle: "active_top", destinationLifecycle: "active_derived",
+		rate: 900,
+	}})
+	alerts, err := NewMissingOriginSignal().Run(
+		context.Background(),
+		missingOriginSyntheticSettings(t, now, payload),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := requireAlertClass(t, alerts, "missing-origin-rate").Markdown()
+	for _, want := range []string{
+		"detail_status=complete",
+		"sender_unattributed_rate_per_minute=900.000",
+		"source_owner_unattributed_rate_per_minute=900.000",
+		"dominant_sender_role=unattributed",
+		"dominant_source_owner=unattributed",
+		"unattributed is an older API schema rather than a cause",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("legacy-detail alert missing %q:\n%s", want, markdown)
+		}
+	}
+	if strings.Contains(markdown, "dominant_source_owner=other") ||
+		strings.Contains(markdown, "dominant_source_owner=egress_prober") {
+		t.Fatalf("legacy detail was falsely attributed:\n%s", markdown)
 	}
 }
 
@@ -142,6 +251,25 @@ func TestMissingOriginSignalSyntheticAmbiguousDetailsStayRedacted(t *testing.T) 
 				extraLabels: map[string]string{"customer_id": secret},
 			}},
 			want: "unexpected_detail_label_set",
+		},
+		{
+			name: "half-upgraded attribution schema",
+			details: []missingOriginDetailFixture{{
+				omitAttribution: true,
+				resolution:      "stream_fallback", relationship: "network",
+				sourceLifecycle: "active_top", destinationLifecycle: "active_derived", rate: 1400,
+				extraLabels: map[string]string{"sender_role": "client"},
+			}},
+			want: "unexpected_detail_label_set",
+		},
+		{
+			name: "producer cannot emit monitor rollout class",
+			details: []missingOriginDetailFixture{{
+				senderRole: "client", sourceOwner: "unattributed",
+				resolution: "stream_fallback", relationship: "network",
+				sourceLifecycle: "active_top", destinationLifecycle: "active_derived", rate: 1400,
+			}},
+			want: "invalid_detail_labels",
 		},
 		{
 			name: "duplicate cohort",
@@ -276,7 +404,7 @@ func missingOriginSyntheticSettings(t testing.TB, now time.Time, payload string)
 			!strings.Contains(command, "missing_companion_origin") ||
 			!strings.Contains(command, "companion%3D%22false%22") ||
 			!strings.Contains(command, "request_companion%3D%22false%22") ||
-			!strings.Contains(command, "sum+by+%28resolution%2Crelationship%2Csource_lifecycle%2Cdestination_lifecycle%29") ||
+			!strings.Contains(command, "sum+by+%28sender_role%2Csource_owner%2Cresolution%2Crelationship%2Csource_lifecycle%2Cdestination_lifecycle%29") ||
 			!strings.Contains(command, "monitor_metric") ||
 			!strings.Contains(command, "%5B5m%5D") ||
 			!strings.Contains(command, "%22synthetic%22") {
@@ -311,6 +439,9 @@ func missingOriginFixtureJSON(t testing.TB, sampleTime time.Time, rates []float6
 }
 
 type missingOriginDetailFixture struct {
+	senderRole           string
+	sourceOwner          string
+	omitAttribution      bool
 	resolution           string
 	relationship         string
 	sourceLifecycle      string
@@ -342,6 +473,18 @@ func missingOriginFixtureWithDetailsJSON(
 			"relationship":          detail.relationship,
 			"source_lifecycle":      detail.sourceLifecycle,
 			"destination_lifecycle": detail.destinationLifecycle,
+		}
+		if !detail.omitAttribution {
+			senderRole := detail.senderRole
+			if senderRole == "" {
+				senderRole = "client"
+			}
+			sourceOwner := detail.sourceOwner
+			if sourceOwner == "" {
+				sourceOwner = "other"
+			}
+			labels["sender_role"] = senderRole
+			labels["source_owner"] = sourceOwner
 		}
 		for key, value := range detail.extraLabels {
 			labels[key] = value

@@ -49,8 +49,11 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 		networkB := server.NewId()
 		activeTop := server.NewId()
 		activeDerived := server.NewId()
+		activeGrandchild := server.NewId()
 		inactiveTop := server.NewId()
 		inactiveDerived := server.NewId()
+		missingSource := server.NewId()
+		rotatedProberClient := server.NewId()
 
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(
@@ -62,7 +65,8 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					($1, $2, true, NULL),
 					($3, $2, true, $1),
 					($4, $5, false, NULL),
-					($6, $5, false, $1)
+					($6, $5, false, $4),
+					($7, $2, true, $3)
 				`,
 				activeTop,
 				networkA,
@@ -70,6 +74,27 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 				inactiveTop,
 				networkB,
 				inactiveDerived,
+				activeGrandchild,
+			))
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+				INSERT INTO prober_identity (singleton, network_id, client_id)
+				VALUES (true, $1, $2)
+				ON CONFLICT (singleton) DO UPDATE
+				SET
+					network_id = excluded.network_id,
+					client_id = excluded.client_id
+				`,
+				networkA,
+				activeTop,
+			))
+			// Credential rotation changes the singleton's current client without
+			// changing ownership of existing or nested clients in its network.
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE prober_identity SET client_id = $1 WHERE singleton`,
+				rotatedProberClient,
 			))
 		})
 
@@ -87,6 +112,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					Mode:                 ProvideModeNetwork,
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleActiveDerived,
+					SourceOwner:          NetworkClientSourceOwnerEgressProber,
 				},
 			},
 			{
@@ -97,6 +123,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					Mode:                 ProvideModePublic,
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleInactiveDerived,
+					SourceOwner:          NetworkClientSourceOwnerEgressProber,
 				},
 			},
 			{
@@ -107,6 +134,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					Mode:                 ProvideModeNetwork,
 					SourceLifecycle:      NetworkClientLifecycleInactiveDerived,
 					DestinationLifecycle: NetworkClientLifecycleInactiveTop,
+					SourceOwner:          NetworkClientSourceOwnerOther,
 				},
 			},
 			{
@@ -117,6 +145,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					Mode:                 ProvideModePublic,
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleMissing,
+					SourceOwner:          NetworkClientSourceOwnerEgressProber,
 				},
 			},
 			{
@@ -127,6 +156,40 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					Mode:                 ProvideModeNetwork,
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleActiveTop,
+					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+				},
+			},
+			{
+				name:        "ordinary source",
+				source:      inactiveTop,
+				destination: activeTop,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModePublic,
+					SourceLifecycle:      NetworkClientLifecycleInactiveTop,
+					DestinationLifecycle: NetworkClientLifecycleActiveTop,
+					SourceOwner:          NetworkClientSourceOwnerOther,
+				},
+			},
+			{
+				name:        "nested prober descendant after root rotation",
+				source:      activeGrandchild,
+				destination: inactiveTop,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModePublic,
+					SourceLifecycle:      NetworkClientLifecycleActiveDerived,
+					DestinationLifecycle: NetworkClientLifecycleInactiveTop,
+					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+				},
+			},
+			{
+				name:        "missing source remains unknown",
+				source:      missingSource,
+				destination: activeTop,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModePublic,
+					SourceLifecycle:      NetworkClientLifecycleMissing,
+					DestinationLifecycle: NetworkClientLifecycleActiveTop,
+					SourceOwner:          NetworkClientSourceOwnerUnknown,
 				},
 			},
 		} {
@@ -136,6 +199,20 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 			if got := GetProvideRelationship(ctx, test.source, test.destination); got != test.want.Mode {
 				t.Fatalf("%s: GetProvideRelationship() = %d, want %d", test.name, got, test.want.Mode)
 			}
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `UPDATE prober_identity SET network_id = NULL WHERE singleton`))
+		})
+		if got := GetProvideRelationshipDetails(ctx, activeTop, inactiveTop); got.SourceOwner != NetworkClientSourceOwnerUnknown {
+			t.Fatalf("NULL prober network source owner = %q, want %q", got.SourceOwner, NetworkClientSourceOwnerUnknown)
+		}
+
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `DELETE FROM prober_identity WHERE singleton`))
+		})
+		if got := GetProvideRelationshipDetails(ctx, activeTop, inactiveTop); got.SourceOwner != NetworkClientSourceOwnerUnknown {
+			t.Fatalf("missing prober singleton source owner = %q, want %q", got.SourceOwner, NetworkClientSourceOwnerUnknown)
 		}
 	})
 }
@@ -150,7 +227,7 @@ func TestNetworkClientHandlerLifecycle(t *testing.T) {
 		connectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			"0.0.0.0:0",
+			"192.0.2.1:0",
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -194,7 +271,7 @@ func TestNetworkClientHandlerLifecycleIPV6(t *testing.T) {
 		connectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			"2001:5a8:4683:4e00:3a76:dcec:7cb:f180:40894",
+			"2001:db8:4683:4e00:3a76:dcec:7cb:f180:40894",
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -234,7 +311,7 @@ func TestCloseExpiredNetworkClientHandlersClosesOrphanedConnections(t *testing.T
 		orphanConnectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			server.NewId(),
-			"10.0.0.1:20000",
+			"192.0.2.1:20000",
 			orphanHandlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -243,7 +320,7 @@ func TestCloseExpiredNetworkClientHandlersClosesOrphanedConnections(t *testing.T
 		liveConnectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			server.NewId(),
-			"10.0.0.2:20000",
+			"192.0.2.2:20000",
 			liveHandlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -277,7 +354,7 @@ func TestNetworkClientLifecycle(t *testing.T) {
 		connectionId, _, _, _, err := ConnectNetworkClient(
 			ctx,
 			clientId,
-			"0.0.0.0:0",
+			"192.0.2.1:0",
 			handlerId,
 		)
 		connect.AssertEqual(t, err, nil)
@@ -592,7 +669,15 @@ func TestRemoveNetworkClientsDeactivatesTargetedClients(t *testing.T) {
 			},
 		}
 
-		beforeCall := server.NowUtc()
+		var beforeCall time.Time
+		server.Db(ctx, func(conn server.PgConn) {
+			if err := conn.QueryRow(
+				ctx,
+				`SELECT clock_timestamp() AT TIME ZONE 'UTC'`,
+			).Scan(&beforeCall); err != nil {
+				t.Fatal(err)
+			}
+		})
 		_, err := RemoveNetworkClients(&RemoveNetworkClientsArgs{
 			ClientIds: []server.Id{clientIdA, clientIdB},
 		}, sess)
@@ -626,7 +711,7 @@ func TestRemoveNetworkClientsDeactivatesTargetedClients(t *testing.T) {
 			t.Fatal("deactivate_time was not set")
 		}
 		if deactivateTime.Before(beforeCall) {
-			t.Fatal("deactivate_time predates the call")
+			t.Fatal("deactivate_time predates the database-clock control")
 		}
 	})
 }
@@ -1677,12 +1762,12 @@ func TestSweepOrphanConnectionAndClientData(t *testing.T) {
 		liveClientId := server.NewId()
 		liveDeviceId := server.NewId()
 		Testing_CreateDevice(ctx, server.NewId(), liveDeviceId, liveClientId, "test", "test")
-		liveConnectionId := newConnectionData(liveClientId, "10.1.1.1:20000")
+		liveConnectionId := newConnectionData(liveClientId, "192.0.2.1:20000")
 		SetClientTlsCertificateWithSignature(ctx, liveClientId, []byte("live-pem"), nil)
 
 		// orphan the dependent rows: delete the connection row directly,
 		// simulating a deletion path that did not cascade
-		orphanConnectionId := newConnectionData(server.NewId(), "10.2.2.2:20000")
+		orphanConnectionId := newConnectionData(server.NewId(), "192.0.2.17:20000")
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(
 				ctx,
@@ -1961,7 +2046,7 @@ func TestRemoveDisconnectedCascadesReapedClients(t *testing.T) {
 
 		// a disconnected connection with location/latency/speed rows, which
 		// must be cascaded with the connection delete
-		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "10.7.8.9:20000", server.NewId())
+		connectionId, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.9:20000", server.NewId())
 		connect.AssertEqual(t, err, nil)
 		location := &Location{
 			LocationType: LocationTypeCity,
@@ -2298,7 +2383,7 @@ func TestRemoveDisconnectedNetworkClientsTopLevelReap(t *testing.T) {
 
 		// stale auth time but currently connected: must not be marked
 		connectedClientId := newClient()
-		_, _, _, _, err := ConnectNetworkClient(ctx, connectedClientId, "127.0.0.1:20000", server.NewId())
+		_, _, _, _, err := ConnectNetworkClient(ctx, connectedClientId, "192.0.2.1:20000", server.NewId())
 		connect.AssertEqual(t, err, nil)
 		setAuthTime(connectedClientId, idleAuthTime)
 
@@ -2421,7 +2506,7 @@ func TestConnectNetworkClientAuthTimeThrottle(t *testing.T) {
 
 		// a fresh auth_time is not refreshed on connect, and the throttled
 		// connect still succeeds
-		_, _, _, _, err := ConnectNetworkClient(ctx, clientId, "10.0.0.1:20000", server.NewId())
+		_, _, _, _, err := ConnectNetworkClient(ctx, clientId, "192.0.2.1:20000", server.NewId())
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, authTime().Equal(initialAuthTime), true)
 
@@ -2429,7 +2514,7 @@ func TestConnectNetworkClientAuthTimeThrottle(t *testing.T) {
 		// refreshed to ~now on connect
 		staleAuthTime := server.NowUtc().Add(-2 * clientAuthTimeRefreshMinInterval)
 		setAuthTime(staleAuthTime)
-		_, _, _, _, err = ConnectNetworkClient(ctx, clientId, "10.0.0.1:20001", server.NewId())
+		_, _, _, _, err = ConnectNetworkClient(ctx, clientId, "192.0.2.1:20001", server.NewId())
 		connect.AssertEqual(t, err, nil)
 		refreshedAuthTime := authTime()
 		connect.AssertEqual(t, staleAuthTime.Before(refreshedAuthTime), true)
@@ -2499,7 +2584,7 @@ func TestRemoveDisconnectedChildReapBumpsConnected(t *testing.T) {
 
 		// stale child with a live connection: bumped out of the band, not reaped
 		connectedChildId := newClient(&parentClientId)
-		_, _, _, _, err := ConnectNetworkClient(ctx, connectedChildId, "10.0.0.2:20000", server.NewId())
+		_, _, _, _, err := ConnectNetworkClient(ctx, connectedChildId, "192.0.2.2:20000", server.NewId())
 		connect.AssertEqual(t, err, nil)
 		setAuthTime(connectedChildId, staleAuthTime)
 

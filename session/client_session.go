@@ -108,9 +108,11 @@ func ResolveClientAddress(req *http.Request) (string, error) {
 
 	forwardedValues := req.Header.Values(urForwardedForHeader)
 	if len(forwardedValues) == 0 {
+		noteClientAddressSource(clientAddressSourcePeerAbsent, remote)
 		return remote.String(), nil
 	}
 	if len(forwardedValues) != 1 {
+		noteClientAddressSource(clientAddressSourcePeerRepeated, remote)
 		glog.Errorf(
 			"[session]%s must be one ingress-overwritten ip:port value; using peer %s\n",
 			urForwardedForHeader,
@@ -121,10 +123,12 @@ func ResolveClientAddress(req *http.Request) (string, error) {
 
 	forwardedValue := strings.TrimSpace(forwardedValues[0])
 	if forwardedValue == "" {
+		noteClientAddressSource(clientAddressSourcePeerEmpty, remote)
 		return remote.String(), nil
 	}
 	forwarded, err := parseRequestAddress(forwardedValue)
 	if err != nil {
+		noteClientAddressSource(clientAddressSourcePeerMalformed, remote)
 		// Do not log the value: a future ingress regression could make it
 		// caller-controlled. The peer and fixed header name are actionable.
 		glog.Errorf(
@@ -134,6 +138,7 @@ func ResolveClientAddress(req *http.Request) (string, error) {
 		)
 		return remote.String(), nil
 	}
+	noteClientAddressSource(clientAddressSourceUrHeader, remote)
 	return forwarded.String(), nil
 }
 
@@ -168,7 +173,11 @@ func NewLocalClientSessionWithAddressHash(ctx context.Context, clientAddressHash
 }
 
 // Sets authentication claims or returns an authentication error.
-func (self *ClientSession) Auth(req *http.Request) error {
+func (self *ClientSession) Auth(req *http.Request) (returnErr error) {
+	method := requestAuthMethod(req)
+	defer func() {
+		recordSessionAuth(method, self.ByJwt, returnErr)
+	}()
 	if auth := req.Header.Get("Authorization"); auth != "" {
 		if strings.HasPrefix(auth, authBearerPrefix) {
 			authStr := auth[len(authBearerPrefix):]

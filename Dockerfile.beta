@@ -20,6 +20,9 @@ COPY ./goidenticons /workspace/goidenticons
 # operator-proxy directly), so it is now a build dependency, not just a
 # separately-deployed service.
 COPY ./operator-proxy /workspace/operator-proxy
+# required since the 2026-09-15 upstream merge: alt/ imports
+# github.com/urnetwork/warp/services, so warp is a build dependency now.
+COPY ./warp /workspace/warp
 
 WORKDIR /workspace/server
 # Build only the binaries the beta stack runs, not ./... . Beta ships these

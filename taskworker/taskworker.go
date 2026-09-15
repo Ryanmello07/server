@@ -44,6 +44,8 @@ func InitTasks(ctx context.Context) {
 		work.ScheduleRemoveExpiredAuthCodes(clientSession, tx)
 		controller.ScheduleAppleOfferCodeTopUp(clientSession, tx, server.NowUtc().Add(1*time.Hour))
 		controller.ScheduleOnboardingResultsRollup(clientSession, tx, onboarding.NextRollupAt(server.NowUtc()))
+		controller.ScheduleOnboardingEmailTrackerSync(clientSession, tx, server.NowUtc())
+		controller.ScheduleSubscriptionMetricsSync(clientSession, tx, server.NowUtc())
 		work.SchedulePayout(clientSession, tx)
 		work.ScheduleProcessPendingPayouts(clientSession, tx)
 		work.ScheduleCancelHungAccountPayments(clientSession, tx)
@@ -77,6 +79,8 @@ func InitTasks(ctx context.Context) {
 		work.ScheduleProberBootstrap(clientSession, tx)
 		work.ScheduleRefreshGeolocationSourcePins(clientSession, tx)
 		work.ScheduleProviderEgressProbeTasks(clientSession, tx)
+		work.ScheduleExtenderProbe(clientSession, tx)
+		work.ScheduleExtenderPublish(clientSession, tx)
 		work.ScheduleRemoveExpiredBulkClientRemovalQuota(clientSession, tx)
 		work.ScheduleRemoveOldAuditNetworkEvents(clientSession, tx)
 		work.ScheduleRemoveOldAuditEvents(clientSession, tx)
@@ -311,6 +315,14 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.ProviderEgressProbePost,
 		),
 		task.NewTaskTargetWithPost(
+			work.ExtenderProbe,
+			work.ExtenderProbePost,
+		),
+		task.NewTaskTargetWithPost(
+			work.ExtenderPublish,
+			work.ExtenderPublishPost,
+		),
+		task.NewTaskTargetWithPost(
 			work.RemoveExpiredBulkClientRemovalQuota,
 			work.RemoveExpiredBulkClientRemovalQuotaPost,
 		),
@@ -389,6 +401,14 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 		task.NewTaskTargetWithPost(
 			controller.OnboardingResultsRollup,
 			controller.OnboardingResultsRollupPost,
+		),
+		task.NewTaskTargetWithPost(
+			controller.OnboardingEmailTrackerSync,
+			controller.OnboardingEmailTrackerSyncPost,
+		),
+		task.NewTaskTargetWithPost(
+			controller.SubscriptionMetricsSync,
+			controller.SubscriptionMetricsSyncPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.UpdateClientLocations,

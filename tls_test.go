@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/pem"
 	"os"
 	"path/filepath"
@@ -208,10 +209,9 @@ func TestTransportTlsWildcardFallsBackFromPartialRotations(t *testing.T) {
 }
 
 func TestTransportTls(t *testing.T) {
-
-	// create from config
-
-	// get various certs that should exist
+	if os.Getenv("WARP_TEST_ENV_USE_PORTABLE_RESOURCES") != "1" {
+		t.Skip("requires the portable synthetic TLS fixture")
+	}
 
 	settings := &TransportTlsSettings{
 		EnableSelfSign: false,
@@ -219,26 +219,13 @@ func TestTransportTls(t *testing.T) {
 	transportTls, err := NewTransportTlsFromConfig(settings)
 	connect.AssertEqual(t, err, nil)
 
-	tlsConfig, err := transportTls.GetTlsConfig("ur.network")
+	tlsConfig, err := transportTls.GetTlsConfig("fixture.example")
 	connect.AssertEqual(t, err, nil)
 	connect.AssertNotEqual(t, tlsConfig, nil)
 
-	tlsConfig, err = transportTls.GetTlsConfig("bringyour.com")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
-	tlsConfig, err = transportTls.GetTlsConfig("main-connect.ur.network")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
-	tlsConfig, err = transportTls.GetTlsConfig("main-connect.bringyour.com")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
-	tlsConfig, err = transportTls.GetTlsConfig("foo.ur.network")
+	tlsConfig, err = transportTls.GetTlsConfig("unlisted.fixture.example")
 	connect.AssertNotEqual(t, err, nil)
 	connect.AssertEqual(t, tlsConfig, nil)
-
 }
 
 func TestTransportTlsSelfSign(t *testing.T) {
@@ -249,28 +236,39 @@ func TestTransportTlsSelfSign(t *testing.T) {
 	transportTls, err := NewTransportTlsFromConfig(settings)
 	connect.AssertEqual(t, err, nil)
 
-	tlsConfig, err := transportTls.GetTlsConfig("ur.network")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
+	for _, hostName := range []string{
+		"fixture.example",
+		"unlisted.fixture.example",
+		"deep.unlisted.fixture.example",
+	} {
+		tlsConfig, err := transportTls.GetTlsConfig(hostName)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertNotEqual(t, tlsConfig, nil)
+	}
+}
 
-	tlsConfig, err = transportTls.GetTlsConfig("bringyour.com")
+// A self-signed identity must be valid when it is created. Measuring the
+// validity window from the back-dated start let the back-dating consume the
+// whole window, so every generated certificate had already expired and any
+// client that verified it failed the handshake.
+func TestTransportTlsSelfSignIsValidWhenItIsCreated(t *testing.T) {
+	transportTls := NewTransportTls(map[string]bool{}, &TransportTlsSettings{
+		EnableSelfSign: true,
+	})
+	tlsConfig, err := transportTls.GetTlsConfig("fixture.example")
 	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
 
-	tlsConfig, err = transportTls.GetTlsConfig("main-connect.ur.network")
+	certificate, err := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])
 	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
-	tlsConfig, err = transportTls.GetTlsConfig("main-connect.bringyour.com")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
-	tlsConfig, err = transportTls.GetTlsConfig("foo.ur.network")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
-	tlsConfig, err = transportTls.GetTlsConfig("foo2.bar.ur.network")
-	connect.AssertEqual(t, err, nil)
-	connect.AssertNotEqual(t, tlsConfig, nil)
-
+	now := time.Now()
+	if now.Before(certificate.NotBefore) {
+		t.Fatalf("self-signed certificate is not yet valid: %s is before %s", now, certificate.NotBefore)
+	}
+	if certificate.NotAfter.Before(now) {
+		t.Fatalf("self-signed certificate has expired: %s is after %s", now, certificate.NotAfter)
+	}
+	// the whole configured window remains, less the time it took to create
+	if certificate.NotAfter.Before(now.Add(179 * 24 * time.Hour)) {
+		t.Fatalf("self-signed certificate expires at %s, less than the configured window from %s", certificate.NotAfter, now)
+	}
 }

@@ -30,12 +30,15 @@ func TestLogErrorsSignalSyntheticStructuredProblemClasses(t *testing.T) {
 	}{
 		{"dial timeout", "dial tcp 192.0.2.1:6380: i/o timeout", "dial-io-timeout"},
 		{"connection refused", "connect: connection refused", "connection-refused"},
+		{"Grafana local Mimir refusal", `Stats push error (Post "http://synthetic-mimir.invalid:14818/api/v1/push": dial tcp synthetic-mimir.invalid:14818: connect: connection refused)`, "grafana-mimir-push-refused"},
 		{"Connect TLS disabled", "[c]Could not initialize tls config. Disabling transport. = synthetic loader failure", "connect-tls-disabled"},
 		{"port exhaustion", "connect: cannot assign requested address", "port-exhaustion"},
 		{"pool timeout", "redis: connection pool timeout", "pool-timeout"},
 		{"cluster down", "CLUSTERDOWN Hash slot not served", "clusterdown"},
 		{"oom writes", "OOM command not allowed when used memory > maxmemory", "oom-writes"},
 		{"Mimir series admission", "Stats push rejected (400): per-user series limit of 75000 exceeded", "mimir-series-limit"},
+		{"Mimir structured rate admission", "Stats push rejected status=429 reason=rate-limit job=api metric_families=2 time_series=3 family_classes=go:1,process:1 family_classes_truncated=false", "mimir-ingestion-rate-limit"},
+		{"Mimir structured other rejection", "Stats push rejected status=503 reason=server job=other metric_families=1 time_series=1 family_classes=other:1 family_classes_truncated=false", "mimir-push-rejected"},
 		{"Loki tail backend EOF", `level=error caller=tail.go:230 component=tail-querier org_id=fake msg="Error receiving response from grpc tail client" addr=192.0.2.10:6490 err=EOF`, "loki-tail-backend-eof"},
 		{"Loki tail dropped streams", `level=info caller=tailer.go:271 msg="tailer dropped streams is reset" length=100`, "loki-tail-dropped-streams"},
 		{"Warpctl direct Loki tail loss", `[warpctl][loki-tail-dropped-entries] service=proxy count=2`, "loki-tail-dropped-entries"},
@@ -45,6 +48,9 @@ func TestLogErrorsSignalSyntheticStructuredProblemClasses(t *testing.T) {
 		{"required vault", "panic: Resource not found in vault (verify.yml)", "required-vault-resource"},
 		{"grafana plugin", "error=\"the result-set has errors: [plugin.notRegistered] plugin not registered\"", "grafana-plugin-unregistered"},
 		{"source attribution", "[session]X-UR-Forwarded-For from untrusted peer", "source-attribution"},
+		{"onboarding post-primary canceled", "[onboarding]campaign enrollment failed for network synthetic-network: Done", "onboarding-post-primary-canceled"},
+		{"onboarding app-open attribution", "[onboarding]app open attribution failed for network synthetic-private-network: ERROR: inconsistent types deduced for parameter $4 (SQLSTATE 42P08)", "onboarding-app-open-attribution"},
+		{"onboarding connect-day write", "[onboarding]connect.day write failed for client private-client.fixture.example: ERROR: inconsistent types deduced for parameter $3 (SQLSTATE 42P08)", "onboarding-connect-day-write"},
 		{"HTTP write after hijack", "http: response.WriteHeader on hijacked connection from github.com/urnetwork/server/router.(*Router).ServeHTTP.func1.1 (router.go:104)", "http-hijack-write"},
 		{"negative escrow", "[netescrow]negative counter after release", "netescrow-negative"},
 		{"escrow mirror write", "[netescrow]mirror write failed after reservation: i/o timeout", "netescrow-mirror-write"},
@@ -55,8 +61,14 @@ func TestLogErrorsSignalSyntheticStructuredProblemClasses(t *testing.T) {
 		{"payment processor rate limit", `Bad status: 429 Too Many Requests {"code":5,"message":"API rate limit error"}`, "payment-processor-rate-limit"},
 		{"net escrow ttl", `[redis][ttl]"expireat" key="{escrow_019c640e-f467-4fa7-177f-d7ca43c33b6f}net" ttl 3139393191s-from-now exceeds 9600h0m0s`, "redis-netescrow-ttl"},
 		{"redis ttl", "[redis][ttl] suspicious ttl on key", "redis-ttl-suspect"},
+		{"HTTP drain hard cut", "[http]drain deadline after 1m10.25s: 2 connection(s) cut", "http-drain-cut"},
 		{"taskworker drain", "[taskworker]drain gave up with 2 tasks", "taskworker-drain-gave-up"},
 		{"legacy database maintenance", "[db]maintenance reindex[16/22] contract_close", "db-maintenance-legacy-reindex"},
+		{"legacy signal send", "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z][transport_p2p_webrtc.go:149][signal]send failed ->11111111-1111-1111-1111-111111111111", "signal-send-unclassified"},
+		{"signal admission", "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z][transport_p2p_webrtc.go:164][signal]send failed mode=receive-reply reason=not-admitted", "signal-send-not-admitted"},
+		{"signal encryption", "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z][transport_p2p_webrtc.go:164][signal]send failed mode=sender reason=encryption-not-ready", "signal-send-encryption-not-ready"},
+		{"signal closure", "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z][transport_p2p_webrtc.go:164][signal]send failed mode=sender reason=canceled-or-closed", "signal-send-canceled-or-closed"},
+		{"other signal error", "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z][transport_p2p_webrtc.go:164][signal]send failed mode=sender reason=other", "signal-send-other"},
 		{"tls identity", "CONTRACT vs FETCHED peer client public key MISMATCH", "tls-key-mitm"},
 		{"tls rotation", "peer client public key mismatch with prior commitment", "tls-key-rotate-refused"},
 		{"tls publication", "Invalid PEM in certificate chain", "tls-cert-publish-invalid"},
@@ -88,6 +100,349 @@ func TestLogErrorsSignalSyntheticStructuredProblemClasses(t *testing.T) {
 	}
 }
 
+func TestLogErrorsSignalKeepsLegacySignalSendCausallyUnclassifiedAndPrivate(t *testing.T) {
+	const privateDestination = "11111111-1111-1111-1111-111111111111"
+	line := "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z]" +
+		"[transport_p2p_webrtc.go:149][signal]send failed ->" + privateDestination
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-taskworker", nil
+		}
+		return strings.Repeat(line+"\n", novelRateThreshold), nil
+	}}
+
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := requireAlertClass(t, alerts, "signal-send-unclassified").Markdown()
+	for _, want := range []string{
+		"legacy destination omitted; result unavailable",
+		"boolean-only caller discarded",
+		"does not prove send capacity healthy",
+		"corrected from Taskworker to Connect",
+		"Do not infer pressure, lifecycle, transport failure",
+		"structured sender diagnostic",
+		"below 20/min for ten minutes",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("legacy signal-send alert missing %q:\n%s", want, markdown)
+		}
+	}
+	if strings.Contains(markdown, privateDestination) {
+		t.Fatalf("legacy signal-send alert retained destination id:\n%s", markdown)
+	}
+	for _, alert := range alerts {
+		if alert.Class == "novel" {
+			t.Fatalf("legacy signal-send line remained novel: %+v", alert)
+		}
+	}
+}
+
+func TestLogErrorsSignalClassifiesStructuredSignalSendReasons(t *testing.T) {
+	tests := []struct {
+		mode   string
+		reason string
+		class  string
+	}{
+		{mode: "receive-reply", reason: "not-admitted", class: "signal-send-not-admitted"},
+		{mode: "sender", reason: "encryption-not-ready", class: "signal-send-encryption-not-ready"},
+		{mode: "sender", reason: "canceled-or-closed", class: "signal-send-canceled-or-closed"},
+		{mode: "sender", reason: "other", class: "signal-send-other"},
+	}
+	for _, test := range tests {
+		line := fmt.Sprintf(
+			"[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z]"+
+				"[transport_p2p_webrtc.go:164][signal]send failed mode=%s reason=%s",
+			test.mode,
+			test.reason,
+		)
+		source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+			if len(args) > 1 && args[0] == "ls" {
+				return "repo names synthetic-taskworker", nil
+			}
+			return strings.Repeat(line+"\n", novelRateThreshold), nil
+		}}
+
+		alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		alert := requireAlertClass(t, alerts, test.class)
+		if !strings.Contains(alert.Observed, "frame="+test.mode) {
+			t.Errorf("%s alert omitted bounded mode: %+v", test.class, alert)
+		}
+		if !strings.Contains(alert.Markdown(), "mode="+test.mode+" reason="+test.reason) {
+			t.Errorf("%s alert omitted bounded sample: %s", test.class, alert.Markdown())
+		}
+		for _, other := range alerts {
+			if other.Class == "novel" {
+				t.Errorf("structured %s signal-send line remained novel: %+v", test.reason, other)
+			}
+		}
+	}
+}
+
+func TestLogErrorsSignalLeavesMalformedSignalSendNovel(t *testing.T) {
+	line := "[fixture-edge][taskworker][g2][cid:fixture][I][2026-09-11T22:04:45Z]" +
+		"[transport_p2p_webrtc.go:164][signal]send failed mode=receive-reply reason=network-error"
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-taskworker", nil
+		}
+		return strings.Repeat(line+"\n", novelRateThreshold), nil
+	}}
+
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireAlertClass(t, alerts, "novel")
+	for _, class := range []string{
+		"signal-send-unclassified",
+		"signal-send-not-admitted",
+		"signal-send-encryption-not-ready",
+		"signal-send-canceled-or-closed",
+		"signal-send-other",
+	} {
+		for _, alert := range alerts {
+			if alert.Class == class {
+				t.Fatalf("malformed signal-send line entered %s: %+v", class, alert)
+			}
+		}
+	}
+}
+
+func TestLogErrorsSignalRedactsOnboardingAppOpenAttribution(t *testing.T) {
+	const privateNetwork = "synthetic-private-network"
+	line := "[onboarding]app open attribution failed for network " + privateNetwork + ": ERROR: inconsistent types deduced for parameter $4 (SQLSTATE 42P08)"
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-api", nil
+		}
+		return line, nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "onboarding-app-open-attribution")
+	if alert.Severity != SeverityWarn {
+		t.Fatalf("onboarding attribution severity = %q, want warn", alert.Severity)
+	}
+	markdown := alert.Markdown()
+	for _, want := range []string{"SQLSTATE 42P08", "network identifier omitted", "0aac4806", "exact flow_step"} {
+		if !strings.Contains(markdown, want) {
+			t.Errorf("onboarding attribution alert lacks %q: %s", want, markdown)
+		}
+	}
+	if strings.Contains(markdown, privateNetwork) {
+		t.Fatalf("onboarding attribution alert retained network evidence: %s", markdown)
+	}
+	for _, other := range alerts {
+		if other.Class == "novel" {
+			t.Fatalf("known onboarding attribution failure remained novel: %+v", other)
+		}
+	}
+}
+
+func TestLogErrorsSignalClassifiesOnboardingPostPrimaryCancellationByStage(t *testing.T) {
+	tests := []struct {
+		name       string
+		line       string
+		stage      string
+		identifier string
+	}{
+		{
+			name:       "app open",
+			line:       "[onboarding]app open attribution failed for network synthetic-network-token: Done",
+			stage:      "app-open",
+			identifier: "synthetic-network-token",
+		},
+		{
+			name:       "campaign enrollment",
+			line:       "[onboarding]campaign enrollment failed for network synthetic-enrollment-token: Done",
+			stage:      "campaign-enrollment",
+			identifier: "synthetic-enrollment-token",
+		},
+		{
+			name:       "client context",
+			line:       "[onboarding]client context failed for network synthetic-context-token: Done",
+			stage:      "client-context",
+			identifier: "synthetic-context-token",
+		},
+		{
+			name:       "connect day",
+			line:       "[onboarding]connect.day write failed for client synthetic-client-token: Done",
+			stage:      "connect-day",
+			identifier: "synthetic-client-token",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+				if len(args) > 1 && args[0] == "ls" {
+					return "repo names synthetic-service", nil
+				}
+				return test.line, nil
+			}}
+			alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			alert := requireAlertClass(t, alerts, "onboarding-post-primary-canceled")
+			markdown := alert.Markdown()
+			for _, want := range []string{
+				"frame=stage=" + test.stage,
+				"stage=" + test.stage,
+				"identifier omitted",
+				"primary",
+				"ten-second",
+				"API and Connect",
+			} {
+				if !strings.Contains(markdown, want) {
+					t.Errorf("post-primary cancellation alert lacks %q: %s", want, markdown)
+				}
+			}
+			if strings.Contains(markdown, test.identifier) {
+				t.Fatalf("post-primary cancellation alert retained identifier: %s", markdown)
+			}
+			for _, other := range alerts {
+				if other.Class == "novel" {
+					t.Fatalf("known post-primary cancellation remained novel: %+v", other)
+				}
+			}
+		})
+	}
+}
+
+func TestLogErrorsSignalRedactsOnboardingConnectDayWrite(t *testing.T) {
+	const privateClient = "private-client.fixture.example"
+	line := "[onboarding]connect.day write failed for client " + privateClient + ": ERROR: inconsistent types deduced for parameter $3 (SQLSTATE 42P08)"
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-connect", nil
+		}
+		return line, nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "onboarding-connect-day-write")
+	if alert.Severity != SeverityWarn {
+		t.Fatalf("onboarding connect-day severity = %q, want warn", alert.Severity)
+	}
+	markdown := alert.Markdown()
+	for _, want := range []string{
+		"SQLSTATE 42P08",
+		"client identifier omitted",
+		"already committed",
+		"next connection retries",
+		"deploy Connect",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Errorf("onboarding connect-day alert lacks %q: %s", want, markdown)
+		}
+	}
+	if strings.Contains(markdown, privateClient) {
+		t.Fatalf("onboarding connect-day alert retained client evidence: %s", markdown)
+	}
+	for _, other := range alerts {
+		if other.Class == "novel" {
+			t.Fatalf("known onboarding connect-day failure remained novel: %+v", other)
+		}
+	}
+}
+
+func TestLogErrorsSignalAttributesGrafanaMimirPushRefusalWithoutEndpoint(t *testing.T) {
+	line := `[synthetic-edge.invalid][grafana][g1][cid:synthetic-container][2026-09-10T11:20:08Z] Stats push error (Post "http://synthetic-mimir.invalid:14818/api/v1/push": dial tcp synthetic-mimir.invalid:14818: connect: connection refused)`
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-grafana", nil
+		}
+		return line, nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "grafana-mimir-push-refused")
+	if alert.Severity != SeverityPage {
+		t.Fatalf("Grafana/Mimir refusal severity = %q, want PAGE", alert.Severity)
+	}
+	markdown := alert.Markdown()
+	for _, want := range []string{
+		"frame=local-mimir-push",
+		"co-located Mimir listener was unavailable",
+		"SO_REUSEPORT",
+		"not Redis §5.2",
+		"child shutdown/SIGTERM boundary",
+		"two successive generations on one block",
+		"counts rejected pushes, not failed parents or incidents",
+		"drain-before-child-stop",
+		"6544fe1",
+		"Do not restart Redis",
+		"closed at the bounded deadline",
+		"full rollout plus 10 steady minutes",
+		"§11.20 continuity gap",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Errorf("Grafana/Mimir refusal alert omitted %q:\n%s", want, markdown)
+		}
+	}
+	for _, private := range []string{
+		"synthetic-edge.invalid",
+		"synthetic-container",
+		"synthetic-mimir.invalid",
+		"14818",
+	} {
+		if strings.Contains(markdown, private) {
+			t.Errorf("Grafana/Mimir refusal retained endpoint detail %q:\n%s", private, markdown)
+		}
+	}
+	for _, other := range alerts {
+		if other.Class == "connection-refused" || other.Class == "novel" {
+			t.Errorf("specific Grafana/Mimir refusal escaped into %s", other.Class)
+		}
+	}
+}
+
+func TestLogErrorsSignalGenericConnectionRefusalDoesNotAssumeRedis(t *testing.T) {
+	line := `synthetic request to service.invalid failed: connect: connection refused`
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-service", nil
+		}
+		return strings.Repeat(line+"\n", 10), nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := requireAlertClass(t, alerts, "connection-refused").Markdown()
+	for _, want := range []string{
+		"otherwise-unclassified TCP target",
+		"does not identify the target service",
+		"Do not assume this is Redis",
+		"same network namespace",
+		"Do not restart an inferred service",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Errorf("generic refusal alert omitted %q:\n%s", want, markdown)
+		}
+	}
+	for _, stale := range []string{
+		"SIGNALS.md 5.2",
+		"after manual restart",
+		"restart with correct conf",
+	} {
+		if strings.Contains(markdown, stale) {
+			t.Errorf("generic refusal retained stale attribution %q:\n%s", stale, markdown)
+		}
+	}
+}
+
 func TestLogErrorsSignalMimirSeriesLimitIsSpecificAndSanitized(t *testing.T) {
 	line := `Stats push rejected (400): per-user series limit of 75000 exceeded; series metric{customer="private-customer",instance="private-instance",address="192.0.2.19:9494",detail="connect: connection refused"}`
 	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
@@ -104,8 +459,8 @@ func TestLogErrorsSignalMimirSeriesLimitIsSpecificAndSanitized(t *testing.T) {
 	markdown := alert.Markdown()
 	for _, want := range []string{
 		"tenant-series-admission", "series details omitted", "per-user-series admission discards",
-		"predates the desired release", "19 readiness-rejected candidates", "Preserve random instance identity",
-		"630", "627", "30d14ce", "two-hour",
+		"candidate contributors", "Accepted per-service", "Legacy unstructured events",
+		"preserve random instance identity", "two-hour",
 	} {
 		if !strings.Contains(markdown, want) {
 			t.Errorf("Mimir admission alert omitted %q", want)
@@ -710,9 +1065,10 @@ func TestLogErrorsSignalExplainsPayoutWalletInsufficiency(t *testing.T) {
 		"software release cannot fund",
 		"Do not delete or manually replay pending_task rows",
 		"First use §8.12 to verify every taskworker block's source/digest identity",
-		"intentional local checkout containing current-main server commit 66525afc",
-		"§2.14 to prove complete admission metrics",
-		"fewer than four canonical attempts/second",
+		"intentional local checkout containing current-main marker-capable server commit 928abfca",
+		"earlier 66525afc baseline alone does not provide the gauge or marker",
+		"§2.14 to prove complete admission-observable and activity metrics",
+		"fewer than four exact pre-POST admission markers/second",
 		"allow the same window plus ingestion delay",
 		"duplicate Circle transfers",
 		"<id>",
@@ -730,6 +1086,51 @@ func TestLogErrorsSignalExplainsPayoutWalletInsufficiency(t *testing.T) {
 	if strings.Contains(markdown, "The observed value is outside the SIGNALS.md healthy band") ||
 		strings.Contains(markdown, "Follow SIGNALS.md §4") {
 		t.Fatalf("payout-wallet alert retained generic guidance:\n%s", markdown)
+	}
+}
+
+func TestLogErrorsSignalRendersOnlyBoundedAdmissionBurstEvidence(t *testing.T) {
+	lines := []string{}
+	for admission := 0; admission < 4; admission++ {
+		lines = append(lines, payoutAdmissionLogLine("2026-09-12T19:13:00", admission))
+	}
+	// This resembles the fixed prefix but appends provider-controlled text.
+	// The strict grammar must neither count it nor retain it in evidence.
+	lines = append(lines,
+		payoutAdmissionLogLine("2026-09-12T19:13:00", 4)+" arbitrary_private_field=synthetic-value",
+	)
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-taskworker", nil
+		}
+		return strings.Join(lines, "\n") + "\n", nil
+	}}
+
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := requireAlertClass(t, alerts, "payout-retry-microburst").Markdown()
+	for _, want := range []string{
+		"peak_admitted_submissions_per_second=4",
+		"admitted_submissions=4",
+		"exact-replay-deduplicated pre-POST admission markers",
+		"absent markers are unknown rather than zero",
+		"§2.14 admission-observable capability",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("admission-burst Markdown lacks %q:\n%s", want, markdown)
+		}
+	}
+	for _, forbidden := range []string{
+		"worker-a.invalid",
+		"cid:synthetic",
+		"arbitrary_private_field",
+		"synthetic-value",
+	} {
+		if strings.Contains(markdown, forbidden) {
+			t.Fatalf("admission-burst Markdown retained %q:\n%s", forbidden, markdown)
+		}
 	}
 }
 
@@ -770,10 +1171,12 @@ func TestLogErrorsSignalExplainsPaymentProcessorRateLimit(t *testing.T) {
 		"peak_coincident_wallet_attempts_per_second=5",
 		"source-second correlation: 1/1 payment-processor-rate-limit source second(s)",
 		"Do not manually retry",
-		"commit 66525afc",
+		"marker-capable server commit 928abfca",
+		"earlier 66525afc baseline can expose the activity/error collectors without the capability gauge or exact marker",
 		"fleet-wide Redis-time transfer gate",
 		"conservative three-per-second ceiling",
-		"all §2.14 admission metrics",
+		"§2.14 admission-observable capability plus all five activity families",
+		"exact pre-POST admission markers stay below four/second",
 		"full 90-minute retry window",
 		"account's authoritative quota",
 		"processor-rate-limit events stay zero",
@@ -1036,6 +1439,76 @@ func TestLogErrorsSignalGroupsRequiredVaultFailuresByRouteAndGeneration(t *testi
 	for frame, seen := range wantFrames {
 		if !seen {
 			t.Fatalf("missing required-vault frame %q: %+v", frame, alerts)
+		}
+	}
+}
+
+// Keep causal caveats in the owning section, not an unrelated catalog mention.
+func TestLogErrorsWindowObservationNegativeControlsDocumented(t *testing.T) {
+	catalogBytes, err := os.ReadFile("SIGNALS.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := string(catalogBytes)
+	sectionStart := strings.Index(catalog, "\n### 14.6 ")
+	if sectionStart < 0 {
+		t.Fatal("catalog is missing the owning section 14.6")
+	}
+	section := catalog[sectionStart:]
+	sectionEnd := strings.Index(section, "\n### 14.7 ")
+	if sectionEnd < 0 {
+		t.Fatal("catalog is missing the section 14.7 boundary")
+	}
+	section = section[:sectionEnd]
+	paragraphFor := func(anchor string) string {
+		anchorIndex := strings.Index(section, anchor)
+		if anchorIndex < 0 {
+			return ""
+		}
+		paragraphStart := strings.LastIndex(section[:anchorIndex], "\n\n")
+		if paragraphStart < 0 {
+			paragraphStart = 0
+		} else {
+			paragraphStart += len("\n\n")
+		}
+		paragraphEnd := len(section)
+		if nextParagraph := strings.Index(section[anchorIndex:], "\n\n"); nextParagraph >= 0 {
+			paragraphEnd = anchorIndex + nextParagraph
+		}
+		paragraph := strings.ReplaceAll(section[paragraphStart:paragraphEnd], "`", "")
+		return strings.Join(strings.Fields(paragraph), " ")
+	}
+	checks := []struct {
+		name    string
+		anchor  string
+		clauses []string
+	}{
+		{
+			name:    "session settings are not evaluation outcomes",
+			anchor:  "event=session",
+			clauses: []string{"settings", "configuration evidence", "not evaluation outcomes"},
+		},
+		{
+			name:    "generic timeout does not establish authentication or lifecycle cause",
+			anchor:  "Timeout.",
+			clauses: []string{"not proof of credential rejection", "request deadline", "caller/strategy cancellation"},
+		},
+		{
+			name:    "window events retain task attribution limits",
+			anchor:  "identity-free lines",
+			clauses: []string{"cannot be joined one-to-one to those tasks", "do not identify customer sessions"},
+		},
+	}
+	for _, check := range checks {
+		paragraph := paragraphFor(check.anchor)
+		missingClauses := []string{}
+		for _, clause := range check.clauses {
+			if !strings.Contains(paragraph, clause) {
+				missingClauses = append(missingClauses, clause)
+			}
+		}
+		if len(missingClauses) > 0 {
+			t.Errorf("section 14.6 %s is missing %q", check.name, missingClauses)
 		}
 	}
 }

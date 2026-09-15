@@ -19,14 +19,23 @@ submission. There is no per-epoch submission-count cap. A duplicate canonical
 patch reuses the existing immutable job/cache identity and must not collect a
 second fee.
 
+A continuously available evaluator host has 56 full three-hour slots per
+seven-day admission window. The first complete 18-replicate staging pass
+reached scoring in about 2 hours 33 minutes (about 65 theoretical slots before
+scoring and operational overhead), but admission is intentionally unbounded:
+the FIFO continues in a private grading period after close until every
+accepted job is terminal.
+
 Before production epoch 1, `GET /competition/info` may expose the current
 `staging_round`. The staging era begins at epoch zero and can advance through
 multiple sequential epochs. A response carrying `staging: true` is fee-free
 and follows the production admission, cache, FIFO, isolated evaluation,
 scoring, embargo, and authenticated polling paths against frozen source epoch
 zero. After close and complete drain, it finalizes automatically with no winner
-and makes each job's score or typed failure visible through its status URL. It
-does not create a production leaderboard row, candidate review, or promotion.
+and makes each job's score or typed failure visible through its status URL.
+`GET /competition/leaderboard?include_staging=true` also publishes a clearly
+marked, null-winner staging entry for exact adapter-path testing. It does not
+create a production leaderboard row, candidate review, or promotion.
 
 UR creates or retrieves each identity with `run-main.sh staging`, then uses
 `run-main.sh advance-staging` to stop admission, drain all accepted work,
@@ -54,15 +63,74 @@ The adapter sends it as `Authorization: Bearer TOKEN`.
 4. Poll the exact status URL. Preserve identity across HTTP 429 and retriable
    5xx responses; use bounded exponential backoff and never resubmit under a
    new identity to bypass FIFO order or the fee boundary.
-5. Before finalization, non-operator responses expose state only. A finalized
-   staging epoch publishes each outcome at its status URL. After production
-   review finalizes an epoch, read its public leaderboard, reveal, and
-   authenticated workload.
+5. Read `evaluation_status` as the evaluator lifecycle: `queued`, `running`,
+   `completed`, `failed`, or `canceled`. `completed` says only that evaluation
+   produced a private score; it reveals no value, placeability, gate,
+   significance, or diagnostic. `failed` is terminal. Its optional
+   `evaluation_failure` contains only a reviewed `kind`, `code`, and
+   `retriable:false`; an unknown code produces no summary. It never contains
+   the raw message or readiness detail. Keep using the legacy `state` field for
+   compatibility: before publication both successful and failed evaluation
+   retain `state: completed`.
+6. During a rolling API update, a response may lack `evaluation_status`.
+   Derive `queued`, `running`, and `canceled` from the same legacy state, but
+   treat legacy `completed` as outcome-neutral and continue the normal epoch
+   reconciliation path. An actual HTTP 429 or typed retriable 5xx response is
+   still a transport/service retry; a polled `evaluation_status: failed` is
+   not.
+7. Before finalization, non-operator responses continue to omit `score` and
+   full `eval_error`. A finalized staging epoch publishes each outcome at its
+   status URL and in the opt-in staging leaderboard. Published historical
+   terminal errors are returned with `retriable:false` without rewriting their
+   retained evidence. After production review finalizes an epoch, read its
+   default public leaderboard, reveal, and authenticated workload.
 
 The authoritative schema is
 [`sn/api/competition.yml`](../../../../sn/api/competition.yml). The Go Apex
 adapter and conformance suite cover immutable job identity, FIFO polling,
 429/5xx retry, embargo, reveal, and leaderboard reconciliation.
+
+## Canonical patch bytes
+
+The `patch` JSON string is the exact submission and cache identity. The API
+validates it but never repairs or rewrites it. A canonical patch must:
+
+- be nonempty UTF-8 text with no NUL byte;
+- use LF (`0x0a`) line endings and contain no CR (`0x0d`) byte;
+- end in exactly one LF: its last byte is `0x0a`, and it does not end in
+  `0x0a 0x0a`;
+- contain no control character other than LF and tab;
+- use strict unified Git sections beginning `diff --git a/PATH b/PATH`, with
+  matching `--- a/PATH`, `+++ b/PATH`, and valid `@@` hunk counts;
+- sort multiple file sections lexicographically by path; and
+- modify only existing regular 100644 files on the published allowlist, with
+  no binary, create, delete, rename, copy, mode, submodule, or build-tag
+  operation.
+
+For this season the only allowed path is
+`connect/resident_contract_manager.go`. Generate and JSON-encode the patch
+without passing its contents through a shell variable:
+
+```sh
+git diff --no-ext-diff --src-prefix=a/ --dst-prefix=b/ -- \
+  connect/resident_contract_manager.go > submission.patch
+
+test -s submission.patch
+test "$(tail -c 1 submission.patch | od -An -tu1 | tr -d ' ')" = 10
+test "$(tail -c 2 submission.patch | od -An -tu1 | tr -s ' ' | sed 's/^ //')" != "10 10"
+! LC_ALL=C grep -q $'\r' submission.patch
+
+jq -n --arg round_id "$ROUND_ID" --rawfile patch submission.patch \
+  '{round_id:$round_id,patch:$patch}' > submission.json
+curl --fail-with-body --header "Authorization: Bearer $SUBMITTER_TOKEN" \
+  --header 'Content-Type: application/json' --data-binary @submission.json \
+  https://api.bringyour.com/competition/score
+```
+
+Do not use `patch=$(git diff ...)`, `printf %s`, or a JSON helper that trims
+text: shell command substitution removes trailing newlines. A
+`noncanonical_patch` response is terminal for those bytes; correct the byte
+format and submit the intended canonical patch.
 
 ## What is scored
 
