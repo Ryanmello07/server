@@ -21,6 +21,11 @@ import (
 // Writes one counted URL turn: cycle-admitted, one URL, the selected policy.
 // A nil evidence document stores SQL NULL.
 func urlDarkTestRow(ctx context.Context, clientId server.Id, at time.Time, ok int, evidence any) {
+	urlDarkTestRowAs(ctx, clientId, at, ok, evidence, true, SelectedProviderUrlProbePolicyVersion())
+}
+
+// urlDarkTestRow with the admission bit and policy version given.
+func urlDarkTestRowAs(ctx context.Context, clientId server.Id, at time.Time, ok int, evidence any, urlProbe bool, policyVersion int) {
 	var encoded *string
 	if evidence != nil {
 		var raw string
@@ -37,8 +42,8 @@ func urlDarkTestRow(ctx context.Context, clientId server.Id, at time.Time, ok in
 		server.RaisePgResult(tx.Exec(ctx, `INSERT INTO provider_egress_health_history
 			(run_id, client_id, measured_at, ok_count, total_count, class_results, tls_authentication_failure,
 			 cycle_started_at, url_probe, url_probe_evidence, url_probe_policy_version)
-			VALUES ($1, $2, $3, $4, 1, '{}', false, $3, true, $5::jsonb, $6)`,
-			server.NewId(), clientId, at.UTC(), ok, encoded, SelectedProviderUrlProbePolicyVersion()))
+			VALUES ($1, $2, $3, $4, 1, '{}', false, $3, $7, $5::jsonb, $6)`,
+			server.NewId(), clientId, at.UTC(), ok, encoded, policyVersion, urlProbe))
 	})
 }
 
@@ -592,5 +597,61 @@ func TestUrlDarkServingFloorKeyIsStable(t *testing.T) {
 
 		// population 11, floor 10: one verdict stands
 		urlDarkTestAssert(ctx, t, city, 11, append(fleet, recent, longDark), longDark)
+	})
+}
+
+// Which turns count and where the windows sit: a turn that was not
+// cycle-admitted, or is of another policy, is not counted; a control 29
+// minutes before still counts; the success lookback runs from the newest of
+// the K failures; and a provider's own success never vouches for it.
+func TestUrlDarkCountedTurnsAndWindows(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		version := SelectedProviderUrlProbePolicyVersion()
+		// each case sits hours from the others, so no window reaches another's
+		threeTurns := func(first time.Time) []time.Time {
+			return []time.Time{first, first.Add(10 * time.Minute), first.Add(20 * time.Minute)}
+		}
+
+		notAdmitted := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		otherPolicy := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		for i, provider := range []*egressTestProvider{notAdmitted, otherPolicy} {
+			for _, at := range threeTurns(now.Add(-23*time.Hour + time.Duration(i)*2*time.Hour)) {
+				urlDarkTestControls(ctx, at, 3, time.Minute)
+				evidence := urlDarkTestNoResponseEvidence(at)
+				if provider == notAdmitted {
+					urlDarkTestRowAs(ctx, provider.clientId, at, 0, evidence, false, version)
+				} else {
+					urlDarkTestRowAs(ctx, provider.clientId, at, 0, evidence, true, version+1)
+				}
+			}
+		}
+
+		lateControls := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		for _, at := range threeTurns(now.Add(-19 * time.Hour)) {
+			urlDarkTestControls(ctx, at, 3, 29*time.Minute)
+			urlDarkTestTurn(ctx, lateControls.clientId, at, providerUrlDarkNoResponse)
+		}
+
+		// failures an hour apart; a success 6h30m before the first is more
+		// than 8h before the newest
+		anchored := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		first := now.Add(-15 * time.Hour)
+		urlDarkTestTurn(ctx, anchored.clientId, first.Add(-6*time.Hour-30*time.Minute), providerUrlDarkSuccess)
+		urlDarkTestDark(ctx, anchored.clientId, 3, first, first.Add(time.Hour), first.Add(2*time.Hour))
+
+		// the first turn has two other controls and the provider's own
+		// success: excused, so only two turns count
+		ownSuccess := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		first = now.Add(-11 * time.Hour)
+		urlDarkTestControls(ctx, first, 2, time.Minute)
+		urlDarkTestTurn(ctx, ownSuccess.clientId, first.Add(-2*time.Minute), providerUrlDarkSuccess)
+		urlDarkTestTurn(ctx, ownSuccess.clientId, first, providerUrlDarkNoResponse)
+		urlDarkTestDark(ctx, ownSuccess.clientId, 3, first.Add(8*time.Hour), first.Add(8*time.Hour+10*time.Minute))
+
+		urlDarkTestAssert(ctx, t, city, 15, append(fleet, notAdmitted, otherPolicy, lateControls, anchored, ownSuccess), lateControls, anchored)
 	})
 }
