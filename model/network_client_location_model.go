@@ -3917,9 +3917,7 @@ func newProviderCountFilter(ctx context.Context, loadEgressEvidence bool) provid
 		countryCodes:            GetAllProviderEgressCountryCodes(ctx),
 	}
 	f.healthCounts, f.healthWindowEnd = getAllProviderEgressHealthCountsSnapshot(ctx)
-	urlDark, err := loadProviderUrlDarkHonored(ctx, nil)
-	server.Raise(err)
-	f.urlDark = urlDark
+	f.urlDark = loadProviderUrlDarkHonored(ctx, nil)
 	server.Db(ctx, func(conn server.PgConn) {
 		rows, err := conn.Query(ctx, providerCountFilterCommonSql())
 		server.WithPgResult(rows, err, func() {

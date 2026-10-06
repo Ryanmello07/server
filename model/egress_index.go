@@ -588,7 +588,8 @@ func getProviderHardExclusions(ctx context.Context, clientIds []server.Id) (excl
 // the fleet. Each query has at most 256 distinct candidates and result rows;
 // it observes the caller's context and never publishes a partial global set.
 // URL-dark is the exception: its serving floor is a fleet property, so the
-// exporter's own honored set is read, and only when a candidate is dark.
+// exporter's own honored set is read, and only when a candidate is dark. It
+// alone fails open on a backend error (loadProviderUrlDarkHonored).
 func readProviderHardExclusions(ctx context.Context, clientIds []server.Id) (map[server.Id]bool, error) {
 	const chunkSize = 256
 	uniqueClientIds := make([]server.Id, 0, len(clientIds))
@@ -647,11 +648,7 @@ func readProviderHardExclusions(ctx context.Context, clientIds []server.Id) (map
 	if returnErr != nil {
 		return nil, returnErr
 	}
-	urlDark, err := loadProviderUrlDarkHonored(ctx, uniqueClientIds)
-	if err != nil {
-		return nil, err
-	}
-	for clientId := range urlDark {
+	for clientId := range loadProviderUrlDarkHonored(ctx, uniqueClientIds) {
 		excludedClientIds[clientId] = true
 	}
 	return excludedClientIds, nil

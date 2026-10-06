@@ -6,8 +6,12 @@ package model
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/urnetwork/glog"
@@ -22,6 +26,21 @@ import (
 // is ignored entirely: it neither extends nor resets a streak.
 const providerUrlDarkControlWindow = 30 * time.Minute
 const providerUrlDarkControlProviders = 3
+
+// Only counted turns this recent are walked. The prober paces a dark provider
+// in bursts about four hours apart (providerUrlProbeRunWindowSql), so several
+// always fall inside; one it has not reached in a day is not judged, which
+// fails toward serving. It also bounds the walk when every turn is excused.
+const providerUrlDarkHorizon = 24 * time.Hour
+
+// Budgets for one URL-dark read on the publication and request paths. Past
+// one the read fails open (loadProviderUrlDarkHonored). Vars for tests.
+var providerUrlDarkFleetTimeout = 15 * time.Second
+var providerUrlDarkScopedTimeout = 5 * time.Second
+
+// After a read fails, this process serves its last honored set without
+// reading again for a while, so a slow outage walk does not run every pass.
+var providerUrlDarkRetryAfter = time.Minute
 
 // Breaker layer 2, serving floor: verdicts are released, newest first, until
 // at least max(10, ceil(10%)) of the published population remains.
@@ -81,7 +100,16 @@ func providerUrlDarkCountedSql(alias string, version int) string {
 }
 
 // One row per call: the population's size, then each dark member (NULL when
-// none) with the oldest of its K failures. The population is the public
+// none) with the oldest of its K failures.
+//
+// A member's walk starts after its newest counted turn within the horizon
+// that is not no-response (answered: a success or a forwarded turn, never
+// excused), so a provider that answered last costs one index probe, and
+// every turn walked is no-response. A member whose latest counted success is
+// within ProviderEgressHealthMaxAge of its newest counted turn is not walked:
+// the success clause already clears it for any K turns, and this keeps a
+// prober outage shorter than that from walking every provider's excused
+// turns. The population is the public
 // count's (CountProviderEgress) less providers another hard exclusion already
 // removes (providerEgressEligibilitySql, the rules providerHardExclusionsSql
 // negates): they serve no one either way, so they must not count toward the
@@ -93,12 +121,12 @@ func providerUrlDarkCountedSql(alias string, version int) string {
 // no-response and it has no counted success within ProviderEgressHealthMaxAge
 // of the newest of them. Any later success or forwarded turn breaks the run.
 //
-// $1 public provide mode, $2 K, $3 control window seconds, $4 control
-// providers, $5 success lookback seconds, $6 client ids when scoped.
+// $1 public provide mode, $2 K, $3 control window seconds, $4 success
+// lookback seconds, $5 horizon start, $6 client ids when scoped.
 func providerUrlDarkSql(version int, clientScoped bool) string {
 	scope := ""
 	if clientScoped {
-		scope = "WHERE population.client_id = ANY($6)"
+		scope = "AND population.client_id = ANY($6)"
 	}
 	return fmt.Sprintf(`
 	WITH population AS MATERIALIZED (
@@ -112,34 +140,48 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 			WHERE provide_key.client_id = provider_location.client_id AND provide_key.provide_mode = $1
 		)
 		AND %[7]s
-	), recent AS MATERIALIZED (
-		SELECT population.client_id, turn.measured_at, turn.no_response
+	), member AS MATERIALIZED (
+		SELECT population.client_id, answered.measured_at AS answered_at, answered.run_id AS answered_run_id
 		FROM population
+		LEFT JOIN LATERAL (
+			SELECT answered.measured_at, answered.run_id
+			FROM provider_egress_health_history AS answered
+			WHERE answered.client_id = population.client_id AND %[8]s
+			AND answered.measured_at > $5 AND NOT %[2]s
+			ORDER BY answered.measured_at DESC, answered.run_id DESC
+			LIMIT 1
+		) AS answered ON true
+		WHERE NOT EXISTS (
+			SELECT 1 FROM provider_egress_health_history AS success
+			WHERE success.client_id = population.client_id AND %[6]s AND success.ok_count = 1
+			AND success.measured_at > (
+				SELECT max(newest.measured_at) FROM provider_egress_health_history AS newest
+				WHERE newest.client_id = population.client_id AND %[9]s
+			) - make_interval(secs => $4)
+		)
+		%[5]s
+	), recent AS MATERIALIZED (
+		SELECT member.client_id, turn.measured_at
+		FROM member
 		CROSS JOIN LATERAL (
-			SELECT turn.measured_at, turn.run_id, %[2]s AS no_response
+			SELECT turn.measured_at, turn.run_id
 			FROM provider_egress_health_history AS turn
-			WHERE turn.client_id = population.client_id AND %[3]s
-			AND CASE WHEN %[2]s THEN (
-				SELECT count(DISTINCT control.client_id)
-				FROM provider_egress_health_history AS control
-				WHERE control.measured_at > turn.measured_at - make_interval(secs => $3)
-				AND control.measured_at <= turn.measured_at
-				AND control.client_id <> turn.client_id
-				AND %[4]s AND control.ok_count = 1
-			) >= $4 ELSE true END
+			WHERE turn.client_id = member.client_id AND %[3]s
+			AND turn.measured_at > $5
+			AND (member.answered_at IS NULL OR (turn.measured_at, turn.run_id) > (member.answered_at, member.answered_run_id))
+			AND %[4]s
 			ORDER BY turn.measured_at DESC, turn.run_id DESC
 			LIMIT $2
 		) AS turn
-		%[5]s
 	), dark AS (
 		SELECT recent.client_id, min(recent.measured_at) AS oldest_failure_at
 		FROM recent
 		GROUP BY recent.client_id
-		HAVING count(*) = $2 AND bool_and(recent.no_response)
+		HAVING count(*) = $2
 		AND NOT EXISTS (
 			SELECT 1 FROM provider_egress_health_history AS success
 			WHERE success.client_id = recent.client_id AND %[6]s AND success.ok_count = 1
-			AND success.measured_at > max(recent.measured_at) - make_interval(secs => $5)
+			AND success.measured_at > max(recent.measured_at) - make_interval(secs => $4)
 		)
 	)
 	SELECT population_count.count, dark.client_id, dark.oldest_failure_at
@@ -147,13 +189,40 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 	LEFT JOIN dark ON true
 	`,
 		version,
-		providerUrlDarkNoResponseSql("turn"),
+		providerUrlDarkNoResponseSql("answered"),
 		providerUrlDarkCountedSql("turn", version),
-		providerUrlDarkCountedSql("control", version),
+		providerUrlDarkControlSql(version),
 		scope,
 		providerUrlDarkCountedSql("success", version),
 		providerEgressEligibilitySql("provider_location"),
+		providerUrlDarkCountedSql("answered", version),
+		providerUrlDarkCountedSql("newest", version),
 	)
+}
+
+// Breaker layer 1 for the no-response turn at alias turn, as P probes: each
+// takes the newest counted success in the window from a client not yet seen
+// (the turn's own included). A probe walks the (measured_at) index newest
+// first and stops at its first match, so a window full of successes costs P
+// index steps, where a count(DISTINCT) reads the whole window.
+func providerUrlDarkControlSql(version int) string {
+	seen := []string{"turn.client_id"}
+	probes := []string{}
+	for i := range providerUrlDarkControlProviders {
+		alias := fmt.Sprintf("control_%d", i)
+		probes = append(probes, fmt.Sprintf(`CROSS JOIN LATERAL (
+				SELECT control.client_id
+				FROM provider_egress_health_history AS control
+				WHERE control.measured_at > turn.measured_at - make_interval(secs => $3)
+				AND control.measured_at <= turn.measured_at
+				AND control.client_id <> ALL(ARRAY[%s])
+				AND %s AND control.ok_count = 1
+				ORDER BY control.measured_at DESC
+				LIMIT 1
+			) AS %s`, strings.Join(seen, ", "), providerUrlDarkCountedSql("control", version), alias))
+		seen = append(seen, alias+".client_id")
+	}
+	return "EXISTS (\n\t\t\tSELECT 1 FROM (SELECT) AS start\n\t\t\t" + strings.Join(probes, "\n\t\t\t") + "\n\t\t)"
 }
 
 // A dark member of the published population.
@@ -203,48 +272,70 @@ func loadProviderUrlDarkVerdicts(ctx context.Context, clientIds []server.Id) (po
 		ProvideModePublic,
 		int64(rules.DarkConsecutiveFailures),
 		providerUrlDarkControlWindow.Seconds(),
-		int64(providerUrlDarkControlProviders),
 		ProviderEgressHealthMaxAge.Seconds(),
+		server.NowUtc().Add(-providerUrlDarkHorizon),
 	}
 	if clientIds != nil {
 		args = append(args, clientIds)
 	}
-	// A safety decision: read the primary, as the hard-exclusion read-through does.
-	server.Db(ctx, func(conn server.PgConn) {
-		rows, err := conn.Query(ctx, query, args...)
-		if err != nil {
-			returnErr = err
-			return
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var count int64
-			var clientId *server.Id
-			var oldestFailureAt *time.Time
-			if err := rows.Scan(&count, &clientId, &oldestFailureAt); err != nil {
+	// A safety decision: read the primary, as the hard-exclusion read-through
+	// does. server.Db raises a connection or deadline failure; recover it so
+	// the caller can fail open.
+	server.HandleError(func() {
+		server.Db(ctx, func(conn server.PgConn) {
+			rows, err := conn.Query(ctx, query, args...)
+			if err != nil {
 				returnErr = err
 				return
 			}
-			populationCount = int(count)
-			if clientId != nil && oldestFailureAt != nil {
-				verdicts = append(verdicts, providerUrlDarkVerdict{clientId: *clientId, oldestFailureAt: *oldestFailureAt})
+			defer rows.Close()
+			for rows.Next() {
+				var count int64
+				var clientId *server.Id
+				var oldestFailureAt *time.Time
+				if err := rows.Scan(&count, &clientId, &oldestFailureAt); err != nil {
+					returnErr = err
+					return
+				}
+				populationCount = int(count)
+				if clientId != nil && oldestFailureAt != nil {
+					verdicts = append(verdicts, providerUrlDarkVerdict{clientId: *clientId, oldestFailureAt: *oldestFailureAt})
+				}
 			}
-		}
-		returnErr = rows.Err()
-	}, server.OptReadOnly())
+			returnErr = rows.Err()
+		}, server.OptReadOnly(), server.OptNoRetry())
+	}, func(err error) {
+		returnErr = err
+	})
 	return
 }
 
-// The honored URL-dark set: the single source every consumer reads. With
-// clientIds it is the fleet set restricted to them. Honored verdicts are a
-// subset of dark ones, so the fleet read runs only when a requested client is
-// dark at all.
-func loadProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) (map[server.Id]bool, error) {
+var errProviderUrlDarkRetryAfter = errors.New("a recent url_dark read failed")
+
+// The last fleet honored set this process computed, and when a read last
+// failed: the fail-open fallback.
+var providerUrlDarkLast struct {
+	sync.Mutex
+	honored    map[server.Id]bool
+	computedAt time.Time
+	failedAt   time.Time
+}
+
+func readProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) (map[server.Id]bool, error) {
+	providerUrlDarkLast.Lock()
+	failedAt := providerUrlDarkLast.failedAt
+	providerUrlDarkLast.Unlock()
+	if time.Since(failedAt) < providerUrlDarkRetryAfter {
+		return nil, errProviderUrlDarkRetryAfter
+	}
+	timeout := providerUrlDarkFleetTimeout
 	if clientIds != nil {
-		if len(clientIds) == 0 {
-			return map[server.Id]bool{}, nil
-		}
-		_, verdicts, err := loadProviderUrlDarkVerdicts(ctx, clientIds)
+		timeout = providerUrlDarkScopedTimeout
+	}
+	readCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if clientIds != nil {
+		_, verdicts, err := loadProviderUrlDarkVerdicts(readCtx, clientIds)
 		if err != nil {
 			return nil, err
 		}
@@ -252,13 +343,49 @@ func loadProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) (map
 			return map[server.Id]bool{}, nil
 		}
 	}
-	populationCount, verdicts, err := loadProviderUrlDarkVerdicts(ctx, nil)
+	populationCount, verdicts, err := loadProviderUrlDarkVerdicts(readCtx, nil)
 	if err != nil {
 		return nil, err
 	}
 	honored := honorProviderUrlDarkVerdicts(populationCount, verdicts)
+	providerUrlDarkLast.Lock()
+	providerUrlDarkLast.honored = honored
+	providerUrlDarkLast.computedAt = time.Now()
+	providerUrlDarkLast.Unlock()
+	return honored, nil
+}
+
+// The honored URL-dark set: the single source every consumer reads. With
+// clientIds it is the fleet set restricted to them. Honored verdicts are a
+// subset of dark ones, so the fleet read runs only when a requested client is
+// dark at all.
+//
+// Unlike the other hard exclusions it fails open, so a slow fleet walk can
+// never stop publication or a request: if a read errs or outlasts its budget,
+// the last set this process computed stands while younger than
+// ProviderEgressHealthMaxAge, else none. Both breaker layers already lean
+// toward serving; holding the last set keeps a seeded proxy out through the
+// prober outage that makes the walk slow, which no successes could readmit.
+func loadProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) map[server.Id]bool {
+	if clientIds != nil && len(clientIds) == 0 {
+		return map[server.Id]bool{}
+	}
+	honored, err := readProviderUrlDarkHonored(ctx, clientIds)
+	if err != nil {
+		providerUrlDarkLast.Lock()
+		// a caller giving up is not a failed read
+		if ctx.Err() == nil && !errors.Is(err, errProviderUrlDarkRetryAfter) {
+			providerUrlDarkLast.failedAt = time.Now()
+			glog.Errorf("[egress]url_dark read failed (%s); the last honored set from %s stands\n", err, providerUrlDarkLast.computedAt)
+		}
+		honored = map[server.Id]bool{}
+		if time.Since(providerUrlDarkLast.computedAt) < ProviderEgressHealthMaxAge {
+			honored = maps.Clone(providerUrlDarkLast.honored)
+		}
+		providerUrlDarkLast.Unlock()
+	}
 	if clientIds == nil {
-		return honored, nil
+		return honored
 	}
 	scoped := map[server.Id]bool{}
 	for _, clientId := range clientIds {
@@ -266,5 +393,5 @@ func loadProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) (map
 			scoped[clientId] = true
 		}
 	}
-	return scoped, nil
+	return scoped
 }

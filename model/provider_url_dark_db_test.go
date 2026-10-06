@@ -471,3 +471,99 @@ func TestUrlDarkServingFloorIgnoresOtherExclusions(t *testing.T) {
 		urlDarkTestAssert(ctx, t, city, 15, append(fleet, dark...), dark[:5]...)
 	})
 }
+
+// Only turns inside the horizon are walked: a provider the prober has not
+// reached for a day is not judged.
+func TestUrlDarkHorizon(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		stale := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		first := now.Add(-providerUrlDarkHorizon - time.Hour)
+		urlDarkTestDark(ctx, stale.clientId, 3, first, first.Add(10*time.Minute), first.Add(20*time.Minute))
+		inside := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		first = now.Add(-providerUrlDarkHorizon + time.Hour)
+		urlDarkTestDark(ctx, inside.clientId, 3, first, first.Add(10*time.Minute), first.Add(20*time.Minute))
+
+		urlDarkTestAssert(ctx, t, city, 12, append(fleet, stale, inside), inside)
+	})
+}
+
+// A failed or slow URL-dark read never stops publication: the last honored
+// set stands while it is fresh, then none, and the other hard exclusions
+// publish as before.
+func TestUrlDarkReadFailsOpen(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleetTimeout, scopedTimeout := providerUrlDarkFleetTimeout, providerUrlDarkScopedTimeout
+		resetLast := func() {
+			providerUrlDarkLast.Lock()
+			providerUrlDarkLast.honored, providerUrlDarkLast.computedAt, providerUrlDarkLast.failedAt = nil, time.Time{}, time.Time{}
+			providerUrlDarkLast.Unlock()
+		}
+		resetLast()
+		defer func() {
+			providerUrlDarkFleetTimeout, providerUrlDarkScopedTimeout = fleetTimeout, scopedTimeout
+			resetLast()
+		}()
+
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
+		quarantined := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `INSERT INTO provider_egress_url_security(client_id,url_key,destination,measured_at,tls_failure)
+				VALUES($1,'synthetic','{}',$2,true)`, quarantined.clientId, now))
+		})
+		candidateIds := []server.Id{dark.clientId, quarantined.clientId}
+		for _, provider := range fleet {
+			candidateIds = append(candidateIds, provider.clientId)
+		}
+		published := func(want ...*egressTestProvider) {
+			t.Helper()
+			// egressTestPasses requires every pass to succeed
+			egressTestPasses(ctx, t)
+			for _, cold := range []bool{false, true} {
+				if cold {
+					hardExclusionTestClear(ctx, t)
+				}
+				excluded, err := getProviderHardExclusions(ctx, candidateIds)
+				connect.AssertEqual(t, err, nil)
+				wantIds := map[server.Id]bool{quarantined.clientId: true}
+				for _, provider := range want {
+					wantIds[provider.clientId] = true
+				}
+				if !maps.Equal(excluded, wantIds) {
+					t.Fatalf("cold=%t excluded %v, want %v", cold, excluded, wantIds)
+				}
+			}
+			GetClientProviderStatus(ctx, dark.networkId, dark.clientId)
+		}
+		published(dark)
+
+		// every read now outlasts its budget: the last set stands
+		providerUrlDarkFleetTimeout, providerUrlDarkScopedTimeout = time.Nanosecond, time.Nanosecond
+		published(dark)
+		providerUrlDarkLast.Lock()
+		failed := !providerUrlDarkLast.failedAt.IsZero()
+		providerUrlDarkLast.Unlock()
+		connect.AssertEqual(t, failed, true)
+
+		// a fallback older than the success lookback is not used
+		providerUrlDarkLast.Lock()
+		providerUrlDarkLast.computedAt = time.Now().Add(-ProviderEgressHealthMaxAge - time.Minute)
+		providerUrlDarkLast.Unlock()
+		published()
+
+		// budgets restored and the retry delay over: computed again
+		providerUrlDarkFleetTimeout, providerUrlDarkScopedTimeout = fleetTimeout, scopedTimeout
+		providerUrlDarkLast.Lock()
+		providerUrlDarkLast.failedAt = time.Time{}
+		providerUrlDarkLast.Unlock()
+		published(dark)
+	})
+}
