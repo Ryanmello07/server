@@ -326,6 +326,21 @@ func TestUrlDarkServingFloorHonorsOldest(t *testing.T) {
 		// population 15, floor 10: the five oldest first failures stand
 		connect.AssertEqual(t, providerUrlDarkServingFloor(15), 10)
 		urlDarkTestAssert(ctx, t, city, 15, append(fleet, dark...), dark[:5]...)
+
+		// Scoped readers see the fleet's honored set, not a floor over their
+		// own clients: a released verdict stays released for a request or a
+		// status that names only it.
+		connect.AssertEqual(t, GetClientProviderStatus(ctx, dark[0].networkId, dark[0].clientId).Reason, ProviderStatusReasonNotEligible)
+		if GetClientProviderStatus(ctx, dark[11].networkId, dark[11].clientId).Reason == ProviderStatusReasonNotEligible {
+			t.Fatal("a released verdict is not eligible in provider status")
+		}
+		hardExclusionTestClear(ctx, t)
+		for _, provider := range []*egressTestProvider{dark[0], dark[11]} {
+			excluded, err := getProviderHardExclusions(ctx, []server.Id{provider.clientId})
+			connect.AssertEqual(t, err, nil)
+			connect.AssertEqual(t, excluded[provider.clientId], provider == dark[0])
+			connect.AssertEqual(t, len(excluded), map[bool]int{true: 1, false: 0}[provider == dark[0]])
+		}
 	})
 }
 
@@ -359,5 +374,64 @@ func TestUrlDarkPartialFailureStaysOnline(t *testing.T) {
 				t.Errorf("%s: partial failure left online: %s", provider.clientId, fmt.Sprintf("%+v", inspection.Reason))
 			}
 		}
+	})
+}
+
+// Breaker layer 1 counts only other providers' successes, each provider once:
+// failures from the rest of the fleet, or one healthy provider answering
+// repeatedly, cannot vouch for the prober.
+func TestUrlDarkControlsAreDistinctOtherSuccesses(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		candidates := append([]*egressTestProvider{}, fleet...)
+
+		// a fleet-wide outage: four providers fail at the same instants and
+		// nobody succeeds, so each one's failures sit in the others' windows
+		for range 4 {
+			provider := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+			for _, at := range []time.Time{now.Add(-50 * time.Minute), now.Add(-40 * time.Minute), now.Add(-30 * time.Minute)} {
+				urlDarkTestTurn(ctx, provider.clientId, at, providerUrlDarkNoResponse)
+			}
+			candidates = append(candidates, provider)
+		}
+
+		// three successes before each turn, all from one other provider, then
+		// from only two
+		for i, controlCount := range []int{1, 2} {
+			provider := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+			controlIds := []server.Id{}
+			for range controlCount {
+				controlIds = append(controlIds, server.NewId())
+			}
+			first := now.Add(-6*time.Hour + time.Duration(i)*2*time.Hour)
+			for _, at := range []time.Time{first, first.Add(10 * time.Minute), first.Add(20 * time.Minute)} {
+				for j := range 3 {
+					urlDarkTestTurn(ctx, controlIds[j%controlCount], at.Add(-time.Duration(j+1)*time.Minute), providerUrlDarkSuccess)
+				}
+				urlDarkTestTurn(ctx, provider.clientId, at, providerUrlDarkNoResponse)
+			}
+			candidates = append(candidates, provider)
+		}
+
+		urlDarkTestAssert(ctx, t, city, 16, candidates)
+	})
+}
+
+// A verdict needs K counted no-response turns: a provider with fewer, even
+// all controlled, has not shown it is dark.
+func TestUrlDarkNeedsKTurns(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		connect.AssertEqual(t, GetProviderEgressRules().DarkConsecutiveFailures, 3)
+		short := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, short.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute))
+
+		urlDarkTestAssert(ctx, t, city, 11, append(fleet, short))
 	})
 }
