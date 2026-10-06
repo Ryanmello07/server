@@ -24,6 +24,12 @@ type WarpStatusResult struct {
 }
 
 func WarpStatus(w http.ResponseWriter, r *http.Request) {
+	(*WarpStatusState)(nil).Handler(w, r)
+}
+
+// A nil receiver preserves the standalone process latch. A nonnil state is
+// owned by one service in a process running several independent listeners.
+func (self *WarpStatusState) Handler(w http.ResponseWriter, r *http.Request) {
 	var warpVersion *string
 	if version, err := server.Version(); err == nil {
 		warpVersion = &version
@@ -45,10 +51,7 @@ func WarpStatus(w http.ResponseWriter, r *http.Request) {
 		clientAddress = fmt.Sprintf("error: %s", err.Error())
 	}
 
-	status, err := collectStatus(r.Context())
-	if err != nil {
-		status = fmt.Sprintf("error: %s", err.Error())
-	}
+	status := self.Status()
 
 	result := &WarpStatusResult{
 		Version:       warpVersion,
@@ -86,6 +89,61 @@ func WarpStatus(w http.ResponseWriter, r *http.Request) {
 //     not count an operator-initiated drain as a service error.
 var warpStatusOverride atomic.Pointer[string]
 
+// Each composed service owns its readiness. Methods are safe for concurrent
+// use. The zero value is pending, so a ready sibling cannot admit this service.
+type WarpStatusState struct {
+	status atomic.Pointer[string]
+}
+
+// Reads only the service's latch; nil retains the historical process status.
+func (self *WarpStatusState) Status() string {
+	if self == nil {
+		if status := warpStatusOverride.Load(); status != nil {
+			return *status
+		}
+		return "ok"
+	}
+	if status := self.status.Load(); status != nil {
+		return *status
+	}
+	return "error not ready: startup pending"
+}
+
+// Stores one service's status without changing a sibling or legacy latch.
+func (self *WarpStatusState) set(status string) {
+	if self == nil {
+		warpStatusOverride.Store(&status)
+	} else {
+		self.status.Store(&status)
+	}
+}
+
+// Admits this service after its startup work succeeds.
+func (self *WarpStatusState) SetReady() { self.set("ok") }
+
+// Retains the startup failure through graceful shutdown.
+func (self *WarpStatusState) SetNotReady(err error) {
+	self.set(fmt.Sprintf("error not ready: %s", err))
+}
+
+// A concurrent startup failure wins over a graceful drain transition.
+func (self *WarpStatusState) SetDrainingIfReady() {
+	latch := &warpStatusOverride
+	if self != nil {
+		latch = &self.status
+	}
+	for {
+		previous := latch.Load()
+		if previous != nil && strings.HasPrefix(*previous, "error") || previous == nil && self != nil {
+			return
+		}
+		draining := "draining"
+		if latch.CompareAndSwap(previous, &draining) {
+			return
+		}
+	}
+}
+
 func setWarpStatus(status string) {
 	warpStatusOverride.Store(&status)
 }
@@ -113,10 +171,7 @@ func SetWarpStatusDraining() {
 // failure from fleet status sampling. Use this in signal handlers; use
 // SetWarpStatusDraining only where the caller knows the service was ready.
 func SetWarpStatusDrainingIfReady() {
-	if status := warpStatusOverride.Load(); status != nil && strings.HasPrefix(*status, "error") {
-		return
-	}
-	setWarpStatus("draining")
+	(*WarpStatusState)(nil).SetDrainingIfReady()
 }
 
 func collectStatus(ctx context.Context) (string, error) {
@@ -128,7 +183,7 @@ func collectStatus(ctx context.Context) (string, error) {
 
 // StartupReadiness runs the one-shot deep checks behind the /status readiness
 // latch — the database's successful migration head must be at least the
-// binary-required head, then Redis must answer PING, all under a 15s budget —
+// binary-required head, then Redis must answer PING, all under a 300s budget —
 // and latches the outcome: ready ("ok") or not ready ("error not ready: ...",
 // which the deploy poll fails on). Allowing the database to be ahead preserves
 // rollback compatibility for older binaries after append-only migrations.
@@ -156,7 +211,13 @@ func CheckStartupReadiness(ctx context.Context) error {
 }
 
 func startupReadinessCheckAtMigration(ctx context.Context, requiredMigrationVersion int) error {
-	checkCtx, checkCancel := context.WithTimeout(ctx, 15*time.Second)
+	if ctx == nil {
+		return fmt.Errorf("startup readiness context is absent")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	checkCtx, checkCancel := context.WithTimeout(ctx, 300*time.Second)
 	defer checkCancel()
 
 	databaseVersion := 0
@@ -174,7 +235,7 @@ func startupReadinessCheckAtMigration(ctx context.Context, requiredMigrationVers
 			})
 		})
 	}); r != nil {
-		return fmt.Errorf("pg: %s", r)
+		return startupReadinessReadError("pg", r)
 	}
 	if err := validateMigrationHead(databaseVersion, requiredMigrationVersion); err != nil {
 		return fmt.Errorf("pg: %w", err)
@@ -185,10 +246,10 @@ func startupReadinessCheckAtMigration(ctx context.Context, requiredMigrationVers
 			server.Raise(client.Ping(checkCtx).Err())
 		})
 	}); r != nil {
-		return fmt.Errorf("redis: %s", r)
+		return startupReadinessReadError("redis", r)
 	}
 
-	return nil
+	return checkCtx.Err()
 }
 
 func validateMigrationHead(databaseVersion int, requiredMigrationVersion int) error {

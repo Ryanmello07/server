@@ -11,7 +11,6 @@ import (
 	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/onboarding"
 	"github.com/urnetwork/server/session"
-	"github.com/urnetwork/server/stats"
 	"github.com/urnetwork/server/task"
 	"github.com/urnetwork/server/taskworker/work"
 )
@@ -31,6 +30,15 @@ var removedTaskTargets = []string{
 // InitTasks schedules the recurring tasks. It is invoked at startup by the
 // taskworkercli command (and by the `init-tasks` subcommand).
 func InitTasks(ctx context.Context) {
+	initTaskSchedule(ctx)
+	controller.ApplyBlobRetention(ctx)
+}
+
+// Scheduling is bounded startup work. Long-lived retention observers are
+// activated separately after the process acquires its runtime owner.
+func initTaskSchedule(ctx context.Context) {
+	// Run-once upserts merge independently with live claim updates. A fixed
+	// snapshot needlessly retries the entire initializer whenever a claim wins.
 	server.Tx(ctx, func(tx server.PgTx) {
 		clientSession := session.NewLocalClientSession(ctx, "0.0.0.0:0", nil)
 		defer clientSession.Cancel()
@@ -70,17 +78,26 @@ func InitTasks(ctx context.Context) {
 		work.ScheduleRemoveLocationLookupResults(clientSession, tx)
 		work.ScheduleRemoveCompletedContracts(clientSession, tx)
 		work.ScheduleReconcileNetEscrow(clientSession, tx)
+		work.ScheduleFlushTransferDebits(clientSession, tx)
+		work.ScheduleFlushLegacySettlements(clientSession, tx)
 		work.ScheduleDbMaintenance(clientSession, tx, 0)
 		work.ScheduleWarmNetworkGetProviderLocations(clientSession, tx)
 		work.ScheduleRemoveExpiredAuthAttempts(clientSession, tx)
 		work.ScheduleRemoveExpiredWalletAuthChallenges(clientSession, tx)
 		work.ScheduleRemoveExpiredWalletNonces(clientSession, tx)
 		work.ScheduleRemoveExpiredProviderEgressLocations(clientSession, tx)
+		work.ScheduleRemoveExpiredProviderUrlProbeRuns(clientSession, tx)
 		work.ScheduleProberBootstrap(clientSession, tx)
-		work.ScheduleRefreshGeolocationSourcePins(clientSession, tx)
+		// no geolocation-source pin refresh: its sources are gone
+		// (connect/GEOMAP.md D24), and a pending row drains through the
+		// registered task below without scheduling a successor
 		work.ScheduleProviderEgressProbeTasks(clientSession, tx)
+		work.ScheduleRefreshEgressDestinations(clientSession, tx)
 		work.ScheduleExtenderProbe(clientSession, tx)
 		work.ScheduleExtenderPublish(clientSession, tx)
+		work.ScheduleRemoveOldExtenderLatencies(clientSession, tx)
+		work.ScheduleRemoveExpiredPings(clientSession, tx)
+		work.ScheduleDeriveLocations(clientSession, tx)
 		work.ScheduleRemoveExpiredBulkClientRemovalQuota(clientSession, tx)
 		work.ScheduleRemoveOldAuditNetworkEvents(clientSession, tx)
 		work.ScheduleRemoveOldAuditEvents(clientSession, tx)
@@ -121,11 +138,7 @@ func InitTasks(ctx context.Context) {
 		if removedCount := work.RemoveDisabledProviderEgressProbeTasks(ctx, tx); 0 < removedCount {
 			glog.Infof("[taskworker]reaped %d pending provider egress probe tasks while probing is disabled\n", removedCount)
 		}
-	})
-
-	// apply per-stream stats retention (MinIO ILM, or the local reaper) once at
-	// init, from the central defaults in the stats package
-	stats.ApplyStreamRetention(ctx)
+	}, server.TxReadCommitted)
 }
 
 // InitTaskWorker preserves the historical exact Go signature, including
@@ -139,14 +152,16 @@ func InitTaskWorker(ctx context.Context) *task.TaskWorker {
 // registered. One TaskWorker can be shared with many goroutines calling
 // EvalTasks. Passing nil uses the defaults.
 func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSettings) *task.TaskWorker {
-	if settings == nil {
-		settings = task.DefaultTaskWorkerSettings()
-	}
-	taskWorker := task.NewTaskWorker(ctx, settings)
+	return initTaskWorkerWithSettings(ctx, settings, WorkloadProfileProduction)
+}
+
+// initTaskWorkerWithSettings selects targets before the worker can claim rows.
+func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSettings, profile WorkloadProfile) *task.TaskWorker {
+	taskWorker := task.NewTaskWorker(ctx, taskWorkerSettingsForProfile(settings, profile))
 
 	// 2024.11.15 migration from "bringyour.com" to new package
 
-	taskWorker.AddTargets(
+	addProfileTargets(taskWorker, profile,
 		task.NewTaskTargetWithPost(
 			task.TaskCleanup,
 			task.TaskCleanupPost,
@@ -186,7 +201,7 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.CancelHungAccountPayments,
 			work.CancelHungAccountPaymentsPost,
 		),
-		task.NewTaskTargetWithPost(
+		task.NewTaskTargetWithCommitPost(
 			controller.PlaySubscriptionRenewal,
 			controller.PlaySubscriptionRenewalPost,
 			"bringyour.com/bringyour/controller.PlaySubscriptionRenewal",
@@ -222,6 +237,7 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.SweepOrphanNetworkClientData,
 			work.SweepOrphanNetworkClientDataPost,
 		),
+		task.NewTaskTarget(model.ApplyLegacyProviderTotals),
 		task.NewTaskTargetWithPost(
 			model.RemoveNetworkClientsTask,
 			model.RemoveNetworkClientsTaskPost,
@@ -272,6 +288,8 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.RemoveCompletedContracts,
 			work.RemoveCompletedContractsPost,
 		),
+		task.NewTaskTargetWithPost(work.FlushTransferDebits, work.FlushTransferDebitsPost),
+		task.NewTaskTargetWithPost(work.FlushLegacySettlements, work.FlushLegacySettlementsPost),
 		task.NewTaskTargetWithPost(
 			work.ReconcileNetEscrow,
 			work.ReconcileNetEscrowPost,
@@ -303,9 +321,13 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.RemoveExpiredProviderEgressLocationsPost,
 		),
 		task.NewTaskTargetWithPost(
+			work.RemoveExpiredProviderUrlProbeRuns,
+			work.RemoveExpiredProviderUrlProbeRunsPost,
+		),
+		task.WithErrorRetryCap(task.NewTaskTargetWithPost(
 			work.ProberBootstrap,
 			work.ProberBootstrapPost,
-		),
+		), work.ProberBootstrapTimeout),
 		task.NewTaskTargetWithPost(
 			work.RefreshGeolocationSourcePins,
 			work.RefreshGeolocationSourcePinsPost,
@@ -315,12 +337,28 @@ func InitTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.ProviderEgressProbePost,
 		),
 		task.NewTaskTargetWithPost(
+			work.RefreshEgressDestinations,
+			work.RefreshEgressDestinationsPost,
+		),
+		task.NewTaskTargetWithPost(
 			work.ExtenderProbe,
 			work.ExtenderProbePost,
 		),
 		task.NewTaskTargetWithPost(
 			work.ExtenderPublish,
 			work.ExtenderPublishPost,
+		),
+		task.NewTaskTargetWithPost(
+			work.RemoveOldExtenderLatencies,
+			work.RemoveOldExtenderLatenciesPost,
+		),
+		task.NewTaskTargetWithPost(
+			work.RemoveExpiredPings,
+			work.RemoveExpiredPingsPost,
+		),
+		task.NewTaskTargetWithPost(
+			work.DeriveLocations,
+			work.DeriveLocationsPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.RemoveExpiredBulkClientRemovalQuota,

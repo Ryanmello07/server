@@ -87,6 +87,9 @@ const (
 // proxyTestOptions parameterizes setupProxyTestWithOptions. The defaults
 // reproduce the original setupProxyTest behavior.
 type proxyTestOptions struct {
+	// The hosted device alone uses this origin; the fixture provider retains
+	// its separately owned API. A rejecting server proves local control.
+	hostedApiUrl string
 	// initial transfer balance redeemed for the proxy device network
 	pdInitialBalance model.ByteCount
 	// initial transfer balance redeemed for the provider network
@@ -100,6 +103,11 @@ type proxyTestOptions struct {
 	// the e2e can drive it over ws (the way server/connect exposes its handler
 	// for tests). Used by the device rpc e2e.
 	enableDeviceRpc bool
+	// the endpoint accepts XL by default, like production; true opts out
+	disableDeviceRpcH1Plus bool
+	deviceRpcH1PlusStats   *connect.H1PlusStats
+	// Set only on an unpublished device, before its lifecycle and idle worker start.
+	proxyDeviceIdleTimeout time.Duration
 	// when true, stand up only what the device rpc CONTROL plane needs: no live
 	// provider client (transport, egress NAT, provide registration) and no wait
 	// for the proxy device to reach a usable egress path. For tests of rpc
@@ -333,9 +341,13 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 
 	// ---- the test network space pointing the SDK at the local servers --------
 	connectSettings := connect.DefaultConnectSettings()
+	hostedApiUrl := fmt.Sprintf("http://127.0.0.1:%d", testApiPort)
+	if opts.hostedApiUrl != "" {
+		hostedApiUrl = opts.hostedApiUrl
+	}
 	networkSpace := sdk.Testing_NewNetworkSpaceWithUrls(
 		ctx,
-		fmt.Sprintf("http://127.0.0.1:%d", testApiPort),
+		hostedApiUrl,
 		fmt.Sprintf("ws://127.0.0.1:%d", connectClientPort),
 		connectSettings,
 	)
@@ -498,6 +510,10 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 
 	// ---- the real proxy servers (socks/http/https/wg/api) --------------------
 	proxySettings := DefaultProxySettings()
+	if opts.disableDeviceRpcH1Plus {
+		proxySettings.EnableDeviceRpcH1Plus = false
+	}
+	proxySettings.DeviceRpcH1PlusStats = opts.deviceRpcH1PlusStats
 	testPorts, releaseTestPorts := reserveProxyTestPorts(t)
 	proxySettings.SocksPort = testPorts.socks
 	proxySettings.HttpPort = testPorts.http
@@ -515,6 +531,17 @@ func setupProxyTestWithOptions(t testing.TB, opts *proxyTestOptions) *proxyTestH
 		pdmSettings.ClientSecurityPolicyGenerator = connect.DisableSecurityPolicyWithStats
 	}
 	proxyDeviceManager := NewProxyDeviceManager(ctx, pdmSettings)
+	if idleTimeout := opts.proxyDeviceIdleTimeout; 0 < idleTimeout {
+		buildProxyDevice := proxyDeviceManager.proxyDeviceBuilder
+		proxyDeviceManager.proxyDeviceBuilder = func(proxyId server.Id) (*ProxyDevice, error) {
+			pd, err := buildProxyDevice(proxyId)
+			if err == nil {
+				// The builder has not published pd or started CancelIfIdle.
+				pd.settings.ProxyDeviceIdleTimeout = idleTimeout
+			}
+			return pd, err
+		}
+	}
 	go func() {
 		<-ctx.Done()
 		_ = proxyDeviceManager.CloseAndWait(context.Background())

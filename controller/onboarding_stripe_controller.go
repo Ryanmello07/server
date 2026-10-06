@@ -330,6 +330,14 @@ func StripePaymentSheet(
 	args *StripePaymentSheetArgs,
 	clientSession *session.ClientSession,
 ) (*StripePaymentSheetResult, error) {
+	if refuseGuestPurchase(clientSession) {
+		return &StripePaymentSheetResult{
+			Error: &OnboardingError{
+				Code:    PurchaseErrorCodeGuestSignInRequired,
+				Message: purchaseGuestSignInRequiredMessage,
+			},
+		}, nil
+	}
 	plan := strings.ToLower(strings.TrimSpace(args.Plan))
 	if plan != model.PlanYearly && plan != model.PlanMonthly {
 		return stripePaymentSheetError("Unknown plan."), nil
@@ -352,6 +360,13 @@ func StripePaymentSheet(
 	if err != nil {
 		glog.Errorf("[stripe]payment sheet: customer: %s\n", err)
 		return stripePaymentSheetError("Could not start the payment. Please try again."), nil
+	}
+
+	// never start a second subscription while one is active: a sheet that looked
+	// like it failed would otherwise charge the customer again
+	if stripeNetworkHasActiveSubscription(clientSession, customerId) {
+		glog.Infof("[stripe]payment sheet: network %s already has an active subscription\n", networkId)
+		return stripePaymentSheetError(stripeAlreadySubscribedMessage), nil
 	}
 
 	// a sheet the customer abandoned leaves a pending subscription behind; replace
@@ -479,6 +494,71 @@ func stripeCustomerIdForSession(clientSession *session.ClientSession) (string, e
 
 // stripeCancelPendingPaymentSheetSubscriptions cancels the customer's
 // subscriptions still waiting for a payment sheet to finish. Best effort.
+// shown when a network that already pays for Pro starts another purchase
+const stripeAlreadySubscribedMessage = "You already have an active Pro subscription, so no new payment was made. Manage your subscription from your account."
+
+// subscriptionMarketsBlockNewPurchase reports whether the network's active
+// supporter subscription markets mean it is already paying for Pro. Manual
+// grants and x402 agent payments are not a store subscription the customer
+// would be charged for twice.
+func subscriptionMarketsBlockNewPurchase(markets []model.SubscriptionMarket) bool {
+	for _, market := range markets {
+		switch market {
+		case model.SubscriptionMarketManual, model.SubscriptionMarketX402:
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// stripeSubscriptionBlocksNewPurchase reports whether a Stripe subscription is
+// a live one that a new purchase would duplicate. A payment sheet the customer
+// abandoned (still pending, no payment method) does not count; it is canceled
+// and replaced by stripeCancelPendingPaymentSheetSubscriptions.
+func stripeSubscriptionBlocksNewPurchase(sub *stripe.Subscription) bool {
+	if sub == nil {
+		return false
+	}
+	switch sub.Status {
+	case stripe.SubscriptionStatusActive, stripe.SubscriptionStatusTrialing, stripe.SubscriptionStatusPastDue:
+	default:
+		return false
+	}
+	if sub.Metadata[stripeMetadataPaymentSheet] == stripePaymentSheetPending && sub.DefaultPaymentMethod == nil {
+		return false
+	}
+	return true
+}
+
+// stripeNetworkHasActiveSubscription checks the network's recorded subscription
+// renewals (any store) and, when it has a Stripe customer, the customer's live
+// Stripe subscriptions, which cover a payment made before its webhook landed.
+// A Stripe listing error does not block the purchase. stripe.Key must be set.
+func stripeNetworkHasActiveSubscription(clientSession *session.ClientSession, customerId string) bool {
+	networkId := clientSession.ByJwt.NetworkId
+	markets := model.GetActiveSubscriptionRenewalMarkets(clientSession.Ctx, networkId, model.SubscriptionTypeSupporter)
+	if subscriptionMarketsBlockNewPurchase(markets) {
+		return true
+	}
+	if customerId == "" {
+		return false
+	}
+	iter := subscription.List(&stripe.SubscriptionListParams{
+		Customer: stripe.String(customerId),
+		Status:   stripe.String("all"),
+	})
+	for iter.Next() {
+		if stripeSubscriptionBlocksNewPurchase(iter.Subscription()) {
+			return true
+		}
+	}
+	if err := iter.Err(); err != nil {
+		glog.Infof("[stripe]could not list subscriptions for customer %s: %s\n", customerId, err)
+	}
+	return false
+}
+
 func stripeCancelPendingPaymentSheetSubscriptions(customerId string, networkId server.Id) {
 	iter := subscription.List(&stripe.SubscriptionListParams{
 		Customer: stripe.String(customerId),
@@ -552,6 +632,10 @@ func stripeHandleInvoicePaidWithOnboarding(
 	}
 	result, err := stripeHandleInvoicePaid(invoice, clientSession)
 	if err != nil {
+		var unresolved *stripeInvoiceDestinationUnresolvedError
+		if errors.As(err, &unresolved) {
+			return stripeAcknowledgeUnresolvedInvoice(clientSession.Ctx, invoice, unresolved)
+		}
 		return result, err
 	}
 	if sub != nil {

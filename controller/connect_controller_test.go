@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -62,9 +64,9 @@ func TestContractResultErrorSeparatesReliabilityFromAccountFailures(t *testing.T
 			want: protocol.ContractError_InsufficientBalance,
 		},
 		{
-			name: "unknown legacy failure",
+			name: "unclassified failure",
 			err:  fmt.Errorf("postgres unavailable"),
-			want: protocol.ContractError_InsufficientBalance,
+			want: protocol.ContractError_Setup,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -72,6 +74,111 @@ func TestContractResultErrorSeparatesReliabilityFromAccountFailures(t *testing.T
 				t.Fatalf("contractResultError() = %s, want %s", got, test.want)
 			}
 		})
+	}
+}
+
+// The apps tell the user they are out of data when a contract is refused with
+// InsufficientBalance, so only a refusal that found the payer's balance short
+// may carry it. Each failure class newContract can return is pinned to its
+// wire result next to its metric cause, so the cause label and the wire result
+// keep agreeing. The error shapes are the model's: the Redis grant census, the
+// ledger path and balance drain, admission cleanup, and the Redis client.
+func TestContractResultErrorReportsOnlyBalanceRefusalsAsInsufficientBalance(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		err   error
+		want  protocol.ContractError
+		cause string
+	}{
+		{
+			name:  "redis grant census found the balance short",
+			err:   fmt.Errorf("%w (%d).", errors.New("Insufficient balance"), 512*1024),
+			want:  protocol.ContractError_InsufficientBalance,
+			cause: "insufficient_balance",
+		},
+		{
+			name:  "ledger path or balance drain found the balance short",
+			err:   fmt.Errorf("Insufficient balance (%d).", 0),
+			want:  protocol.ContractError_InsufficientBalance,
+			cause: "insufficient_balance",
+		},
+		{
+			name:  "balance refusal whose reservation release also failed",
+			err:   errors.Join(fmt.Errorf("Insufficient balance (%d).", 0), errors.New("redis: connection pool timeout")),
+			want:  protocol.ContractError_InsufficientBalance,
+			cause: "insufficient_balance",
+		},
+		{
+			name:  "missing companion origin",
+			err:   model.ErrMissingCompanionOrigin,
+			want:  protocol.ContractError_Reliability,
+			cause: "missing_companion_origin",
+		},
+		{
+			name:  "inactive intermediary",
+			err:   fmt.Errorf("Contract intermediary is inactive: %s: %w", server.NewId(), model.ErrActiveClientNotFound),
+			want:  protocol.ContractError_NoPermission,
+			cause: "client_not_found",
+		},
+		{
+			name:  "redis admission deadline",
+			err:   context.DeadlineExceeded,
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name:  "redis connection refused",
+			err:   &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")},
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name:  "redis reservation script error",
+			err:   errors.New("missing owned reservation marker"),
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name: "grant census reached its selection bound",
+			err: errors.Join(fmt.Errorf(
+				"%w: rows=%d/%d selected=%d/%d last_balance=%s; increase the reviewed redis_contract_admission.yml profile or reduce request size",
+				errors.New("Redis grant selection capacity reached; remaining funding is unknown"),
+				320, 4096, 256, 256, server.NewId(),
+			)),
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name:  "grant census met an unknown counter",
+			err:   fmt.Errorf("Redis grant funding incomplete because a counter remains unknown: %w", errors.New("invalid reservation counter")),
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name:  "grant changed under the request",
+			err:   errors.New("selected Redis grant expired or changed before contract publication"),
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name:  "retired probe shard",
+			err:   model.ErrProberShardRetired,
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+		{
+			name:  "canceled request",
+			err:   context.Canceled,
+			want:  protocol.ContractError_Setup,
+			cause: "other",
+		},
+	} {
+		if got := contractResultError(test.err); got != test.want {
+			t.Errorf("%s: contractResultError() = %s, want %s", test.name, got, test.want)
+		}
+		if got := contractFailureClass(test.err); got != test.cause {
+			t.Errorf("%s: contractFailureClass() = %q, want %q", test.name, got, test.cause)
+		}
 	}
 }
 
@@ -182,6 +289,7 @@ func TestRecordMissingOriginDetailsAreBounded(t *testing.T) {
 			fmt.Sprintf("%t", requestCompanion),
 			senderRole,
 			sourceOwner,
+			"unknown",
 			resolution,
 			relationship,
 			sourceLifecycle,
@@ -274,6 +382,7 @@ func TestRecordInactiveDestinationDetailsAreBounded(t *testing.T) {
 			fmt.Sprintf("%t", requestCompanion),
 			senderRole,
 			sourceOwner,
+			"unknown",
 			resolution,
 			relationship,
 			sourceLifecycle,
@@ -1146,6 +1255,17 @@ func TestCreateContractCompanionNetworkNormalization(t *testing.T) {
 				storedContract := &protocol.StoredContract{}
 				err := proto.Unmarshal(result.Contract.StoredContractBytes, storedContract)
 				connect.AssertEqual(t, err, nil)
+				// Transport normalization must preserve the original provider for
+				// subnet usage, even though no companion or escrow is stored.
+				contractId, err := server.IdFromBytes(storedContract.ContractId)
+				connect.AssertEqual(t, err, nil)
+				start := server.NowUtc()
+				connect.AssertEqual(t, model.CloseContract(ctx, contractId, source, 121, false), nil)
+				connect.AssertEqual(t, model.CloseContract(ctx, contractId, destination, 120, false), nil)
+				usages, usageErr := model.GetStEpochProviderUsage(ctx, start, start.Add(time.Hour))
+				if usageErr != nil || len(usages) != 1 || usages[0].ClientId != source || usages[0].PayoutByteCount != 120 {
+					t.Fatalf("normalized return lost its service origin: %+v, %v", usages, usageErr)
+				}
 				connect.AssertEqual(t, storedContract.Priority != nil, true)
 				if storedContract.Priority != nil {
 					connect.AssertEqual(t, int(*storedContract.Priority), int(model.TrustedPriority))

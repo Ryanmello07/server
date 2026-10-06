@@ -6,10 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/urnetwork/server"
 	"io"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	servermonitor "github.com/urnetwork/server/monitor"
 )
@@ -28,22 +30,43 @@ const (
 )
 
 type monitorOptions struct {
-	once                  bool
-	listSignals           bool
-	mode                  string
-	format                string
-	keys                  stringFlags
-	includedSignals       stringFlags
-	excludedSignals       stringFlags
-	excludedHosts         stringFlags
-	excludedEdgeIPv6Hosts stringFlags
+	once                    bool
+	listSignals             bool
+	mode                    string
+	format                  string
+	output                  string
+	keys                    stringFlags
+	includedSignals         stringFlags
+	excludedSignals         stringFlags
+	excludedHosts           stringFlags
+	excludedEdgeIPv6Hosts   stringFlags
+	minimumProbeCadence     time.Duration
+	apiReleaseProofFile     string
+	pgQuerySampleUntil      string
+	pgQuerySampleContinuous bool
 }
 
+// Exit only after the command-owned process lifecycle has returned.
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	os.Exit(runMonitorProcess(func() error {
+		return run(os.Args[1:], os.Stdout)
+	}, os.Stderr, server.ScrubProcessLogs))
+}
+
+// Drain both scrubbed descriptors before returning the final process status.
+func runMonitorProcess(runCommand func() error, stderr io.Writer, scrubLogs func() (func(), error)) int {
+	// Address scrubbing for everything this process writes to stdout and
+	// stderr, installed before anything can log. A failure here is not fatal:
+	// it degrades to the previous unscrubbed behavior rather than losing
+	// logging entirely. See server.ScrubProcessLogs.
+	restore, _ := scrubLogs()
+	defer restore()
+
+	if err := runCommand(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
 	}
+	return 0
 }
 
 func run(args []string, stdout io.Writer) error {
@@ -55,7 +78,21 @@ func runWithSettingsLoader(args []string, stdout io.Writer, loadSettings func() 
 	if err != nil {
 		return err
 	}
+	var releaseProof *servermonitor.APIReleaseProofSettings
+	if opts.apiReleaseProofFile != "" {
+		releaseProof, err = servermonitor.LoadAPIReleaseProofSettings(opts.apiReleaseProofFile)
+		if err != nil {
+			return err
+		}
+	}
 
+	var pgSampleUntil time.Time
+	if opts.pgQuerySampleUntil != "" {
+		pgSampleUntil, err = time.Parse(time.RFC3339, opts.pgQuerySampleUntil)
+		if err != nil {
+			return errors.New("monitor: invalid -pg-query-sample-until clock")
+		}
+	}
 	signals := servermonitor.NewSignals()
 	if opts.listSignals {
 		return writeSignalList(stdout, signals)
@@ -69,11 +106,32 @@ func runWithSettingsLoader(args []string, stdout io.Writer, loadSettings func() 
 		return err
 	}
 
+	if opts.pgQuerySampleContinuous || !pgSampleUntil.IsZero() {
+		selected := false
+		for _, signal := range signals {
+			selected = selected || signal.Key() == "pg-query-sample"
+		}
+		if !selected {
+			return errors.New("monitor: configured bounded PG query sample signal is excluded")
+		}
+	}
+	if releaseProof != nil {
+		selected := false
+		for _, signal := range signals {
+			selected = selected || signal.Key() == "api-release-proof"
+		}
+		if !selected {
+			return errors.New("monitor: configured API release proof signal is excluded")
+		}
+	}
 	loadEffectiveSettings := func() (servermonitor.SignalSettings, error) {
 		settings, err := loadSettings()
 		if err != nil {
 			return servermonitor.SignalSettings{}, err
 		}
+		settings.APIReleaseProof = releaseProof
+		settings.PGQuerySampleUntil = pgSampleUntil
+		settings.PGQuerySampleContinuous = opts.pgQuerySampleContinuous
 		return applyMonitorSettingsOptions(settings, opts)
 	}
 	settings, err := loadEffectiveSettings()
@@ -93,12 +151,18 @@ func runWithSettingsLoader(args []string, stdout io.Writer, loadSettings func() 
 	defer stop()
 	if opts.once {
 		alerts, runErr := monitor.Run(ctx)
-		if err := writeAlerts(stdout, opts.format, alerts); err != nil {
+		output, closeOutput, err := openAlertOutput(stdout, opts.output)
+		if err != nil {
 			return err
+		}
+		writeErr := writeAlerts(output, opts.format, alerts)
+		closeErr := closeOutput()
+		if writeErr != nil || closeErr != nil {
+			return errors.Join(writeErr, closeErr)
 		}
 		return runErr
 	}
-	return monitor.RunLoop(ctx, func(ctx context.Context, signal servermonitor.Signal, alerts servermonitor.Alerts) error {
+	return monitor.RunLoopWithOptions(ctx, servermonitor.RunLoopOptions{MinimumProbeCadence: opts.minimumProbeCadence}, func(ctx context.Context, signal servermonitor.Signal, alerts servermonitor.Alerts) error {
 		if len(alerts) == 0 {
 			return nil
 		}
@@ -128,13 +192,36 @@ func parseMonitorOptions(args []string) (monitorOptions, error) {
 	flags.BoolVar(&opts.listSignals, "list-signals", false, "list registered signal identifiers and exit without loading settings")
 	flags.StringVar(&opts.mode, "mode", "", "SSH address mode: lan or overlay")
 	flags.StringVar(&opts.format, "format", alertFormatMarkdown, "alert output format: markdown or jsonl")
+	flags.StringVar(&opts.output, "output", "", "write one-shot alert output directly to this file")
+	flags.BoolVar(&opts.pgQuerySampleContinuous, "pg-query-sample-continuous", false, "continuously collect bounded PostgreSQL query/load samples at the 15m cadence floor")
+	flags.StringVar(&opts.pgQuerySampleUntil, "pg-query-sample-until", "", "UTC expiry for one optional bounded PostgreSQL query/load sample")
+	flags.StringVar(&opts.apiReleaseProofFile, "api-release-proof", "", "private local JSON expectation for the optional bounded API release proof")
+	flags.DurationVar(&opts.minimumProbeCadence, "min-probe-cadence", 0, "continuous active-probe cadence floor and first-run delay; standing logs are unchanged")
 	flags.Var(&opts.keys, "ssh-key", "SSH identity path; may be repeated")
 	flags.Var(&opts.includedSignals, "include-signal", "signal key, number, or ID to run; may be repeated")
 	flags.Var(&opts.excludedSignals, "exclude-signal", "signal key, number, or ID to omit; may be repeated")
 	flags.Var(&opts.excludedHosts, "exclude-host", "exact inventory host whose observation should be paused; may be repeated")
 	flags.Var(&opts.excludedEdgeIPv6Hosts, "exclude-edge-ipv6-host", "host whose exact public IPv6 paths should be paused; may be repeated")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
-		return monitorOptions{}, errors.New("usage: monitor [-once] [-list-signals] [-format markdown|jsonl] [-include-signal IDENTIFIER | -exclude-signal IDENTIFIER]")
+		return monitorOptions{}, errors.New("usage: monitor [-once] [-list-signals] [-min-probe-cadence DURATION] [-format markdown|jsonl] [-include-signal IDENTIFIER | -exclude-signal IDENTIFIER]")
+	}
+	if opts.minimumProbeCadence < 0 {
+		return monitorOptions{}, errors.New("monitor: -min-probe-cadence must not be negative")
+	}
+	if opts.pgQuerySampleContinuous && opts.pgQuerySampleUntil != "" {
+		return monitorOptions{}, errors.New("monitor: continuous and expiring PG sample modes are mutually exclusive")
+	}
+	if (opts.pgQuerySampleContinuous || opts.pgQuerySampleUntil != "") && (opts.once || opts.minimumProbeCadence < 15*time.Minute) {
+		return monitorOptions{}, errors.New("monitor: PG query sampling requires continuous mode with at least 15m cadence floor")
+	}
+	if (opts.pgQuerySampleContinuous || opts.pgQuerySampleUntil != "") && opts.listSignals {
+		return monitorOptions{}, errors.New("monitor: PG query sampling cannot be used with -list-signals")
+	}
+	if opts.apiReleaseProofFile != "" && opts.listSignals {
+		return monitorOptions{}, errors.New("monitor: -api-release-proof cannot be used with -list-signals")
+	}
+	if opts.minimumProbeCadence != 0 && (opts.once || opts.listSignals) {
+		return monitorOptions{}, errors.New("monitor: nonzero -min-probe-cadence requires continuous mode")
 	}
 	if len(opts.includedSignals) > 0 && len(opts.excludedSignals) > 0 {
 		return monitorOptions{}, errors.New("monitor: -include-signal and -exclude-signal are mutually exclusive")
@@ -142,7 +229,27 @@ func parseMonitorOptions(args []string) (monitorOptions, error) {
 	if opts.format != alertFormatMarkdown && opts.format != alertFormatJSONL {
 		return monitorOptions{}, fmt.Errorf("monitor: format %q is not supported; use markdown or jsonl", opts.format)
 	}
+	if opts.output != "" && !opts.once {
+		return monitorOptions{}, errors.New("monitor: -output requires -once")
+	}
+	if opts.output != "" && opts.listSignals {
+		return monitorOptions{}, errors.New("monitor: -output cannot be used with -list-signals")
+	}
 	return opts, nil
+}
+
+// openAlertOutput lets one-shot monitor output bypass an ambient stdout
+// capture boundary. The caller supplies a private temporary path and promotes
+// it only after validating the terminal Markdown completion marker.
+func openAlertOutput(stdout io.Writer, path string) (io.Writer, func() error, error) {
+	if path == "" {
+		return stdout, func() error { return nil }, nil
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("monitor: open output %q: %w", path, err)
+	}
+	return file, file.Close, nil
 }
 
 func writeSignalList(w io.Writer, signals []servermonitor.Signal) error {

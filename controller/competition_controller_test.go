@@ -303,6 +303,233 @@ func validSettings() *Settings {
 	}
 }
 
+func testRoundBaseline(t testing.TB, settings *Settings, round *roundRecord, rawScores []float64) []byte {
+	t.Helper()
+	if len(rawScores) != settings.EvaluationPolicy.Replicates {
+		t.Fatalf("baseline raw-score count = %d, want %d", len(rawScores), settings.EvaluationPolicy.Replicates)
+	}
+	replicates := make([]roundBaselineReplicate, 0, len(rawScores))
+	for _, rawScore := range rawScores {
+		replicates = append(replicates, roundBaselineReplicate{
+			RawScore: rawScore, SuccessRate: 1, RequestCount: 100, ReceivedBytes: 1000,
+			FindProvidersLoadP95Ms: 2, FindProvidersPoolP05: 10,
+			FindProvidersSampleSpanFraction: 1,
+			LiveMetrics: map[string]roundBaselineMetricSummary{
+				"ttfb_p50_ms":                {Value: 10, N: 100, BlockSe: 1},
+				"ttfb_p95_ms":                {Value: 20, N: 100, BlockSe: 1},
+				"throughput_p50_bytes_per_s": {Value: 1000, N: 100, BlockSe: 10},
+				"throughput_p95_bytes_per_s": {Value: 2000, N: 100, BlockSe: 10},
+			},
+		})
+	}
+	content, err := json.MarshalIndent(roundBaselineManifest{
+		ScoreSchema: ScoreSchema, Kind: "sim-latency-score-baseline", ScorerVersion: ScorerVersion,
+		RoundId: round.RoundId.String(), ConfigSha256: round.ProvidersSha256,
+		RequestTimeoutMs: settings.EvaluationPolicy.RequestTimeoutMs,
+		RunFlags:         map[string]string{"official": "true"},
+		TakeoverMargin:   settings.EvaluationPolicy.TakeoverMargin, Replicates: replicates,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(content, '\n')
+}
+
+// Mirrors the production evaluator's baseline-bearing outcome; callers that
+// model historical per-job controls must insert those legacy records explicitly.
+func testSharedBaselineOutcome(t testing.TB, settings *Settings, job *queuedJob, outcome EvaluationOutcome) EvaluationOutcome {
+	t.Helper()
+	if job.RoundBaseline != nil {
+		outcome.RoundBaselineJson = job.RoundBaseline.Json
+		outcome.RoundBaselineSha256 = job.RoundBaseline.Sha256
+	} else {
+		rawScores := make([]float64, settings.EvaluationPolicy.Replicates)
+		for index := range rawScores {
+			rawScores[index] = 100 + float64(index%3) - 1
+		}
+		outcome.RoundBaselineJson = testRoundBaseline(t, settings, &job.Round, rawScores)
+		digest := sha256.Sum256(outcome.RoundBaselineJson)
+		outcome.RoundBaselineSha256 = hex.EncodeToString(digest[:])
+	}
+	if len(outcome.ArtifactManifest) == 0 {
+		outcome.ArtifactManifest = json.RawMessage(`{"schema":1,"synthetic":true}`)
+	}
+	if outcome.Score != nil {
+		if outcome.Score.Diagnostics == nil {
+			outcome.Score.Diagnostics = map[string]any{}
+		}
+		outcome.Score.Diagnostics["baseline_sha256"] = outcome.RoundBaselineSha256
+	}
+	return outcome
+}
+
+func TestRoundBaselineAuthenticationBindsEpochAndLiveMetrics(t *testing.T) {
+	settings := validSettings()
+	policyJson, err := policySnapshot(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round := &roundRecord{
+		RoundResult: RoundResult{
+			RoundId: server.NewId(), ProvidersSha256: strings.Repeat("c", 64),
+		},
+		PolicyJson: policyJson,
+	}
+	content := testRoundBaseline(t, settings, round, []float64{100, 101, 99})
+	digest, err := validateRoundBaselineJson(settings, round, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := sha256.Sum256(content)
+	if digest != hex.EncodeToString(expected[:]) {
+		t.Fatalf("baseline digest = %q", digest)
+	}
+
+	foreign := *round
+	foreign.RoundId = server.NewId()
+	if _, err := validateRoundBaselineJson(settings, &foreign, content); err == nil {
+		t.Fatal("baseline accepted for a foreign round")
+	}
+	var malformed map[string]any
+	if err := json.Unmarshal(content, &malformed); err != nil {
+		t.Fatal(err)
+	}
+	replicates := malformed["replicates"].([]any)
+	delete(replicates[0].(map[string]any)["live_metrics"].(map[string]any), "ttfb_p95_ms")
+	missingMetric, err := json.Marshal(malformed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateRoundBaselineJson(settings, round, missingMetric); err == nil {
+		t.Fatal("baseline with incomplete live metrics was accepted")
+	}
+}
+
+func TestEvaluatorRequestDistributesOnlyAuthenticatedRoundBaseline(t *testing.T) {
+	settings := validSettings()
+	job := &queuedJob{
+		ScoreJobResult: ScoreJobResult{
+			JobId: server.NewId(), RoundId: server.NewId(), PatchSha256: strings.Repeat("a", 64),
+			EvaluatorImageDigest: settings.EvaluatorImageDigest,
+			ApiImageDigest:       testApiImageDigest(), WorkerImageDigest: testWorkerImageDigest(),
+		},
+		AttemptCount:  1,
+		Round:         roundRecord{RoundResult: RoundResult{Epoch: 1}},
+		RoundBaseline: &roundBaselineRecord{Sha256: strings.Repeat("b", 64)},
+	}
+	request := evaluatorRequestForJob(
+		settings, job, strings.Repeat("c", 64), "/attempt",
+		"/attempt/canonical.patch", "/attempt/providers.yml",
+	)
+	if request.RoundBaselinePath != "/attempt/round-baseline.json" ||
+		request.RoundBaselineSha256 != job.RoundBaseline.Sha256 {
+		t.Fatalf("round baseline request = %q, %q", request.RoundBaselinePath, request.RoundBaselineSha256)
+	}
+	job.RoundBaseline = nil
+	request = evaluatorRequestForJob(
+		settings, job, strings.Repeat("c", 64), "/attempt",
+		"/attempt/canonical.patch", "/attempt/providers.yml",
+	)
+	if request.RoundBaselinePath != "" || request.RoundBaselineSha256 != "" {
+		t.Fatal("unfrozen round request invented a baseline identity")
+	}
+}
+
+func TestCompetitionRoundBaselineFreezesOnceAndIsReused(t *testing.T) {
+	testEnv := server.DefaultTestEnv()
+	testEnv.RerunCount = 0
+	testEnv.Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		settings := validSettings()
+		settings.CompetitionId += "-shared-baseline"
+		settings.ArtifactRoot = t.TempDir()
+		currentTime := server.NowUtc().Truncate(time.Second)
+		settings.SeasonEndsAt = currentTime.Add(60 * 24 * time.Hour)
+		settings.RetainUntil = settings.SeasonEndsAt.Add(30 * 24 * time.Hour)
+		store := PostgresStore{now: func() time.Time { return currentTime }}
+		listKey, memberKey := competitionFifoKeys(settings)
+		server.Redis(ctx, func(client server.RedisClient) {
+			server.Raise(client.Del(ctx, listKey, memberKey).Err())
+		})
+		t.Cleanup(func() {
+			server.Redis(context.Background(), func(client server.RedisClient) {
+				_ = client.Del(context.Background(), listKey, memberKey).Err()
+			})
+		})
+
+		round, err := store.CreateStagingRound(ctx, settings, GenerateRoundArgs{
+			OpensAt: currentTime, ClosesAt: currentTime.Add(time.Hour), RevealAt: currentTime.Add(time.Hour),
+		}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs := make([]*queuedJob, 0, 2)
+		for _, name := range []string{"shared-baseline-a", "shared-baseline-b"} {
+			patch, patchErr := ValidateAndCanonicalizePatch(testPatch(name), settings.PatchPolicy)
+			if patchErr != nil {
+				t.Fatal(patchErr)
+			}
+			job, cacheHit, enqueueErr := store.Enqueue(
+				ctx, settings, round.RoundId, patch, "miner-"+name, testApiImageDigest(),
+			)
+			if enqueueErr != nil || cacheHit {
+				t.Fatalf("enqueue %s: hit=%t error=%v", name, cacheHit, enqueueErr)
+			}
+			jobs = append(jobs, job)
+		}
+
+		first, err := store.Claim(ctx, settings, "worker-a", testWorkerImageDigest())
+		if err != nil || first == nil || first.JobId != jobs[0].JobId || first.RoundBaseline != nil {
+			t.Fatalf("first claim = %#v, %v", first, err)
+		}
+		baselineJson := testRoundBaseline(t, settings, &first.Round, []float64{100, 101, 99})
+		baselineDigest := sha256.Sum256(baselineJson)
+		baselineSha256 := hex.EncodeToString(baselineDigest[:])
+		outcome := EvaluationOutcome{
+			Error:               submissionError("run_unstable", "synthetic candidate instability"),
+			ArtifactManifest:    json.RawMessage(`{"schema":1}`),
+			RoundBaselineJson:   baselineJson,
+			RoundBaselineSha256: baselineSha256,
+		}
+		if retry, err := store.Complete(ctx, settings, "worker-a", first.JobId, outcome); err != nil || retry {
+			t.Fatalf("freeze baseline: retry=%t error=%v", retry, err)
+		}
+
+		second, err := store.Claim(ctx, settings, "worker-a", testWorkerImageDigest())
+		if err != nil || second == nil || second.JobId != jobs[1].JobId || second.RoundBaseline == nil {
+			t.Fatalf("second claim = %#v, %v", second, err)
+		}
+		if second.RoundBaseline.Sha256 != baselineSha256 || !bytes.Equal(second.RoundBaseline.Json, baselineJson) ||
+			second.RoundBaseline.SourceJobId != first.JobId || second.RoundBaseline.SourceAttempt != first.AttemptCount {
+			t.Fatalf("reused baseline = %#v", second.RoundBaseline)
+		}
+
+		changedJson := testRoundBaseline(t, settings, &second.Round, []float64{110, 111, 109})
+		changedDigest := sha256.Sum256(changedJson)
+		changedOutcome := outcome
+		changedOutcome.RoundBaselineJson = changedJson
+		changedOutcome.RoundBaselineSha256 = hex.EncodeToString(changedDigest[:])
+		if _, err := store.Complete(ctx, settings, "worker-a", second.JobId, changedOutcome); err == nil ||
+			!strings.Contains(err.Error(), "conflicts with the immutable round baseline") {
+			t.Fatalf("changed baseline completion error = %v", err)
+		}
+		if retry, err := store.Complete(ctx, settings, "worker-a", second.JobId, outcome); err != nil || retry {
+			t.Fatalf("complete with frozen baseline: retry=%t error=%v", retry, err)
+		}
+
+		updateErr := captureDatabaseError(func() {
+			server.Db(ctx, func(conn server.PgConn) {
+				server.RaisePgResult(conn.Exec(ctx, `
+					UPDATE competition_round_baseline SET baseline_sha256 = $2 WHERE round_id = $1
+				`, round.RoundId, strings.Repeat("0", 64)))
+			}, server.OptReadWrite())
+		})
+		if updateErr == nil || !strings.Contains(updateErr.Error(), "append-only") {
+			t.Fatalf("round baseline mutation error = %v", updateErr)
+		}
+	})
+}
+
 // The competition archive must not inherit the ordinary stats bucket because
 // that bucket predates object locking and cannot satisfy retained submissions.
 func TestArtifactArchiveDefaultsToDedicatedBucket(t *testing.T) {
@@ -2051,10 +2278,11 @@ func TestSubmissionBuilderProtectsSimulatorTree(t *testing.T) {
 	}
 	script := string(scriptBytes)
 	for _, required := range []string{
-		`protected_simulator_tree="$(git -C "$source_root/server" rev-parse HEAD:connect/sim-latency)"`,
+		`protected_simulator_tree="$(git -C "$source_root/server" rev-parse --verify HEAD:connect/sim-latency)"`,
 		`git -C "$source_root/server" diff --quiet -- connect/sim-latency`,
 		`status --porcelain=v1 --untracked-files=all -- connect/sim-latency`,
-		`[ "$(git -C "$source_root/server" rev-parse HEAD:connect/sim-latency)" = "$protected_simulator_tree" ]`,
+		`candidate_simulator_tree="$(git -C "$source_root/server" rev-parse --verify HEAD:connect/sim-latency)"`,
+		`[ "$candidate_simulator_tree" = "$protected_simulator_tree" ]`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("submission builder is missing protected-tree check %q", required)
@@ -2268,7 +2496,7 @@ func TestEvaluatorUsesAttemptLocalSourceCheckouts(t *testing.T) {
 	}
 	prepare := string(prepareBytes)
 	for _, required := range []string{
-		`readonly REPOSITORIES=(server connect sdk proxy glog goidenticons userwireguard sn)`,
+		`readonly REPOSITORIES=(server connect sdk proxy glog goidenticons userwireguard sn operator-proxy warp)`,
 		`docker cp "$source_container:/workspace/$repository" "$destination/"`,
 		`checkout --quiet -B sim-latency "$expected_commit"`,
 		`source_lock_sha256`,
@@ -2294,8 +2522,8 @@ func TestEvaluatorUsesAttemptLocalSourceCheckouts(t *testing.T) {
 		`--destination "$baseline_source_root"`,
 		`--destination "$candidate_source_root"`,
 		`--source-root "$candidate_source_root"`,
-		`for repository in server connect sdk proxy glog goidenticons userwireguard sn; do`,
-		`rev-parse HEAD:connect/sim-latency`,
+		`for repository in server connect sdk proxy glog goidenticons userwireguard sn operator-proxy warp; do`,
+		`rev-parse --verify HEAD:connect/sim-latency`,
 		`candidate changed the protected sim-latency source tree`,
 		`EVALUATION_SOURCE_DIR=$source`,
 		`.Destination == "/workspace" and .RW == false`,
@@ -2314,7 +2542,7 @@ func TestEvaluatorUsesAttemptLocalSourceCheckouts(t *testing.T) {
 	}
 	if !strings.Contains(
 		string(buildSubmissionBytes),
-		"for repository in server connect sdk proxy glog goidenticons userwireguard sn; do",
+		"for repository in server connect sdk proxy glog goidenticons userwireguard sn operator-proxy warp; do",
 	) {
 		t.Fatal("submission builder does not authenticate the complete source graph")
 	}
@@ -2385,7 +2613,7 @@ func TestEvaluatorMountsOnlyLocalConfigAndVault(t *testing.T) {
 		`.Destination == "/runtime/config/local" and .RW == false`,
 		`.Destination == "/runtime/vault/local" and .RW == false`,
 		`[.Mounts[] | select(.Destination | startswith("/runtime"))] | length == 2`,
-		`mounts:[.Mounts[] | {type:.Type,destination:.Destination,rw:.RW}]`,
+		`mounts:[.Mounts[]? | {type:.Type,destination:.Destination,rw:.RW}]`,
 	} {
 		if !strings.Contains(evaluator, required) {
 			t.Errorf("evaluator local-only mount attestation is missing %q", required)
@@ -2439,7 +2667,7 @@ func TestEvaluatorMountsOnlyLocalConfigAndVault(t *testing.T) {
 	}
 	if !strings.Contains(
 		string(buildBaseBytes),
-		"readonly REPOSITORIES=(server connect sdk proxy glog goidenticons userwireguard sn)",
+		"readonly REPOSITORIES=(server connect sdk proxy glog goidenticons userwireguard sn operator-proxy warp)",
 	) {
 		t.Fatal("evaluator base repository allowlist changed; re-audit config/vault exclusion")
 	}
@@ -2702,7 +2930,7 @@ func TestEvaluatorRetainsOnlySanitizedFailureEvidence(t *testing.T) {
 	}
 	evaluator := string(evaluatorBytes)
 	retainCall := strings.Index(evaluator, `"$RETAIN_FAILURE_EVIDENCE" \`)
-	unmountCall := strings.Index(evaluator, `sudo -n umount "$active_work_mount"`)
+	unmountCall := strings.Index(evaluator, `umount "$active_work_mount"`)
 	if retainCall < 0 || unmountCall < 0 || unmountCall < retainCall {
 		t.Fatal("evaluator does not retain failure evidence before unmounting its tmpfs")
 	}
@@ -2712,7 +2940,7 @@ func TestEvaluatorRetainsOnlySanitizedFailureEvidence(t *testing.T) {
 		`baseline_scorer_log="$work_dir/baseline-scorer.log"`,
 		`candidate_scorer_log="$work_dir/candidate-scorer.log"`,
 		`inspect_json="$(sudo -n docker inspect`,
-		`<<<"$inspect_json" > "$inspect_path"`,
+		`write_container_inspection "$inspect_path" <<<"$inspect_json"`,
 		`[ "$scorer_exit" -eq 0 ] || die "baseline scorer exited $scorer_exit"`,
 	} {
 		if !strings.Contains(evaluator, required) {
@@ -2792,7 +3020,8 @@ func TestEvaluatorReservesManagementResources(t *testing.T) {
 		"MANAGEMENT_PHYSICAL_CORE_COUNT=2",
 		"RUNNER_MEMORY_LIMIT=72g",
 		"MINIMUM_MANAGEMENT_MEMORY_RESERVE_BYTES=25769803776",
-		"disjoint_cpu_sets:true,memory_capacity_passed:true",
+		"disjoint_cpu_sets:true",
+		"memory_capacity_passed:true",
 	} {
 		if !strings.Contains(boundary, required) {
 			t.Errorf("resource boundary is missing %q", required)
@@ -3454,7 +3683,7 @@ func TestSubmissionBuildFailureRequiresOnlyBuildBoundaryEvidence(t *testing.T) {
 func TestAuthenticateSubmissionFailureArtifacts(t *testing.T) {
 	root := t.TempDir()
 	var declared []evaluationArtifact
-	for _, path := range []string{"submission-error.json", "evaluation.complete.json"} {
+	for _, path := range []string{"baseline.json", "submission-error.json", "evaluation.complete.json"} {
 		full := filepath.Join(root, path)
 		if err := os.WriteFile(full, []byte(path+"\n"), 0600); err != nil {
 			t.Fatal(err)
@@ -3469,7 +3698,7 @@ func TestAuthenticateSubmissionFailureArtifacts(t *testing.T) {
 	if _, err := authenticateResultArtifacts(root, declared, evalError); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := authenticateResultArtifacts(root, declared[:1], evalError); err == nil {
+	if _, err := authenticateResultArtifacts(root, declared[:2], evalError); err == nil {
 		t.Fatal("submission failure without completion marker was accepted")
 	}
 }
@@ -3848,7 +4077,8 @@ func TestApexAdapterReconcileStagingOptsIntoFinalizedEpochs(t *testing.T) {
 	}
 }
 
-func TestApexAdapterReconciliationRejectsStagingWinner(t *testing.T) {
+// A named winner must have exactly one matching eligible leaderboard entry.
+func TestApexAdapterReconciliationRejectsMissingStagingWinner(t *testing.T) {
 	storeDirectory := t.TempDir()
 	if err := os.Chmod(storeDirectory, 0700); err != nil {
 		t.Fatal(err)
@@ -3871,7 +4101,7 @@ func TestApexAdapterReconciliationRejectsStagingWinner(t *testing.T) {
 			Entries:       []LeaderboardEntry{},
 		}},
 	}, time.Date(2026, time.August, 29, 2, 1, 0, 0, time.UTC))
-	if err == nil || !strings.Contains(err.Error(), "staging winner") {
+	if err == nil || !strings.Contains(err.Error(), "winner missing") {
 		t.Fatalf("staging winner reconciliation error = %v", err)
 	}
 }
@@ -4002,7 +4232,7 @@ func TestApexAdapterConformance(t *testing.T) {
 				t.Error("public leaderboard received a bearer token")
 			}
 			rawScores := []float64{90, 95}
-			normalizedScores := []float64{0.90, 0.85}
+			normalizedScores := []float64{110, 105}
 			entries := make([]LeaderboardEntry, len(jobIds))
 			for i, jobId := range jobIds {
 				entries[i] = LeaderboardEntry{
@@ -4014,7 +4244,7 @@ func TestApexAdapterConformance(t *testing.T) {
 						if i == 0 {
 							return "approved"
 						}
-						return "not_selected"
+						return "not_reviewed"
 					}(),
 					Score: ScoreResult{
 						ScoreSchema:      ScoreSchema,
@@ -4022,10 +4252,8 @@ func TestApexAdapterConformance(t *testing.T) {
 						NormalizedScore:  &normalizedScores[i],
 						Placeable:        true,
 						TakeoverEligible: true,
-						Significance: &ScoreSignificance{
-							Method:                   "welch_t",
-							StatisticallySignificant: true,
-						},
+						Gates:            map[string]Gate{"G1": {Passed: true, Details: map[string]any{}}},
+						Significance:     testScoreSignificance(true),
 					},
 				}
 			}
@@ -4976,6 +5204,9 @@ func TestCompetitionStagingEraEvaluatesFinalizesAndAdvances(t *testing.T) {
 		if err != nil || hit || job == nil {
 			t.Fatalf("staging enqueue = %#v, hit=%t, err=%v", job, hit, err)
 		}
+		if unfinished, err := store.FinalizeStagingRound(ctx, settings, first.Epoch); err != nil || unfinished.FinalizedAt != nil {
+			t.Fatalf("open staging epoch finalized = %#v, %v", unfinished, err)
+		}
 		closed, err := store.CloseStagingRound(ctx, settings)
 		if err != nil || closed.RoundId != first.RoundId || closed.Status != "grading" ||
 			closed.AdmissionClosedAt == nil || !closed.AdmissionClosedAt.Equal(currentTime) ||
@@ -4991,27 +5222,41 @@ func TestCompetitionStagingEraEvaluatesFinalizesAndAdvances(t *testing.T) {
 		if err != nil || preserved.State != "queued" || preserved.EvalError != nil {
 			t.Fatalf("staging close changed queued job = %#v, %v", preserved, err)
 		}
+		if unfinished, err := store.FinalizeStagingRound(ctx, settings, first.Epoch); err != nil || unfinished.FinalizedAt != nil {
+			t.Fatalf("queued staging epoch finalized = %#v, %v", unfinished, err)
+		}
 		claimed, err := store.Claim(ctx, settings, "staging-worker", testWorkerImageDigest())
 		if err != nil || claimed == nil || claimed.JobId != job.JobId || !claimed.Staging {
 			t.Fatalf("staging claim = %#v, %v", claimed, err)
 		}
+		if unfinished, err := store.FinalizeStagingRound(ctx, settings, first.Epoch); err != nil || unfinished.FinalizedAt != nil {
+			t.Fatalf("running staging epoch finalized = %#v, %v", unfinished, err)
+		}
 		raw, normalized := 100.0, 100.0
-		_, err = store.Complete(ctx, settings, "staging-worker", claimed.JobId, EvaluationOutcome{
+		_, err = store.Complete(ctx, settings, "staging-worker", claimed.JobId, testSharedBaselineOutcome(t, settings, claimed, EvaluationOutcome{
 			Score: &ScoreResult{
 				ScoreSchema: 1, RawScore: &raw, NormalizedScore: &normalized,
 				Placeable: true, TakeoverEligible: true,
 				Gates:        map[string]Gate{"G1": {Passed: true, Details: map[string]any{}}},
 				Significance: testScoreSignificance(true),
 			},
-		})
+		}))
 		if err != nil {
 			t.Fatalf("complete staging evaluation: %v", err)
 		}
+		service := newServiceWithImageDigest(settings, store, testApiImageDigest(), nil)
+		embargoed, embargoStatus, embargoError := service.GetScore(ctx, job.JobId, &Principal{Id: "macrocosmos-stage", Role: "submitter"})
+		if embargoError != nil || embargoStatus != http.StatusOK || embargoed.Score != nil || embargoed.State != "completed" {
+			t.Fatalf("staging result escaped finalization embargo = %#v, %d, %#v", embargoed, embargoStatus, embargoError)
+		}
+		if boards, err := store.Leaderboards(ctx, settings, true); err != nil || len(boards.Epochs) != 0 {
+			t.Fatalf("unfinalized staging leaderboard = %#v, %v", boards, err)
+		}
 		finalized, err := store.FinalizeStagingRound(ctx, settings, first.Epoch)
-		if err != nil || finalized.FinalizedAt == nil || finalized.WinnerJobId != nil || finalized.Status != "finalized" {
+		if err != nil || finalized.FinalizedAt == nil || finalized.WinnerJobId == nil ||
+			*finalized.WinnerJobId != job.JobId || finalized.Status != "finalized" {
 			t.Fatalf("finalized staging epoch = %#v, %v", finalized, err)
 		}
-		service := newServiceWithImageDigest(settings, store, testApiImageDigest(), nil)
 		visible, status, evalError := service.GetScore(
 			ctx,
 			job.JobId,
@@ -5040,9 +5285,9 @@ func TestCompetitionStagingEraEvaluatesFinalizesAndAdvances(t *testing.T) {
 		stagingBoard := stagingLeaderboards.Epochs[0]
 		if !stagingBoard.Staging || stagingBoard.RoundId != first.RoundId ||
 			stagingBoard.Epoch != first.Epoch || stagingBoard.Status != "finalized" ||
-			stagingBoard.WinnerJobId != nil || len(stagingBoard.Entries) != 1 ||
+			stagingBoard.WinnerJobId == nil || *stagingBoard.WinnerJobId != job.JobId || len(stagingBoard.Entries) != 1 ||
 			stagingBoard.Entries[0].JobId != job.JobId ||
-			stagingBoard.Entries[0].Winner ||
+			!stagingBoard.Entries[0].Winner ||
 			stagingBoard.Entries[0].HonestyReview != "not_reviewed" {
 			t.Fatalf("published staging leaderboard = %#v", stagingBoard)
 		}
@@ -5054,7 +5299,7 @@ func TestCompetitionStagingEraEvaluatesFinalizesAndAdvances(t *testing.T) {
 		if err := json.Unmarshal(encodedBoard, &wireBoard); err != nil {
 			t.Fatal(err)
 		}
-		if winnerJobId, present := wireBoard["winner_job_id"]; !present || winnerJobId != nil {
+		if winnerJobId, present := wireBoard["winner_job_id"]; !present || winnerJobId != job.JobId.String() {
 			t.Fatalf("staging winner_job_id = %#v, present=%t", winnerJobId, present)
 		}
 
@@ -5343,10 +5588,10 @@ func TestCompetitionFullLifecycleQueueCacheHonestyPromotionAndNextEpoch(t *testi
 			t.Fatalf("heartbeat: %s", err)
 		}
 		raw, normalized := 100.0, 100.0
-		_, err = store.Complete(ctx, settings, "worker-a", claimed1.JobId, EvaluationOutcome{
+		_, err = store.Complete(ctx, settings, "worker-a", claimed1.JobId, testSharedBaselineOutcome(t, settings, claimed1, EvaluationOutcome{
 			Score:            &ScoreResult{ScoreSchema: 1, RawScore: &raw, NormalizedScore: &normalized, Placeable: true, TakeoverEligible: true, Gates: map[string]Gate{"G1": {Passed: true, Details: map[string]any{}}}, Significance: testScoreSignificance(true)},
 			ArtifactManifest: []byte(`{"schema":1,"test":true}`),
-		})
+		}))
 		if err != nil {
 			t.Fatalf("complete first: %s", err)
 		}
@@ -5401,8 +5646,10 @@ func TestCompetitionFullLifecycleQueueCacheHonestyPromotionAndNextEpoch(t *testi
 		if err != nil || retried3 == nil || retried3.JobId != job3.JobId || retried3.AttemptCount != 2 {
 			t.Fatalf("third retry claim = %#v, %v", retried3, err)
 		}
-		raw3, normalized3 := 101.0, 99.0
-		_, err = store.Complete(ctx, settings, "worker-b", retried3.JobId, EvaluationOutcome{
+		// Deliberately conflict with the old normalized-score ordering. The
+		// shared round control makes absolute candidate latency authoritative.
+		raw3, normalized3 := 101.0, 200.0
+		_, err = store.Complete(ctx, settings, "worker-b", retried3.JobId, testSharedBaselineOutcome(t, settings, retried3, EvaluationOutcome{
 			Score: &ScoreResult{
 				ScoreSchema: 1, RawScore: &raw3, NormalizedScore: &normalized3,
 				Placeable: true, TakeoverEligible: true,
@@ -5410,7 +5657,7 @@ func TestCompetitionFullLifecycleQueueCacheHonestyPromotionAndNextEpoch(t *testi
 				Significance: testScoreSignificance(true),
 			},
 			ArtifactManifest: []byte(`{"schema":1,"attempt":2}`),
-		})
+		}))
 		if err != nil {
 			t.Fatalf("complete retried submission: %s", err)
 		}
@@ -5653,14 +5900,14 @@ func TestCompetitionFullLifecycleNoWinnerCarryForward(t *testing.T) {
 			t.Fatalf("immediate claim = %#v, %v", claimed, err)
 		}
 		raw, normalized := 95.0, 105.0
-		_, err = store.Complete(ctx, settings, "worker-a", job.JobId, EvaluationOutcome{
+		_, err = store.Complete(ctx, settings, "worker-a", job.JobId, testSharedBaselineOutcome(t, settings, claimed, EvaluationOutcome{
 			Score: &ScoreResult{
 				ScoreSchema: 1, RawScore: &raw, NormalizedScore: &normalized,
 				Placeable: true, TakeoverEligible: false,
 				Gates:        map[string]Gate{"G1": {Passed: true, Details: map[string]any{}}},
 				Significance: testScoreSignificance(false),
 			},
-		})
+		}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -5711,14 +5958,14 @@ func TestCompetitionFullLifecycleNoWinnerCarryForward(t *testing.T) {
 			t.Fatalf("significant claim = %#v, %v", claimed, err)
 		}
 		raw, normalized = 70, 142.857
-		_, err = store.Complete(ctx, settings, "worker-a", significantJob.JobId, EvaluationOutcome{
+		_, err = store.Complete(ctx, settings, "worker-a", significantJob.JobId, testSharedBaselineOutcome(t, settings, claimed, EvaluationOutcome{
 			Score: &ScoreResult{
 				ScoreSchema: 1, RawScore: &raw, NormalizedScore: &normalized,
 				Placeable: true, TakeoverEligible: true,
 				Gates:        map[string]Gate{"G1": {Passed: true, Details: map[string]any{}}},
 				Significance: testScoreSignificance(true),
 			},
-		})
+		}))
 		if err != nil {
 			t.Fatal(err)
 		}

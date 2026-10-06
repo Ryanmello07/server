@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -140,6 +141,7 @@ type StripeEventInvoiceObject struct {
 	PeriodStart int    `json:"period_start"`
 	PeriodEnd   int    `json:"period_end"`
 	Customer    string `json:"customer"`
+	Currency    string `json:"currency"`
 }
 
 type StripeEventDataObjectCustomerDetails struct {
@@ -225,7 +227,7 @@ type StripeLineItemProduct struct {
 	UnitAmount int    `json:"unit_amount"`
 }
 
-func VerifyStripeBody(req *http.Request) (io.Reader, error) {
+func VerifyStripeBody(_ *session.ClientSession, req *http.Request) (io.Reader, error) {
 	bodyBytes, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
@@ -569,18 +571,66 @@ type StripeInvoiceExpanded struct {
 	} `json:"subscription"`
 }
 
-func stripeHandleInvoicePaid(
-	invoice *StripeEventInvoiceObject,
+// Complete destination reads found no account. This is distinct from a named
+// account's deletion and from incomplete provider or database observations.
+var errStripeInvoiceDestinationUnresolved = errors.New("stripe invoice destination unresolved")
+
+// stripeInvoiceDestinationUnresolvedError is errStripeInvoiceDestinationUnresolved
+// with the Stripe identities support needs to place the payment by hand: the
+// invoice, its subscription and customer (the customer email is recorded for
+// support only; it is never used to pick an account), and the paid period.
+type stripeInvoiceDestinationUnresolvedError struct {
+	invoiceId      string
+	subscriptionId string
+	customerId     string
+	customerEmail  string
+	periodStart    int64
+	periodEnd      int64
+}
+
+func (self *stripeInvoiceDestinationUnresolvedError) Error() string {
+	return fmt.Sprintf("%s for invoice %s", errStripeInvoiceDestinationUnresolved, self.invoiceId)
+}
+
+func (self *stripeInvoiceDestinationUnresolvedError) Unwrap() error {
+	return errStripeInvoiceDestinationUnresolved
+}
+
+// details are the payment_reconciliation_event details for support.
+func (self *stripeInvoiceDestinationUnresolvedError) details() map[string]any {
+	return map[string]any{
+		"reason":         "destination_unresolved",
+		"invoice":        self.invoiceId,
+		"subscription":   self.subscriptionId,
+		"customer":       self.customerId,
+		"customer_email": self.customerEmail,
+		"period_start":   time.Unix(self.periodStart, 0).UTC().Format(time.RFC3339),
+		"period_end":     time.Unix(self.periodEnd, 0).UTC().Format(time.RFC3339),
+	}
+}
+
+// Read-only input shared by real credits and reconciliation dry runs.
+type stripeInvoiceCredit struct {
+	networkId      server.Id
+	subscriptionId string
+	startTime      time.Time
+	endTime        time.Time
+}
+
+// Resolves the network from the subscription's network_id metadata, then the
+// checkout session's client_reference_id. Nothing else names a network: the
+// legacy customer-email fallback is removed (UPGRADE.md S11), because a Stripe
+// customer email that matches a different account credited that account.
+// A nil result means a non-subscription invoice, not an unresolved destination.
+func stripeResolveInvoiceCredit(
+	invoiceId string,
 	clientSession *session.ClientSession,
-) (*StripeWebhookResult, error) {
+) (*stripeInvoiceCredit, error) {
 
-	invoiceId := invoice.Id
-	total := invoice.Total
-
-	url := fmt.Sprintf("%s/v1/invoices/%s?expand[]=subscription&expand[]=customer", stripeApiBaseUrl, invoiceId)
+	invoiceUrl := fmt.Sprintf("%s/v1/invoices/%s?expand[]=subscription&expand[]=customer", stripeApiBaseUrl, url.PathEscape(invoiceId))
 	fullInvoice, err := server.HttpGetRequireStatusOk[*StripeInvoiceExpanded](
 		clientSession.Ctx,
-		url,
+		invoiceUrl,
 		func(header http.Header) {
 			header.Add("Authorization", fmt.Sprintf("Bearer %s", stripeApiTokenFunc()))
 		},
@@ -589,6 +639,9 @@ func stripeHandleInvoicePaid(
 	if err != nil {
 		glog.Errorf("Failed to fetch invoice details: %v", err)
 		return nil, fmt.Errorf("failed to fetch invoice details: %v", err)
+	}
+	if fullInvoice == nil {
+		return nil, errors.New("missing expanded Stripe invoice")
 	}
 
 	var subscriptionId string
@@ -627,12 +680,12 @@ func stripeHandleInvoicePaid(
 
 	if !isSubscription {
 		glog.Infof("Invoice is not for a subscription")
-		return &StripeWebhookResult{}, nil
+		return nil, nil
 	}
 
 	if subscriptionId == "" {
 		glog.Infof("Invoice does not have a subscription in its line items")
-		return &StripeWebhookResult{}, nil
+		return nil, nil
 	}
 
 	var networkId *server.Id
@@ -668,115 +721,154 @@ func stripeHandleInvoicePaid(
 
 		glog.Infof("no network id in subscription metadata, checking checkout session")
 
-		// check for client_reference_id in the checkout session. This is checked
-		// BEFORE the email fallback: the session's client_reference_id names the
-		// exact network the checkout was started from, while an email is only a
-		// guess (see below).
+		// check for client_reference_id in the checkout session: it names the
+		// exact network the checkout was started from.
 
 		// Get the checkout session using the subscription ID
-		url = fmt.Sprintf("%s/v1/checkout/sessions?subscription=%s", stripeApiBaseUrl, subscriptionId)
-		sessionsResp, err := server.HttpGetRequireStatusOk[map[string]interface{}](
+		sessionsUrl := fmt.Sprintf("%s/v1/checkout/sessions?subscription=%s&limit=100", stripeApiBaseUrl, url.QueryEscape(subscriptionId))
+		type checkoutSessionList struct {
+			Data []*struct {
+				Id                string  `json:"id"`
+				ClientReferenceId *string `json:"client_reference_id"`
+			} `json:"data"`
+			HasMore *bool `json:"has_more"`
+		}
+		sessionsResp, err := server.HttpGetRequireStatusOk[*checkoutSessionList](
 			clientSession.Ctx,
-			url,
+			sessionsUrl,
 			func(header http.Header) {
 				header.Add("Authorization", fmt.Sprintf("Bearer %s", stripeApiTokenFunc()))
 			},
-			server.ResponseJsonObject[map[string]interface{}],
+			server.ResponseJsonObject[*checkoutSessionList],
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch checkout session: %v", err)
 		}
 
-		if dataArray, ok := sessionsResp["data"].([]interface{}); ok && len(dataArray) > 0 {
-			if session, ok := dataArray[0].(map[string]interface{}); ok {
-				if clientRefId, ok := session["client_reference_id"].(string); ok {
-					id, err := server.ParseId(clientRefId)
-					if err != nil {
-						return nil, fmt.Errorf("failed to parse id err=%v id=%s", err, clientRefId)
-					}
-					networkId = &id
+		if sessionsResp == nil || sessionsResp.Data == nil || sessionsResp.HasMore == nil || *sessionsResp.HasMore {
+			return nil, errors.New("incomplete Stripe checkout session destination evidence")
+		}
+		for _, checkout := range sessionsResp.Data {
+			if checkout == nil || checkout.Id == "" {
+				return nil, errors.New("missing Stripe checkout session destination evidence")
+			}
+			if checkout.ClientReferenceId != nil && *checkout.ClientReferenceId != "" {
+				id, err := server.ParseId(*checkout.ClientReferenceId)
+				if err != nil {
+					return nil, fmt.Errorf("invalid Stripe checkout session destination: %w", err)
 				}
+				if networkId != nil && *networkId != id {
+					return nil, errors.New("conflicting Stripe checkout session destinations")
+				}
+				networkId = &id
 			}
 		}
 	}
 
-	// LAST resort: associate by the Stripe customer's email. This exists only for
-	// legacy subscriptions created before the network id was stamped into the
-	// subscription metadata, and it can be WRONG: a customer paying with an email
-	// that matches a different account credits that account. Kept (loudly) until
-	// the legacy subscriptions all carry metadata, then it should be retired.
-	// Every use that actually credits is ALSO recorded as an email_fallback
-	// operator event below (S11), surfaced by the stripe reconciler leg and the
-	// `bringyourctl payments reconcile` summary.
-	emailFallback := false
-	if networkId == nil && fullInvoice != nil && fullInvoice.Customer != nil && fullInvoice.Customer.Email != "" {
-
-		glog.Warningf(
-			"[sub]invoice %s resolving network by customer email fallback -- "+
-				"legacy subscription without metadata\n",
-			invoiceId,
-		)
-
-		// search network by email
-		foundId, err := model.FindNetworkIdByEmail(clientSession.Ctx, fullInvoice.Customer.Email)
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to find network by email: %v", err)
-		}
-
-		if foundId != nil {
-			networkId = foundId
-			emailFallback = true
-		}
-
-	}
-
-	feeFraction := 0.3
-	netRevenue := model.UsdToNanoCents((1.0 - feeFraction) * float64(total) / 100.0)
-
-	startTime := time.Unix(periodStart, 0)
-	endTime := time.Unix(periodEnd, 0).Add(SubscriptionGracePeriod)
-
 	if networkId == nil {
-		return nil, fmt.Errorf("could not find network for invoice %s", invoiceId)
+		// Only complete expanded identities can prove a legacy invoice has no
+		// owner. Missing expansion fields are schema failures to retry instead.
+		if fullInvoice.Subscription == nil || fullInvoice.Subscription.ID != subscriptionId ||
+			fullInvoice.Customer == nil || fullInvoice.Customer.Id == "" {
+			return nil, errors.New("incomplete Stripe invoice destination evidence")
+		}
+		return nil, &stripeInvoiceDestinationUnresolvedError{
+			invoiceId:      invoiceId,
+			subscriptionId: subscriptionId,
+			customerId:     fullInvoice.Customer.Id,
+			customerEmail:  fullInvoice.Customer.Email,
+			periodStart:    periodStart,
+			periodEnd:      periodEnd,
+		}
 	}
+	credit := &stripeInvoiceCredit{
+		networkId:      *networkId,
+		subscriptionId: subscriptionId,
+		startTime:      time.Unix(periodStart, 0),
+		endTime:        time.Unix(periodEnd, 0).Add(manualPaymentGracePeriod),
+	}
+	return credit, nil
+}
 
-	credited, err := stripeCreditInvoicePaid(
+// Credits through the same lifecycle and invoice ledger gate for webhook and
+// reconciliation delivery. Destination reads are shared with dry-run reports.
+func stripeHandleInvoicePaid(
+	invoice *StripeEventInvoiceObject,
+	clientSession *session.ClientSession,
+) (*StripeWebhookResult, error) {
+	credit, err := stripeResolveInvoiceCredit(invoice.Id, clientSession)
+	if err != nil {
+		return nil, err
+	}
+	if credit == nil {
+		return &StripeWebhookResult{}, nil
+	}
+	invoiceId := invoice.Id
+	feeFraction := 0.3
+	netRevenue := model.UsdToNanoCents((1.0 - feeFraction) * float64(invoice.Total) / 100.0)
+
+	_, err = stripeCreditInvoicePaid(
 		clientSession.Ctx,
-		*networkId,
+		credit.networkId,
 		invoiceId,
 		netRevenue,
-		startTime,
-		endTime,
+		credit.startTime,
+		credit.endTime,
 	)
 	if err != nil {
 		glog.Infof("Error processing invoice paid: %v", err)
 		return nil, err
 	}
 
-	// S11: every credit that resolved its network by the legacy email fallback
-	// is an operator-visible audit row. Only on an actual credit -- a
-	// redelivery of an already-credited invoice re-resolves the email but must
-	// not inflate the count. The audit write must never fail the credit.
-	if credited && emailFallback {
-		if eventErr := model.AddPaymentReconciliationEvent(clientSession.Ctx, &model.PaymentReconciliationEvent{
-			RunId:     server.NewId(),
-			Store:     model.SubscriptionMarketStripe,
-			NetworkId: networkId,
-			Action:    model.PaymentReconcileActionEmailFallback,
-			Evidence:  invoiceId,
-			Details: map[string]any{
-				"subscription":   subscriptionId,
-				"resolution":     "customer_email",
-				"customer_email": fullInvoice.Customer.Email,
-			},
-		}); eventErr != nil {
-			glog.Errorf("[sub]invoice %s: could not record email_fallback event: %s\n", invoiceId, eventErr)
-		}
-	}
-
 	return &StripeWebhookResult{}, nil
 
+}
+
+// stripeRecordUnresolvedInvoice is the durable-record seam for paid invoices
+// with no resolvable network. Replaceable only by hermetic tests (no database
+// in that env). Production never mutates it.
+var stripeRecordUnresolvedInvoice = model.AddPaymentReconciliationEventOnce
+
+// stripeAcknowledgeUnresolvedInvoice answers an invoice.paid delivery whose
+// invoice names no network (no subscription network_id metadata and no checkout
+// client_reference_id). The payment is NOT credited to anyone. Instead it is
+// recorded once as a stripe credit_unfulfillable payment_reconciliation_event
+// with the Stripe identities support needs, and the delivery is acknowledged.
+//
+// The 2xx is load-bearing: Stripe retries a non-2xx delivery for up to 72h and
+// disables an endpoint that keeps failing, which would take every crediting
+// webhook down with one unresolvable legacy renewal. Only when the record
+// itself cannot be written does the delivery fail, so Stripe redelivers until
+// the payment is durably on file (the hourly reconciler records it as well).
+func stripeAcknowledgeUnresolvedInvoice(
+	ctx context.Context,
+	invoice *StripeEventInvoiceObject,
+	unresolved *stripeInvoiceDestinationUnresolvedError,
+) (*StripeWebhookResult, error) {
+	details := unresolved.details()
+	details["leg"] = "webhook"
+	details["amount_total"] = invoice.Total
+	details["currency"] = invoice.Currency
+	added, err := stripeRecordUnresolvedInvoice(ctx, &model.PaymentReconciliationEvent{
+		RunId:    server.NewId(),
+		Store:    model.SubscriptionMarketStripe,
+		Action:   model.PaymentReconcileActionCreditUnfulfillable,
+		Evidence: unresolved.invoiceId,
+		Details:  details,
+	})
+	if err != nil {
+		glog.Errorf("[sub]invoice %s: could not record unresolved destination: %s\n", unresolved.invoiceId, err)
+		return nil, err
+	}
+	if added {
+		glog.Errorf(
+			"[sub]invoice %s (subscription %s, customer %s) is paid but names no network; not credited, recorded for support as credit_unfulfillable\n",
+			unresolved.invoiceId,
+			unresolved.subscriptionId,
+			unresolved.customerId,
+		)
+	}
+	return &StripeWebhookResult{}, nil
 }
 
 // stripeCreditInvoicePaid is the ONE place an invoice.paid turns into a credit,
@@ -1200,6 +1292,9 @@ const (
 type StripeCreatePaymentIntentArgs struct{}
 
 type StripeCreatePaymentIntentArgsErr struct {
+	// one of the `PurchaseErrorCode*` values, when the refusal has one. Added
+	// after `Message`; older clients ignore it.
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -1220,6 +1315,14 @@ func StripeCreatePaymentIntent(
 	args *StripeCreatePaymentIntentArgs,
 	session *session.ClientSession,
 ) (*StripeCreatePaymentIntentResult, error) {
+	if refuseGuestPurchase(session) {
+		return &StripeCreatePaymentIntentResult{
+			Error: &StripeCreatePaymentIntentArgsErr{
+				Code:    PurchaseErrorCodeGuestSignInRequired,
+				Message: purchaseGuestSignInRequiredMessage,
+			},
+		}, nil
+	}
 
 	// check if user has a stripe customer id
 	stripeCustomerId, _ := model.GetStripeCustomer(session)
@@ -1569,6 +1672,9 @@ type StripeCreateCheckoutSessionArgs struct {
 }
 
 type StripeCreateCheckoutSessionError struct {
+	// one of the `PurchaseErrorCode*` values, when the refusal has one. Added
+	// after `Message`; older clients ignore it.
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -1753,6 +1859,14 @@ func StripeCreateCheckoutSession(
 	args *StripeCreateCheckoutSessionArgs,
 	clientSession *session.ClientSession,
 ) (*StripeCreateCheckoutSessionResult, error) {
+	if refuseGuestPurchase(clientSession) {
+		return &StripeCreateCheckoutSessionResult{
+			Error: &StripeCreateCheckoutSessionError{
+				Code:    PurchaseErrorCodeGuestSignInRequired,
+				Message: purchaseGuestSignInRequiredMessage,
+			},
+		}, nil
+	}
 
 	uiMode, ok := stripeCheckoutUiMode(args.UiMode)
 	if !ok {
@@ -1789,6 +1903,16 @@ func StripeCreateCheckoutSession(
 	switch args.ItemId {
 
 	case StripeItemProMonthly, StripeItemProYearly:
+		// never start a second subscription while one is active (see StripePaymentSheet)
+		customerId := ""
+		if existing, _ := model.GetStripeCustomer(clientSession); existing != nil {
+			customerId = *existing
+		}
+		if stripeNetworkHasActiveSubscription(clientSession, customerId) {
+			glog.Infof("[stripe]checkout: network %s already has an active subscription\n", networkId)
+			return stripeCheckoutError(stripeAlreadySubscribedMessage), nil
+		}
+
 		// the caller's regional tier price, and the welcome-offer coupon when
 		// the offer is redeemable (yearly only)
 		priceId, discounts, onboardingMetadata, err := stripeCheckoutTierAndDiscount(args.ItemId, args.StorefrontCountry, clientSession)
@@ -1806,14 +1930,14 @@ func StripeCreateCheckoutSession(
 			},
 		}
 		// Stamp the network onto the SUBSCRIPTION itself, not just the session.
-		// stripeHandleInvoicePaid resolves the network in this order:
+		// stripeResolveInvoiceCredit resolves the network in this order:
 		//   1. subscription metadata network_id  <- this
-		//   2. the Stripe customer's email -> FindNetworkIdByEmail
-		//   3. the checkout session's client_reference_id
-		// Without (1) a customer who pays with a different email than their account
-		// falls through to (2), which can resolve to the WRONG network or none at all.
-		// Renewal invoices also carry the subscription but no checkout session, so (3)
-		// is not a reliable long-term anchor either.
+		//   2. the checkout session's client_reference_id
+		// and nothing else (the customer-email fallback is removed, S11).
+		// Renewal invoices carry the subscription but no checkout session, so (2) is
+		// not a reliable long-term anchor. Without (1) such a renewal resolves to no
+		// network: it is acknowledged and recorded for support as a
+		// credit_unfulfillable event, never credited.
 		params.SubscriptionData = &stripe.CheckoutSessionSubscriptionDataParams{
 			Metadata: map[string]string{
 				"network_id": networkId.String(),

@@ -4,7 +4,6 @@ package monitor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/urnetwork/server"
 )
 
 // Return a policy-only copy with sorted exact selectors. Unknown, malformed,
@@ -29,6 +30,16 @@ func ExcludeHosts(settings SignalSettings, names ...string) (SignalSettings, err
 	for name := range requestedHostNames {
 		matches := 0
 		for _, configured := range settings.Hosts {
+			if configured.Name == name {
+				matches++
+			}
+		}
+		for _, configured := range settings.Routers {
+			if configured.Name == name {
+				matches++
+			}
+		}
+		for _, configured := range settings.disabledHosts {
 			if configured.Name == name {
 				matches++
 			}
@@ -82,8 +93,12 @@ func newHostScopeRunner(transport probeRunner, cfg *monitorConfig, names []strin
 	for _, name := range names {
 		self.excludedHostNames[name] = true
 	}
-	for _, configured := range cfg.hosts {
+	for _, configured := range cfg.scopeHosts() {
+		if configured.disabled {
+			self.excludedHostNames[configured.name] = true
+		}
 		endpoints := []string{configured.name, configured.lanIp, configured.overlayIp}
+		endpoints = append(endpoints, configured.scopeEndpoints...)
 		if cfg.publicDomain != "" {
 			endpoints = append(endpoints, configured.name+"."+cfg.publicDomain)
 		}
@@ -99,6 +114,13 @@ func newHostScopeRunner(transport probeRunner, cfg *monitorConfig, names []strin
 		for _, endpoint := range endpoints {
 			if normalized := normalizeHostScopeEndpoint(endpoint); normalized != "" {
 				self.endpointHostNames[normalized] = append(self.endpointHostNames[normalized], configured.name)
+			}
+		}
+	}
+	for _, target := range cfg.publicUdp.Targets {
+		for _, endpoint := range []string{target.IPv4Address, target.IPv6Address} {
+			if normalized := normalizeHostScopeEndpoint(endpoint); normalized != "" {
+				self.endpointHostNames[normalized] = append(self.endpointHostNames[normalized], target.Host)
 			}
 		}
 	}
@@ -351,7 +373,7 @@ func (self *hostScopeRunner) reduceFindings(settings SignalSettings, findings []
 	result := make([]finding, 0, len(findings)+1)
 	for _, observed := range findings {
 		excludedTarget, allowedTarget := false, false
-		for _, configured := range self.cfg.hosts {
+		for _, configured := range self.cfg.scopeHosts() {
 			if hostScopeTargetMatches(observed.target, configured.name) {
 				if self.excludedHostNames[configured.name] {
 					excludedTarget = true
@@ -374,25 +396,18 @@ func (self *hostScopeRunner) reduceFindings(settings SignalSettings, findings []
 // A joined failure is intentional policy only when every leaf is a scope
 // denial; another observation failure must not become successful scope.
 func hostScopeOnlyError(err error) bool {
-	if err == nil {
+	causes := server.InspectErrorCauses(err)
+	if !causes.Complete || causes.NilBranches != 0 {
 		return false
 	}
-	if _, ok := err.(*hostScopeExcludedError); ok {
-		return true
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		children := joined.Unwrap()
-		if len(children) == 0 {
-			return false
-		}
-		for _, child := range children {
-			if !hostScopeOnlyError(child) {
+	for _, node := range causes.Nodes {
+		if node.Leaf {
+			if value, excluded := node.Err.(*hostScopeExcludedError); !excluded || value == nil {
 				return false
 			}
 		}
-		return true
 	}
-	return hostScopeOnlyError(errors.Unwrap(err))
+	return true
 }
 
 // Operational partial coverage never pages because the pause persists.

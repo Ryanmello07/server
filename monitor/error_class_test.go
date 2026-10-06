@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/server"
 )
 
 func TestClassifyTaskErrorUsesFixedAllowlist(t *testing.T) {
@@ -57,6 +59,7 @@ func TestRepresentativeTaskErrorClassUsesBoundedDatabaseClass(t *testing.T) {
 		t.Fatalf("unknown database class = %q, want %q", got, taskErrorClassUnclassified)
 	}
 	for _, class := range []string{
+		taskErrorClassInvalidDestinationResetFailed,
 		taskErrorClassPostgresStatementTimeout,
 		taskErrorClassDeadlineTimeout,
 		taskErrorClassDrained,
@@ -68,6 +71,92 @@ func TestRepresentativeTaskErrorClassUsesBoundedDatabaseClass(t *testing.T) {
 	}
 }
 
+// Only the wrapped post family owns this bounded class, and operational
+// database failures take precedence when the same error contains both markers.
+func TestTaskPostMissingRecipientClassificationIsScopedAndSanitized(t *testing.T) {
+	const privateSuffix = " private-task=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	for _, testCase := range []struct {
+		name string
+		task string
+		raw  string
+		want string
+	}{
+		{name: "wrapped post", task: "(*TaskWorker)", raw: "Missing user auth.", want: taskErrorClassPostMissingRecipient},
+		{name: "wrapped uppercase", task: "(*TaskWorker)", raw: "MISSING USER AUTH.", want: taskErrorClassPostMissingRecipient},
+		{name: "unrelated task", task: "PlaySubscriptionRenewal", raw: "Missing user auth.", want: taskErrorClassUnclassified},
+		{name: "incomplete marker", task: "(*TaskWorker)", raw: "Missing user auth", want: taskErrorClassUnclassified},
+		{name: "database error", task: "(*TaskWorker)", raw: "Missing user auth. statement timeout (SQLSTATE 57014)", want: taskErrorClassPostgresStatementTimeout},
+		{name: "cancellation", task: "(*TaskWorker)", raw: "Missing user auth. context canceled", want: taskErrorClassContextCanceled},
+	} {
+		if got := classifyTaskError(testCase.task, testCase.raw+privateSuffix); got != testCase.want {
+			t.Errorf("%s class = %q, want %q", testCase.name, got, testCase.want)
+		}
+	}
+	if got := representativeTaskErrorClass("(*TaskWorker)", "Missing user auth."+privateSuffix, 1, "post-missing-recipient=1"); got != taskErrorClassPostMissingRecipient {
+		t.Fatalf("database post class = %q", got)
+	}
+}
+
+// Execute the production aggregate on a transaction-local synthetic table so
+// task scoping and error precedence agree with the Go classifier in PostgreSQL.
+func TestTaskPostMissingRecipientSqlClassificationMatchesGo(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `
+				CREATE TEMP TABLE pending_task (
+					function_name text,
+					reschedule_error_count integer,
+					run_at timestamp,
+					claim_time timestamp,
+					reschedule_error text,
+					run_max_time_seconds integer
+				) ON COMMIT DROP
+			`))
+			for _, testCase := range []struct {
+				name string
+				task string
+				raw  string
+			}{
+				{name: "wrapped post", task: "(*TaskWorker)", raw: "Missing user auth. synthetic-private-task"},
+				{name: "wrapped uppercase", task: "(*TaskWorker)", raw: "MISSING USER AUTH. synthetic-private-task"},
+				{name: "unrelated task", task: "PlaySubscriptionRenewal", raw: "Missing user auth. synthetic-private-task"},
+				{name: "incomplete marker", task: "(*TaskWorker)", raw: "Missing user auth"},
+				{name: "database error", task: "(*TaskWorker)", raw: "Missing user auth. statement timeout (SQLSTATE 57014)"},
+				{name: "cancellation", task: "(*TaskWorker)", raw: "Missing user auth. context canceled"},
+			} {
+				server.RaisePgResult(tx.Exec(ctx, `DELETE FROM pg_temp.pending_task`))
+				server.RaisePgResult(tx.Exec(ctx, `
+					INSERT INTO pg_temp.pending_task (
+						function_name, reschedule_error_count, run_at, reschedule_error, run_max_time_seconds
+					) VALUES ($1, 1, now() + interval '1 hour', $2, 120)
+				`, "synthetic.example."+testCase.task, testCase.raw))
+				result, err := tx.Query(ctx,
+					`SELECT task, cause_class_count, cause_summary FROM (`+
+						strings.TrimSuffix(strings.TrimSpace(taskFailureSummarySQL), ";")+`) AS summary`)
+				server.WithPgResult(result, err, func() {
+					if !result.Next() {
+						t.Errorf("%s: no failure summary", testCase.name)
+						return
+					}
+					var task string
+					var classCount int
+					var classSummary string
+					server.Raise(result.Scan(&task, &classCount, &classSummary))
+					class, _, _ := strings.Cut(classSummary, "=")
+					want := classifyTaskError(testCase.task, testCase.raw)
+					if task != testCase.task || classCount != 1 || fixedTaskErrorClass(class) != want {
+						t.Errorf("%s: task=%q classes=%d summary=%q, want %q", testCase.name, task, classCount, classSummary, want)
+					}
+					if result.Next() {
+						t.Errorf("%s: extra failure summary", testCase.name)
+					}
+				})
+			}
+		})
+	})
+}
+
 func TestTaskFailureSummarySQLMirrorsFixedTaskErrorVocabulary(t *testing.T) {
 	for _, class := range []string{
 		taskErrorClassConcurrentSettled,
@@ -76,6 +165,7 @@ func TestTaskFailureSummarySQLMirrorsFixedTaskErrorVocabulary(t *testing.T) {
 		taskErrorClassIdleTransactionTimeout,
 		taskErrorClassConnectionCleanupDeadline,
 		taskErrorClassProcessorRateLimit,
+		taskErrorClassInvalidDestinationResetFailed,
 		taskErrorClassProcessorInvalidDestination,
 		taskErrorClassProcessorBadRequest,
 		taskErrorClassSchemaObjectMissing,
@@ -84,6 +174,7 @@ func TestTaskFailureSummarySQLMirrorsFixedTaskErrorVocabulary(t *testing.T) {
 		taskErrorClassContextCanceled,
 		taskErrorClassDrained,
 		taskErrorClassTargetNotFound,
+		taskErrorClassPostMissingRecipient,
 	} {
 		if !strings.Contains(taskFailureSummarySQL, "THEN '"+class+"'") {
 			t.Errorf("task failure SQL is missing fixed class %q", class)
@@ -109,6 +200,44 @@ func TestTaskFailureSummarySQLMirrorsFixedTaskErrorVocabulary(t *testing.T) {
 	}
 }
 
+func TestInvalidDestinationResetFailurePrecedesProcessorAndPersistenceErrors(t *testing.T) {
+	for _, suffix := range []string{
+		"Invalid payment.",
+		"statement timeout (SQLSTATE 57014)",
+		"failed to deallocate cached statement(s): conn closed",
+		"context canceled",
+	} {
+		raw := "Payment create transaction error = 400 Bad Request Invalid destination address.; invalid destination reset error = " + suffix
+		if got := classifyTaskError("AdvancePayment", raw); got != taskErrorClassInvalidDestinationResetFailed {
+			t.Errorf("reset suffix %q classified as %q", suffix, got)
+		}
+	}
+	resetIndex := strings.Index(taskFailureSummarySQL, "THEN 'invalid-destination-reset-failed'")
+	for _, class := range []string{taskErrorClassProcessorInvalidDestination, taskErrorClassPostgresStatementTimeout, taskErrorClassConnectionCleanupDeadline} {
+		if index := strings.Index(taskFailureSummarySQL, "THEN '"+class+"'"); resetIndex < 0 || index < resetIndex {
+			t.Errorf("SQL reset classifier must precede %q", class)
+		}
+	}
+	if !strings.Contains(taskFailureSummarySQL, "WHEN split_part(function_name,'.',3) = 'AdvancePayment'\n\t\t           AND lower(coalesce(reschedule_error,'')) LIKE '%; invalid destination reset error = %'") {
+		t.Fatal("SQL reset classifier lost the task-scoped exact composed marker")
+	}
+}
+
+func TestInvalidDestinationResetFailureRequiresExactOwnedMarker(t *testing.T) {
+	for _, raw := range []string{
+		"400 Bad Request Invalid destination address.",
+		"Invalid destination address.; invalid destination reset error",
+		"Invalid destination address.; invalid destination reset error: synthetic",
+	} {
+		if got := classifyTaskError("AdvancePayment", raw); got != taskErrorClassProcessorInvalidDestination {
+			t.Errorf("ordinary destination control classified as %q", got)
+		}
+	}
+	if got := classifyTaskError("SyntheticTask", "Invalid destination address.; invalid destination reset error = synthetic"); got != taskErrorClassProcessorInvalidDestination {
+		t.Fatalf("unrelated task's ordinary destination error was replaced by reset class: %q", got)
+	}
+}
+
 func TestClassifyObservationErrorNeverReturnsRawText(t *testing.T) {
 	hostile := "provider supplied task=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa address=192.0.2.91 pointer=0xdeadbeef goroutine synthetic.Stack"
 	tests := []struct {
@@ -123,12 +252,17 @@ func TestClassifyObservationErrorNeverReturnsRawText(t *testing.T) {
 		{"unreachable timeout", &unreachableError{host: "synthetic-edge-a", err: errors.New("timeout after synthetic duration")}, observationErrorClassTimeout},
 		{"counter reset", errors.New("a monotonic counter decreased within one process generation"), observationErrorClassCounterReset},
 		{"contract", errors.New("installed helper predates this observation contract"), observationErrorClassContractMismatch},
+		{"peer diagnostics version", errors.New("unsupported peer diagnostics version=99"), observationErrorClassContractMismatch},
+		{"peer diagnostics absent", errors.New("versioned peer diagnostics are absent"), observationErrorClassContractMismatch},
 		{"state", errors.New("durable state is unreadable"), observationErrorClassStateUnavailable},
 		{"bound", errors.New("current child identity bound exceeded"), observationErrorClassBoundExceeded},
 		{"access", errors.New("permission denied: " + hostile), observationErrorClassAccessDenied},
 		{"http access", errors.New("service returned HTTP 401"), observationErrorClassAccessDenied},
 		{"command", errors.New("exit status 1: " + hostile), observationErrorClassCommandFailed},
 		{"response", errors.New("decode synthetic response: " + hostile), observationErrorClassInvalidResponse},
+		{"peer aggregate", errors.New("peer log aggregate bounds are invalid"), observationErrorClassInvalidResponse},
+		{"signup route metrics unavailable", &signupRouteMetricsUnavailableError{}, observationErrorClassMetricUnavailable},
+		{"required state unavailable", &observationStateUnavailableError{}, observationErrorClassStateUnavailable},
 		{"unknown", errors.New(hostile), observationErrorClassUnclassified},
 	}
 	for _, test := range tests {
@@ -137,6 +271,21 @@ func TestClassifyObservationErrorNeverReturnsRawText(t *testing.T) {
 				t.Fatalf("classifyObservationError() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestClassifyObservationErrorRequiresSSHSourceForNative255(t *testing.T) {
+	localExit := syntheticProcessExit(t, 255)
+	if got := classifyObservationError(localExit); got != observationErrorClassCommandFailed {
+		t.Fatalf("local process exit 255 became SSH evidence: %s", got)
+	}
+	if got := classifyObservationError(&sshCommandError{err: fmt.Errorf("wrapped: %w", localExit)}); got != observationErrorClassSSHExit255 {
+		t.Fatalf("native SSH exit 255 was not distinguished: %s", got)
+	}
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		if got, want := classifyObservationError(&sshCommandError{err: cause}), classifyObservationError(cause); got != want {
+			t.Fatalf("SSH wrapper changed lifecycle classification: %s, want %s", got, want)
+		}
 	}
 }
 

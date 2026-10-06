@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/urnetwork/glog"
 	"github.com/urnetwork/server"
@@ -20,6 +21,8 @@ type AccountErrorMessage string
 var (
 	ErrInvalidBlockchain    = errors.New("invalid blockchain, use SOL, MATIC, or TAO")
 	ErrInvalidWalletAddress = errors.New("invalid wallet address")
+	// a 400: the router answers the status and logs nothing for client input
+	ErrInvalidDefaultTokenType = errors.New("400 invalid default token type")
 )
 
 // used for creating external wallets
@@ -42,6 +45,15 @@ func CreateAccountWalletExternal(
 
 	wallet.Blockchain = blockchain.String()
 	wallet.WalletAddress = strings.TrimSpace(wallet.WalletAddress)
+
+	// the token type is client input: a value the column cannot store (over
+	// its length, or with a NUL character, which postgres text cannot hold) is
+	// refused here. It used to fail the insert, after which the transaction
+	// went on to a commit that server.Tx retried for a minute.
+	if model.MaxWalletDefaultTokenTypeLength < utf8.RuneCountInString(wallet.DefaultTokenType) ||
+		strings.ContainsRune(wallet.DefaultTokenType, 0) {
+		return nil, ErrInvalidDefaultTokenType
+	}
 
 	walletValidateAddressArgs := WalletValidateAddressArgs{
 		Address: wallet.WalletAddress,
@@ -126,7 +138,21 @@ type HeliusSearchAssetsResult struct {
 	} `json:"result"`
 }
 
+// Stable machine codes for a Seeker verification that did not succeed. Apps
+// pick a localized message from the code and fall back to `Message`.
+const (
+	// the wallet signature did not verify
+	VerifySeekerNftHolderErrorCodeInvalidSignature = "seeker_invalid_signature"
+	// the wallet's tokens could not be looked up
+	VerifySeekerNftHolderErrorCodeLookupFailed = "seeker_lookup_failed"
+	// the wallet holds no Seeker or Saga Genesis token
+	VerifySeekerNftHolderErrorCodeTokenNotFound = "seeker_token_not_found"
+)
+
 type VerifySeekerNftHolderError struct {
+	// one of the `VerifySeekerNftHolderErrorCode*` values. Added after
+	// `Message`; older clients ignore it.
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -145,6 +171,32 @@ func VerifySeekerNftHolder(
 	verify *VerifySeekerNftHolderArgs,
 	session *session.ClientSession,
 ) (*VerifySeekerNftHolderResult, error) {
+	return verifySeekerNftHolder(verify, session, seekerHolderLookup{
+		searchAssets: heliusSearchAssets,
+		searchSagaAssets: func(ctx context.Context, publicKey string) ([]HeliusAsset, error) {
+			sagaResult, err := heliusSearchAssetsSaga(ctx, publicKey)
+			if err != nil {
+				return nil, err
+			}
+			return sagaResult.Result.Items, nil
+		},
+		markHolder: model.MarkWalletSeekerHolder,
+	})
+}
+
+// The token lookups and the holder mark, injected so verification is testable
+// without Helius or a database.
+type seekerHolderLookup struct {
+	searchAssets     func(ctx context.Context, publicKey string) ([]HeliusAsset, error)
+	searchSagaAssets func(ctx context.Context, publicKey string) ([]HeliusAsset, error)
+	markHolder       func(walletAddress string, clientSession *session.ClientSession) error
+}
+
+func verifySeekerNftHolder(
+	verify *VerifySeekerNftHolderArgs,
+	session *session.ClientSession,
+	lookup seekerHolderLookup,
+) (*VerifySeekerNftHolderResult, error) {
 
 	isValid, err := model.VerifySolanaSignature(
 		verify.PublicKey,
@@ -161,6 +213,7 @@ func VerifySeekerNftHolder(
 		return &VerifySeekerNftHolderResult{
 			Success: false,
 			Error: &VerifySeekerNftHolderError{
+				Code:    VerifySeekerNftHolderErrorCodeInvalidSignature,
 				Message: "Invalid signature",
 			},
 		}, nil
@@ -169,12 +222,13 @@ func VerifySeekerNftHolder(
 		return &VerifySeekerNftHolderResult{
 			Success: false,
 			Error: &VerifySeekerNftHolderError{
+				Code:    VerifySeekerNftHolderErrorCodeInvalidSignature,
 				Message: "Invalid signature",
 			},
 		}, nil
 	}
 
-	searchAssets, returnErr := heliusSearchAssets(
+	searchAssets, returnErr := lookup.searchAssets(
 		session.Ctx,
 		verify.PublicKey,
 	)
@@ -183,35 +237,38 @@ func VerifySeekerNftHolder(
 		return &VerifySeekerNftHolderResult{
 			Success: false,
 			Error: &VerifySeekerNftHolderError{
+				Code:    VerifySeekerNftHolderErrorCodeLookupFailed,
 				Message: "Error fetching fungible assets by owner",
 			},
 		}, returnErr
 	}
 
-	sagaResult, returnErr := heliusSearchAssetsSaga(session.Ctx, verify.PublicKey)
+	sagaAssets, returnErr := lookup.searchSagaAssets(session.Ctx, verify.PublicKey)
 
 	if returnErr != nil {
 		return &VerifySeekerNftHolderResult{
 			Success: false,
 			Error: &VerifySeekerNftHolderError{
+				Code:    VerifySeekerNftHolderErrorCodeLookupFailed,
 				Message: "Error fetching saga assets by owner",
 			},
 		}, returnErr
 	}
 
 	isSeekerHolder := isSeekerNftHolder(searchAssets)
-	isSagaHolder := isSagaNftHolder(sagaResult.Result.Items)
+	isSagaHolder := isSagaNftHolder(sagaAssets)
 
 	if !isSeekerHolder && !isSagaHolder {
 		return &VerifySeekerNftHolderResult{
 			Success: false,
 			Error: &VerifySeekerNftHolderError{
+				Code:    VerifySeekerNftHolderErrorCodeTokenNotFound,
 				Message: "Wallet is not a holder of the Seeker or Saga Genesis tokens",
 			},
 		}, nil
 	}
 
-	model.MarkWalletSeekerHolder(verify.PublicKey, session)
+	lookup.markHolder(verify.PublicKey, session)
 
 	return &VerifySeekerNftHolderResult{
 		Success: true,

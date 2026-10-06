@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -98,12 +99,14 @@ func (l *hostCommandLimiter) acquire(ctx context.Context, host string) (func(), 
 
 // host is one monitored host from the inventory (vault/<env>/monitor.yml).
 type host struct {
-	name        string
-	lanIp       string // resolved from config settings.yml routes (lan mode)
-	overlayIp   string // from monitor.yml (overlay mode)
-	roles       []string
-	sshUser     string // optional host-specific override
-	sshKeyPaths []string
+	scopeEndpoints []string
+	disabled       bool
+	name           string
+	lanIp          string // resolved from config settings.yml routes (lan mode)
+	overlayIp      string // from monitor.yml (overlay mode)
+	roles          []string
+	sshUser        string // optional host-specific override
+	sshKeyPaths    []string
 	// redis-cluster hosts only
 	redisEntryPort        int
 	redisPorts            []int
@@ -158,6 +161,7 @@ type monitorConfig struct {
 	managerHostname        string              // configured manager alias, when exposed
 	logServices            []string            // active services.yml service inventory
 	logServiceBlocks       map[string][]string // active blocks and expected-process denominators
+	logServiceHosts        map[string][]string // active host placements, including excluded hosts
 	proxyPathExpectedHosts int                 // active services.yml proxy placements
 	verificationEnabled    bool
 	stConfigStatus         STConfigurationStatus
@@ -168,7 +172,10 @@ type monitorConfig struct {
 	sshKeyPaths []string
 	addressMode string
 
-	hosts []*host
+	hosts                 []*host
+	routers               []*host
+	disabledHosts         []*host
+	routerGenerationCheck func(context.Context) (bool, error)
 
 	pgPort        int
 	pgbouncerPort int
@@ -178,12 +185,16 @@ type monitorConfig struct {
 
 	grafanaAdminPassword string
 
-	sourceIPv4URL      string
-	sourceIPv6URL      string
-	expectedSourceIPv4 string
-	expectedSourceIPv6 string
-	dnsAliases         DNSAliasSettings
-	mimirPublishers    MimirPublisherSettings
+	sourceIPv4URL           string
+	sourceIPv6URL           string
+	expectedSourceIPv4      string
+	expectedSourceIPv6      string
+	dnsAliases              DNSAliasSettings
+	mimirPublishers         MimirPublisherSettings
+	apiReleaseProof         *APIReleaseProofSettings
+	pgQuerySampleUntil      time.Time
+	pgQuerySampleContinuous bool
+	publicUdp               PublicUdpSettings
 
 	// state dir for baselines and other local persistence
 	stateDir string
@@ -228,6 +239,7 @@ type runner struct {
 	cfg                 *monitorConfig
 	remoteCommands      *hostCommandLimiter
 	runSSH              sshCommandRunner
+	runLocal            localCommandRunner
 	operatorDiagnostics io.Writer
 }
 
@@ -240,11 +252,21 @@ func newRunner(cfg *monitorConfig) *runner {
 		cfg:                 cfg,
 		remoteCommands:      remoteCommands,
 		runSSH:              runSSHCommand,
+		runLocal:            runLocalCommand,
 		operatorDiagnostics: os.Stderr,
 	}
 }
 
 type sshCommandRunner func(ctx context.Context, args []string, stdin string) (stdout string, stderr string, err error)
+
+// sshCommandError preserves the execution source as well as the native process
+// status. An exit-255-shaped string from another command is not SSH evidence.
+// OpenSSH's status 255 does not locate the fault: it can also be the remote
+// command's own status, so this type must not imply observer or host route loss.
+type sshCommandError struct{ err error }
+
+func (e *sshCommandError) Error() string { return e.err.Error() }
+func (e *sshCommandError) Unwrap() error { return e.err }
 
 func runSSHCommand(ctx context.Context, args []string, stdin string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, "ssh", args...)
@@ -270,6 +292,8 @@ func (self *unreachableError) Error() string {
 	return fmt.Sprintf("unreachable %s: %s", self.host, self.err)
 }
 
+func (self *unreachableError) Unwrap() error { return self.err }
+
 // ssh runs remoteCmd on h, feeding stdin, returning stdout. It applies the
 // config's hard timeout; a timeout or missing address is returned as
 // *unreachableError.
@@ -281,6 +305,9 @@ func (self *runner) ssh(ctx context.Context, h *host, remoteCmd string, stdin st
 // deliberately slow reads (the daily keyspace scan) that exceed the default
 // budget.
 func (self *runner) sshTimeout(ctx context.Context, h *host, remoteCmd string, stdin string, timeout time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	addr := h.addr(self.cfg.addressMode)
 	if addr == "" {
 		return "", &unreachableError{host: h.name, err: fmt.Errorf("no address for mode %q", self.cfg.addressMode)}
@@ -316,11 +343,13 @@ func (self *runner) sshTimeout(ctx context.Context, h *host, remoteCmd string, s
 	if cmdCtx.Err() == context.DeadlineExceeded {
 		return out, &unreachableError{host: h.name, err: fmt.Errorf("timeout after %s", timeout)}
 	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
 	if err != nil {
-		// ssh dial failures (exit 255) mean the host itself is unobservable;
-		// a nonzero exit from the remote command is a command error. Both
-		// surface with the stderr text.
-		return out, fmt.Errorf("%s: %w: %s", h.name, err, strings.TrimSpace(errOut))
+		// Retain native SSH status for the fixed error classifier. Neither 255
+		// nor stderr alone proves a local VPN, network, or remote-host cause.
+		return out, &sshCommandError{err: fmt.Errorf("%s: %w: %s", h.name, err, strings.TrimSpace(errOut))}
 	}
 	return out, nil
 }
@@ -332,8 +361,10 @@ func (self *runner) sshArgs(target, remoteCmd string, connectTimeout time.Durati
 func (self *runner) sshArgsWithKeys(target, remoteCmd string, connectTimeout time.Duration, keyPaths []string) []string {
 	sshArgs := []string{
 		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", int(connectTimeout.Seconds())),
-		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UpdateHostKeys=no",
 	}
 	for _, keyPath := range keyPaths {
 		if strings.TrimSpace(keyPath) != "" {
@@ -434,24 +465,31 @@ func (self *runner) shell(ctx context.Context, h *host, remoteCmd string) (strin
 // stdout+stderr because several operational tools emit useful structured
 // context on stderr even on success.
 func (self *runner) local(ctx context.Context, name string, args ...string) (string, error) {
+	logQuery := isBoundedWarpctlLogQuery(name, args)
+	if logQuery && ctx.Err() != nil {
+		return "", newWarpctlLogQueryError(ctx.Err(), "")
+	}
 	timeout := self.cfg.commandTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(cmdCtx, name, args...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
+	runCommand := self.runLocal
+	if runCommand == nil {
+		runCommand = runLocalCommand
+	}
+	out, stderr, err := runCommand(cmdCtx, name, args...)
+	if logQuery && (err != nil || cmdCtx.Err() != nil) {
+		return out, newWarpctlLogQueryError(errors.Join(cmdCtx.Err(), err), stderr)
+	}
 	if cmdCtx.Err() == context.DeadlineExceeded {
-		return out.String(), fmt.Errorf("%s timeout after %s", name, timeout)
+		return out, fmt.Errorf("%s timeout after %s", name, timeout)
 	}
 	if err != nil {
-		return out.String(), fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+		return out, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
-	return out.String(), nil
+	return out, nil
 }
 
 func (self *runner) tcpExchange(ctx context.Context, network, address string, payload []byte, responseBytes int) ([]byte, error) {

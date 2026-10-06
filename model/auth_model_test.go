@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +36,84 @@ func TestGetUserAuth(t *testing.T) {
 		userAuth, err := GetUserAuth(ctx, networkId)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, userAuth, testingUserAuth)
+	})
+}
+
+// Guest and wallet admins share the null-recipient outcome without hiding
+// their distinct authentication types behind an untyped error string.
+func TestGetUserAuthMissingRecipientIsTyped(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		for _, accountType := range []string{"guest", "wallet"} {
+			networkId := server.NewId()
+			if accountType == "guest" {
+				Testing_CreateGuestNetwork(ctx, networkId, "synthetic-no-recipient-guest", server.NewId())
+			} else {
+				wallet := solana.NewWallet()
+				message := "synthetic recipient lookup fixture"
+				signature, err := wallet.PrivateKey.Sign([]byte(message))
+				if err != nil {
+					t.Fatal(err)
+				}
+				Testing_CreateNetworkByWallet(ctx, networkId, "synthetic-no-recipient-wallet", server.NewId(),
+					wallet.PublicKey().String(), base64.StdEncoding.EncodeToString(signature[:]), message)
+			}
+			userAuth, err := GetUserAuth(ctx, networkId)
+			if userAuth != "" || !errors.Is(err, ErrMissingUserAuth) {
+				t.Fatalf("%s recipient=%q error=%v, want typed missing recipient", accountType, userAuth, err)
+			}
+		}
+	})
+}
+
+// The in-transaction read answers from the caller's transaction: it sees the
+// transaction's own uncommitted recipient, which a pooled read cannot, and
+// keeps the typed outcome for an admin without a recipient and the empty
+// answer for a missing network.
+func TestGetUserAuthInTxReadsTheCallersTransaction(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkId := server.NewId()
+		userId := server.NewId()
+		Testing_CreateNetwork(ctx, networkId, "synthetic-in-tx-recipient", userId)
+		guestNetworkId := server.NewId()
+		Testing_CreateGuestNetwork(ctx, guestNetworkId, "synthetic-in-tx-guest", server.NewId())
+		const recipient = "in-tx-recipient@synthetic.example"
+
+		var inTxUserAuth string
+		var inTxErr error
+		var pooledUserAuth string
+		var guestUserAuth string
+		var guestErr error
+		var missingUserAuth string
+		var missingErr error
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`UPDATE network_user SET user_auth = $1 WHERE user_id = $2`,
+				recipient,
+				userId,
+			))
+			inTxUserAuth, inTxErr = GetUserAuthInTx(ctx, tx, networkId)
+			pooledUserAuth, _ = GetUserAuth(ctx, networkId)
+			guestUserAuth, guestErr = GetUserAuthInTx(ctx, tx, guestNetworkId)
+			missingUserAuth, missingErr = GetUserAuthInTx(ctx, tx, server.NewId())
+		})
+		if inTxErr != nil || inTxUserAuth != recipient {
+			t.Fatalf("in-transaction recipient=%q error=%v, want the uncommitted %q", inTxUserAuth, inTxErr, recipient)
+		}
+		if pooledUserAuth == recipient {
+			t.Fatal("the pooled read saw the uncommitted recipient")
+		}
+		if guestUserAuth != "" || !errors.Is(guestErr, ErrMissingUserAuth) {
+			t.Fatalf("guest recipient=%q error=%v, want typed missing recipient", guestUserAuth, guestErr)
+		}
+		if missingUserAuth != "" || missingErr != nil {
+			t.Fatalf("missing network recipient=%q error=%v, want empty", missingUserAuth, missingErr)
+		}
+		if userAuth, err := GetUserAuth(ctx, networkId); err != nil || userAuth != recipient {
+			t.Fatalf("committed recipient=%q error=%v, want %q", userAuth, err, recipient)
+		}
 	})
 }
 
@@ -87,6 +167,25 @@ func TestResetPassword(t *testing.T) {
 		)
 		connect.AssertEqual(t, err, nil)
 
+		// a password that fails the password policy is rejected and does not
+		// consume the reset code
+		shortResult, err := AuthPasswordSet(
+			AuthPasswordSetArgs{
+				ResetCode: *passwordResetCreateCodeResult.ResetCode,
+				Password:  "short",
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertNotEqual(t, shortResult.Error, nil)
+
+		userAuths, err := getUserAuths(userId, ctx)
+		connect.AssertEqual(t, err, nil)
+		for _, userAuth := range userAuths {
+			loginPasswordHash := computePasswordHashV1([]byte(password), userAuth.PasswordSalt)
+			connect.AssertEqual(t, bytes.Equal(userAuth.PasswordHash, loginPasswordHash), true)
+		}
+
 		newPassword := "testagain"
 
 		result, err := AuthPasswordSet(
@@ -97,9 +196,10 @@ func TestResetPassword(t *testing.T) {
 			clientSession,
 		)
 		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Error, nil)
 		connect.AssertNotEqual(t, result.NetworkId, nil)
 
-		userAuths, err := getUserAuths(userId, ctx)
+		userAuths, err = getUserAuths(userId, ctx)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, len(userAuths), 2)
 
@@ -109,6 +209,28 @@ func TestResetPassword(t *testing.T) {
 		}
 
 	})
+}
+
+// TestAuthPasswordSetRejectsWeakPassword checks the password policy is
+// applied before the reset code is looked up, so it needs no database.
+func TestAuthPasswordSetRejectsWeakPassword(t *testing.T) {
+	ctx := context.Background()
+	clientSession := session.NewLocalClientSession(ctx, "127.0.0.1:0", nil)
+	defer clientSession.Cancel()
+
+	for _, password := range []string{"", "a", "12345"} {
+		result, err := AuthPasswordSet(
+			AuthPasswordSetArgs{
+				ResetCode: "not-a-reset-code",
+				Password:  password,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertNotEqual(t, result, nil)
+		connect.AssertNotEqual(t, result.Error, nil)
+		connect.AssertEqual(t, result.Error.Message, fmt.Sprintf("Password must have at least %d characters", MinPasswordLength))
+	}
 }
 
 func TestAuthCode(t *testing.T) {
@@ -307,11 +429,36 @@ func TestVerifyEthereumSignature(t *testing.T) {
 		}
 		sigHex := hex.EncodeToString(signature)
 
+		// --- hex-encoded signature, checksummed address (baseline) ---
 		isValid, err := VerifyEthereumSignature(address.String(), messageStr, sigHex)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, isValid, true)
 
-		// Test with an invalid signature (modified signature)
+		// --- hex-encoded signature, all-lowercase address ---
+		// Catches: case-sensitive address comparison bug.
+		// address.String() returns EIP-55 checksummed (mixed-case); real clients
+		// often send all-lowercase. The old code used == which would fail here.
+		lowercaseAddr := strings.ToLower(address.String())
+		isValid, err = VerifyEthereumSignature(lowercaseAddr, messageStr, sigHex)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, isValid, true)
+
+		// --- base64url (no padding) encoded signature, checksummed address ---
+		// Catches: mobile clients (e.g. DGEN1) that encode the signature with
+		// base64.RawURLEncoding instead of hex. The old code used common.FromHex
+		// which silently returns ~0 bytes for base64url input.
+		sigBase64url := base64.RawURLEncoding.EncodeToString(signature)
+		isValid, err = VerifyEthereumSignature(address.String(), messageStr, sigBase64url)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, isValid, true)
+
+		// --- standard base64 (with padding) encoded signature ---
+		sigBase64 := base64.StdEncoding.EncodeToString(signature)
+		isValid, err = VerifyEthereumSignature(address.String(), messageStr, sigBase64)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, isValid, true)
+
+		// --- invalid signature (modified bits) ---
 		invalidSigBytes, _ := hex.DecodeString(sigHex)
 		invalidSigBytes[10] ^= 0xFF // Flip some bits in the R or S part
 		invalidSigHex := hex.EncodeToString(invalidSigBytes)
@@ -319,7 +466,7 @@ func TestVerifyEthereumSignature(t *testing.T) {
 		isValid, err = VerifyEthereumSignature(address.String(), messageStr, invalidSigHex)
 		connect.AssertEqual(t, isValid, false)
 
-		// Malformed signature (wrong length)
+		// --- malformed signature (wrong length) ---
 		malformedSig := "wrongsig"
 		isValid, err = VerifyEthereumSignature(address.String(), messageStr, malformedSig)
 		connect.AssertNotEqual(t, err, nil) // Error expected
@@ -907,6 +1054,149 @@ func TestAuthVerifyCodeInvalidation(t *testing.T) {
 				connect.AssertEqual(t, c, 0)
 			})
 		})
+	})
+}
+
+// An email or phone sign-in added after the account was created lives only in
+// network_user_auth_password (network_user.user_auth keeps the original
+// identity). Logging in with it asks for verification, so a code must be
+// created for it and must verify it.
+func TestAuthVerifyAddedUserAuth(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		userId := server.NewId()
+		Testing_CreateNetwork(ctx, networkId, "test", userId)
+
+		phone := "+1 609-737-0011"
+		password := "password123"
+		passwordSalt := createPasswordSalt()
+		passwordHash := computePasswordHashV1([]byte(password), passwordSalt)
+		err := addUserAuth(
+			&AddUserAuthArgs{
+				UserId:       userId,
+				UserAuth:     &phone,
+				PasswordHash: passwordHash,
+				PasswordSalt: passwordSalt,
+			},
+			ctx,
+		)
+		connect.AssertEqual(t, err, nil)
+		normalPhone, _ := NormalUserAuthV1(&phone)
+
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+
+		loginResult, err := AuthLoginWithPassword(
+			AuthLoginWithPasswordArgs{
+				UserAuth: phone,
+				Password: password,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, loginResult.Error, nil)
+		connect.AssertNotEqual(t, loginResult.VerificationRequired, nil)
+
+		createResult, err := AuthVerifyCreateCode(
+			AuthVerifyCreateCodeArgs{
+				UserAuth: loginResult.VerificationRequired.UserAuth,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertNotEqual(t, createResult.VerifyCode, nil)
+
+		verifyResult, err := AuthVerify(
+			AuthVerifyArgs{
+				UserAuth:   phone,
+				VerifyCode: *createResult.VerifyCode,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, verifyResult.Error, nil)
+		connect.AssertNotEqual(t, verifyResult.Network, nil)
+
+		byJwt, err := jwt.ParseByJwt(ctx, verifyResult.Network.ByJwt)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, byJwt.NetworkId, networkId)
+		connect.AssertEqual(t, byJwt.UserId, userId)
+
+		verified := false
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(
+				ctx,
+				`SELECT verified FROM network_user_auth_password WHERE user_auth = $1`,
+				*normalPhone,
+			)
+			server.WithPgResult(result, err, func() {
+				connect.AssertEqual(t, result.Next(), true)
+				server.Raise(result.Scan(&verified))
+			})
+		})
+		connect.AssertEqual(t, verified, true)
+	})
+}
+
+// A password reset for an added email or phone sign-in creates a reset code
+// for the account that owns it.
+func TestPasswordResetAddedUserAuth(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		userId := server.NewId()
+		Testing_CreateNetwork(ctx, networkId, "test", userId)
+
+		phone := "+1 609-737-0012"
+		passwordSalt := createPasswordSalt()
+		passwordHash := computePasswordHashV1([]byte("password123"), passwordSalt)
+		err := addUserAuth(
+			&AddUserAuthArgs{
+				UserId:       userId,
+				UserAuth:     &phone,
+				PasswordHash: passwordHash,
+				PasswordSalt: passwordSalt,
+				Verified:     true,
+			},
+			ctx,
+		)
+		connect.AssertEqual(t, err, nil)
+
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+
+		resetResult, err := AuthPasswordResetCreateCode(
+			AuthPasswordResetCreateCodeArgs{
+				UserAuth: phone,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertNotEqual(t, resetResult.ResetCode, nil)
+
+		newPassword := "password456"
+		setResult, err := AuthPasswordSet(
+			AuthPasswordSetArgs{
+				ResetCode: *resetResult.ResetCode,
+				Password:  newPassword,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, setResult.NetworkId, networkId)
+
+		loginResult, err := AuthLoginWithPassword(
+			AuthLoginWithPasswordArgs{
+				UserAuth: phone,
+				Password: newPassword,
+			},
+			clientSession,
+		)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, loginResult.Error, nil)
+		connect.AssertNotEqual(t, loginResult.Network, nil)
+		connect.AssertNotEqual(t, loginResult.Network.ByJwt, nil)
 	})
 }
 

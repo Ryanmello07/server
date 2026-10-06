@@ -1,6 +1,6 @@
 schema: 1
-status_date: 2026-09-15
-launch_state: staging_epoch_4_open_worker_running_accepted_live_score_pending
+status_date: 2026-09-23
+launch_state: shared_epoch_baseline_staging_epoch_8_open_best_safe_winner_rollout_pending
 
 evaluation_host:
   authoritative_hosts_required: 1
@@ -24,6 +24,13 @@ season:
   season_ends_at: null
   retain_until: null
   baseline_source_policy: promote_significant_winner_or_carry_forward_unchanged
+  score_baseline_scope: one_append_only_control_per_epoch
+  score_baseline_replicates: 9
+  candidate_replicates_per_submission: 9
+  first_attempt_order: trusted_baseline_before_untrusted_candidate_build
+  later_attempt_order: authenticate_frozen_baseline_then_build_and_run_candidate
+  baseline_failure_policy: freeze_completed_control_even_when_candidate_build_is_terminal
+  host_drift_policy: full_self_check_after_every_job_stop_without_rebaseline_on_mismatch
 
 significance:
   authority: config/main/sim-latency.yml
@@ -31,21 +38,46 @@ significance:
   alpha: 0.05
   initial_improvement_percent: 16.1
   threshold_scope: per_source_epoch
+  control_sample_scope: immutable_round_baseline_shared_by_all_submissions
+  control_identity: exact_baseline_json_sha256_in_every_score
   evaluation_record: means_variances_p_value_and_next_epoch_recommendation
   winner_requirement: placeable_margin_statistical_significance_and_approved_honesty_review
   no_winner_policy: carry_commits_and_threshold_forward_when_none_significant_or_all_rejected
 
 honesty_review:
+  scope: production_only
   authority: postgres_append_only_competition_candidate_review
   command: sim-latency epoch-review
   environment: main
-  ordering: normalized_score_desc_raw_score_asc_submitted_at_job_id
+  ordering: raw_score_asc_submitted_at_job_id
+  normalized_score_role: display_only
+  historical_ordering: preserve_normalized_score_first_for_epochs_without_a_shared_control
   candidate_materialization: fresh_mode_0700_temp_dir_with_mode_0400_patch_score_and_metadata
   evidence: bounded_json_object_with_sha256_reviewer_reason_and_timestamp
   reject_behavior: advance_to_next_ranked_significant_candidate
   approve_behavior: atomically_finalize_exact_candidate_as_winner
   exhaustion_behavior: atomically_finalize_without_winner
   public_before_finalization: false
+
+staging_winner_policy:
+  deployment: best_safe_control_plane_follow_up_pending
+  deployment_order: current_migration_runner_apply_720_then_main_api_then_competition_worker
+  api_contract: updated_sn_api_competition_yml
+  pending_openapi_sha256: bb4b57f8bf584211cc18f89be0ae43769213c39655804e360719d87ac95e4610
+  monitor_cli: refresh_separately_for_migration_720_guard
+  evaluator_rebuild: not_required
+  baseline_reset: not_required
+  config_updater_rollout: not_required
+  finalization: automatic_after_admission_close_and_fifo_drain
+  selection: highest_ranked_placeable_candidate_passing_all_gates_without_significance_or_takeover_margin
+  ordering: raw_score_asc_submitted_at_job_id
+  no_eligible_candidate: null_winner
+  honesty_review: not_reviewed_no_review_rows_or_pause
+  honesty_or_safety_approval: false
+  promotion: never
+  source_epoch: 0
+  threshold: unchanged
+  historical_finalized_results: preserved
 
 evaluation_source:
   manifest: config/main/sim-latency.yml
@@ -59,8 +91,11 @@ evaluation_source:
     - goidenticons
     - userwireguard
     - sn
+    - operator-proxy
+    - warp
   canonical_patch_repository: server
-  round_source_epoch_offset: -1
+  production_round_source_epoch_offset: -1
+  staging_source_epoch: 0
   promotion_command: sim-latency promote
   activation_order: repository_branches_then_config_ledger
   promotion_review_gate: finalized_exact_approved_job_patch_sha256_and_full_score_document
@@ -70,64 +105,220 @@ evaluation_source:
 
 evaluator_release:
   source_epoch: 0
-  server_source_commit: 759b7462ef4dbe849d7bfbcc7a73e8b5c573c340
-  evaluator_image_id: sha256:4b7e46e2243d26b915e83a85d3c2b4b7679d5038bc0c53197ce274cec137209b
+  server_source_commit: 807b473c927d1ae09a03276bb9758afb715fac9e
+  evaluator_image_id: sha256:b0c07cf45c30adb483ee5c215b7426b2e098c0b35c7cf4c4abcb0166cb43a87e
+  source_config_sha256: f123d5332a2d68a387c983de373d5eafacb6d797c04039c087962c410d3172ca
+  source_lock_sha256: fff5bd221ff13c37f4a0250ced9458c1ceba056bbe91d22d72280c908bd0a58c
+  release_record: launch/STAGING-5-RELEASE.md
   local_image_load:
-    status: installed_and_full_docker_smoke_passed
+    status: installed_clean_source_build_and_docker_smoke_passed
     runtime: docker
-    immutable_reference: sha256:4b7e46e2243d26b915e83a85d3c2b4b7679d5038bc0c53197ce274cec137209b
-    convenience_tag: urnetwork/sim-latency-evaluator-base:significance-contract-759b7462
-    verified_at: 2026-09-14T18:27:24Z
-  simulator_sha256: fcadc7f736e26e23f5c6eb4867713f528728fdf9193a40616c80d5ccb1963a7f
-  main_api_config_rollout: live_pin_and_polling_contract_verified_2026_09_15
+    immutable_reference: sha256:b0c07cf45c30adb483ee5c215b7426b2e098c0b35c7cf4c4abcb0166cb43a87e
+    convenience_tag: urnetwork/sim-latency-evaluator-base:shared-baseline-epoch5-807b473c
+    verified_on: 2026-09-18
+  simulator_sha256: e27929e9f2ef45f9f23c2120b651fafe048f38d82f3ca308b1b200b48ea05cbf
+  evaluator_command_sha256: a71956232074e7bb09e2014037db4f62e4aac6ed1230f6cc89aeeb62254819f2
+  main_api_config_rollout: verified_live_api_source_image_and_database_guards_2026_09_19
   accepted_live_staging_score: pending
-  smoke_log_sha256: 6f2652772933ae516f0e63b3b08a80a458d7c3de063b610c16c203a3026f7079
-  retained_input_replay:
+  production_exact_image_qualification: pending_prior_containment_retained_for_staging_only
+  shared_epoch_baseline_release:
+    code_status: implemented
+    validation_status: go_race_offline_vet_compatibility_migrations_api_and_launch_tests_passed
+    deployment_status: staging_epoch_5_open_singleton_worker_running
+    database_table: competition_round_baseline
+    immutable_event: round_baseline_frozen
+    legacy_ranking_compatibility: migration_678_and_conditional_controller_ordering
+  known_regression:
+    incident: launch/STAGING-4-G5-INCIDENT.md
+    cause: frozen_source_omitted_qualified_wrapped_database_error_fix
+    missing_server_commit: 46515d82fe98ff666c61b2b5bb1d34a89cf4dad8
+    current_main_contains_fix: true
+    repair_target_staging_epoch: 5
+    operator_approved_main_pull_for_epoch_5: true
+    status: runtime_repair_in_new_image_live_epoch_5_proof_pending
+    existing_round_source_image_and_results_unchanged: true
+    validation:
+      status: passed_2026_09_16
+      reviewed_code_diff_sha256: 1eece5fc9e0819b877f8ee0381bc7e1bc3f608ea73f26b2f8426c2651d0a6200
+      private_manifest_sha256: 6d96b30698c6dc93e7ed48611dde306907967c31590e2ec8cb71cd0242371b36
+      deterministic_pre_fix_reproductions: passed
+      targeted_database_tests: 9
+      adjacent_database_transaction_liveness_tests: 19
+      targeted_database_race: passed
+      targeted_database_consecutive_repetitions: 3
+      sim_latency_tests_consecutive_passes: 3
+      go_vet: passed
+      replacement_evaluator_image: built_installed_and_activated_for_staging_epoch_5
+  build_log_sha256: 72c63f21037dae3fa63ad5f06d278af53d0af6daaf28641b8746ec702f5055e8
+  smoke_status: passed
+  smoke_log_sha256: 2d85794ee3122be18638f0c8d5054220981d295528756bf6eae762cf54b75964
+  smoke_elapsed_seconds: 351
+  smoke_checks_passed: 17
+  smoke_qualification: development_fixture_not_production_baseline
+  residual_labeled_containers: 0
+  residual_labeled_networks: 0
+  staging_containment_check:
+    status: all_common_checks_passed_exact_production_identity_ineligible
+    log_sha256: f2648843f32e68a937f919636532068c22789522b7da00419e37f3c5a8f6b10e
+    exit_code: 1
+    qualification_match: false
+    reported_qualification_sha256: 1bfcc9beb530fe1578bf4ceb8efb4860194e53f024ee14486858333e1f435986
+    reported_historical_image: sha256:2abcf145c0f914899debbd2fd52e57a16cf20072165c8d13f04a0ba487198a4c
+    host_manifest_modified: false
+  timing_serialization:
+    status: independently_reviewed_go_tests_and_rebuilt_image_smoke_passed
+    changes: retain_exact_persisted_csv_timing_precision_before_summarizing
+    csv_bytes_scorer_tolerances_and_workload_changed: false
+    focused_log_sha256: b756f4f13b80236aa8175db8956227b13dc189bc1f30ac3219c2a8c48718a516
+    tests_sh_log_sha256: 711fd7ac6b8ce7a08ada0f8fc3cddffc1032ede17e7008b162ba9a1352bcd35e
+    sim_race_log_sha256: 0b072e26d4996c7bfb51976e31fdaabdec64223de30531bfb81de658bfa446b9
+    offline_vet_log_sha256: 1bca58ebd034f1e5b2405be199b0db2aa1f060fbc9b51ce569b9d84ae113dd05
+  rejected_precision_smoke:
+    evaluator_image_id: sha256:51252f632b000193cf691ebb735411a95444a997bb9ae0317d7bb4e0d305b833
+    failure: live_timing_precision_differs_from_persisted_csv
+    log_sha256: 78f7d924d716bdc0d1802d1898ce4d2c58884c9d08bf87b138e1d27f38cb9205
+    deployed: false
+  simulator_handler_lifecycle:
+    status: implemented_and_independently_validated
+    changes: owned_registration_heartbeat_joined_cleanup_h1_only_listeners_and_synchronous_http_bind
+    production_eligibility_and_workload_changed: false
+    db_lifecycle_log_sha256: 0f8ec366e5b77ae2c0e39ae94b3fc0a34b808635e2aef92786de576902aec602
+    sim_race_log_sha256: c6b2239830674efb977fc10db3da6c0e838cf7574b49eff1ee26039c18affb32
+    tests_sh_log_sha256: d322beec64f22130f973094c8a6b3244e669b3bd59119c78747dc8a9f5e0b6e4
+    offline_vet_log_sha256: ba002bf396ee95dd44aea58d702f74bb426641bed3aeed3b1156e4f55f18a419
+  rejected_runtime_smoke:
+    evaluator_image_id: sha256:a13bc0da78cd4e82630c559c3ecb12a5f3800f8db0750177bd8ee7fee4770d6c
+    failure: client_warmup_timeout_missing_handler_registration
+    log_sha256: eb9eb6793851b05ab3ce95c9a1801add0d299ec0c203fc6965b2e7f5894f2f55
+    deployed: false
+  historical_retained_input_replay:
     official: false
     status: complete_significance_and_shared_model_validation_passed
     baseline_replicates: 9
     candidate_replicates: 9
     elapsed_seconds: 5
     score_sha256: 73523f0c42f711bf42a44088d03cccd6bb76b0dc24fc571949f3d420f81adb83
-  superseded_release:
+  prior_live_release:
+    evaluator_image_id: sha256:4b7e46e2243d26b915e83a85d3c2b4b7679d5038bc0c53197ce274cec137209b
+    server_source_commit: 759b7462ef4dbe849d7bfbcc7a73e8b5c573c340
+    smoke_log_sha256: 6f2652772933ae516f0e63b3b08a80a458d7c3de063b610c16c203a3026f7079
+    staging_epoch: 4
+    published_entries: 4
+  historical_significance_failure:
     evaluator_image_id: sha256:6c68b85355e87e381f266b65f5c98581f232682cec2ac77c73c5ea6f151e2d5c
     simulator_sha256: 05c2a721c652fd1f066eae26270361ce6127d266f6e5dc0c10a0caffe9fb0319
     reason: scorer_omitted_required_significance_record
 
 staging_deployment:
-  verified_at: 2026-09-15T14:56:17Z
-  epoch: 4
-  round_id: 01a0a58b-9a3e-2e43-f612-0034ff7296ff
+  verified_at: 2026-09-19T09:59:31Z
+  open_first_verified_at: 2026-09-19T09:57:30Z
+  final_repeated_api_checks: 3
+  api_version: 2026.9.18+1049819730
+  migration_audit_max: 683
+  round_baseline_table_present: true
+  legacy_and_shared_ranking_guards_present: true
+  prior_queued_or_running_staging_jobs_before_creation: 0
+  epoch: 5
+  source_epoch: 0
+  round_id: 01a0b913-c344-27f3-cb64-338dbddc8b07
   status: open
-  opens_at: 2026-09-15T14:56:00Z
-  closes_at: 2026-09-17T14:56:00Z
+  created_status: scheduled
+  creation_http_status: 201
+  opens_at: 2026-09-19T09:57:00Z
+  closes_at: 2026-09-21T09:57:00Z
+  reveal_at: 2026-09-21T09:57:00Z
+  submission_window_seconds: 172800
+  successful_shared_control_score: pending
+  shared_baseline_count: 0
+  shared_baseline_state: awaiting_first_submission
+  opening_worker_winner_policy: historical_null_winner_after_close_and_drain
+  finalized_leaderboard: pending
   immutable_policy_matches_live_pin: true
-  worker_service: urnetwork-sim-latency-staging-epoch-4.service
-  worker_status: running_preflight_passed
+  worker_service: urnetwork-sim-latency-staging-epoch-5.service
+  worker_status: active_running_preflight_passed
+  worker_started_at: 2026-09-19T09:53:30Z
+  worker_invocation_id: ae75d48be35948189dea302ab747d6f8
+  worker_pid: 3449082
+  worker_restarts: 0
+  worker_management_cpuset: "20,22"
+  worker_oom_score_adjust: -900
+  worker_restart_policy: on-failure
+  worker_main_commit: 07b210bc76f15c714d2de8484153e407bbf65808
+  worker_image_digest: sha256:07d6caa778715a1e104fdf661eaaf68f3c13b1ca2b0e4dee2cb0246d45c6dcae
+  worker_image_tag: urnetwork/competitionworker:staging-07b210bc76f1
+  worker_binary: /usr/local/libexec/urnetwork/competition-worker-07d6caa7/competitionworker
+  worker_binary_owner: root:root
+  worker_binary_mode: "0555"
+  worker_binary_sha256: f5fed5489bc49a37e60300efcfdf0541fb2c8b6f5c0f7d0feb5bd0592ef59ecd
+  worker_version_image_log_sha256: e915831831edada6a1b111f564d3b8d1d16693450f7bde71a9336a3939e6d4e2
+  worker_staging_preflight_elapsed_seconds: 2
+  worker_staging_preflight_log_sha256: be0021cca91d5bbe68d40b61bb4c618995d6dfeddf48692eb41b77fd1be12431
+  worker_authenticated_host_refresh_last_observed_at: 2026-09-19T09:57:19Z
+  database_host_heartbeat_at: 2026-09-19T09:57:59Z
+  database_host_heartbeat_checked_at: 2026-09-19T09:58:11Z
+  database_host_heartbeat_age_seconds: 11.897
+  database_production_eligible: false
+  admission_qualification: explicit_staging_exception_only
+  creation_response_sha256: 374edcae7f66581d6aced00196e959793a4f61bc1ee45eadfe7e2a17006b32a9
+  source_check_sha256: d497589c83aa217a2b33ef72c6d207b00abf016f2c2414d2b827ea17eba8bc8c
+  operator_artifact_directory: /tmp/urnetwork-staging5-launch.tNf1cYJO
   production_round_created: false
   production_host_rebaseline: pending
-  fifo_dispatch: authoritative_postgres_fallback_redis_cluster_ports_unreachable
-  grafana_ingestion: authenticated_push_verified_via_temporary_crisp_forwarder
+  infrastructure_last_verified: 2026-09-19
+  fifo_dispatch: authoritative_postgres_fallback_observed_2026_09_19
+  redis_remote_cluster_ports: connection_refused_supported_postgres_fallback_not_an_admission_blocker
+  grafana_ingestion: fresh_epoch_5_worker_metrics_verified_via_authenticated_public_tls_query
+  grafana_query:
+    verified_at: 2026-09-19T09:58:17Z
+    http_status: 200
+    host: sille
+    env: main
+    service: sim
+    epoch: 5
+    staging: 1
+    queue_depth: 0
+    backlog_seconds: 0
+    heartbeat_age_seconds: 25.955
+    stale_threshold_seconds: 30
+    exact_worker_image_and_revision_verified: true
+    response_sha256: 9eeab8f1dd3975d96d1c63be412bc79e014f6cb9c70289401ea557ac1572378a
+    verification_metadata_sha256: d2df1abfa95e22f4d2d0d5f3e5689029b080c0ce852a95244f6f4c36e13ec3d8
   grafana_forwarder:
     service: urnetwork-sim-latency-metrics-forward.service
     local_listen: 127.0.0.1:3100
     remote_endpoint: 172.28.208.58:3100
-    verified_push_at: 2026-09-15T15:06:32Z
+    historical_verified_push_at: 2026-09-15T15:06:32Z
     persistent_across_reboot: false
     multi_endpoint_support: pending_publisher_change
   historical_round_reveal_fix:
     server_commit: 45215c8f1cd3c3ef5855734042c513706a179b53
     tests: deterministic_unit_and_postgres_lifecycle_passed
-    api_rollout: pending
+    api_rollout: current_api_deployed_epoch_4_reveal_authenticated_2026_09_19
+    verified_on: 2026-09-19
+    revealed_round_id: 01a0a58b-9a3e-2e43-f612-0034ff7296ff
+    providers_sha256: 3f3829a588e4c024459e2c4c653be8244e2e515c56da645e3c6447b9c1d99fae
     blocks_current_staging_epoch: false
+  prior_epoch:
+    verified_at: 2026-09-18T06:54:27Z
+    epoch: 4
+    round_id: 01a0a58b-9a3e-2e43-f612-0034ff7296ff
+    status: finalized
+    opens_at: 2026-09-15T14:56:00Z
+    closes_at: 2026-09-17T14:56:00Z
+    finalized_at: 2026-09-17T14:56:00.946063Z
+    published_entry_count: 4
+    macrocosmos_downstream: confirmed_end_to_end_by_operator
+    immutable_policy_scores_and_legacy_ranking_preserved: true
+    worker_service: urnetwork-sim-latency-staging-epoch-4.service
+    worker_status: exited
 
 release_record:
   control_plane_branch: main
   control_plane_commits_are_scoring_inputs: false
   exact_runtime_image_digest_persisted_per_evaluation: true
-  openapi_sha256: aaaaf82658ee7a15256cfd4759f35ffbe8af7f09093468b488d146d8b1cb6a87
-  recorded_by: local_staging_repair
-  recorded_at: 2026-09-14T18:44:02Z
+  openapi_sha256: 7bb6154d7682ac241f892fd2f6611064196402874c400d055b1b81a2b9cad134
+  recorded_by: shared_epoch_baseline_release
+  recorded_on: 2026-09-19
 
 validation:
   completed_at: 2026-08-29T04:37:06Z
@@ -191,7 +382,7 @@ monitoring:
 
 checklist:
   - id: evaluator_and_baseline
-    status: complete
+    status: historical_qualification_preserved_shared_control_image_built_production_requalification_required
     evidence: connect/sim-latency/baseline/final-baseline.html
   - id: single_host_containment
     status: complete
@@ -209,9 +400,10 @@ checklist:
     status: complete
     evidence: sn/api/competition.yml
   - id: staging_era
-    status: implementation_complete_multi_epoch_apex_proof_pending
+    status: epoch_5_open_worker_running_epoch_4_history_preserved_new_shared_control_score_pending
     evidence: server/controller/competition_controller.go and server/connect/sim-latency/run-main.sh
-    lifecycle: fee_free_real_fifo_evaluation_against_source_epoch_zero_auto_finalize_no_winner_opt_in_staging_leaderboard
+    lifecycle: fee_free_source_epoch_zero_auto_finalize_eligible_named_winner_without_review_or_promotion
+    named_winner_rollout: pending_control_plane_deployment
   - id: six_epoch_immediate_fifo_lifecycle
     status: complete
     evidence: server/controller/competition_controller.go and server/connect/sim-latency/run-main.sh
@@ -229,10 +421,13 @@ checklist:
     status: complete
     evidence: server/controller/competition_controller.go
   - id: epoch_zero_evaluator_image
-    status: local_install_smoke_and_live_pin_verified_accepted_score_and_production_rebaseline_pending
+    status: live_staging_pin_and_worker_verified_shared_control_score_and_production_rebaseline_pending
     evidence: config/main/sim-latency.yml and server/connect/sim-latency/evaluator/container/build-base.sh
+  - id: frozen_database_regression
+    status: runtime_fix_in_epoch_5_image_live_proof_pending
+    evidence: server/connect/sim-latency/launch/STAGING-4-G5-INCIDENT.md
   - id: historical_round_seed_reveal
-    status: tested_and_pushed_api_rollout_pending
+    status: epoch_4_live_reveal_authenticated_2026_09_19
     evidence: server_commit_45215c8f1cd3c3ef5855734042c513706a179b53
   - id: live_minio_readiness_backup_capacity_and_deletion_owner
     status: deployment_verification_required

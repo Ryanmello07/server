@@ -48,14 +48,16 @@ func AuthNetworkClient(
 }
 
 // recordAuthNetworkClientOnboarding runs only after AuthNetworkClient has
-// committed its primary client creation. Preserve request cancellation for
-// that primary operation, then give its optional onboarding persistence one
-// finite detached budget. A shallow session copy retains authenticated and
-// ingress-derived values without changing ownership of the request session.
+// committed its primary client creation. Derived window identities are
+// transport maintenance, not a device opening the app. Only top-level device
+// auth enters the optional, finitely bounded post-commit persistence phase.
 func recordAuthNetworkClientOnboarding(
 	authClient *model.AuthNetworkClientArgs,
 	clientSession *session.ClientSession,
 ) {
+	if authClient.SourceClientId != nil {
+		return
+	}
 	runPostPrimaryOnboarding(clientSession, func(postSession *session.ClientSession) {
 		networkId := clientSession.ByJwt.NetworkId
 
@@ -99,6 +101,11 @@ func newPostPrimaryOnboardingSession(
 	return &postSession, cancel
 }
 
+// Runs after the model committed the client and its proxy. The
+// RefreshVerifyProxyEgress task re-feeds every live allocation each
+// EgressRefreshInterval, so a failed feed only delays the egress index: it is
+// logged, and the call still returns the committed client. Failing the call
+// here would hand out no credentials for a proxy that stays allocated.
 func feedAuthNetworkClientVerifyEgress(
 	ctx context.Context,
 	result *model.AuthNetworkClientResult,
@@ -107,12 +114,14 @@ func feedAuthNetworkClientVerifyEgress(
 	if result == nil || result.ClientId == nil || result.ProxyConfigResult == nil || result.ProxyConfigResult.WgConfig == nil || settings == nil {
 		return
 	}
-	model.FeedVerifyEgress(
-		ctx,
-		*result.ClientId,
-		result.ProxyConfigResult.WgConfig.ClientIpv4,
-		settings,
-	)
+	server.HandleError(func() {
+		model.FeedVerifyEgress(
+			ctx,
+			*result.ClientId,
+			result.ProxyConfigResult.WgConfig.ClientIpv4,
+			settings,
+		)
+	})
 }
 
 // ConnectNetworkClient records a legacy, family-agnostic connection (intent
@@ -137,9 +146,10 @@ func ConnectNetworkClientWithIpFamily(
 	handlerId server.Id,
 	retryLocationTimeout time.Duration,
 	ipFamilyIntent int,
+	authenticatedNetworkIds ...server.Id,
 ) (connectionId server.Id, clientAddressHash [32]byte, err error) {
 	var clientIp string
-	connectionId, clientIp, _, clientAddressHash, err = model.ConnectNetworkClientWithIpFamily(ctx, clientId, clientAddress, handlerId, ipFamilyIntent)
+	connectionId, clientIp, _, clientAddressHash, err = model.ConnectNetworkClientWithIpFamily(ctx, clientId, clientAddress, handlerId, ipFamilyIntent, authenticatedNetworkIds...)
 	if err != nil {
 		return
 	}
@@ -201,11 +211,17 @@ func freshProviderEgressLocationForConnection(
 	)
 }
 
+// Stores where a connection is. The precedence is connect/GEOMAP.md §6: the
+// client's derived location, while it has one -- the sweep removes a row a
+// day after the derivation that wrote it, so a row that is present is fresh
+// -- then a fresh egress probe (subject to probedLocationPreferred), then the
+// mmdb lookup on the control ip, which is the genesis every derivation starts
+// from.
 func SetConnectionLocation(
 	ctx context.Context,
 	connectionId server.Id,
 	clientIp string,
-) error {
+) (returnErr error) {
 	// the mmdb lookup on the control ip. This is resolved up front even when
 	// the probed path is about to win, because the probed path has to know how
 	// precise the mmdb answer is before it can decide whether replacing it is
@@ -214,6 +230,23 @@ func SetConnectionLocation(
 	// `err` is deliberately not returned yet: a failed mmdb lookup is not a
 	// reason to discard a perfectly good probed location.
 	location, connectionLocationScores, err := GetLocationForIp(ctx, clientIp)
+	// Optional shadow observer is absent by default. Successful connection
+	// writes may compare two attested readers without retaining the address.
+	defer func() {
+		// A panic is not a successful durable write. Preserve its propagation
+		// while preventing the optional observer from recording that result.
+		if failure := recover(); failure != nil {
+			panic(failure)
+		}
+		if returnErr == nil && connectionLocationScores != nil && connectionLocationScores.ArinLookupAt != nil {
+			server.ObserveArinShadowConnection(connectionId.String(), clientIp, server.ArinShadowActiveFacts{
+				Epoch: connectionLocationScores.ArinDatabaseBuildEpoch,
+				At:    *connectionLocationScores.ArinLookupAt,
+				Risk:  connectionLocationScores.ArinRisk, NonQuality: connectionLocationScores.ArinNonQuality,
+				Verified: connectionLocationScores.ArinQualityVerified,
+			})
+		}
+	}()
 
 	// a provider probed through its own egress is located from that probe, not
 	// from a lookup on its control-connection ip: the egress is where user
@@ -251,28 +284,91 @@ func SetConnectionLocation(
 	// an unmigrated or otherwise unhappy database must not be able to break
 	// connections. The probed location is an optimisation over mmdb, never a
 	// requirement, so mmdb is the correct answer whenever it is unavailable.
-	if egress := freshProviderEgressLocationForConnection(
-		ctx,
-		connectionId,
-	); egress != nil && probedLocationPreferred(egress, location) {
+	egress := freshProviderEgressLocationForConnection(ctx, connectionId)
+
+	// A fresh probe decides the location only. It used to carry hosting and
+	// proxy verdicts onto the connection's net-type scores as well, and those
+	// came from ip-intelligence vendors the prober no longer consults
+	// (connect/GEOMAP.md §11.3, D24); nothing reads them since the egress
+	// index replaced the net-type score (§10), so a probed connection stores
+	// NetTypeHosting and NetTypePrivacy as 0, exactly like an unprobed one.
+
+	// A derived location (connect/GEOMAP.md §6) is the client's own co-signed
+	// pings placing it, against the genesis they refined, so it comes first --
+	// before the probe too, whose location the derivation already started from
+	// when it was fresh. It is taken only with the lookup's genesis to store
+	// beside it: without one, the next derivation would read the derived
+	// location back as this connection's genesis and anchor to its own answer.
+	// The lookup is non-fatal for the same deploy-ordering reason as the probe
+	// lookup above.
+	if err == nil {
+		// model.GetDerivedLocationForConnection made non-fatal, for the reason
+		// the egress lookup is: on any failure it logs and returns nil, which
+		// reads as "no derived location", and the connection is located
+		// exactly as it was before derived locations existed
+		derivedLocation := func() *model.DerivedLocation {
+			return server.HandleError1(
+				func() *model.DerivedLocation {
+					return model.GetDerivedLocationForConnection(ctx, connectionId)
+				},
+				func(err error) *model.DerivedLocation {
+					glog.Infof(
+						"[ncc][%s]derived location lookup failed, using the probe or mmdb. err = %s\n",
+						connectionId,
+						err,
+					)
+					return nil
+				},
+			)
+		}
+		// Stores the connection at its client's derived location, with the
+		// mmdb lookup it was derived from as its genesis, and reports whether
+		// it did. On false nothing was stored, and the connection is located
+		// by the probe or the lookup as if there were no derived location. The
+		// scores are the lookup's: net_type_foreign is the lookup's for the
+		// parity the probed path keeps (arinForeignScore).
+		setDerivedLocation := func(derived *model.DerivedLocation) bool {
+			// the genesis row, created exactly as the mmdb path creates it.
+			// CreateLocation raises on a place it cannot name; contained here,
+			// so the derived path can only fall through to the paths that ran
+			// before it existed, and never fail a connection they would have
+			// located
+			if r := server.HandleError(func() {
+				model.CreateLocation(ctx, location)
+			}); r != nil {
+				glog.Infof("[ncc][%s]no genesis location row for the derived location, using the probe or mmdb. err = %s\n", connectionId, r)
+				return false
+			}
+			scores := *connectionLocationScores
+			genesisLocationId := location.LocationId
+			scores.GenesisLocationId = &genesisLocationId
+			if err := model.SetConnectionLocation(ctx, connectionId, derived.LocationId, &scores); err != nil {
+				glog.Infof("[ncc][%s]could not set derived location. err = %s\n", connectionId, err)
+				return false
+			}
+			return true
+		}
+		if derived := derivedLocation(); derived != nil {
+			if setDerivedLocation(derived) {
+				return nil
+			}
+		}
+	}
+
+	if egress != nil && probedLocationPreferred(egress, location) {
+		// no AccuracyKm: the probed location is not GeoLite2's, so its radius
+		// does not describe it. The row stores NULL, and the derive phase
+		// gives a probed genesis its own radius (connect/GEOMAP.md §5.1)
 		scores := &model.ConnectionLocationScores{}
-		if egress.Hosting {
-			scores.NetTypeHosting = 1
+		addr, parseErr := netip.ParseAddr(clientIp)
+		if parseErr != nil {
+			return parseErr
 		}
-		if egress.Proxy {
-			scores.NetTypePrivacy = 1
+		arinInfo, arinErr := server.GetArinInfo(addr)
+		if arinErr != nil {
+			return arinErr
 		}
-		// egress.Mobile deliberately does NOT feed NetTypeVirtual: unlike
-		// Hosting/Proxy, Mobile has no mmdb-path equivalent (IpInfo has no
-		// Mobile concept; NetTypeVirtual is set from the ipinfo schema's
-		// is_satellite field only, see GetLocationForIp, and never from
-		// DB-IP). Deriving NetTypeVirtual from Mobile here would penalize a
-		// probed mobile provider's ranking with no equivalent penalty for an
-		// otherwise-identical unprobed one -- the opposite of the parity
-		// this feature is meant to preserve (see arinForeignScore's doc for
-		// the same parity reasoning applied to net_type_foreign). Mobile
-		// stays on the model/wire contract as metadata; it just does not
-		// feed the ranking score.
+		setArinConnectionFacts(scores, arinInfo)
 
 		// keep the ARIN org-vs-country foreign check on the probed path too,
 		// so a probed provider is ranked on equal terms with an equivalent
@@ -295,6 +391,7 @@ func SetConnectionLocation(
 		}
 		setErr := model.SetConnectionLocation(ctx, connectionId, egress.LocationId, scores)
 		if setErr == nil {
+			connectionLocationScores = scores
 			return nil
 		}
 		// fall through to the mmdb path on a storage error
@@ -308,6 +405,9 @@ func SetConnectionLocation(
 	}
 
 	model.CreateLocation(ctx, location)
+	// the stored location is the lookup's own, and so is its genesis
+	genesisLocationId := location.LocationId
+	connectionLocationScores.GenesisLocationId = &genesisLocationId
 	err = model.SetConnectionLocation(ctx, connectionId, location.LocationId, connectionLocationScores)
 	if err != nil {
 		// server.Logger().Printf("Get ip for location error: %s", err)
@@ -324,13 +424,11 @@ func SetConnectionLocation(
 // Read this before changing it: the naive rule -- "a probe is better evidence
 // than mmdb, so the probe always wins" -- is wrong, and produced a live
 // regression. The probed location is not always as *precise* as the mmdb one.
-// SubmitProviderEgressLocation only stores a city when the probed city matches
-// a location row that already exists; anything else is stored at country
-// granularity, deliberately, so that a probe can never mint new city rows in
-// the shared `location` table. Cities are not seeded either -- AddDefaultLocations
-// runs with cityLimit = 0 -- so the pool a probed city can match against is only
-// the rows organic traffic happened to create, and a country-granular fallback
-// is the common case, not a rare one.
+// SubmitProviderEgressLocation stores a city only when GeoLite2 places the exit
+// within ProviderEgressRules.CityConfidentRadiusKm; anything coarser is stored
+// at its region or country, deliberately, so a probe never pins a provider to
+// a city GeoLite2 itself is unsure of. A region- or country-granular probe is
+// the common case for a wide-radius exit, not a rare one.
 //
 // Letting that country row overwrite an mmdb *city* row would drop the provider
 // out of every city filter in FindProviders2 and GetProviderLocations. Being

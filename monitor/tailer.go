@@ -16,6 +16,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
@@ -94,6 +96,9 @@ type logClass struct {
 	// classes intentionally aggregate retry volume by service; route-bound
 	// configuration defects must retain their resource, route, and generation.
 	groupBy func(string) string
+	// Keep the service-wide bucket while adding bounded independently actionable
+	// owner groups. Grouping must not hide a mixed-owner aggregate threshold.
+	aggregateWithGroup bool
 	// per-minute rate above which the class is a finding; §4 healthy is ~0
 	// for all classes, but transient blips (LOADING during a restart) are
 	// tolerated by the higher thresholds
@@ -110,6 +115,12 @@ type logClass struct {
 	// shared layer but is not necessarily the affected application selector.
 	// Its alert symptom and observed fields must state that attribution limit.
 	observationOnly bool
+	// countEveryLiveOccurrence is reserved for strict, timestamp-free local
+	// summaries whose identical bytes represent distinct upstream responses.
+	// Such summaries cannot be returned by source-time reconciliation, so live
+	// replay suppression would hide real events rather than remove overlap.
+	// Reconciliation and ordinary source records retain exact replay dedup.
+	countEveryLiveOccurrence bool
 	// redactIDs removes UUID/server.Id values from the retained sample. Some
 	// classes need a representative site/error but their entity identifiers
 	// must not be copied into alert artifacts.
@@ -214,7 +225,9 @@ var (
 	)
 	signalSendStructuredRe = regexp.MustCompile(
 		`\[transport_p2p_webrtc\.go:[0-9]+\](\[signal\]send failed mode=(sender|receive-reply) ` +
-			`reason=(not-admitted|encryption-not-ready|canceled-or-closed|other))[[:space:]]*$`,
+			`reason=(not-admitted|encryption-not-ready|canceled-or-closed|other)` +
+			`(?: boundary=(unknown|loopback|resend-capacity|pack-admission|queue-handoff)` +
+			` kind=(none|offer|answer|candidate|waiting|mixed|unknown) reset=(true|false|unknown))?)[[:space:]]*$`,
 	)
 	onboardingPostPrimaryCanceledRe = regexp.MustCompile(
 		`\[onboarding\](app open attribution|campaign enrollment|client context|connect\.day write) ` +
@@ -319,9 +332,15 @@ func mimirRejectedLogGroup(line string) string {
 }
 
 func signalSendStructuredReasonRe(reason string) *regexp.Regexp {
+	boundaries := "unknown"
+	if reason == "not-admitted" {
+		boundaries += "|loopback|resend-capacity|pack-admission|queue-handoff"
+	}
 	return regexp.MustCompile(
 		`\[transport_p2p_webrtc\.go:[0-9]+\]\[signal\]send failed ` +
-			`mode=(?:sender|receive-reply) reason=` + regexp.QuoteMeta(reason) + `[[:space:]]*$`,
+			`mode=(?:sender|receive-reply) reason=` + regexp.QuoteMeta(reason) +
+			`(?: boundary=(?:` + boundaries + `)` +
+			` kind=(?:none|offer|answer|candidate|waiting|mixed|unknown) reset=(?:true|false|unknown))?[[:space:]]*$`,
 	)
 }
 
@@ -331,10 +350,10 @@ func signalSendLegacyLogSample(string) string {
 	return "[signal]send failed (legacy destination omitted; result unavailable)"
 }
 
-// Retains only the fixed mode/reason suffix from current Connect output.
+// Retains only fixed diagnostic fields, including both deployed schema versions.
 func signalSendStructuredLogSample(line string) string {
 	match := signalSendStructuredRe.FindStringSubmatch(line)
-	if len(match) != 4 {
+	if len(match) != 7 {
 		return "[signal]send failed (malformed structured result omitted)"
 	}
 	return match[1]
@@ -342,10 +361,24 @@ func signalSendStructuredLogSample(line string) string {
 
 func signalSendLogMode(line string) string {
 	match := signalSendStructuredRe.FindStringSubmatch(line)
-	if len(match) != 4 {
+	if len(match) != 7 {
 		return "unknown"
 	}
 	return match[2]
+}
+
+// Legacy mode-only evidence cannot identify an admission gate. New finite
+// groups retain the gate and payload kind; the class also keeps its aggregate
+// so splitting a mixed burst never hides the original service-level threshold.
+func signalSendLogAdmission(line string) string {
+	match := signalSendStructuredRe.FindStringSubmatch(line)
+	if len(match) != 7 {
+		return "unknown"
+	}
+	if match[4] == "" {
+		return match[2] + "/boundary=unobserved"
+	}
+	return match[2] + "/boundary=" + match[4] + "/kind=" + match[5] + "/reset=" + match[6]
 }
 
 func onboardingPostPrimaryCanceledStage(line string) string {
@@ -393,8 +426,49 @@ func windowGeneratorCanceledLogSample(line string) string {
 	return strings.TrimSpace(windowGeneratorCanceledRe.FindString(line))
 }
 
+var peerConnectionTeardownStalledRe = regexp.MustCompile(`\[peerconn\]teardown stalled for 5s at (starting|stopping-dtls|closing-peer|closing-fast-path|closing-data-channel|clearing-signals|complete)(?:[[:space:]]|$)`)
+
+func peerConnectionTeardownStalledStage(line string) string {
+	match := peerConnectionTeardownStalledRe.FindStringSubmatch(line)
+	if len(match) != 2 {
+		return "unknown"
+	}
+	return match[1]
+}
+
 // the §4 taxonomy. Order matters: first match wins.
 var logClasses = []logClass{
+	{name: "peerconn-teardown-stalled", re: peerConnectionTeardownStalledRe,
+		sample: func(line string) string {
+			return "[peerconn]teardown stalled stage=" + peerConnectionTeardownStalledStage(line) + " (peer identity omitted)"
+		},
+		groupBy:       func(line string) string { return "stage=" + peerConnectionTeardownStalledStage(line) },
+		rateThreshold: 1, pageRateThreshold: 5, tier: tierWarn, playbook: "SIGNALS.md §1.5 and §14.6",
+		meaning:   "one or more peer connection teardowns exceeded the five-second watchdog at the reported finite stage",
+		mechanism: "A stalled teardown can retain a Pion peer generation and delay release of owned resources. Legacy diagnostics additionally captured every process goroutine and emitted one record per goroutine; their synchronous watchdog callback was joined by teardown, amplifying log load and completion delay.",
+		context:   "The stage names the last completed teardown phase, not the exact blocked primitive. Count watchdog headers, not goroutine stack records, as stall diagnostics. A Taskworker emitting the line does not prove its provider probe caused the stall or that §2.19 throughput fell for this reason. Missing or incomplete Loki reconciliation makes absence of this line unknown, not healthy.",
+		action:    "Correlate a bounded stall header with the exact running Connect-bearing artifact and process generation, owner teardown phase, and independent probe progress. Preserve a representative private stack sample; fix the blocked lifecycle primitive. Deploy bounded diagnostics only with a tested containing artifact, and do not raise the log-query page budget to absorb whole-process stack floods.",
+		verify:    "After complete artifact convergence, require zero stalled teardown headers for ten minutes through comparable connection churn, bounded diagnostic emission per watchdog, and two complete current-generation log reconciliations. Confirm resource release and provider progress separately.",
+		redactIDs: true,
+	},
+	// Preserve the controller-owned reset phase before its processor response
+	// or persistence suffix can match an ordinary destination/network class.
+	{name: "payout-invalid-destination-reset-failed", re: regexp.MustCompile(`(?is)Payment create transaction error = .*; invalid destination reset error = \S`),
+		rateThreshold: 1, tier: tierWarn, playbook: "SIGNALS.md §1.2, §4, and §5.7",
+		canonical: &logCanonical{
+			eventRe: regexp.MustCompile(`\[task\.go:[0-9]+\]`),
+			name:    "invalid_destination_reset_failed_events",
+		},
+		sample: func(string) string {
+			return "AdvancePayment invalid-destination-reset-failed (private payment and persistence details omitted)"
+		},
+		groupBy:   func(string) string { return "phase=guarded-reset" },
+		meaning:   "AdvancePayment reported a failed guarded attempt reset after an invalid-destination rejection",
+		mechanism: "The controller reported a definitive pre-chain destination rejection followed by an unsuccessful guarded attempt reset. Concurrent, terminal, or on-chain payment state can prevent that reset, as can a persistence failure. The rejection does not prove that the configured wallet remains unchanged or that the idempotency key was released.",
+		context:   "This composed controller marker identifies the reset phase, not the persistence root cause. Diagnostic and exact-replay-deduplicated evaluator counts are not unique payment counts. A separate ordinary Circle-client rejection can still appear for the same attempt; it does not override this reset failure.",
+		action:    "Inspect current payment and processor state privately, distinguish concurrent or terminal progress from a persistence failure, and reconcile the existing attempt before any new submission. Preserve the existing idempotency key. Do not infer unchanged wallet configuration, change wallet data solely from this class, manually release attempts, or clear payment/task rows.",
+		verify:    "The guarded reset succeeds only for an eligible pre-chain attempt, or the existing attempt reaches a reconciled terminal outcome. Both invalid_destination_reset_failed_events and the durable invalid-destination-reset-failed cohort clear on natural retries without duplicate transfers; keys remain stable for ambiguous submissions. Observe the full 90-minute retry window plus ingestion delay after the authorized correction.",
+		redactIDs: true},
 	// Current Grafana fronts emit only a fixed rejected-batch schema. Keep the
 	// legacy body matcher during rollout, but never retain that body's contents.
 	// Order matters: all three fixed rejection classes precede generic network
@@ -477,10 +551,53 @@ var logClasses = []logClass{
 		action:    "Match the emitting parent and local child generation, child shutdown/SIGTERM, HTTP-front shutdown, listener, and rollout boundary. If the artifact predates the drain-before-child-stop correction in Warp commit 6544fe1, deploy a Grafana artifact containing it only after proving ancestry. If it is current or occurs outside drain, diagnose the named generation's Mimir readiness, restart, bind, and OOM evidence. Do not restart Redis, suppress the push error, or treat a healthy replacement as proof that the rejected old-generation samples were delivered.",
 		verify:    "Every active Grafana artifact contains Warp commit 6544fe1; during a controlled rolling replacement every old HTTP front stops accepting and finishes in-flight requests (or is closed at the bounded deadline) before its Mimir/Loki children stop; no grafana-mimir-push-refused line occurs through the full rollout plus 10 steady minutes; every exact child /ready and front /status remains healthy; and fresh pushed metrics remain queryable without a new §11.20 continuity gap.",
 	},
+	// A resolver fanout leg is not a logical lookup outcome. Keep this before
+	// generic TCP timeouts, including the endpoint-free timeout form.
+	{name: "doh-dial-timeout", re: regexp.MustCompile(`\[(?:family|egress)\]dial tag=doh[[:space:]][^\r\n]*(?:\berr=(?:dial tcp(?:4|6)? [^[:space:]\r\n]+: )?i/o timeout(?:$|[[:space:]])|\bobservable=v1[^\r\n]*\bresult=timeout(?:$|[[:space:]]))`),
+		match: func(line string) bool {
+			return !strings.Contains(line, "[family]dial tag=doh observable=") || dohDialTimeoutObserved(line)
+		},
+		sample:        dohDialTimeoutSample,
+		groupBy:       func(string) string { return "doh-attempt" },
+		rateThreshold: 10, tier: tierPage, playbook: "SIGNALS.md §1.5, §4, and §5.2",
+		meaning:   "an outgoing DoH resolver dial attempt timed out; absent terminal provenance the logical DNS outcome is unknown",
+		mechanism: "The resolver races endpoint attempts and can return a usable answer from another leg. These per-target throttled diagnostic lines count neither unique attempts nor failed logical DNS queries; endpoint-free timeouts cannot identify a particular public resolver.",
+		context:   "This is not evidence of a Redis event-loop wedge, a host outage, or a failed user request. Later host TCP success does not prove that the earlier process path was healthy, and a success-only DoH result callback cannot supply a logical failure denominator. New finite provenance distinguishes host/caller/tun and the attempted literal family. A detached losing HTTP hedge may time out after its initiating resolver call answered; pending and legacy unknown do not establish either outcome. Taskworker can be measuring a selected provider through a dual-stack TUN; its emitter alone does not establish task control-plane DNS failure or the Proxy-only MTU defect. Fixed samples and a single doh-attempt frame omit endpoints, queried domains, and correlation identifiers.",
+		action:    "Correlate the emitting process and original path with bounded same-window TCP, resource, and resolver controls. Distinguish endpoint attempts from the final logical DNS result; if that result is unavailable, retain impact as unknown rather than asserting either an outage or successful fallback. Compare fresh same-process [doh]resolver cumulative snapshots for complete resolver-call outcomes; owner_path names configured remote ownership, while local fallback dials can still use path=host. Cache calls, waiters, raw forwarding and multi-name one-shot calls are not a user-request denominator. Do not restart Redis, change resolver policy, lengthen timeouts, or suppress the alert from an individual fanout-leg failure.",
+		verify:    "Require this diagnostic class below its unchanged 10/min PAGE threshold for 10 minutes with fresh observation coverage and healthy original-path controls. Verify the deployed producer exposes path, attempted_family and resolver_outcome; use fresh same-process counter deltas including failures, cancellations and stale answers. Claim user-facing DNS recovery only with an independent final-query or end-to-end outcome; endpoint TCP success and quiet sampled logs alone do not establish it.",
+	},
+	{name: "doh-observation-schema", re: regexp.MustCompile(`\[(?:family|doh)\](?:dial tag=doh|resolver) observable=`),
+		match: func(line string) bool {
+			return parseDohDialObservation(line) == nil && !dohResolverObserved(line)
+		},
+		sample: func(string) string {
+			return "DoH observation schema is unknown or malformed (all fields and outer identity omitted)"
+		},
+		groupBy:       func(string) string { return "doh-observation-schema" },
+		rateThreshold: 1, tier: tierWarn, playbook: "SIGNALS.md §4 and §5.2",
+		meaning:   "DoH provenance cannot be read with the monitor's known schema",
+		mechanism: "A DoH observation has an unknown version, a malformed enum/counter, or extra fields. None of its path, family, outcome, or counter values can be trusted.",
+		context:   "This is an observation gap, not proof that a resolver or user request failed. Discard all fields rather than retaining identities or silently treating the record as healthy.",
+		action:    "Compare the deployed producer and monitor schema, preserve the unknown state, and add a bounded parser and deterministic sanitized fixture for a verified new schema.",
+		verify:    "Current producer records parse with exact finite fields, synthetic malformed records retain this visibility warning, and ten fresh minutes contain no schema gap alongside positive original-path resolver workload.",
+	},
+	{name: "doh-dial-observation", re: dohDialObservationRe, match: dohDialInformational, metricOnly: true},
+	{name: "doh-resolver-observation", re: dohResolverObservationRe, match: dohResolverObserved, metricOnly: true},
 	{name: "dial-io-timeout", re: regexp.MustCompile(`dial tcp ([0-9.]+:[0-9]+).*i/o timeout`),
-		rateThreshold: 10, tier: tierPage, playbook: "SIGNALS.md 5.2",
-		meaning: "node accept path starving — process alive but event loop wedged (or syn drop)"},
-	{name: "connection-refused", re: regexp.MustCompile(`connect: connection refused`),
+		sample: func(string) string {
+			return "outgoing TCP dial: i/o timeout (correlation metadata and other fields omitted)"
+		},
+		rateThreshold: 10, tier: tierPage, playbook: "SIGNALS.md §1.5, §4, and §5.2",
+		meaning:   "an otherwise-unclassified outgoing TCP connection attempt exceeded its deadline",
+		mechanism: "A dial timeout identifies an unfinished connection attempt, not the target service or cause. Remote listener saturation, packet loss, routing, local resource pressure, and scheduling remain alternatives until independently distinguished.",
+		context:   "Service-specific signatures take precedence. Do not infer a Redis event-loop wedge or a persistent target outage from this generic text alone; the stable service target names the emitter and the endpoint frame names only the attempted destination.",
+		action:    "Resolve the exact target and original source path, then compare bounded same-window process, listener, TCP, and resource evidence. Use §5.2 only for an identified Redis node with a corroborating local PING hang and accept-path evidence. Do not restart an inferred service before attribution and authorization.",
+		verify:    "The original source path reaches the intended target, its owning health signal remains healthy, and this class stays below threshold for 10 minutes through the relevant lifecycle. Later reachability alone does not establish the earlier cause.",
+	},
+	{name: "connection-refused", re: regexp.MustCompile(`connect: connection refused|\[family\]dial tag=doh observable=v1 [^\r\n]* result=refused `),
+		match: func(line string) bool {
+			return !strings.Contains(line, "[family]dial tag=doh observable=") || parseDohDialObservation(line) != nil
+		},
 		rateThreshold: 10, tier: tierPage, playbook: "SIGNALS.md §1.5 and §4",
 		meaning:   "an otherwise-unclassified TCP target had no accepting listener at the attempted address and instant",
 		mechanism: "TCP returned an active refusal, which distinguishes an absent/nonmatching listener from a silent SYN drop but does not identify the target service, namespace, exit cause, or rollout state. Service-specific signatures earlier in this taxonomy take precedence.",
@@ -543,13 +660,25 @@ var logClasses = []logClass{
 	// querier response-channel path use the existing dropped_entries field.
 	// Warpctl receives that metadata on the affected service's WebSocket and
 	// can attribute it without retaining labels.
-	{name: "loki-tail-dropped-entries", re: regexp.MustCompile(`^\[warpctl\]\[loki-tail-dropped-entries\]\s+service=[A-Za-z0-9._-]+\s+count=[1-9][0-9]*(?:\s|$)`),
-		rateThreshold: 1, tier: tierWarn, playbook: "SIGNALS.md §1.5 and §4",
+	{name: "loki-tail-dropped-entries", re: regexp.MustCompile(`^\[warpctl\]\[loki-tail-dropped-entries\]\s+service=[A-Za-z0-9._-]+\s+count=[1-9][0-9]*\s*$`),
+		rateThreshold: 1, tier: tierWarn, playbook: "SIGNALS.md §1.5 and §4", countEveryLiveOccurrence: true,
 		meaning:   "Loki declared live-tail loss for this service's standing tail and returned a non-empty dropped_entries list",
 		mechanism: "Two bounded Loki stages can populate this API field. The querier buffers ten tail responses and attaches up to 1,000 descriptors after that downstream channel overflows. Separately, each ingester sends up to ten DroppedStreams descriptors with its next stream; Warp 5927527 forwards those descriptors into the same existing response without enlarging a queue. Warp 35453fd contains that forwarding and prevents sub-processing-bound bursts from being dropped merely because the five-slot handoff is momentarily full; genuine sustained blockage still produces bounded descriptors. Older Warpctl decoded dropped_entries but silently discarded it; Warp commit 26089b2 emits one local service/count summary for every non-empty response.",
-		context:   "The owning monitor tail supplies exact affected-service attribution, but the summary alone does not distinguish the two stages. A same-window ingester reset identifies the earlier path; otherwise inspect the querier-to-WebSocket consumer path as well. The summary is privacy-safe: Warpctl deliberately omits dropped stream labels and timestamps. Bounded range reconciliation remains the content-recovery path.",
+		context:   "The owning monitor tail supplies exact affected-service attribution, but the summary alone does not distinguish the two stages. A same-window ingester reset corroborates ingester-side loss in that window but cannot assign the reset to this exact service summary without a privacy-safe join; inspect the querier-to-WebSocket consumer path as well. The alert rate counts summary lines, while the retained count is only one response's bounded descriptor count; neither is a unique lost-record total. Both Loki stages bound descriptor metadata, so the summary can understate loss magnitude. The summary is privacy-safe: Warpctl deliberately omits dropped stream labels and timestamps. Bounded range reconciliation remains the content-recovery path.",
 		action:    "Verify the running Grafana artifact contains Warp 35453fd and the Warpctl artifact contains 26089b2 or later, retain bounded overlap reconciliation for the named service, and remove any residual producer burst or genuinely blocked consumer. Do not print dropped labels or timestamps, disable reconciliation, or raise any Loki response or ingester queue.",
 		verify:    "The named service tail stays connected, two consecutive overlap reconciliations complete, and no service-attributed loki-tail-dropped-entries summary, ingester reset, or backend EOF appears for 10 minutes through the workload that triggered the loss.",
+	},
+	// Reserve the local summary prefix after the strict valid shape. A malformed
+	// producer must remain visible without falling into the generic novel path,
+	// which would retain an arbitrary trailing field in its sample.
+	{name: "loki-tail-dropped-entries-unobservable", re: regexp.MustCompile(`^\[warpctl\]\[loki-tail-dropped-entries\]`),
+		rateThreshold: 1, tier: tierWarn, playbook: "SIGNALS.md §1.5 and §4", countEveryLiveOccurrence: true,
+		meaning:   "Warpctl emitted the reserved dropped-entries summary prefix without the complete fixed privacy-safe schema, so live-tail loss metadata is unobservable",
+		mechanism: "The valid local event requires exactly one bounded service token and a positive decimal descriptor count with no trailing fields. A zero or malformed count, missing field, or suffix indicates producer/version drift or corrupted local output. The monitor reserves the prefix and retains only a fixed schema error rather than copying the malformed suffix into a generic novel sample.",
+		context:   "This visibility finding does not prove zero loss, a particular Loki loss stage, or a descriptor cardinality. The malformed event cannot safely establish the affected service or magnitude, and its raw suffix is deliberately discarded.",
+		action:    "Verify the running Warpctl artifact contains the fixed dropped-entries summary contract, inspect its local producer path without copying the malformed suffix, and repair version drift or serialization. Preserve bounded range reconciliation; do not reinterpret a malformed count as zero or expose trailing fields.",
+		verify:    "The standing tail stays connected, two consecutive overlap reconciliations complete, every future summary matches the strict privacy-safe schema, and this visibility class plus the three Loki loss classes remain zero for 10 minutes through comparable load.",
+		sample:    func(string) string { return "[warpctl][loki-tail-dropped-entries] invalid_schema" },
 	},
 	// Loki's live API can deliver a record after ingestion even when its source
 	// timestamp is behind the WebSocket cursor. Warpctl drops that record before
@@ -673,9 +802,21 @@ var logClasses = []logClass{
 		rateThreshold: 1, tier: tierPage, playbook: "SIGNALS.md §1.3a and §2.11",
 		meaning:   "PgBouncer could not open a PostgreSQL server connection because the database had exhausted the connection slots available to the configured login role",
 		mechanism: "PostgreSQL rejected a new backend at max_connections while PgBouncer cached the failure under server_login_retry. A request that times out during a stalled transaction or COMMIT can make PgBouncer discard the uncertain server session and open a replacement while the old backend is still unwinding. With 32 independent PgBouncer processes, that replacement overlap plus direct maintenance sessions can fill the normal-role ceiling even when each local pool is within its own limit.",
-		context:   "The raw line rate is diagnostic amplification, not unique rejected PostgreSQL sessions: one failed request can emit both trace.go Unexpected error and a router unhandled-error record, and both carry goroutine-shaped JSON that the generic panic class previously counted. This class takes precedence over panic. It is distinct from query_wait_timeout (server sessions all busy) and a :6432 client-write timeout (request may not reach PgBouncer). The 2026-09-01 control found 60-66-second COMMITs, WALSync/WALInsert/WALWrite waits, client-loss records, and replacement connection churn during repeated legacy reindex attempts; PostgreSQL never restarted. A later idle snapshot was recovery turnover, not evidence that idle retention caused the burst.",
+		context:   "The raw line rate is diagnostic amplification, not unique rejected PostgreSQL sessions: one failed request can emit both trace.go Unexpected error and a router unhandled-error record, and both carry goroutine-shaped JSON that the generic panic class previously counted. This class takes precedence over panic. It is distinct from query_wait_timeout (a client waited too long for a server; established-server saturation versus backend-startup failure remains unknown) and a :6432 client-write timeout (request may not reach PgBouncer). The 2026-09-01 control found 60-66-second COMMITs, WALSync/WALInsert/WALWrite waits, client-loss records, and replacement connection churn during repeated legacy reindex attempts; PostgreSQL never restarted. A later idle snapshot was recovery turnover, not evidence that idle retention caused the burst.",
 		action:    "Run §1.3a through direct 5432 and split active, young idle-in-transaction, idle, and starting owners. Correlate them with wait events, completed PostgreSQL COMMIT latency, and PgBouncer connection logs or SHOW POOLS where permitted. If db-maintenance-legacy-reindex is present, wait for pg_stat_progress_create_index to become empty, then deploy a clean Taskworker containing current-main commits 908a8b2c and d8392c83; do not interrupt a live rebuild implicitly. Remove the proved upstream stall or leak before tuning pools. Do not raise max_connections first, restart PostgreSQL/PgBouncer, or mass-terminate sessions; this host's large work_mem makes a blind slot increase a memory-risk change.",
 		verify:    "For ten minutes through the workload that triggered the burst, normal-role connection headroom stays above 25%, direct 5432 remains available, completed COMMIT latency and WAL waits return to their ordinary band, and neither pg-client-capacity nor query_wait_timeout recurs. Correlate unique request failures separately from diagnostic lines.",
+	},
+	{name: "pgbouncer-query-wait", re: regexp.MustCompile(`(?:^|[[:space:]=:"])FATAL: query_wait_timeout(?:[[:space:]"']|$)`),
+		rateThreshold: 1, pageRateThreshold: 5, tier: tierWarn, playbook: "SIGNALS.md §1.5, §2.11, and §4",
+		groupBy: func(string) string { return "cause-unknown" },
+		sample: func(string) string {
+			return "FATAL: query_wait_timeout (client queue deadline; details omitted)"
+		},
+		meaning:   "PgBouncer disconnected a client whose query waited beyond query_wait_timeout for an available server connection",
+		mechanism: "The queue deadline proves loss of service on the pool path but does not establish why no server was available. Established servers can be busy, or backend connection/startup can stop replenishing the pool while PostgreSQL load falls.",
+		context:   "The raw line rate is diagnostic amplification, not a unique-request count. This exact FATAL class takes precedence over generic panic, retains PAGE at five lines per minute, and warns at one. A TCP listener, successful privileged Unix-socket query, or low PostgreSQL/Redis load cannot clear it. The 2026-10-04 native control found all 32 shards with waiting clients, zero established normal or cancellation servers, and exactly one sv_login each. A bare pgconn deadline or Done does not identify this class or its cause; a five-second initial Ping can fail before the longer queue deadline is logged.",
+		action:    "Bind every active shard to its native process and collect bounded SHOW POOLS plus SHOW SERVERS/CONFIG: split sv_active/idle/used/tested, cancellation states, sv_login, connection ages and effective startup timeout. Require a bounded authenticated direct probe to the same backend endpoint with the same backend role, database and TLS mode. If established servers are busy, attribute direct PostgreSQL waits and owners; if only startup connections remain, inspect their progress and pooler state. Missing, capped or stale evidence leaves the cause unknown. Preserve evidence before any explicitly authorized recovery; do not increase pool size or deadlines from this log alone.",
+		verify:    "Every active shard resumes established-server progress, the matched direct control and affected API/Connect requests succeed, and complete fresh log windows show no recurring queue or initial-Ping timeout for ten minutes with healthy §1.3a headroom. A successful restart or quiet log window alone does not prove application recovery or a durable fix.",
 	},
 	{name: "payment-balance-code-undelivered", re: regexp.MustCompile(`automatic balance-code delivery failed without email recovery(?:[^\r\n]*)$`),
 		sample: func(string) string {
@@ -701,8 +842,14 @@ var logClasses = []logClass{
 		verify:    "Every affected service runs the corrected server artifact, rollback regression tests preserve canceled transient and nontransient outcomes, and this exact dual-frame class remains zero for ten minutes after log-ingestion delay under comparable transaction traffic.",
 	},
 	{name: "panic", re: regexp.MustCompile(`panic:|Unexpected error|goroutine [0-9]+ \[`),
+		sample: panicLogSample, groupBy: panicLogOwner, aggregateWithGroup: true,
 		rateThreshold: 5, tier: tierPage, playbook: "SIGNALS.md §4",
-		meaning: "panic stack — the innermost app frame identifies the load-bearing call path"},
+		meaning:   "a panic-shaped diagnostic, including recovered failures; a recognized structured stack supplies its innermost owning application function",
+		mechanism: "The service-wide bucket retains every matching diagnostic. Recognized owners additionally have bounded per-owner buckets at the same threshold; these counts overlap and must not be summed as incidents. A recovered post-commit error is not proof of a failed primary operation or process crash.",
+		context:   "Only normalized function ownership, an allowlisted Go error type, and a PostgreSQL SQLSTATE may enter the sample. Unknown, malformed, oversized, or excess-cardinality stacks remain in the aggregate; an absent owner is not a healthy result.",
+		action:    "Correlate the framed owner with its source recovery boundary and exact running artifact before assigning impact or deploying. For SQLSTATE 25006 at server/model.StampTopLevelClientContractTime, follow the contained post-commit write discriminator in §4; do not infer global database failure.",
+		verify:    "Require the owning regression and exact artifact convergence, then ten minutes below the unchanged service-wide and owner thresholds under comparable traffic with fresh log coverage. Verify the primary operation and any derived write independently; aggregate and owner alerts are overlapping views, not separate incident counts.",
+	},
 	// Contract errors are emitted here only as rate-limited exemplars. Their
 	// lossless rates come from urnetwork_connect_contract_failures_total and
 	// are evaluated by the provisioned Grafana rules; counting these sampled
@@ -773,9 +920,9 @@ var logClasses = []logClass{
 			name:    "invalid_destination_events",
 		},
 		meaning:   "Circle definitively rejected a payout destination before creating a transfer because the configured wallet address is invalid for its declared chain",
-		mechanism: "A pre-fix chain-blind validator allowed cross-chain wallet shapes such as a Solana base58 key declared as MATIC. Current taskworker code recognizes Circle's typed invalid-destination response and safely releases only that pre-chain submit attempt, but the next retry selects the same invalid payout_wallet configuration until the account owner or operator corrects it.",
+		mechanism: "A pre-fix chain-blind validator allowed cross-chain wallet shapes such as a Solana base58 key declared as MATIC. Current taskworker code recognizes Circle's typed invalid-destination response and safely releases only that pre-chain submit attempt when its guarded reset succeeds. After that successful reset, an unchanged account wallet causes the next retry to select the same invalid payout_wallet configuration.",
 		context:   "One failure is normally logged at the Circle client and again by the task evaluator, so diagnostic lines are not unique attempts. Historical bounded controls on a pre-dispersion taskworker found the same six payments recurring at the same minute in each UTC hour. That history proves persistent invalid wallet selection after the safe typed reset, but it is not a statement about the currently deployed artifact and this alert intentionally does not infer runtime provenance from a historical version. Retry dispersion cannot repair wallet data; the separate payout-retry-microburst finding owns any remaining software-rollout diagnosis.",
-		action:    "Correct the affected network's payout wallet through the supported account API so its address matches its declared payout chain. This alert is an account-owner/operations action only. If payout-retry-microburst also fires, follow that separate finding's artifact-provenance and 90-minute observation gate; do not redeploy taskworker solely from this invalid-destination alert. Do not edit account_payment or pending_task rows, manually release attempts, rotate processor idempotency keys, or invent a replacement wallet without account-owner or operator authority.",
+		action:    "Confirm the guarded reset succeeded and inspect the current wallet selection before correcting a proven chain mismatch through the supported account API. Wallet correction is an account-owner/operations action only. If payout-invalid-destination-reset-failed also fires, resolve that persistence/reset boundary first; an ordinary Circle-client line is not proof of reset success. If payout-retry-microburst also fires, follow that separate finding's artifact-provenance and 90-minute observation gate; do not redeploy taskworker solely from this invalid-destination alert. Do not edit account_payment or pending_task rows, manually release attempts, rotate processor idempotency keys, or invent a replacement wallet without account-owner or operator authority.",
 		verify:    "After the payout wallet is corrected, the next natural retry selects it with a fresh key released only by the prior definitive rejection, completes without a duplicate transfer, invalid_destination_events remains zero, and the durable processor-invalid-destination count converges to zero within 90 minutes plus log-ingestion delay.",
 		redactIDs: true},
 	{name: "payment-processor-rate-limit", re: regexp.MustCompile(`Bad status: 429 Too Many Requests.*API rate limit error`),
@@ -853,14 +1000,15 @@ var logClasses = []logClass{
 		redactIDs: true,
 	},
 	{name: "signal-send-not-admitted", re: signalSendStructuredReasonRe("not-admitted"),
-		sample:        signalSendStructuredLogSample,
-		groupBy:       signalSendLogMode,
-		rateThreshold: novelRateThreshold, tier: tierWarn, playbook: "SIGNALS.md §4 and §14.6",
-		meaning:   "the Connect signaling send returned false without an error; mode identifies whether this was the receive-reply zero-wait boundary or the ordinary sender path",
-		mechanism: "A receive-reply send deliberately offers into bounded admission with timeout zero so one peer cannot block the shared receive callback. A full admission boundary therefore refuses that reply and leaves retry machinery to recover it. Sender mode does not use that zero-wait policy and requires a separate send-budget audit.",
-		context:   "This result identifies admission refusal, not CPU, memory, transport, or provider failure. Correlate it with the exact mode, send-admission controls, negotiation retry/recovery, and artifact ancestry. A burst distributed across processes is not by itself proof that their resources are saturated.",
-		action:    "For receive-reply mode, inspect bounded send-admission pressure and retry recovery without changing the nonblocking callback contract. For sender mode, verify its effective wait and owning generation. Prove any proposed queue, lane, or carrier correction with a deterministic admission test; do not block the receive path or enlarge a queue from this log alone.",
-		verify:    "The class stays below 20/min for ten minutes under comparable signaling traffic, refused receive replies recover through ordinary negotiation retry, and deterministic full-admission tests retain zero-wait callback behavior and exact pooled-frame return.",
+		sample:             signalSendStructuredLogSample,
+		groupBy:            signalSendLogAdmission,
+		aggregateWithGroup: true,
+		rateThreshold:      novelRateThreshold, tier: tierWarn, playbook: "SIGNALS.md §4 and §14.6",
+		meaning:   "the Connect signaling send returned false without an error; mode identifies the receive-reply zero-wait policy, and newer artifacts retain the exact local refusal gate and signal kind",
+		mechanism: "boundary=pack-admission means the fixed pre-sequence count/fairness gate refused; resend-capacity means reliable resend capacity was unavailable before that gate; queue-handoff means the final channel offer refused after passing the earlier gates, including a zero-buffer rendezvous without a ready consumer; loopback is the client's own queue. Old mode/reason-only lines leave the boundary unobserved. None of these is a remote delivery result.",
+		context:   "A finite kind identifies offer, answer, candidate, waiting, none, mixed, or unknown; reset describes only the local frame's generation-reset flag. Unknown can mean a malformed, oversized, or unrecognized frame, not a proved protocol error. Pack refusal does not prove total capacity exhausted because fairness also reserves capacity; queue-handoff does not prove a full Pack budget. Distributed counts do not prove CPU, memory, provider failure, or successful fallback. The aggregate threshold is retained across diagnostic groups.",
+		action:    "For receive-reply mode, correlate the exact gate with its effective buffer/count or resend policy and the identified kind's negotiation recovery. An offer may replay on WaitingForSdpOffer; a refused answer is not replayed merely by a duplicate offer, and a refused candidate is not proved regenerated after its local flush. Verify fresh-generation reconnect or usable exchange fallback where replay is absent. For sender mode, audit its own wait budget and generation. Preserve zero-wait callbacks, encryption, and queue bounds; do not restart from this line alone.",
+		verify:    "Deploy the diagnostic Connect input into every emitting service and refresh the monitor parser. Require fresh comparable traffic for ten minutes with the aggregate and each group below 20/min, plus independent negotiation success or usable exchange fallback for the refused signal kind. Quiet or accepted sends alone do not prove remote delivery. Deterministic tests must force resend-capacity, Pack-admission, and final-handoff refusals, retain public false/nil results and zero-wait replies, and return each pooled frame exactly once.",
 		redactIDs: true,
 	},
 	{name: "signal-send-encryption-not-ready", re: signalSendStructuredReasonRe("encryption-not-ready"),
@@ -906,6 +1054,23 @@ var logClasses = []logClass{
 		verify:    "For a proved pre-fix artifact, cancellation-correlated exact lines and paired window-stall transitions remain zero for ten minutes through comparable teardown after rollout. A deterministic live-outer-context generator returning the identical text is still logged and classified, genuine other errors and abandonments remain visible, and provider windows continue reaching their configured minimum.",
 		redactIDs: true,
 	},
+	{name: "window-evaluation-unwritten-expiry", re: regexp.MustCompile(
+		`\[ip_remote_multi_client\.go:[0-9]+\]\[multi\]evaluation ping error ` +
+			`\[[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}\] = ` +
+			`queued Pack expired before serialization: send Pack was not admitted(?: \([1-9][0-9]{0,18} suppressed\))?[[:space:]]*$`,
+	),
+		sample: func(string) string {
+			return "[multi]evaluation ping error: queued Pack expired before serialization: send Pack was not admitted (identity omitted)"
+		},
+		groupBy:       func(string) string { return "pre-serialization" },
+		rateThreshold: novelRateThreshold, tier: tierWarn, playbook: "SIGNALS.md §1.5 and §14.6",
+		meaning:   "an initial evaluation ping expired in the local Transfer queue before serialization or sequence-number assignment; this is not a provider-response result",
+		mechanism: "The exact source-reviewed singleton marker is delivered through the asynchronous acknowledgement callback after its absolute local send budget expires. It is distinct from the synchronous signaling refusal reported by signal-send-not-admitted. A generic send Pack was not admitted result does not carry this unwritten proof.",
+		context:   "This line does not identify the queue-delay cause, the effective write budget, active artifact ancestry, or remote reachability. Current Connect still records this callback under its provider-failure fallback; that reason is not independent remote evidence. The rate counts throttled diagnostic lines, not unique candidates, providers, failures, or the suppressed total. Taskworker is the emitting service, not proof of a task failure.",
+		action:    "Prove the emitting artifact's embedded Connect input under §8.12, then correlate the same generation's effective PingWriteTimeout, local queue/admission waits, sequence/carrier progress and independent provider-window outcome. Preserve bounded queues and deadlines. Do not restart Taskworker, increase timeout/capacity, or diagnose provider/network failure from the expiry alone.",
+		verify:    "Require fresh comparable evaluation traffic for ten minutes with this exact class below 20/min and independent provider-window progress. A quiet log alone is not delivery proof. Generic admission errors, other ping errors and malformed suffixes must remain visible rather than acquiring this unwritten classification.",
+		redactIDs: true,
+	},
 	{name: "window-evaluation-budget", re: windowEvaluationBudgetRe,
 		sample:        windowEvaluationBudgetLogSample,
 		rateThreshold: novelRateThreshold, tier: tierWarn, playbook: "SIGNALS.md §4 and §14.6",
@@ -943,11 +1108,11 @@ var logClasses = []logClass{
 	{name: "db-maintenance-legacy-reindex", re: dbMaintenanceLegacyReindexRe,
 		groupBy:       dbMaintenanceLegacyReindexLogGroup,
 		rateThreshold: 1, tier: tierPage, playbook: "SIGNALS.md §2.2a",
-		meaning:   "a Taskworker selected a table that current maintenance policy excludes and entered the legacy full-table concurrent-reindex path",
-		mechanism: "Before current-main server commits 908a8b2c and d8392c83, the daily hash rotation could select these large or high-churn tables, and incomplete-index cleanup ran only after the whole rotation. An interrupted rebuild can leave numbered _ccnew/_ccold artifacts; the same durable DbMaintenance epoch can then be lease-recovered and launch another full-table rebuild before reaching cleanup. The current policy excludes these tables, keeps cleanup adjacent to every permitted rebuild, and preserves task ownership when only the pooled timestamp refresh stalls. Stable patch IDs prove these commits are patch-identical to the former 7676014f and abfd976b hashes after main was rewritten.",
-		context:   "The exact start line proves legacy selection and entry into the call path; because old code logs before opening the maintenance connection, it does not by itself prove that PostgreSQL began the statement, that the operation completed or remains active, or that it created any particular artifact. It pages because two same-day contract_close retries independently drove hundreds of ordinary backends active, exhausted PostgreSQL admission, lost the pooled task heartbeat, left another invalid index, and reclaimed the same durable task into a new retry. Correlate the table with pg_stat_progress_create_index, the reindex-debris lower-bound/active-candidate split, direct client-slot capacity, and the exact DbMaintenance task/worker lifecycle. A shift between those two byte buckets is not cleanup.",
-		action:    "Inspect the active database operation before changing Taskworker. Do not let a rollout or manual cancellation implicitly interrupt a protected rebuild. Operations must explicitly choose whether a bounded active operation should finish or be canceled; cancellation is a database mutation and requires authorization. Once pg_stat_progress_create_index is empty, satisfy §8.13 identity observation and deploy Taskworker from an intentional local checkout containing current-main server commits 908a8b2c and d8392c83. Clean existing artifacts separately with the supported cleanup-only maintenance command and explicit database-maintenance authorization; never wildcard-drop _ccnew/_ccold indexes.",
-		verify:    "§8.12 proves every active Taskworker's source/digest identity and runtime behavior for both fixes; one complete maintenance epoch emits no legacy start line and pg_stat_progress_create_index never names an excluded table; after authorized cleanup the reindex-debris probe reports zero inactive artifacts; and no related DataFileExtend/WAL wait cluster or Connect login-timeout wave recurs.",
+		meaning:   "a Taskworker selected a table excluded from scheduled whole-table concurrent reindexing",
+		mechanism: "Before current-main server commits 908a8b2c and d8392c83, the daily hash rotation could select these large or high-churn tables, and incomplete-index cleanup ran only after the whole rotation. An interrupted rebuild can leave numbered _ccnew/_ccold artifacts; the same durable DbMaintenance epoch can then be lease-recovered and launch another full-table rebuild before reaching cleanup. The current policy excludes these tables, keeps cleanup adjacent to every permitted rebuild, and preserves task ownership when only the pooled timestamp refresh stalls. Stable patch IDs prove these commits are patch-identical to the former 7676014f and abfd976b hashes after main was rewritten. The later network_client exclusion closes a separate omission in the same scheduled policy; both the old reindex[...] and current table[...] reindex start formats are recognized. Log format alone does not identify a worker revision.",
+		context:   "The exact start line proves selection and entry into the call path; both formats log before opening the maintenance connection, so it does not by itself prove that PostgreSQL began the statement, that the operation completed or remains active, that it created any particular artifact, or that it consumed CPU. Confirm current relation and phase through direct progress/catalog evidence and measure native process CPU separately. It pages because two same-day contract_close retries independently drove hundreds of ordinary backends active, exhausted PostgreSQL admission, lost the pooled task heartbeat, left another invalid index, and reclaimed the same durable task into a new retry. Correlate the table with pg_stat_progress_create_index, the reindex-debris lower-bound/active-candidate split, direct client-slot capacity, and the exact DbMaintenance task/worker lifecycle. A shift between those two byte buckets is not cleanup.",
+		action:    "Inspect the active database operation before changing Taskworker. Do not let a rollout or manual cancellation implicitly interrupt a protected rebuild. Operations must explicitly choose whether a bounded active operation should finish or be canceled; cancellation is a database mutation and requires authorization. Once pg_stat_progress_create_index is empty, satisfy §8.13 identity observation and deploy Taskworker from an intentional local checkout containing current-main server commits 908a8b2c and d8392c83 and the scheduled network_client exclusion. Clean existing artifacts separately with the supported cleanup-only maintenance command and explicit database-maintenance authorization; never wildcard-drop _ccnew/_ccold indexes.",
+		verify:    "§8.12 proves every active Taskworker's source/digest identity and runtime behavior for both fixes; one complete maintenance epoch emits no excluded-table start line in either format and pg_stat_progress_create_index never names an excluded table; after authorized cleanup the reindex-debris probe reports zero inactive artifacts; and no related DataFileExtend/WAL wait cluster or Connect login-timeout wave recurs.",
 	},
 	{name: "framer-message-too-large", re: framerRejectRe,
 		sample:        framerRejectLogSample,
@@ -995,6 +1160,155 @@ var novelNormalizeRes = []*regexp.Regexp{
 
 const novelRateThreshold = 20
 
+const (
+	panicLogMaxBytes       = 64 * 1024
+	panicLogMaxStackLines  = 128
+	panicLogOwnerMaxBytes  = 112
+	logClassMaxOwnerGroups = 16
+)
+
+// Only source symbols from the application's go.mod module closure can become
+// owner frames. Arguments, paths, line numbers and compiler closures never do.
+var panicLogFunctionRe = regexp.MustCompile(`^github\.com/urnetwork/((?:server|connect|sdk|proxy|operator-proxy|userwireguard|warp)(?:/[A-Za-z_][A-Za-z0-9_-]*)*)\.((?:\(\*?[A-Za-z_][A-Za-z0-9_]*(?:\[\.\.\.\])?\)|[A-Za-z_][A-Za-z0-9_]*(?:\[\.\.\.\])?)(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\[\.\.\.\])?|\.[0-9]+)*)(?:-fm)?\(`)
+var panicLogVersionedRootRe = regexp.MustCompile(`^(server|connect)/v[0-9]+$`)
+var panicLogClosureRe = regexp.MustCompile(`\.(?:(?:func|gowrap)[0-9]+|[0-9]+)(?:\.|$)`)
+var panicLogSourceRe = regexp.MustCompile(`(?:^|/)[A-Za-z_][A-Za-z0-9_]*\.go:[0-9]+(?: \+0x[0-9a-f]+)?$`)
+var panicLogSqlstateRe = regexp.MustCompile(`\(SQLSTATE ([0-9A-Z]{5})\)$`)
+
+// A fixed redacted projection; no raw error, source path or stack is retained.
+type panicLogObservation struct {
+	owner     string
+	errorType string
+	sqlstate  string
+}
+
+// Accepts the exact bounded ErrorJson schema, including duplicate-key rejection.
+// Unknown stack symbols do not borrow a later caller's apparent ownership.
+func parsePanicLogObservation(line string) panicLogObservation {
+	unknown := panicLogObservation{errorType: "unknown", sqlstate: "unknown"}
+	if len(line) > panicLogMaxBytes {
+		return unknown
+	}
+	_, body, ok := strings.Cut(line, "Unexpected error:")
+	if !ok {
+		return unknown
+	}
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(body)))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return unknown
+	}
+	var errorText string
+	var stack []string
+	errorSeen, stackSeen := false, false
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return unknown
+		}
+		switch token {
+		case "error":
+			if errorSeen || decoder.Decode(&errorText) != nil {
+				return unknown
+			}
+			errorSeen = true
+		case "stack":
+			if stackSeen {
+				return unknown
+			}
+			stackSeen = true
+			if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+				return unknown
+			}
+			for decoder.More() {
+				token, err := decoder.Token()
+				line, ok := token.(string)
+				if err != nil || !ok || len(stack) >= panicLogMaxStackLines {
+					return unknown
+				}
+				stack = append(stack, line)
+			}
+			if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+				return unknown
+			}
+		default:
+			return unknown
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') ||
+		!errorSeen || errorText == "" || !stackSeen || len(stack) == 0 || len(stack) > panicLogMaxStackLines {
+		return unknown
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return unknown
+	}
+	observation := unknown
+	errorType, _, _ := strings.Cut(errorText, "=")
+	switch errorType {
+	case "*pgconn.PgError", "*errors.errorString", "*fmt.wrapError", "*fmt.wrapErrors", "runtime.errorString", "*runtime.TypeAssertionError", "string":
+		observation.errorType = errorType
+	}
+	if errorType == "*pgconn.PgError" {
+		if match := panicLogSqlstateRe.FindStringSubmatch(strings.TrimSpace(errorText)); len(match) == 2 {
+			observation.sqlstate = match[1]
+		}
+	}
+	for index := 0; index < len(stack); index++ {
+		line := strings.TrimSpace(stack[index])
+		if !strings.HasPrefix(line, "github.com/urnetwork/") {
+			continue
+		}
+		match := panicLogFunctionRe.FindStringSubmatch(line)
+		if len(match) != 3 || index+1 >= len(stack) || !panicLogSourceRe.MatchString(strings.TrimSpace(stack[index+1])) {
+			return observation
+		}
+		// runtime/debug.Stack elides generic shapes to the literal [...].
+		// Accept only that producer form; type arguments never become owners.
+		function := strings.ReplaceAll(match[2], "[...]", "")
+		if suffix := panicLogClosureRe.FindStringIndex(function); suffix != nil {
+			function = function[:suffix[0]]
+		}
+		function = strings.NewReplacer("(*", "", "(", "", ")", "").Replace(function)
+		owner := match[1] + "." + function
+		wrapperOwner := owner
+		if versionedRoot := panicLogVersionedRootRe.FindStringSubmatch(match[1]); len(versionedRoot) == 2 {
+			// A release-specific module root is still the same recovery
+			// wrapper. Preserve its version only for an actual application owner.
+			wrapperOwner = versionedRoot[1] + "." + function
+		}
+		switch wrapperOwner {
+		case "server.HandleError", "server.HandleError1", "server.HandleError2", "server.HandleErrorWithReturn",
+			"server.Raise", "server.RaisePgResult", "server.WithPgResult",
+			"server.Db", "server.ReplicaDb", "server.MaintenanceDb", "server.dbWithPool",
+			"server.Tx", "server.MaintenanceTx", "server.txWithPool",
+			"connect.HandleError", "connect.HandleError1", "connect.HandleError2", "connect.Raise":
+			// The next record is this wrapper's already-validated source line.
+			// A trimpath build can prefix it with the application module too.
+			index++
+			continue
+		}
+		if len(owner) <= panicLogOwnerMaxBytes {
+			observation.owner = owner
+		}
+		return observation
+	}
+	return observation
+}
+
+// An empty owner deliberately leaves malformed or unknown records aggregate-only.
+func panicLogOwner(line string) string {
+	return parsePanicLogObservation(line).owner
+}
+
+// Fixed field names and allowlisted values fit below the ordinary sample budget.
+func panicLogSample(line string) string {
+	observation := parsePanicLogObservation(line)
+	owner := observation.owner
+	if owner == "" {
+		owner = "unknown"
+	}
+	return fmt.Sprintf("panic owner=%s error_type=%s sqlstate=%s", owner, observation.errorType, observation.sqlstate)
+}
+
 // One negative mirror is an integrity defect. A hundred mutation exposures in
 // one service/site minute is a fleet-scale availability/accounting incident,
 // as opposed to the small irreducible cross-store race retained for diagnosis.
@@ -1040,7 +1354,7 @@ var netEscrowNegativeSiteRe = regexp.MustCompile(`\[netescrow\]negative counter 
 var netEscrowClampMarkerRe = regexp.MustCompile(`\bclamped_to=[^\s]+`)
 var lokiTailBackendAddrRe = regexp.MustCompile(`[[:space:]]addr=("[^"]+"|[^[:space:]]+)`)
 var warpLogIdentityRe = regexp.MustCompile(`^\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\]\[cid:([^\]]+)\]`)
-var dbMaintenanceLegacyReindexRe = regexp.MustCompile(`\[db\]maintenance reindex\[[0-9]+/[0-9]+\] (client_reliability(?:_p[0-9]{8})?|contract_close|network_client_location_reliability|network_client_connection|transfer_contract|transfer_escrow|transfer_escrow_sweep)[[:space:]]*$`)
+var dbMaintenanceLegacyReindexRe = regexp.MustCompile(`\[db\]maintenance (?:reindex\[[0-9]+/[0-9]+\] |table\[[0-9]+/[0-9]+\] reindex )(client_reliability(?:_p[0-9]{8})?|contract_close|network_client|network_client_location_reliability|network_client_connection|transfer_contract|transfer_escrow|transfer_escrow_sweep)[[:space:]]*$`)
 
 type warpLogIdentity struct {
 	host       string
@@ -1105,9 +1419,9 @@ func lokiTailBackendEOFLogGroup(line string) string {
 	return "backend=" + address
 }
 
-// dbMaintenanceLegacyReindexLogGroup retains the excluded table that the old
-// maintenance path selected. The start-only regexp deliberately rejects the
-// later "reindex took" completion line and the fixed table/step log format.
+// dbMaintenanceLegacyReindexLogGroup retains the excluded table selected in
+// either maintenance start format. The regexp rejects cleanup and completion
+// lines because they do not establish that a whole-table reindex was selected.
 func dbMaintenanceLegacyReindexLogGroup(line string) string {
 	match := dbMaintenanceLegacyReindexRe.FindStringSubmatch(line)
 	if len(match) < 2 {
@@ -1282,6 +1596,8 @@ type logTailer struct {
 	stateLock sync.Mutex
 	// class -> count in the current minute window
 	classCounts map[string]int
+	// Caps additive owner groups independently for each class and drain window.
+	classGroupCounts map[string]int
 	// class -> one sample line + one target from the window
 	classSamples map[string]string
 	classTargets map[string]string
@@ -1336,6 +1652,9 @@ type logTailer struct {
 	reconcileInitialized bool
 	lastReconcileTime    time.Time
 	lastReconcileError   string
+	// Bounded successful-query receipts belong only to this collector
+	// generation. Failure or cancellation invalidates the consecutive pair.
+	reconcileSuccesses [2]logReconcileSuccess
 
 	// stream is a test seam over runner.warpctlStream; nil = the real stream
 	stream func(ctx context.Context) (*exec.Cmd, io.ReadCloser, error)
@@ -1356,6 +1675,7 @@ func newLogTailer(service string, env *probeEnv) *logTailer {
 		clock:                   clock,
 		startedAt:               startedAt,
 		classCounts:             map[string]int{},
+		classGroupCounts:        map[string]int{},
 		classSamples:            map[string]string{},
 		classTargets:            map[string]string{},
 		burstSecondCounts:       map[string]int{},
@@ -1482,6 +1802,24 @@ type reconcileLine struct {
 	observedAt time.Time
 }
 
+// Warp's range client can skip a server-limited timestamp and still exit
+// successfully below our requested cap. Its stderr uses Go's date/time/file
+// prefix; unprefixed clients use the same warning. Neither form is a remote
+// timestamp-framed record or an ordinary successful-retry diagnostic.
+var logReconcileIncompleteRe = regexp.MustCompile(`(?m)^(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)? [^[:space:]:]+\.go:[0-9]+: )?Warning: at least [1-9][0-9]* entries at [^\r\n]+\. The range api cannot page within one nanosecond; skipping the rest of this timestamp\.$`)
+
+var errLogReconcileIncomplete = errors.New("bounded overlap producer declared incomplete timestamp coverage")
+
+// Every aggregate, block, and continuation page crosses this completion
+// boundary before parsing. Do not retain the producer's count or timestamp.
+func (self *logTailer) reconcilePage(ctx context.Context, start time.Time, blocks []string) (string, error) {
+	out, err := self.reconcile(ctx, start, blocks)
+	if err == nil && logReconcileIncompleteRe.MatchString(out) {
+		return "", errLogReconcileIncomplete
+	}
+	return out, err
+}
+
 func parseReconcileLines(out string) []reconcileLine {
 	lines := []reconcileLine{}
 	for _, line := range strings.Split(out, "\n") {
@@ -1563,7 +1901,7 @@ func (self *logTailer) completeReconcilePartition(
 		}
 
 		pageStart = boundary
-		out, err := self.reconcile(ctx, pageStart, blocks)
+		out, err := self.reconcilePage(ctx, pageStart, blocks)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -1588,13 +1926,23 @@ func (self *logTailer) reconcileOnce(ctx context.Context) {
 	if self.reconcile == nil {
 		return
 	}
+	defer func() {
+		if ctx.Err() != nil {
+			self.stateLock.Lock()
+			self.reconcileSuccesses = [2]logReconcileSuccess{}
+			self.stateLock.Unlock()
+		}
+	}()
+	if ctx.Err() != nil {
+		return
+	}
 	start := self.clock().Add(-logReconcileLookback)
-	out, err := self.reconcile(ctx, start, nil)
+	out, err := self.reconcilePage(ctx, start, nil)
 	if ctx.Err() != nil {
 		return
 	}
 	if err != nil {
-		self.recordReconcile(err)
+		self.recordReconcile(start, err)
 		return
 	}
 
@@ -1606,19 +1954,19 @@ func (self *logTailer) reconcileOnce(ctx context.Context) {
 				return
 			}
 			if err != nil {
-				self.recordReconcile(err)
+				self.recordReconcile(start, err)
 				return
 			}
 		} else {
 			lines = nil
 			for _, block := range self.blocks {
 				blockPartition := []string{block}
-				out, err := self.reconcile(ctx, start, blockPartition)
+				out, err := self.reconcilePage(ctx, start, blockPartition)
 				if ctx.Err() != nil {
 					return
 				}
 				if err != nil {
-					self.recordReconcile(fmt.Errorf("block %s overlap: %w", block, err))
+					self.recordReconcile(start, fmt.Errorf("block %s overlap: %w", block, err))
 					return
 				}
 				blockLines, err := self.completeReconcilePartition(
@@ -1631,7 +1979,7 @@ func (self *logTailer) reconcileOnce(ctx context.Context) {
 					return
 				}
 				if err != nil {
-					self.recordReconcile(err)
+					self.recordReconcile(start, err)
 					return
 				}
 				lines = append(lines, blockLines...)
@@ -1647,18 +1995,38 @@ func (self *logTailer) reconcileOnce(ctx context.Context) {
 		count := !initial || !entry.observedAt.Before(self.startedAt)
 		self.ingestStanding(entry.line, false, count)
 	}
-	self.recordReconcile(nil)
+	if ctx.Err() != nil {
+		return
+	}
+	self.recordReconcile(start, nil)
 }
 
-func (self *logTailer) recordReconcile(err error) {
+func (self *logTailer) recordReconcile(start time.Time, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if err != nil {
+		var logQueryError *warpctlLogQueryError
+		if errors.Is(err, errLogReconcileIncomplete) {
+			// Block/continuation wrappers must not add private selectors to
+			// this fixed producer-completeness diagnostic.
+			err = errLogReconcileIncomplete
+		} else if errors.As(err, &logQueryError) {
+			// A fixed local-query class must not acquire private block/query
+			// selectors from continuation wrappers before becoming alert text.
+			err = logQueryError
+		}
 		self.lastReconcileError = err.Error()
+		self.reconcileSuccesses = [2]logReconcileSuccess{}
 		return
 	}
 	self.lastReconcileTime = self.clock()
 	self.lastReconcileError = ""
+	latest := logReconcileSuccess{start: start, completed: self.lastReconcileTime}
+	previous := self.reconcileSuccesses[1]
+	self.reconcileSuccesses = [2]logReconcileSuccess{{}, latest}
+	if previous.advancesTo(latest) {
+		self.reconcileSuccesses[0] = previous
+	}
 }
 
 // tailOnce runs one log stream to completion: start, scan lines, reap the
@@ -1829,7 +2197,7 @@ func (self *logTailer) classify(line string) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.lastLineTime = self.clock()
-	self.classifyLocked(line, false, true, self.clock())
+	self.classifyLocked(line, false, true, self.clock(), false)
 }
 
 // ingestStanding is used by both standing transports. Exact replay
@@ -1854,17 +2222,17 @@ func (self *logTailer) ingestStanding(line string, updateLiveness bool, count bo
 			return
 		}
 	}
-	self.classifyLocked(line, true, count, now)
+	self.classifyLocked(line, true, count, now, updateLiveness)
 }
 
-func (self *logTailer) classifyLocked(line string, deduplicate bool, count bool, now time.Time) {
+func (self *logTailer) classifyLocked(line string, deduplicate bool, count bool, now time.Time, liveStanding bool) {
 	if isGrafanaQueryEcho(self.service, line) {
 		return
 	}
 
 	for _, c := range logClasses {
 		if c.re.MatchString(line) && (c.match == nil || c.match(line)) {
-			if deduplicate && self.standingReplayLocked(line, now) {
+			if deduplicate && !(liveStanding && c.countEveryLiveOccurrence) && self.standingReplayLocked(line, now) {
 				return
 			}
 			if !count {
@@ -1874,8 +2242,24 @@ func (self *logTailer) classifyLocked(line string, deduplicate bool, count bool,
 			attribution := ""
 			if c.groupBy != nil {
 				attribution = c.groupBy(line)
+				if c.aggregateWithGroup && attribution != "" {
+					groupKey := c.name + "\x00" + attribution
+					if _, exists := self.classCounts[groupKey]; !exists {
+						if self.classGroupCounts[c.name] >= logClassMaxOwnerGroups {
+							attribution = ""
+						} else {
+							self.classGroupCounts[c.name]++
+						}
+					}
+				}
 				if attribution != "" {
 					key += "\x00" + attribution
+				}
+			}
+			if c.aggregateWithGroup && key != c.name {
+				self.classCounts[c.name]++
+				if _, exists := self.classSamples[c.name]; !exists {
+					self.classSamples[c.name] = logClassSample(c, line)
 				}
 			}
 			self.classCounts[key] += 1
@@ -1883,7 +2267,7 @@ func (self *logTailer) classifyLocked(line string, deduplicate bool, count bool,
 				self.classSamples[key] = logClassSample(c, line)
 				if attribution != "" {
 					self.classTargets[key] = attribution
-				} else if target := targetRe.FindString(line); target != "" {
+				} else if target := targetRe.FindString(line); !c.aggregateWithGroup && target != "" {
 					self.classTargets[key] = target
 				}
 			}
@@ -2067,6 +2451,9 @@ func (self *logTailer) drainWindow() []finding {
 			broken = true
 			tier := c.tier
 			baseline := "healthy ~0/min for all classes; volume is retry amplification, not incident size (1.5)"
+			if c.name == "doh-dial-timeout" {
+				baseline = "healthy ~0/min; sampled outbound dial-leg lines are neither resolver-call failures nor user-request failures; fanout, hedging, and replacement ownership can add legs"
+			}
 			observed := fmt.Sprintf("rate=%d/min class=%s", count, c.name)
 			if c.pageRateThreshold > 0 {
 				observed += fmt.Sprintf(" page_threshold=%d/min", c.pageRateThreshold)
@@ -2079,7 +2466,11 @@ func (self *logTailer) drainWindow() []finding {
 			if c.observationOnly {
 				observed += fmt.Sprintf(" observation_service=%s affected_selector=unknown", self.service)
 			} else if c.groupBy != nil {
-				observed += fmt.Sprintf(" frame=%s", attribution)
+				if attribution == "" {
+					observed += fmt.Sprintf(" target=%s", self.service)
+				} else {
+					observed += fmt.Sprintf(" frame=%s", attribution)
+				}
 			} else {
 				observed += fmt.Sprintf(" target=%s", self.service)
 				if attribution != "" {
@@ -2148,6 +2539,17 @@ func (self *logTailer) drainWindow() []finding {
 		unknownMimirRejection := self.classCounts["mimir-rejection-unobservable\x00rejection-schema"] > 0
 		withholdHealthy := unknownMimirRejection && (c.name == "mimir-series-limit" ||
 			c.name == "mimir-ingestion-rate-limit" || c.name == "mimir-push-rejected")
+		if c.name == "loki-tail-dropped-entries" && self.classCounts["loki-tail-dropped-entries-unobservable"] > 0 {
+			withholdHealthy = true
+		}
+		if c.name == "peerconn-teardown-stalled" && self.reconcile != nil {
+			// A connected stream alone cannot clear a teardown-stall ticket:
+			// high-volume stack output or a failed overlap can hide its header.
+			latest := self.reconcileSuccesses[1]
+			withholdHealthy = withholdHealthy || self.lastReconcileError != "" ||
+				!self.reconcileSuccesses[0].advancesTo(latest) ||
+				self.clock().Sub(latest.completed) >= 2*logReconcileInterval
+		}
 		if !broken && !withholdHealthy {
 			findings = append(findings, healthyFinding("logs/"+c.name, c.tier, c.name, self.service))
 		}
@@ -2275,6 +2677,7 @@ func (self *logTailer) drainWindow() []finding {
 
 	// reset the window
 	self.classCounts = map[string]int{}
+	self.classGroupCounts = map[string]int{}
 	self.classSamples = map[string]string{}
 	self.classTargets = map[string]string{}
 	self.burstSecondCounts = map[string]int{}
@@ -2360,6 +2763,9 @@ type logTailProbe struct {
 	// event must remain visible even when the monitor host cannot expose recent
 	// router-advertisement state. Tests inject it explicitly.
 	monitorRouteEvidence tailTransportMonitorRouteEvidenceCollector
+	// Successful overlap evidence stays in the existing diagnostic stream,
+	// separate from active Alerts. A sink failure must not affect findings.
+	reconcileDiagnostics io.Writer
 }
 
 // tailerSilentThreshold: no line for this long means the monitor is blind to
@@ -2425,6 +2831,9 @@ func (self *logTailProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 		monitorEvidence = self.monitorRouteEvidence(ctx, env, routeEvents)
 	}
 	findings = append(findings, tailTransportRouteFindings(env, routeEvents, monitorEvidence)...)
+	if ctx.Err() == nil {
+		self.writeReconcileReceipt(now)
+	}
 	return findings, nil
 }
 
@@ -2461,7 +2870,7 @@ const (
 var (
 	monitorIPv6LogTimestampPattern      = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3})`)
 	monitorRouterLifetimeExpiredPattern = regexp.MustCompile(`RTADV ([[:alnum:]_.-]+): router lifetime became zero`)
-	monitorAutoconfDetachedPattern      = regexp.MustCompile(`AUTOMATIC-V6 ([[:alnum:]_.-]+): all autoconf addresses detached/deprecated`)
+	monitorAutoconfDetachedPattern      = regexp.MustCompile(`(AUTOMATIC-V6|RTADV) ([[:alnum:]_.-]+): all autoconf addresses detached/deprecated`)
 )
 
 // collectTailTransportMonitorRouteEvidence asks only for the few local
@@ -2564,10 +2973,10 @@ func parseTailTransportMonitorRouteEvidence(out string) tailTransportMonitorRout
 			}
 			continue
 		}
-		if match := monitorAutoconfDetachedPattern.FindStringSubmatch(line); len(match) == 2 {
+		if match := monitorAutoconfDetachedPattern.FindStringSubmatch(line); len(match) == 3 {
 			// A detach on another interface is not causal evidence for this
 			// route loss. The default-router expiry chooses the identity.
-			if evidence.interfaceName != "" && match[1] == evidence.interfaceName {
+			if evidence.interfaceName != "" && match[2] == evidence.interfaceName {
 				evidence.autoconfDetachCount++
 			}
 			continue
@@ -2716,10 +3125,17 @@ func tailTransportRouteFindings(
 				restoredAt = monitorEvidence.ipv6RestoredAt.Format(monitorIPv6LogTimeLayout)
 			}
 			mechanism = fmt.Sprintf(
-				"The monitor host recorded that its IPv6 default-router lifetime on %s reached zero at %s inside the transport-failure window. The monitor then detached/deprecated its autoconfigured IPv6 state, so independent warpctl tails lost their common local route while their child processes remained alive. This proves local default-router expiration and supersedes edge attribution, but the configd record alone does not distinguish an explicit zero-lifetime Router Advertisement from missed or late refresh advertisements.",
+				"The monitor host recorded that its IPv6 default-router lifetime on %s reached zero at %s inside the transport-failure window, followed by loss of that interface's IPv6 network state at %s. The affected warpctl tail transport(s) reported route loss while their child processes remained alive. This proves local default-router expiration and supersedes edge attribution, but the configd record alone does not distinguish an explicit zero-lifetime Router Advertisement from missed or late refresh advertisements or local RA-state invalidation.",
 				monitorEvidence.interfaceName,
 				expiredAt,
+				absentAt,
 			)
+			if monitorEvidence.autoconfDetachCount > 0 {
+				mechanism += fmt.Sprintf(" The bounded window separately recorded %d autoconfiguration detach/deprecate transition(s).", monitorEvidence.autoconfDetachCount)
+			}
+			if !monitorEvidence.ipv6RestoredAt.IsZero() {
+				mechanism += fmt.Sprintf(" IPv6 network state returned at %s.", restoredAt)
+			}
 			observed += fmt.Sprintf(
 				" monitor_interface=%s monitor_router_lifetime_expired=%d monitor_autoconf_detach=%d monitor_ipv6_absent=%s monitor_ipv6_restored=%s",
 				monitorEvidence.interfaceName,
@@ -2744,8 +3160,8 @@ func tailTransportRouteFindings(
 				observed += fmt.Sprintf(" monitor_restoration_before_diagnostic=%s", restorationDelay)
 				evidence += " The route-loss and restoration timestamps are reduced independently; raw configd records are not retained in the alert."
 			}
-			contextText = "This event is a monitor-side first-hop Router Advertisement/default-router expiration, not evidence that the named production edge, its interface, LB, or LAN neighbor failed. A later edge HTTP 200 is expected after the monitor's IPv6 route returns. The first-hop router, its RA/failover owner, or the local path carrying its advertisements is operational infrastructure and cannot be repaired by deploying an edge service."
-			action = "Inspect the monitor's local first-hop IPv6 Router Advertisement path: correlate router and RA-daemon uptime, WAN/failover state, and local-link health at the recorded time, then capture timestamped ICMPv6 type 134 traffic on the monitor interface during recurrence. Use the capture to distinguish an explicit zero-lifetime withdrawal from missed or late refresh advertisements, and repair the identified RA source or delivery path. Do not change the named production edge, its Vault address, LB, firewall, or neighbor state for this locally proven event."
+			contextText = "This event is a monitor-side first-hop IPv6 default-router state loss, not evidence that the named production edge, its interface, LB, or LAN neighbor failed. A later edge HTTP 200 is expected after the monitor's IPv6 route returns. The first-hop router, its RA/failover owner, the local advertisement delivery path, and the monitor's local RA-state owner remain distinct candidates; deploying an edge service cannot repair this local observation boundary."
+			action = "Inspect the monitor's local first-hop IPv6 Router Advertisement path: correlate router and RA-daemon uptime, WAN/failover state, local-link health, and the monitor's stored-router state at the recorded time. With explicit operator authorization, capture timestamped ICMPv6 type 134 traffic on the monitor interface during recurrence. Correlate complete packet coverage with local state to distinguish an explicit zero-lifetime withdrawal, missed or late refresh advertisements, and local RA-state invalidation. An absent packet in incomplete capture is not proof of missed delivery. Select a router, delivery-path, or local-client repair only after that discriminator, not from configd text alone. Do not change the named production edge, its Vault address, LB, firewall, or neighbor state for this locally proven event."
 			verify = "For at least 30 minutes, the monitor's stored default-router lifetime is refreshed before expiry, an unrelated-provider IPv6 control and configured edges remain reachable in the same seconds, and every standing tail remains free of route-loss diagnostics."
 		}
 		findings = append(findings, finding{
@@ -2805,8 +3221,9 @@ func tailerReconcileFinding(service string, now time.Time, startedAt time.Time, 
 		),
 		observed:  observed,
 		mechanism: "Loki accepts out-of-order records, but a WebSocket tail advances by source timestamp. Without a successful overlapping query, a late-ingested record older than that cursor can remain absent even while the tail process is connected and reading newer lines.",
+		context:   "A fixed bounded-query error_class describes Warpctl's terminal local diagnostic, not a panic in the observed service. HTTP 429/502/503/504 does not identify which gateway or backend returned it; a config/schema panic can originate in local configuration or an invalid upstream response. Unknown, truncated, or unrecognized diagnostics remain failed visibility. Successful retry diagnostics do not make a completed query fail.",
 		action:    "Restore bounded warpctl/Loki query visibility. Retain active services.yml block partitioning and inclusive boundary continuation. If one boundary cannot advance or a partition consumes the eight-page budget, diagnose and remove the high-cardinality log producer before changing query limits. Keep the live tail running; do not interpret missing reconciliation as a healthy error window.",
-		verify:    "Two consecutive overlap windows complete below the cap in aggregate or drain every configured block through bounded continuation, and the standing monitor remains free of tailer-reconcile and loki-tail-dropped-streams alerts.",
+		verify:    "Two consecutive overlap windows complete below the cap in aggregate or drain every configured block through bounded continuation. Require a current-watcher monitor-log-reconcile schema=1 diagnostic receipt with collectors=enabled=fresh=consecutive_two > 0 and post-boundary advancing window/completion ranges; alert absence alone is insufficient. The standing monitor remains free of tailer-reconcile and loki-tail-dropped-streams alerts.",
 		playbook:  "SIGNALS.md 1.5",
 	}
 }
@@ -2823,9 +3240,11 @@ func tailerHealthFindings(service string, now time.Time, lastLine time.Time, res
 			probeId: "monitor/visibility", tier: tierWarn,
 			class: "tailer-silent", target: target, sustain: 2,
 			symptom:  fmt.Sprintf("log tailer for %s has read no line in %s (threshold %s)", service, silent.Round(time.Second), tailerSilentThreshold),
-			baseline: "every tailed service logs continuously; a silent tailer means the monitor is blind to that service's logs (§3.7)",
+			baseline: "a service emitting logs has its lines ingested promptly; an idle service may emit none",
 			observed: fmt.Sprintf("silent_for=%s scan_errors_total=%d", silent.Round(time.Second), scanErrors),
-			context:  "either the warpctl stream is broken (restart the monitor / check warpctl auth) or the service itself is down (warpctl ls versions)",
+			context:  "silence alone cannot distinguish an idle producer, a stopped service, and a broken tail stream; this is unknown visibility, not proof of an outage",
+			action:   "Check current process identity and service health, the producer's latest bounded Loki records, and the tailer's scan/restart counters. Do not restart a healthy idle service or monitor solely because no line was emitted.",
+			verify:   "A newly emitted service line appears in the standing tail and bounded Loki query, or document the service's intentional quiet interval while process health and tailer transport remain intact.",
 			playbook: "SIGNALS.md 1.5",
 		})
 	} else {

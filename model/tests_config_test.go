@@ -218,13 +218,15 @@ func TestConfiguredEmailRetainsAttemptLimit(t *testing.T) {
 	})
 }
 
+// Signup verifies configured identities immediately; stale rows must exercise a
+// real repair write even when the caller's identity needs normalization.
 func TestNetworkCreateTestAuthIsImmediatelyVerified(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		pushTestsAuthPolicy(t, "version: 1\nemail_verification:\n  bypass_domains: [signup-test.example]\n  suppress_account_messages: true\nsignup:\n  phone:\n    number: '+13125550100'\n")
 
 		ctx := context.Background()
 		clientSession := session.Testing_CreateClientSession(ctx, nil)
-		email := "acceptance@signup-test.example"
+		email := "Acceptance@SIGNUP-TEST.EXAMPLE"
 		password := "Acceptance-password-123!"
 		result, err := NetworkCreate(NetworkCreateArgs{
 			UserAuth:    &email,
@@ -276,27 +278,53 @@ func TestNetworkCreateTestAuthIsImmediatelyVerified(t *testing.T) {
 			t.Fatal("configured phone signup did not suppress account messages")
 		}
 
-		// Simulate a fixture left pending by the previous server version. Correct
-		// password login must repair it without sending or requesting a code.
-		server.Db(ctx, func(conn server.PgConn) {
-			server.RaisePgResult(conn.Exec(
-				ctx,
-				"UPDATE network_user_auth_password SET verified = false WHERE user_auth = $1",
-				phone,
-			))
-		})
-		phoneLogin, err := AuthLoginWithPassword(AuthLoginWithPasswordArgs{
-			UserAuth: phone,
-			Password: password,
-		}, clientSession)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if phoneLogin.VerificationRequired != nil {
-			t.Fatal("configured phone login unexpectedly required verification")
-		}
-		if phoneLogin.Network == nil || phoneLogin.Network.ByJwt == nil || *phoneLogin.Network.ByJwt == "" {
-			t.Fatalf("configured phone could not log in: %#v", phoneLogin)
+		// Both identity forms are stored canonically. Prove the fixture actually
+		// becomes pending before checking that login repairs the persisted row.
+		for _, userAuth := range []string{email, phone} {
+			normalUserAuth, _ := NormalUserAuthV1(&userAuth)
+			if normalUserAuth == nil {
+				t.Fatalf("invalid configured test identity %q", userAuth)
+			}
+			requireVerified := func(want bool) {
+				t.Helper()
+				server.Db(ctx, func(conn server.PgConn) {
+					var verified bool
+					server.Raise(conn.QueryRow(ctx,
+						"SELECT verified FROM network_user_auth_password WHERE user_auth = $1",
+						*normalUserAuth,
+					).Scan(&verified))
+					if verified != want {
+						t.Fatalf("configured identity %q: persisted verified = %t, want %t", userAuth, verified, want)
+					}
+				})
+			}
+			server.Db(ctx, func(conn server.PgConn) {
+				updated := server.RaisePgResult(conn.Exec(
+					ctx,
+					"UPDATE network_user_auth_password SET verified = false WHERE user_auth = $1 AND verified = true",
+					*normalUserAuth,
+				))
+				if updated.RowsAffected() != 1 {
+					t.Fatalf("configured identity %q: made %d rows pending, want 1", userAuth, updated.RowsAffected())
+				}
+			}, server.OptReadWrite())
+			requireVerified(false)
+			withReadOnlyModelDbSession(t, ctx, func() {
+				repaired, err := AuthLoginWithPassword(AuthLoginWithPasswordArgs{
+					UserAuth: userAuth,
+					Password: password,
+				}, clientSession)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if repaired.VerificationRequired != nil {
+					t.Fatalf("configured identity %q unexpectedly required verification", userAuth)
+				}
+				if repaired.Network == nil || repaired.Network.ByJwt == nil || *repaired.Network.ByJwt == "" {
+					t.Fatalf("configured identity %q could not log in after verification repair", userAuth)
+				}
+				requireVerified(true)
+			})
 		}
 
 		ordinaryEmail := "acceptance@ordinary.example"
@@ -340,16 +368,18 @@ func TestConfiguredPhoneLoginRepairsStaleFixturePassword(t *testing.T) {
 			t.Fatalf("could not create stale configured-phone fixture: %#v", created)
 		}
 
-		repaired, err := AuthLoginWithPassword(AuthLoginWithPasswordArgs{
-			UserAuth: phone,
-			Password: configuredPassword,
-		}, clientSession)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if repaired.Network == nil || repaired.Network.ByJwt == nil {
-			t.Fatalf("configured password did not repair stale phone fixture: %#v", repaired)
-		}
+		withReadOnlyModelDbSession(t, ctx, func() {
+			repaired, err := AuthLoginWithPassword(AuthLoginWithPasswordArgs{
+				UserAuth: phone,
+				Password: configuredPassword,
+			}, clientSession)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if repaired.Network == nil || repaired.Network.ByJwt == nil {
+				t.Fatal("configured password did not repair stale phone fixture")
+			}
+		})
 
 		staleLogin, err := AuthLoginWithPassword(AuthLoginWithPasswordArgs{
 			UserAuth: phone,

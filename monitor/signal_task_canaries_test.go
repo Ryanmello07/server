@@ -1,11 +1,326 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 )
+
+// These four scalar-aggregate owners share a shape contract, not a numeric
+// contract: selection's negative sentinel and legitimate empty GROUP BY
+// results must remain valid. Keep the common public-entry controls here.
+type requiredAggregateFixture struct {
+	newSignal   func() Signal
+	queryMarker string
+	healthyRow  Row
+}
+
+const aggregatePrivateCell = "synthetic-private-aggregate password=fixture-only 192.0.2.61"
+
+func requiredAggregateBadShapes(valid Row) []struct {
+	name string
+	rows []Row
+} {
+	cases := []struct {
+		name string
+		rows []Row
+	}{
+		{name: "nil rows"},
+		{name: "empty rows", rows: []Row{}},
+		{name: "nil row", rows: []Row{nil}},
+		{name: "empty row", rows: []Row{{}}},
+		{name: "extra row", rows: []Row{valid, {aggregatePrivateCell}}},
+		{name: "extra column", rows: []Row{append(append(Row(nil), valid...), aggregatePrivateCell)}},
+	}
+	if len(valid) > 1 {
+		cases = append(cases, struct {
+			name string
+			rows []Row
+		}{name: "short row", rows: []Row{valid[:len(valid)-1]}})
+	}
+	return cases
+}
+
+// Test-only recovery lets every current panic be reported without terminating
+// the package. It is deliberately outside the production monitor/loop.
+func runRequiredAggregateSafely(m *Monitor) (alerts Alerts, err error, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+		}
+	}()
+	alerts, err = m.Run(context.Background())
+	return
+}
+
+func requireAggregateVisibility(t *testing.T, signal Signal, alerts Alerts, class string) {
+	t.Helper()
+	if len(alerts) != 1 {
+		t.Errorf("required aggregate returned %d alerts, want one visibility finding", len(alerts))
+		return
+	}
+	alert := alerts[0]
+	if alert.SignalID != "monitor/visibility" || alert.SignalKey != signal.Key() ||
+		alert.Class != "cannot-observe" || alert.Target != signal.ID() || alert.Frame != "" ||
+		alert.Severity != SeverityWarn || alert.Sustain != 2 || alert.PageSustain != 0 ||
+		alert.Observed != "error_class="+class {
+		t.Error("required aggregate changed the fixed-class visibility identity or sustain")
+	}
+	encoded, err := json.Marshal(alert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonl bytes.Buffer
+	if err := alerts.WriteJSONL(&jsonl); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(jsonl.Bytes(), []byte{'\n'}) != 1 {
+		t.Error("one aggregate visibility finding did not produce one JSONL record")
+	}
+	for _, rendered := range []string{string(encoded), alert.Markdown(), jsonl.String()} {
+		for _, forbidden := range []string{"synthetic-private-aggregate", "fixture-only", "192.0.2.61"} {
+			if strings.Contains(rendered, forbidden) {
+				t.Error("aggregate visibility rendered a rejected synthetic private cell")
+			}
+		}
+	}
+}
+
+func testRequiredAggregateShape(t *testing.T, fixture requiredAggregateFixture) {
+	t.Helper()
+	for _, test := range requiredAggregateBadShapes(fixture.healthyRow) {
+		t.Run(test.name, func(t *testing.T) {
+			requiredReads, otherReads := 0, 0
+			source := &syntheticSource{
+				postgresFn: func(query string) ([]Row, error) {
+					if strings.Contains(query, fixture.queryMarker) {
+						requiredReads++
+						return test.rows, nil
+					}
+					otherReads++
+					return nil, nil
+				},
+				localFn: func(string, ...string) (string, error) { otherReads++; return "", nil },
+			}
+			signal := fixture.newSignal()
+			alerts, err, panicked := runRequiredAggregateSafely(NewWithSignals(syntheticSettings(source), signal))
+			if panicked {
+				t.Error("successful malformed aggregate panicked instead of returning unknown")
+			} else {
+				if err == nil {
+					t.Error("successful malformed aggregate did not return an error")
+				} else {
+					for _, forbidden := range []string{"synthetic-private-aggregate", "fixture-only", "192.0.2.61"} {
+						if strings.Contains(err.Error(), forbidden) {
+							t.Error("shape error rendered a rejected synthetic private cell")
+						}
+					}
+				}
+				requireAggregateVisibility(t, signal, alerts, observationErrorClassInvalidResponse)
+			}
+			if requiredReads != 1 || otherReads != 0 {
+				t.Errorf("invalid aggregate read required=%d optional=%d, want 1/0", requiredReads, otherReads)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		err   error
+		class string
+	}{
+		{name: "untyped source failure", err: errors.New("connection refused"), class: observationErrorClassUnclassified},
+		{name: "source unreachable", err: &unreachableError{host: "synthetic-pg", err: errors.New("connection refused")}, class: observationErrorClassUnreachable},
+		{name: "source deadline", err: context.DeadlineExceeded, class: observationErrorClassTimeout},
+		{name: "source canceled", err: context.Canceled, class: observationErrorClassCanceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reads := 0
+			source := &syntheticSource{postgresFn: func(string) ([]Row, error) { reads++; return nil, test.err }}
+			signal := fixture.newSignal()
+			alerts, err, panicked := runRequiredAggregateSafely(NewWithSignals(syntheticSettings(source), signal))
+			if panicked || !errors.Is(err, test.err) || reads != 1 {
+				t.Error("required aggregate changed the original source error or repeated its read")
+			}
+			requireAggregateVisibility(t, signal, alerts, test.class)
+		})
+	}
+	t.Run("independent sibling still runs", func(t *testing.T) {
+		ownerReads, siblingReads := 0, 0
+		source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+			switch {
+			case strings.Contains(query, fixture.queryMarker):
+				ownerReads++
+				return nil, nil
+			case strings.Contains(query, "create_time >= date_trunc('minute',now())"):
+				siblingReads++
+				return []Row{{"0"}}, nil
+			default:
+				t.Error("unexpected query outside the required aggregate and independent sibling")
+				return nil, nil
+			}
+		}}
+		signal := fixture.newSignal()
+		alerts, err, panicked := runRequiredAggregateSafely(NewWithSignals(syntheticSettings(source), signal, NewContractRateSignal()))
+		if panicked {
+			t.Fatal("malformed aggregate panicked before the independent sibling could run")
+		}
+		if err == nil || len(alerts) != 2 || ownerReads != 1 || siblingReads != 1 {
+			t.Fatal("malformed aggregate erased the independent sibling or repeated a source")
+		}
+		unknown := requireAlertClass(t, alerts, "cannot-observe")
+		requireAggregateVisibility(t, signal, Alerts{unknown}, observationErrorClassInvalidResponse)
+		if sibling := requireAlertClass(t, alerts, "contracts-collapse"); sibling.Severity != SeverityPage || sibling.Sustain != 3 {
+			t.Error("malformed sibling altered genuine contract-rate outage evidence")
+		}
+	})
+}
+
+func testRequiredAggregateRunLoop(t *testing.T, fixture requiredAggregateFixture) {
+	t.Helper()
+	// Fail RED in this goroutine before an unguarded nil row can panic in a
+	// scheduler worker. Once corrected, exercise the actual public RunLoop.
+	source := &syntheticSource{postgresFn: func(string) ([]Row, error) { return nil, nil }}
+	signal := fixture.newSignal()
+	alerts, err, panicked := runRequiredAggregateSafely(NewWithSignals(syntheticSettings(source), signal))
+	if panicked {
+		t.Fatal("empty required aggregate panics; refusing to launch the unsafe loop worker")
+	}
+	if err == nil {
+		t.Fatal("empty required aggregate must be unknown before exercising recurrence")
+	}
+	requireAggregateVisibility(t, signal, alerts, observationErrorClassInvalidResponse)
+	synctest.Test(t, func(t *testing.T) {
+		next := 0
+		observations := [][]Row{nil, nil, {fixture.healthyRow}, nil, nil}
+		source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+			if !strings.Contains(query, fixture.queryMarker) {
+				return nil, nil // Legitimate empty optional GROUP BY observations.
+			}
+			if next >= len(observations) {
+				return nil, errors.New("unexpected synthetic aggregate cadence")
+			}
+			rows := observations[next]
+			next++
+			return rows, nil
+		}}
+		signal := fixture.newSignal()
+		settings := syntheticSettings(source)
+		settings.Now = time.Now
+		m := NewWithSignals(settings, signal)
+		ctx, cancel := context.WithCancel(context.Background())
+		handled := make(chan Alerts, 1)
+		done := make(chan error, 1)
+		go func() {
+			done <- m.RunLoop(ctx, func(_ context.Context, _ Signal, alerts Alerts) error {
+				handled <- alerts
+				return nil
+			})
+		}()
+		defer func() {
+			cancel()
+			synctest.Wait()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Error("public aggregate loop did not shut down cleanly")
+				}
+			default:
+				t.Error("public aggregate loop did not join after parent cancellation")
+			}
+			if len(handled) != 0 {
+				t.Error("parent shutdown manufactured an extra visibility finding")
+			}
+		}()
+		for tick, want := range []int{0, 1, 0, 0, 1} {
+			if tick > 0 {
+				time.Sleep(signal.Cadence())
+			}
+			synctest.Wait()
+			select {
+			case alerts := <-handled:
+				if len(alerts) != want {
+					t.Errorf("cadence %d emitted %d alerts, want %d", tick, len(alerts), want)
+				}
+				if want != 0 {
+					requireAggregateVisibility(t, signal, alerts, observationErrorClassInvalidResponse)
+				}
+			default:
+				t.Fatal("public loop did not finish the scheduled aggregate observation")
+			}
+		}
+		if next != len(observations) {
+			t.Error("public loop did not consume exactly the five required observations")
+		}
+	})
+}
+
+func taskCanaryAggregateFixture() requiredAggregateFixture {
+	return requiredAggregateFixture{NewTaskCanariesSignal, "run_end_time > now() - interval '3 minutes'", Row{"12"}}
+}
+
+func TestTaskCanariesAggregateShape(t *testing.T) {
+	testRequiredAggregateShape(t, taskCanaryAggregateFixture())
+}
+
+func TestTaskCanariesAggregateRunLoop(t *testing.T) {
+	testRequiredAggregateRunLoop(t, taskCanaryAggregateFixture())
+}
+
+func TestTaskCanariesAggregateZeroAndOptionalEmptyGroups(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		count         string
+		batteryFailed bool
+	}{
+		{name: "healthy count with empty groups", count: "12"},
+		{name: "affirmative zero with empty groups", count: "0"},
+		{name: "affirmative zero with optional battery loss", count: "0", batteryFailed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requiredReads, optionalReads, failureReads := 0, 0, 0
+			source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+				if strings.Contains(query, taskCanaryAggregateFixture().queryMarker) {
+					requiredReads++
+					return []Row{{test.count}}, nil
+				}
+				optionalReads++
+				if strings.Contains(query, "WITH failures AS") {
+					failureReads++
+					if test.batteryFailed && failureReads == 1 {
+						return nil, errors.New("permission denied: synthetic optional battery")
+					}
+				}
+				return nil, nil
+			}}
+			signal := NewTaskCanariesSignal()
+			alerts, err := NewWithSignals(syntheticSettings(source), signal).Run(context.Background())
+			if err != nil || requiredReads != 1 || optionalReads == 0 || signal.Cadence() != time.Minute {
+				t.Fatal("valid scalar or empty optional groups changed the canary source contract")
+			}
+			if test.count != "0" {
+				if len(alerts) != 0 {
+					t.Error("valid positive count and empty optional groups became an outage")
+				}
+				return
+			}
+			if len(alerts) != 1 {
+				t.Fatal("affirmative zero did not retain exactly one real canary finding")
+			}
+			alert := requireAlertClass(t, alerts, "canary-dead")
+			if alert.SignalID != signal.ID() || alert.Target != "pg-1" || alert.Severity != SeverityPage || alert.Sustain != 1 {
+				t.Error("affirmative canary zero changed identity, severity or sustain")
+			}
+			if test.batteryFailed && !strings.Contains(alert.Evidence, "task_error_battery=unavailable error_class="+observationErrorClassAccessDenied) {
+				t.Error("optional battery failure erased its qualifier or the real zero-count finding")
+			}
+		})
+	}
+}
 
 func TestTaskCanariesSignalSyntheticDeadCanary(t *testing.T) {
 	source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
@@ -138,6 +453,72 @@ func TestTaskCanariesSignalClassifiesTaskErrorsWithoutRenderingRawText(t *testin
 			t.Fatalf("complete task alert set leaked %q", forbidden)
 		}
 	}
+}
+
+// The wrapped-task diagnosis stays conditional and no private task reference
+// survives either of the public alert representations.
+func TestTaskCanariesSignalExplainsOptionalPostRecipientWithoutLeakingTask(t *testing.T) {
+	const privateId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+		switch {
+		case strings.Contains(query, "UpdateClientLocations"):
+			return []Row{{"12"}}, nil
+		case strings.Contains(query, "WITH history AS"):
+			return nil, nil
+		case strings.Contains(query, "WITH failures AS"):
+			return []Row{{"(*TaskWorker)", "1", "1", "0", "53", "3600", "Missing user auth. private task " + privateId, "120", "1", "post-missing-recipient=1", "18.6", "32", "8MB"}}, nil
+		default:
+			return nil, nil
+		}
+	}}
+	alerts, err := NewTaskCanariesSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "task-parked")
+	markdown := alert.Markdown()
+	for _, expected := range []string{"post-missing-recipient", "wrapped task post hook", "validated task reference", "natural retry", "If it is terminal PlaySubscriptionRenewal", "does not identify the wrapped task", "establish that its notice is optional"} {
+		if !strings.Contains(markdown, expected) {
+			t.Fatalf("missing %q from post guidance: %s", expected, markdown)
+		}
+	}
+	encoded, err := json.Marshal(alert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rendered := range []string{markdown, string(encoded)} {
+		for _, forbidden := range []string{privateId, "Missing user auth. private task"} {
+			if strings.Contains(rendered, forbidden) {
+				t.Fatal("post guidance leaked private task details")
+			}
+		}
+	}
+}
+
+// The same raw error in an ordinary task remains visible without acquiring
+// wrapper-specific deployment advice or permission to skip its failure.
+func TestTaskCanariesSignalDoesNotApplyPostRecipientGuidanceToOrdinaryTask(t *testing.T) {
+	source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+		switch {
+		case strings.Contains(query, "UpdateClientLocations"):
+			return []Row{{"12"}}, nil
+		case strings.Contains(query, "WITH history AS"):
+			return nil, nil
+		case strings.Contains(query, "WITH failures AS"):
+			return []Row{{"PlaySubscriptionRenewal", "1", "1", "0", "53", "3600", "Missing user auth. synthetic-private-task", "120", "1", "other=1", "18.6", "32", "8MB"}}, nil
+		default:
+			return nil, nil
+		}
+	}}
+	alerts, err := NewTaskCanariesSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "task-parked")
+	if !strings.Contains(alert.Markdown(), "representative_error_class=unclassified") {
+		t.Fatal("ordinary task lost its unclassified failure")
+	}
+	requireAlertOmits(t, alert, "post-missing-recipient", "wrapped task post hook", "typed missing-recipient skip", "synthetic-private-task")
 }
 
 func TestTaskCanariesSignalSyntheticOverdueAndParkedTasks(t *testing.T) {
@@ -892,7 +1273,7 @@ func TestTaskCanariesSignalDoesNotLetDominantCauseMisdescribeFamily(t *testing.T
 		"queued, cursor-batched CompletePayment retention path",
 		"verify typed-reset commit b8af229f in every active taskworker artifact",
 		"deploy it only to blocks whose artifact predates it",
-		"on already-current blocks, repeated rejection means the invalid configured wallet is still selected",
+		"confirm the typed pre-chain rejection, successful guarded reset, and current wallet selection",
 		"every active taskworker contains typed-reset commit b8af229f",
 		"never clear payment rows or keys manually",
 		"do not accelerate processor-rate-limit rows",
@@ -1000,9 +1381,9 @@ func TestTaskCanariesSignalExplainsInvalidDestinationRecovery(t *testing.T) {
 	for _, want := range []string{
 		"invalid for its declared chain",
 		"pre-fix chain-blind validator allowed a Solana base58 key to be stored as MATIC",
-		"definitively rejects the destination before creating a transfer",
-		"current taskworker clears only that typed pre-chain attempt automatically",
-		"same invalid wallet on the next retry",
+		"A typed definitive pre-chain rejection permits the guarded attempt reset",
+		"after a successful reset, an unchanged payout-wallet selection repeats the failure",
+		"This text class alone does not prove typed status, successful reset, or current wallet selection",
 		"one-hour-mean backoff",
 		"dispersed across 30–90 minutes",
 		"through the supported account API",
@@ -1015,6 +1396,77 @@ func TestTaskCanariesSignalExplainsInvalidDestinationRecovery(t *testing.T) {
 			t.Fatalf("invalid-destination alert missing %q:\n%s", want, markdown)
 		}
 	}
+	if strings.Contains(markdown, "representative_error_class=invalid-destination-reset-failed") {
+		t.Fatalf("ordinary invalid destination was misclassified as a reset failure:\n%s", markdown)
+	}
+}
+
+func TestTaskCanariesSignalExplainsInvalidDestinationResetFailureFromFullClass(t *testing.T) {
+	const privateId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	// The SQL-owned full-text class survives a representative truncated before
+	// the reset suffix; raw persistence details must never reach Markdown.
+	raw := "[" + privateId + "]Payment create transaction error = 400 Bad Request Invalid destination address. private.fixture.example 192.0.2.83"
+	source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+		switch {
+		case strings.Contains(query, "UpdateClientLocations"):
+			return []Row{{"12"}}, nil
+		case strings.Contains(query, "WITH failures AS"):
+			return []Row{{"AdvancePayment", "2", "2", "0", "8", "1800", raw, "120", "1", "invalid-destination-reset-failed=2"}}, nil
+		default:
+			return nil, nil
+		}
+	}}
+	alerts, err := NewTaskCanariesSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "task-parked")
+	for _, want := range []string{
+		"representative_error_class=invalid-destination-reset-failed",
+		"failed guarded attempt reset",
+		"concurrent, terminal, or on-chain state from a persistence failure",
+		"Preserve the existing idempotency key",
+		"Do not infer unchanged wallet configuration",
+		"without duplicate transfers",
+	} {
+		if !strings.Contains(alert.Markdown(), want) {
+			t.Errorf("reset-failure alert missing %q", want)
+		}
+	}
+	requireAlertOmits(t, alert, privateId, "private.fixture.example", "192.0.2.83", "Correct the network's payout wallet", "current taskworker already releases", "undersized task-specific MaxTime")
+	for _, private := range []string{privateId, "private.fixture.example", "192.0.2.83"} {
+		if strings.Contains(alerts.Markdown(), private) {
+			t.Errorf("complete alert set retained private detail %q", private)
+		}
+	}
+}
+
+func TestTaskCanariesSignalMixedResetFailureDoesNotInventWalletCorrection(t *testing.T) {
+	source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+		switch {
+		case strings.Contains(query, "UpdateClientLocations"):
+			return []Row{{"12"}}, nil
+		case strings.Contains(query, "WITH failures AS"):
+			return []Row{{"AdvancePayment", "9", "8", "1", "8", "1800", "insufficient token balance", "120", "2", "wallet-insufficient=7,invalid-destination-reset-failed=2"}}, nil
+		default:
+			return nil, nil
+		}
+	}}
+	alerts, err := NewTaskCanariesSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "task-parked")
+	for _, want := range []string{
+		"2 distinct error classes", "fund or pause the payout wallet for wallet-insufficient rows",
+		"investigate the guarded attempt reset", "preserve the existing idempotency key",
+		"invalid-destination-reset-failed clears",
+	} {
+		if !strings.Contains(alert.Markdown(), want) {
+			t.Errorf("mixed reset-failure alert missing %q", want)
+		}
+	}
+	requireAlertOmits(t, alert, "correct a proven chain-mismatched", "supported account API", "verify typed-reset commit", "unchanged wallet is still selected")
 }
 
 func TestTaskCanariesSignalExplainsNonDrainDeadlineCancellation(t *testing.T) {
@@ -1367,10 +1819,10 @@ func TestTaskCanariesSignalExplainsCloseCohortDeadline(t *testing.T) {
 	for _, want := range []string{
 		"task row does not contain the selected cohort size",
 		"matching live selection log",
-		"older 100,000-contract generation from the current 25,000 cap",
+		"merged count above 25,000 does not prove an older generation",
 		"per-contract commits made durable progress",
-		"If n exceeds 25,000",
-		"if n is already at or below 25,000",
+		"actual executor artifact and per-scan cap/count authority",
+		"existing 25,000 per-scan cap",
 		"92-worker inner pool",
 		"older-than-five-minute open set falls",
 	} {
@@ -1380,6 +1832,39 @@ func TestTaskCanariesSignalExplainsCloseCohortDeadline(t *testing.T) {
 	}
 	if strings.Contains(markdown, "The deployed closer selected one 100,000-contract cohort") {
 		t.Fatalf("close timeout diagnosis invented an unobserved deployed cohort size: %s", markdown)
+	}
+	if strings.Contains(markdown, "If n exceeds 25,000") || strings.Contains(markdown, "Live selection stays at or below 25,000") {
+		t.Fatal("combined selection count was mistaken for a single-scan cap")
+	}
+}
+
+// Prompt retry is not financial recovery. The existing grouped failure row
+// must remain visible independently of the more-than-five-minute parked count.
+func TestTaskCanariesCloseRejectionRemainsVisibleWithPromptRetry(t *testing.T) {
+	source := &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+		switch {
+		case strings.Contains(query, "UpdateClientLocations"):
+			return []Row{{"12"}}, nil
+		case strings.Contains(query, "WITH failures AS"):
+			return []Row{{"CloseExpiredContracts", "1", "0", "0", "17", "90",
+				"Escrow does not have enough value to pay out the full amount.\ncontract remained non-final after force-close attempt",
+				"1800", "1", "other=1"}}, nil
+		default:
+			return nil, nil
+		}
+	}}
+	alerts, err := NewTaskCanariesSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal("synthetic prompt-retry observation failed")
+	}
+	alert := requireAlertClass(t, alerts, "task-parked")
+	if alert.Severity != SeverityWarn || alert.Sustain != 1 || alert.Frame != "CloseExpiredContracts" {
+		t.Fatal("prompt retry hid or changed the unresolved failure identity")
+	}
+	for _, want := range []string{"failing_rows=1", "parked_over_5m=0", "max_errors=17", "sample_run_at_in_s=90"} {
+		if !strings.Contains(alert.Observed, want) || !strings.Contains(alert.Markdown(), want) {
+			t.Errorf("prompt financial retry omitted fixed evidence %q", want)
+		}
 	}
 }
 

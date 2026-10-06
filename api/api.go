@@ -3,8 +3,10 @@ package api
 import (
 	"github.com/urnetwork/server/api/handlers"
 	"github.com/urnetwork/server/controller"
+	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/oauth"
 	"github.com/urnetwork/server/router"
+	"time"
 )
 
 // Routes returns the full set of api routes.
@@ -18,13 +20,40 @@ import (
 // service; the routes themselves are path-matched, so they answer on either
 // host. The issuer published in the discovery documents is what clients use.
 func Routes() []*router.Route {
-	return routesWithReservedAttemptUpload(nil)
+	return routesWithReservedAttemptUpload(nil, routeOwners{})
+}
+
+// The background owners only the API lifecycle supplies. A nil owner leaves
+// its route bare: the route never starts one itself.
+type routeOwners struct {
+	notifications *model.ContractOriginNotifications
+	appearances   *model.ProviderAppearances
 }
 
 // Only the API lifecycle supplies this authenticated cache; the route never
 // starts a background owner or dials a provider on an upload request.
-func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUpload) []*router.Route {
+func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUpload, owners routeOwners) []*router.Route {
+	providerWork := handlers.NewProviderWorkHandlers()
+	verifyRequestClosure := handlers.NewVerifyRequestClosureHandlers()
+	providerWorkBody := router.StreamingBody{IdleTimeout: 60 * time.Second, TransferTimeout: 60 * time.Second, ResponseTimeout: 300 * time.Second, DrainTimeout: 5 * time.Second}
+	connectControl := handlers.ConnectControl
+	if owners.notifications != nil {
+		connectControl = handlers.ConnectControlWithOriginNotifications(owners.notifications)
+	}
+	findProviders2 := handlers.NetworkFindProviders2
+	if owners.appearances != nil {
+		findProviders2 = handlers.NetworkFindProviders2WithAppearances(owners.appearances)
+	}
 	routes := []*router.Route{
+		router.NewStreamingRoute("POST", "/provider-work/v1/owners", providerWork.ServeHTTP, providerWorkBody),
+		router.NewRoute("GET", "/provider-work/v1/owners", providerWork.ServeHTTP),
+		router.NewRoute("GET", "/provider-work/v1/requests", providerWork.ServeHTTP),
+		router.NewStreamingRoute("POST", "/provider-work/v1/requests", providerWork.ServeHTTP, providerWorkBody),
+		router.NewRoute("GET", "/provider-work/v1/requests/([^/]+)", providerWork.ServeHTTP),
+		router.NewStreamingRoute("POST", "/provider-work/v1/cuts", providerWork.ServeHTTP, providerWorkBody),
+		router.NewRoute("GET", "/provider-work/v1/cuts/([^/]+)", providerWork.ServeHTTP),
+		router.NewStreamingRoute("POST", "/provider-work/v1/authorities", providerWork.ServeHTTP, providerWorkBody),
+		router.NewRoute("GET", "/provider-work/v1/windows", providerWork.ServeHTTP),
 		router.NewRoute("GET", "/privacy.txt", router.Txt),
 		router.NewRoute("GET", "/terms.txt", router.Txt),
 		router.NewRoute("GET", "/vdp.txt", router.Txt),
@@ -84,16 +113,30 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("POST", "/auth/regenerate-seedphrase", handlers.AuthRegenerateSeedphrase),
 		router.NewRoute("POST", "/auth/generate-seedphrase", handlers.AuthGenerateSeedphrase),
 		router.NewRoute("POST", "/network/auth-client", handlers.AuthNetworkClient),
+		router.NewRoute("POST", "/network/register-client-v1", handlers.RegisterNetworkClient),
 		router.NewRoute("POST", "/network/remove-client", handlers.RemoveNetworkClient),
 		router.NewRoute("POST", "/network/remove-clients", handlers.RemoveNetworkClients),
 		// a provider offering itself as an extender; the handler probes the
 		// caller address back before anything is stored (connect/EXTENDER.md C2)
 		router.NewRoute("POST", "/network/extender-activate", handlers.ExtenderActivate),
+		// the continent a client tries extenders on first, and the provider
+		// latency attestations an extender forwards (connect/DESIGNNOTES4.md);
+		// the latter stays for one release beside the ping report that
+		// supersedes it (connect/GEOMAP.md D14)
+		router.NewRoute("GET", "/network/extender-hint", handlers.ExtenderHint),
+		router.NewRoute("POST", "/network/extender-latency", handlers.ExtenderLatencyReport),
+		// the pings a provider or an extender measured, reported by the pinger
+		// with the target's co-signature (connect/GEOMAP.md §2.5)
+		router.NewRoute("POST", "/network/ping-report", handlers.ExtenderPingReport),
 		router.NewRoute("POST", "/network/provider-egress-location", handlers.ProviderEgressLocationSubmit),
 		router.NewRoute("GET", "/network/provider-egress-due", handlers.ProviderEgressLocationDue),
 		router.NewRoute("GET", "/network/provider-blackhole-due", handlers.ProviderBlackholeCheckDue),
 		router.NewRoute("POST", "/network/provider-blackhole-checks", handlers.SubmitProviderBlackholeChecks),
 		router.NewRoute("POST", "/network/provider-egress-attempt", handlers.ProviderEgressLocationAttempt),
+		// operator-to-server, same operator secret: the destination pool the
+		// prober loads each pass (connect/GEOMAP.md §11.4), in the prober
+		// module's own Pool shape
+		router.NewRoute("GET", "/network/provider-egress-destinations", handlers.ProviderEgressDestinations),
 		// operator-to-server, same operator secret as the egress routes above:
 		// the prober fetching the network client jwt that the bootstrap task
 		// minted for it. This is what makes the credential arrive without a
@@ -137,7 +180,11 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("GET", "/network/peers", handlers.NetworkPeers),
 		router.NewRoute("GET", "/network/provider-locations", handlers.NetworkGetProviderLocations),
 		router.NewRoute("POST", "/network/find-provider-locations", handlers.NetworkFindProviderLocations),
-		router.NewRoute("POST", "/network/find-providers2", handlers.NetworkFindProviders2), router.NewRoute("GET", "/network/user", handlers.GetNetworkUser),
+		router.NewRoute("POST", "/network/find-providers2", findProviders2),
+		router.NewRoute("GET", "/network/user", handlers.GetNetworkUser),
+		// the caller's own providers: why each is or is not offered to clients,
+		// with its FindProviders2 appearances per minute over the last hour
+		router.NewRoute("GET", "/network/provider-status", handlers.GetProviderStatus),
 		router.NewRoute("POST", "/network/user/update", handlers.UpdateNetworkName),
 		router.NewRoute("GET", "/network/ranking", handlers.GetLeaderboardNetworkRanking),
 		router.NewRoute("POST", "/network/ranking-visibility", handlers.SetNetworkLeaderboardPublic),
@@ -161,6 +208,7 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("POST", "/pay/play", handlers.PlayWebhook),
 		router.NewRoute("POST", "/pay/solana", handlers.HeliusWebhook),
 		router.NewRoute("POST", "/solana/payment-intent", handlers.CreateSolanaPaymentIntent),
+		router.NewRoute("POST", "/solana/payment-transaction", handlers.CreateSolanaPaymentTransaction),
 		router.NewRoute("POST", "/stripe/payment-intent", handlers.CreateStripePaymentIntent),
 		router.NewRoute("POST", "/stripe/customer-portal", handlers.StripeCreateCustomerPortal),
 		router.NewRoute("POST", "/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession),
@@ -173,6 +221,10 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("POST", "/wallet/circle-init", handlers.WalletCircleInit),
 		router.NewRoute("POST", "/wallet/circle-transfer-out", handlers.WalletCircleTransferOut),
 		router.NewRoute("GET", "/subscription/balance", handlers.SubscriptionBalance),
+		// acceptance-test only: drains the caller's own balance; refused unless
+		// the caller's network is in the vault allowlist (acceptance-balance-drain.yml)
+		router.NewRoute("POST", "/test/balance-drain", handlers.TestBalanceDrain),
+		router.NewRoute("POST", "/test/balance-restore", handlers.TestBalanceRestore),
 		// onboarding program (mmm/onboarding/PLAN.md): the welcome offer, the
 		// closed client event schema, the campaign token endpoints and the
 		// inline Stripe payment sheet
@@ -218,9 +270,12 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("GET", "/device/associations", handlers.DeviceAssociations),
 		router.NewRoute("POST", "/device/remove-association", handlers.DeviceRemoveAssociation),
 		router.NewRoute("POST", "/device/set-association-name", handlers.DeviceSetAssociationName),
-		router.NewRoute("POST", "/device/set-name", handlers.DeviceSetName), router.NewRoute("POST", "/connect/control", handlers.ConnectControl),
+		router.NewRoute("POST", "/device/set-name", handlers.DeviceSetName), router.NewRoute("POST", "/connect/control", connectControl),
 		// Unauthenticated public-key lookup; see handlers.GetClientKey.
 		router.NewRoute("GET", "/key/([^/]+)", handlers.GetClientKey),
+		// Signed registration history for a client id. Empty list, not an
+		// error, when this operator does not run the signed path.
+		router.NewRoute("GET", "/key/([^/]+)/history", handlers.GetClientKeyHistory),
 		router.NewRoute("POST", "/sn/client-key/observation", handlers.SnClientKeyObservation),
 		router.NewRoute("POST", "/sn/client-key/observations", handlers.SnClientKeyObservations),
 		// routing verification (sn/VALIDATOR.md); auth is the protocol's own
@@ -229,8 +284,12 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("GET", "/verify/keys", handlers.GetVerifyKeys),
 		router.NewRoute("GET", "/verify/stats", handlers.GetVerifyStats),
 		router.NewRoute("GET", "/verify/proofs", handlers.GetVerifyProofs),
+		router.NewRoute("POST", "/verify/original", handlers.GetVerifyOriginalRequest),
+		router.NewStreamingRoute("POST", "/verify/original/close", verifyRequestClosure.ServeHTTP, providerWorkBody),
 		// subnet control plane (sn/PLAN.md §5, D-13)
 		router.NewRoute("POST", "/sn/wallet", handlers.SnSetWallet),
+		router.NewRoute("POST", "/sn/wallet/consent", handlers.SnWalletMappingChallenge),
+		router.NewRoute("POST", "/sn/wallet/consent/history", handlers.SnWalletMappingHistory),
 		router.NewRoute("GET", "/sn/wallet", handlers.SnGetWallet),
 		router.NewRoute("POST", "/sn/wallet/validate", handlers.SnValidateWallet),
 		router.NewRoute("GET", "/sn/head", handlers.SnHead),

@@ -30,6 +30,9 @@ type Route struct {
 	id       string
 	captures bool
 	index    int
+	// the body policy of a route that streams its body on every front, lb or
+	// not (NewStreamingRoute); nil streams only on the lb's mark
+	streaming *StreamingBody
 }
 
 func NewRoute(method string, pattern string, handler http.HandlerFunc) *Route {
@@ -44,6 +47,16 @@ func NewRoute(method string, pattern string, handler http.HandlerFunc) *Route {
 	}
 }
 
+// NewStreamingRoute is a route whose request body streams from the client
+// on every front, with its own StreamingBody policy. The pattern syntax is
+// the one a warp `streamable_paths` entry uses, so the lb entry for the
+// route is this pattern.
+func NewStreamingRoute(method string, pattern string, handler http.HandlerFunc, streaming StreamingBody) *Route {
+	route := NewRoute(method, pattern, handler)
+	route.streaming = &streaming
+	return route
+}
+
 func (self *Route) String() string {
 	return self.id
 }
@@ -56,6 +69,8 @@ type Router struct {
 	trie    *routeTrie
 	stats   *RouterStats
 	metrics *httpMetrics
+	// the policy for a request the lb marks as streamed (StreamingBody)
+	streaming StreamingBody
 }
 
 func NewRouter(ctx context.Context, routes []*Route) *Router {
@@ -66,6 +81,14 @@ func NewRouter(ctx context.Context, routes []*Route) *Router {
 		stats:   NewRouterStats(ctx, 60*time.Second),
 		metrics: defaultHttpMetrics,
 	}
+}
+
+// SetStreamingBody sets the policy applied to a request whose body the lb
+// streams (RequestBufferingHeader). The zero policy only drains a body the
+// handler left unread after an early response; a service sets deadlines
+// that match its HttpServerOptions.
+func (self *Router) SetStreamingBody(streaming StreamingBody) {
+	self.streaming = streaming
 }
 
 // ServeHTTP matches the request via the trie, then dispatches. Only routes with
@@ -93,6 +116,9 @@ func (self *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	observation, writer := beginHttpRequest(self.metrics, route.id, w, r)
 
+	// set once the route streams its body; the recover below drains it too
+	var body *streamingBody
+
 	defer func() {
 		if err := recover(); err != nil {
 			// Preserve net/http's exact transport-abort signal, including after
@@ -102,11 +128,19 @@ func (self *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				panic(err)
 			}
 			if server.IsDoneError(err) {
-				// A Done panic is the standard cancellation path. In particular,
-				// Connect can observe it after Gorilla has hijacked the H1 socket;
-				// net/http no longer owns that connection and any attempted error
-				// response produces a write-after-hijack warning. Consume the
-				// lifecycle signal without falling through to http.Error.
+				// A child operation can expire while the HTTP caller is still
+				// alive (for example the 25s due query inside its 30s request).
+				// Returning without a response would forge an empty successful
+				// 200. Hijacked sockets and canceled callers retain their owner;
+				// an already committed response must abort instead of completing
+				// a truncated body or appending an error under its old status.
+				if !observation.writer.hijacked && r.Context().Err() == nil {
+					if observation.writer.status != 0 {
+						observation.finish("aborted")
+						panic(http.ErrAbortHandler)
+					}
+					http.Error(writer, "Service temporarily unavailable.", http.StatusServiceUnavailable)
+				}
 				observation.finish("canceled")
 				return
 			}
@@ -121,6 +155,12 @@ func (self *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				defer recover()
 				http.Error(writer, "Error. Please email support@ur.io for help.", http.StatusInternalServerError)
 			}()
+			if body != nil && !observation.writer.hijacked {
+				func() {
+					defer recover()
+					body.drain()
+				}()
+			}
 			observation.finish("panic")
 			return
 		}
@@ -138,10 +178,18 @@ func (self *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req = r.WithContext(context.WithValue(r.Context(), pathValuesKey{}, pathValues))
 	}
 
+	if policy, ok := self.streamingPolicy(route, req); ok {
+		body = newStreamingBody(req.Body, writer, policy)
+		req.Body = body
+	}
+
 	startTime := time.Now()
 	route.handler(writer, req)
 	endTime := time.Now()
 	self.stats.Success(route.id, endTime.Sub(startTime))
+	if body != nil && !observation.writer.hijacked {
+		body.drain()
+	}
 }
 
 // FlushStats logs the current stats buckets immediately. Called at drain end

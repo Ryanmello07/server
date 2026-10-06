@@ -64,6 +64,8 @@ type linkPacket struct {
 	duplicatePacket *linkPacket
 	orderIndex      uint64
 	heapIndex       int
+	// Nil except in the explicitly scoped request-prefix experiment.
+	fenceEpoch *directionalLinkFenceEpoch
 }
 
 // The release heap orders time first and admission order second.
@@ -201,6 +203,12 @@ type linkScheduleTestHook struct {
 	call func(linkScheduleObservation)
 }
 
+// A synthetic fault decision is installed only by an explicit experiment.
+// The callback borrows bytes for header classification and may not retain them.
+type linkLossTestHook struct {
+	drop func([]byte) bool
+}
+
 // One goroutine owns random decisions, rate state, and release ordering.
 type directionalLink struct {
 	ctx       context.Context
@@ -216,16 +224,17 @@ type directionalLink struct {
 	// after shutdown closes admission and begins its single Wait.
 	submissionWaitGroup sync.WaitGroup
 
-	stateLock                  sync.Mutex
-	profile                    linkProfile
-	closed                     bool
-	activeSubmissionCount      int
-	queuedPacketCount          int
-	queuedByteCount            int
-	maximumQueuedPacket        int
-	maximumQueuedByte          int
-	maximumSubmittedPacketByte int
-	measurementMaximum         *directionalLinkMaximumEpoch
+	stateLock                   sync.Mutex
+	profile                     linkProfile
+	closed                      bool
+	activeSubmissionCount       int
+	queuedPacketCount           int
+	queuedByteCount             int
+	maximumQueuedPacket         int
+	maximumQueuedByte           int
+	maximumSubmittedPacketByte  int
+	measurementMaximum          *directionalLinkMaximumEpoch
+	fenceCurrent, fencePrevious *directionalLinkFenceEpoch
 
 	nextSequence     atomic.Uint64
 	submittedPackets atomic.Uint64
@@ -241,6 +250,8 @@ type directionalLink struct {
 	beforeSubmissionWaitForTest  func()
 	afterReorderPairForTest      func()
 	afterPacketScheduledForTest  atomic.Pointer[linkScheduleTestHook]
+	forcedLossForTest            atomic.Pointer[linkLossTestHook]
+	packetTraceForTest           atomic.Pointer[linkPacketTraceHook]
 }
 
 // A nil callback removes the observer without racing the scheduler goroutine.
@@ -365,12 +376,18 @@ func (self *directionalLink) submitPacket(
 	self.stateLock.Lock()
 	if self.closed {
 		self.stateLock.Unlock()
+		self.tracePacketForTest("closed", 0, packetBytes, linkScheduleObservation{})
 		return 0, errLinkClosed
 	}
 	if self.activeSubmissionCount == 0 && self.queuedPacketCount == 0 {
 		self.idle = make(chan struct{})
 	}
 	self.activeSubmissionCount += 1
+	fenceEpoch := self.fenceCurrent
+	if fenceEpoch != nil {
+		fenceEpoch.pending++ // submit remains owned until counters publish
+		fenceEpoch.startedSubmissions++
+	}
 	self.maximumSubmittedPacketByte = max(self.maximumSubmittedPacketByte, packetByteCount)
 	if self.measurementMaximum != nil {
 		self.measurementMaximum.maximumSubmittedPacketByte = max(
@@ -380,10 +397,12 @@ func (self *directionalLink) submitPacket(
 	}
 	self.submissionWaitGroup.Add(1)
 	defer self.submissionWaitGroup.Done()
-	defer self.finishSubmission()
+	defer self.finishSubmission(fenceEpoch)
 	profile := self.profile
 	if profile.OuterMtu < packetByteCount {
 		self.stateLock.Unlock()
+		self.tracePacketForTest("mtu-drop", 0, packetBytes, linkScheduleObservation{})
+		self.invalidateFence(fenceEpoch)
 		if self.afterImmediateDropForTest != nil {
 			self.afterImmediateDropForTest()
 		}
@@ -406,6 +425,8 @@ func (self *directionalLink) submitPacket(
 	if profile.QueuePacketCount <= self.queuedPacketCount ||
 		profile.QueueByteCount < self.queuedByteCount+packetByteCount {
 		self.stateLock.Unlock()
+		self.tracePacketForTest("queue-drop", 0, packetBytes, linkScheduleObservation{})
+		self.invalidateFence(fenceEpoch)
 		if self.afterImmediateDropForTest != nil {
 			self.afterImmediateDropForTest()
 		}
@@ -420,6 +441,9 @@ func (self *directionalLink) submitPacket(
 	}
 	self.queuedPacketCount += 1
 	self.queuedByteCount += packetByteCount
+	if fenceEpoch != nil {
+		fenceEpoch.pending++ // separate queue ownership may outlive submit
+	}
 	self.maximumQueuedPacket = max(self.maximumQueuedPacket, self.queuedPacketCount)
 	self.maximumQueuedByte = max(self.maximumQueuedByte, self.queuedByteCount)
 	if self.measurementMaximum != nil {
@@ -449,6 +473,7 @@ func (self *directionalLink) submitPacket(
 		packetBytes: ownedPacketBytes,
 		deliver:     deliver,
 		heapIndex:   -1,
+		fenceEpoch:  fenceEpoch,
 	}
 	admissionUnixNano := time.Now().UnixNano()
 	select {
@@ -459,19 +484,20 @@ func (self *directionalLink) submitPacket(
 		return packetByteCount, nil
 	default:
 		self.counters.queueDropPacketCount.Add(1)
+		self.tracePacketForTest("queue-drop", packet.sequence, packet.packetBytes, linkScheduleObservation{})
 		recordLinkDropPolicy(
 			profile.AllowQueueDrops,
 			&self.counters.allowedQueueDropPacketCount,
 			&self.counters.unexpectedQueueDropPacketCount,
 		)
-		self.releaseQueue(packetByteCount)
+		self.releasePacketQueue(packet, true)
 		return packetByteCount, nil
 	}
 }
 
 // Completion publishes every immediate drop and counter update before the
 // live idle boundary can close its current submission generation.
-func (self *directionalLink) finishSubmission() {
+func (self *directionalLink) finishSubmission(fenceEpoch *directionalLinkFenceEpoch) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.activeSubmissionCount -= 1
@@ -481,6 +507,7 @@ func (self *directionalLink) finishSubmission() {
 	if self.activeSubmissionCount == 0 && self.queuedPacketCount == 0 {
 		close(self.idle)
 	}
+	self.finishFenceOwnerWithLock(fenceEpoch)
 }
 
 // Every completed submit wakes count-based workload boundaries. Coalescing is
@@ -507,7 +534,7 @@ func (self *directionalLink) waitForSubmissionCount(ctx context.Context, target 
 }
 
 // A duplicate is admitted against the same hard queue bounds.
-func (self *directionalLink) reserveDuplicate(packetByteCount int) bool {
+func (self *directionalLink) reserveDuplicate(packetByteCount int, fenceEpoch *directionalLinkFenceEpoch) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.closed || self.profile.QueuePacketCount <= self.queuedPacketCount ||
@@ -519,6 +546,10 @@ func (self *directionalLink) reserveDuplicate(packetByteCount int) bool {
 	}
 	self.queuedPacketCount += 1
 	self.queuedByteCount += packetByteCount
+	if fenceEpoch != nil {
+		fenceEpoch.pending++
+		fenceEpoch.duplicates++
+	}
 	self.maximumQueuedPacket = max(self.maximumQueuedPacket, self.queuedPacketCount)
 	self.maximumQueuedByte = max(self.maximumQueuedByte, self.queuedByteCount)
 	if self.measurementMaximum != nil {
@@ -535,17 +566,21 @@ func (self *directionalLink) reserveDuplicate(packetByteCount int) bool {
 }
 
 // Every terminal delivery or drop releases one queue reservation.
-func (self *directionalLink) releaseQueue(packetByteCount int) {
+func (self *directionalLink) releasePacketQueue(packet *linkPacket, invalid bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.queuedPacketCount -= 1
-	self.queuedByteCount -= packetByteCount
+	self.queuedByteCount -= len(packet.packetBytes)
 	if self.queuedPacketCount < 0 || self.queuedByteCount < 0 {
 		panic("simulated link queue ownership became negative")
 	}
 	if self.activeSubmissionCount == 0 && self.queuedPacketCount == 0 {
 		close(self.idle)
 	}
+	if packet.fenceEpoch != nil && invalid {
+		packet.fenceEpoch.invalidTerminals++
+	}
+	self.finishFenceOwnerWithLock(packet.fenceEpoch)
 }
 
 // A serialized update makes dynamic event boundaries observable and replayable.
@@ -906,28 +941,30 @@ func (self *directionalLink) run(seed int64) {
 	}
 
 	releasePacket := func(packet *linkPacket) {
-		finishWireTerminal := func() {
+		finishWireTerminal := func(invalid bool) {
 			self.counters.lastWireTerminalUnixNano.Store(time.Now().UnixNano())
-			self.releaseQueue(len(packet.packetBytes))
+			self.releasePacketQueue(packet, invalid)
 		}
 		switch packet.terminalDropCause {
 		case linkTerminalDropLoss:
+			self.tracePacketForTest("loss-drop", packet.sequence, packet.packetBytes, linkScheduleObservation{})
 			self.counters.lossDropPacketCount.Add(1)
 			recordLinkDropPolicy(
 				packet.terminalDropAllowed,
 				&self.counters.allowedLossDropPacketCount,
 				&self.counters.unexpectedLossDropPacketCount,
 			)
-			finishWireTerminal()
+			finishWireTerminal(!packet.terminalDropAllowed)
 			return
 		case linkTerminalDropOutage:
+			self.tracePacketForTest("outage-drop", packet.sequence, packet.packetBytes, linkScheduleObservation{})
 			self.counters.outageDropPacketCount.Add(1)
 			recordLinkDropPolicy(
 				packet.terminalDropAllowed,
 				&self.counters.allowedOutageDropPacketCount,
 				&self.counters.unexpectedOutageDropPacketCount,
 			)
-			finishWireTerminal()
+			finishWireTerminal(!packet.terminalDropAllowed)
 			return
 		}
 		if packet.sequence < highestReleasedSequence {
@@ -941,15 +978,18 @@ func (self *directionalLink) run(seed int64) {
 			deliver = self.deliver
 		}
 		if deliver != nil {
+			self.tracePacketForTest("delivery-offer", packet.sequence, packet.packetBytes, linkScheduleObservation{})
 			accepted = deliver(packet.packetBytes)
 		}
 		if accepted {
+			self.tracePacketForTest("delivered", packet.sequence, nil, linkScheduleObservation{})
 			self.counters.deliveredPacketCount.Add(1)
 			self.counters.deliveredByteCount.Add(uint64(len(packet.packetBytes)))
 		} else {
+			self.tracePacketForTest("receiver-drop", packet.sequence, nil, linkScheduleObservation{})
 			self.counters.receiverDropPacketCount.Add(1)
 		}
-		finishWireTerminal()
+		finishWireTerminal(!accepted)
 	}
 
 	processPacket := func(packet *linkPacket) {
@@ -958,7 +998,11 @@ func (self *directionalLink) run(seed int64) {
 		self.stateLock.Unlock()
 		terminalDropCause := linkTerminalDropNone
 		terminalDropAllowed := false
-		if profile.Blackhole &&
+		fault := self.forcedLossForTest.Load()
+		if fault != nil && fault.drop(packet.packetBytes) {
+			terminalDropCause = linkTerminalDropLoss
+			terminalDropAllowed = true
+		} else if profile.Blackhole &&
 			!(profile.BlackholeExceptStun && p2pOuterPacketIsStun(packet.packetBytes)) {
 			terminalDropCause = linkTerminalDropOutage
 			terminalDropAllowed = true
@@ -1041,7 +1085,7 @@ func (self *directionalLink) run(seed int64) {
 		var duplicateReleaseTime time.Time
 		if terminalDropCause == linkTerminalDropNone &&
 			random.Float64() < profile.DuplicateProbability &&
-			self.reserveDuplicate(len(packet.packetBytes)) {
+			self.reserveDuplicate(len(packet.packetBytes), packet.fenceEpoch) {
 			// A duplicate is another physical outer packet. It consumes the next
 			// token serialization without drawing another stochastic decision.
 			rateCursor = rateCursor.Add(serializationDuration)
@@ -1066,6 +1110,7 @@ func (self *directionalLink) run(seed int64) {
 				releaseTime: duplicateReleaseTime,
 				orderIndex:  orderIndex,
 				heapIndex:   -1,
+				fenceEpoch:  packet.fenceEpoch,
 			}
 			heap.Push(packets, duplicate)
 			packet.duplicatePacket = duplicate
@@ -1086,6 +1131,10 @@ func (self *directionalLink) run(seed int64) {
 				duplicateReleaseTime:   duplicateReleaseTime,
 			})
 		}
+		self.tracePacketForTest("scheduled", packet.sequence, packet.packetBytes, linkScheduleObservation{
+			scheduleTime: now, rateReadyTime: rateReady, releaseTime: releaseTime,
+			terminalDropCause: terminalDropCause,
+		})
 	}
 
 	for {
@@ -1119,14 +1168,16 @@ func (self *directionalLink) run(seed int64) {
 			for {
 				select {
 				case packet := <-self.ingress:
+					self.tracePacketForTest("canceled", packet.sequence, packet.packetBytes, linkScheduleObservation{})
 					self.counters.canceledDropPacketCount.Add(1)
-					self.releaseQueue(len(packet.packetBytes))
+					self.releasePacketQueue(packet, true)
 				default:
 					for 0 < packets.Len() {
 						packet := heap.Pop(packets).(*linkPacket)
+						self.tracePacketForTest("canceled", packet.sequence, packet.packetBytes, linkScheduleObservation{})
 						self.counters.canceledDropPacketCount.Add(1)
 						self.counters.lastWireTerminalUnixNano.Store(time.Now().UnixNano())
-						self.releaseQueue(len(packet.packetBytes))
+						self.releasePacketQueue(packet, true)
 					}
 					return
 				}

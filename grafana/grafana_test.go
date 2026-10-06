@@ -81,6 +81,33 @@ type testPanel struct {
 	Targets []testTarget `json:"targets"`
 }
 
+func TestHostMetricsDashboardShowsTotalMemoryBesideCPUCores(t *testing.T) {
+	dashboard := readTestDashboard(t, "host-metrics.json")
+	cpu := dashboardPanelById(dashboard, 5)
+	memory := dashboardPanelById(dashboard, 14)
+	if cpu == nil || memory == nil {
+		t.Fatal("host capacity stats are missing")
+	}
+	if cpu.Title != "total cpu cores" || memory.Title != "total memory" || memory.Type != "stat" {
+		t.Fatalf("capacity panel titles/types: cpu=%q memory=%q type=%q", cpu.Title, memory.Title, memory.Type)
+	}
+	if memory.FieldConfig.Defaults.Unit != "bytes" || len(memory.Targets) != 1 ||
+		memory.Targets[0].Expr != `sum(max by (host) (node_memory_MemTotal_bytes{env="$env"}))` {
+		t.Fatalf("total memory has wrong unit or host-deduplicated source: unit=%q targets=%+v", memory.FieldConfig.Defaults.Unit, memory.Targets)
+	}
+	if cpu.GridPos.Y != memory.GridPos.Y || cpu.GridPos.X+cpu.GridPos.W != memory.GridPos.X ||
+		memory.GridPos.X+memory.GridPos.W != 24 {
+		t.Fatalf("capacity stats do not share the fleet row: cpu=%+v memory=%+v", cpu.GridPos, memory.GridPos)
+	}
+}
+
+func TestEgressDashboardUsesProviderQualityName(t *testing.T) {
+	dashboard := readTestDashboard(t, "egress-probes.json")
+	if dashboard.Title != "urnetwork / provider quality probes" {
+		t.Fatalf("dashboard title = %q", dashboard.Title)
+	}
+}
+
 func TestEgressProbeDashboardUsesPopulationAwareOutcomeClasses(t *testing.T) {
 	dashboard := readTestDashboard(t, "egress-probes.json")
 	failures := dashboardPanelById(dashboard, 8)
@@ -91,13 +118,24 @@ func TestEgressProbeDashboardUsesPopulationAwareOutcomeClasses(t *testing.T) {
 		t.Fatalf("egress failure panel title = %q", failures.Title)
 	}
 	expression := failures.Targets[0].Expr
-	for _, class := range []string{
-		"tunnel_failed", "contract_failed", "no_consensus", "locate_failed",
-		"not_confident", "submit_failed", "unknown_failure",
-	} {
-		if !strings.Contains(expression, class) {
-			t.Errorf("egress failure expression omits %q: %s", class, expression)
-		}
+	// exactly the failure vocabulary of the fleet outcome tally, as monitor
+	// signal §2.23 counts it: the classes the prober reports, the run guard's,
+	// the redacted unknown bucket, and the consensus classes, which read zero
+	// once the attempts that carry them age out
+	failureClasses := []string{
+		"tunnel_failed", "contract_failed", "health_not_run", "run_not_measured",
+		"no_exit_ip", "submit_failed", "run_batch_guard", "no_consensus",
+		"locate_failed", "not_confident", "unknown_failure",
+	}
+	resultMatch := regexp.MustCompile(`result=~"([^"]*)"`).FindStringSubmatch(expression)
+	if resultMatch == nil {
+		t.Fatalf("egress failure expression does not select its classes by result: %s", expression)
+	}
+	selectedClasses := strings.Split(resultMatch[1], "|")
+	slices.Sort(selectedClasses)
+	slices.Sort(failureClasses)
+	if !slices.Equal(selectedClasses, failureClasses) {
+		t.Errorf("egress failure expression selects %v, want exactly %v: %s", selectedClasses, failureClasses, expression)
 	}
 	for _, neutral := range []string{"unobserved", "inconsistent", `result!="ok"`} {
 		if strings.Contains(expression, neutral) {
@@ -131,7 +169,9 @@ func TestEgressProbeDashboardUsesPopulationAwareOutcomeClasses(t *testing.T) {
 		strings.Contains(success.Targets[0].Expr, "vector(0)") {
 		t.Fatal("egress success panel must preserve exporter absence in its selected fleet snapshot")
 	}
-	for id := 5; id <= 14; id++ {
+	// the fleet state row, the prober-fault shares included: every panel reads
+	// the one taskworker with a fresh snapshot
+	for _, id := range []int{5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 71, 72} {
 		panel := dashboardPanelById(dashboard, id)
 		if panel == nil || len(panel.Targets) != 1 {
 			t.Fatalf("fleet snapshot panel %d is missing", id)
@@ -153,9 +193,224 @@ func TestEgressProbeDashboardUsesPopulationAwareOutcomeClasses(t *testing.T) {
 			t.Errorf("fleet snapshot panel %d hides stale or absent telemetry as zero: %s", id, expression)
 		}
 	}
+	// the shares the batch guards and monitor signal §2.19b judge the prober by
+	// (connect/GEOMAP.md §11.3), as the one fresh snapshot holds them
+	const freshSnapshot = ` and on(env,service,block,host,instance) topk(1, (urnetwork_egress_probe_fleet_snapshot_timestamp_seconds{env="$env",service="taskworker"} > time() - 900) and (urnetwork_egress_probe_fleet_snapshot_timestamp_seconds{env="$env",service="taskworker"} <= time() + 30))`
+	for _, c := range []struct {
+		id     int
+		title  string
+		expr   string
+		legend string
+	}{
+		{id: 71, title: "fleet dark share", expr: `max(urnetwork_egress_probe_fleet_dark_share{env="$env"}` + freshSnapshot + `)`, legend: ""},
+		{id: 72, title: "fleet failure share by class", expr: `max by (class) (urnetwork_egress_probe_fleet_failure_share{env="$env"}` + freshSnapshot + `)`, legend: "{{class}}"},
+	} {
+		panel := dashboardPanelById(dashboard, c.id)
+		if panel.Title != c.title || panel.Type != "stat" || panel.FieldConfig.Defaults.Unit != "percentunit" {
+			t.Errorf("fleet share panel %d is %s %q in %q, want the percentunit stat %q", c.id, panel.Type, panel.Title, panel.FieldConfig.Defaults.Unit, c.title)
+		}
+		if target := panel.Targets[0]; target.Expr != c.expr || target.LegendFormat != c.legend || !target.Instant {
+			t.Errorf("fleet share panel %d reads %+v, want the instant %s as %q", c.id, target, c.expr, c.legend)
+		}
+	}
 	if !strings.Contains(dashboard.Description, "go no-data after 15 minutes") ||
 		!strings.Contains(dashboard.Description, "§2.23") {
 		t.Fatal("egress dashboard does not disclose snapshot freshness and direct-database authority")
+	}
+
+	documentBytes, err := dashboardsFs.ReadFile("dashboards/egress-probes.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(documentBytes)
+	if strings.Contains(document, "urnetwork_egress_probe_health_check_seconds_bucket") {
+		t.Fatal("egress dashboard still consumes cardinality-multiplying health-check buckets")
+	}
+	for _, required := range []string{
+		"urnetwork_egress_probe_health_check_seconds_sum",
+		"urnetwork_egress_probe_health_check_seconds_count",
+		"urnetwork_egress_probe_health_check_interval_max_seconds",
+		"urnetwork_egress_probe_health_check_interval_max_timestamp_seconds",
+	} {
+		if !strings.Contains(document, required) {
+			t.Errorf("egress dashboard omits %s", required)
+		}
+	}
+	maximum := dashboardPanelById(dashboard, 43)
+	if maximum == nil || len(maximum.Targets) != 2 {
+		t.Fatal("egress fresh health-check maximum panel is missing")
+	}
+	for _, required := range []string{
+		"and on (env, service, block, host, instance, destination, class)",
+		"time() - 120", "time() + 30",
+	} {
+		if !strings.Contains(maximum.Targets[1].Expr, required) {
+			t.Errorf("egress health-check maximum omits %q: %s", required, maximum.Targets[1].Expr)
+		}
+	}
+}
+
+// Every series the egress probes dashboard reads is one the code registers, so
+// a metric retired with the prober that emitted it -- the vendor geolocation
+// sources, the location flags and the consensus diagnostics of
+// connect/GEOMAP.md §11.3 -- fails here instead of leaving a panel that reads
+// nothing. A histogram or summary series counts under its family's name.
+func TestEgressProbeDashboardReadsOnlyRegisteredMetrics(t *testing.T) {
+	dashboard := readTestDashboard(t, "egress-probes.json")
+	registered := registeredApplicationMetrics(t)
+	isRegistered := func(metric string) bool {
+		if slices.Contains(registered, metric) {
+			return true
+		}
+		for _, suffix := range []string{"_bucket", "_sum", "_count"} {
+			if family, ok := strings.CutSuffix(metric, suffix); ok && slices.Contains(registered, family) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// the template variables query series too
+	queries := dashboardExpressions(dashboard)
+	for _, variable := range dashboard.Templating.List {
+		if fields, ok := variable.(map[string]any); ok {
+			if query, ok := fields["query"].(string); ok {
+				queries = append(queries, query)
+			}
+		}
+	}
+	if len(queries) == 0 {
+		t.Fatal("egress probes dashboard has no queries")
+	}
+	for _, query := range queries {
+		for _, metric := range metricNamePattern.FindAllString(query, -1) {
+			if !isRegistered(metric) {
+				t.Errorf("egress probes dashboard reads %s, which nothing registers: %s", metric, query)
+			}
+		}
+	}
+}
+
+// The prober learns where an exit is only from the operator's own /ip echo,
+// and the server places it with GeoLite2 (connect/GEOMAP.md §11.3). The
+// placement panel partitions the submitted exits by the precision GeoLite2
+// gives them; the lookup panel sets the runs whose echo answered against the
+// runs whose echo never did. Both read per-process counters, summed across the
+// taskworkers.
+func TestEgressProbeDashboardFollowsTheExitFromEchoToPlacement(t *testing.T) {
+	dashboard := readTestDashboard(t, "egress-probes.json")
+	const locations = `urnetwork_egress_probe_locations_total{env="$env",country=~"$country"`
+	const attempts = `urnetwork_egress_probe_attempts_total{env="$env",country=~"$country"`
+	perMinute := func(selector string) string {
+		return "sum(rate(" + selector + "}[$__rate_interval])) * 60"
+	}
+	for _, c := range []struct {
+		id      int
+		title   string
+		targets []testTarget
+	}{
+		{
+			id:    32,
+			title: "exit placements / min by precision",
+			targets: []testTarget{
+				{Expr: perMinute(locations + `,city_confident="true"`), LegendFormat: "city"},
+				{Expr: perMinute(locations + `,country!="unknown",city_confident="false"`), LegendFormat: "region or country"},
+				{Expr: perMinute(locations + `,country="unknown"`), LegendFormat: "not placed"},
+			},
+		},
+		{
+			id:    46,
+			title: "exit address lookups / min",
+			targets: []testTarget{
+				{Expr: perMinute(locations), LegendFormat: "exit submitted"},
+				{Expr: perMinute(attempts + `,result="no_exit_ip"`), LegendFormat: "no_exit_ip"},
+			},
+		},
+	} {
+		panel := dashboardPanelById(dashboard, c.id)
+		if panel == nil || panel.Title != c.title || panel.Type != "timeseries" || len(panel.Targets) != len(c.targets) {
+			t.Errorf("egress exit panel %d is not the %d-query time series %q", c.id, len(c.targets), c.title)
+			continue
+		}
+		for index, target := range panel.Targets {
+			want := c.targets[index]
+			if target.Expr != want.Expr || target.LegendFormat != want.LegendFormat {
+				t.Errorf("egress exit panel %d query %d = %s as %q, want %s as %q", c.id, index, target.Expr, target.LegendFormat, want.Expr, want.LegendFormat)
+			}
+		}
+	}
+}
+
+// The prober's own misses are never read as verdicts on providers
+// (connect/GEOMAP.md §11.3): the full-run attempts that ended on the prober's
+// side are tabled by country and class, and the failed blackhole checks leave
+// out the checks that measured nothing. A failed check is no verdict either,
+// and every failed check the prober submits carries its failure class, so the
+// stat counts those classes rather than a dark result.
+func TestEgressProbeDashboardSeparatesProberMissesFromProviderFailures(t *testing.T) {
+	dashboard := readTestDashboard(t, "egress-probes.json")
+	for _, c := range []struct {
+		id        int
+		panelType string
+		title     string
+		expr      string
+		format    string
+	}{
+		{
+			id:        47,
+			panelType: "table",
+			title:     "prober-side attempt outcomes by country (range)",
+			expr:      `sum by (country, result) (increase(urnetwork_egress_probe_attempts_total{env="$env",country=~"$country",result=~"health_not_run|run_not_measured|no_exit_ip|run_batch_guard"}[$__range])) > 0`,
+			format:    "table",
+		},
+		{
+			id:        21,
+			panelType: "stat",
+			title:     "blackhole checks failed (range)",
+			expr:      `sum(increase(urnetwork_egress_probe_blackhole_checks_total{env="$env",result!~"ok|not_measured"}[$__range]))`,
+			format:    "",
+		},
+	} {
+		panel := dashboardPanelById(dashboard, c.id)
+		if panel == nil || panel.Title != c.title || panel.Type != c.panelType || len(panel.Targets) != 1 {
+			t.Errorf("egress panel %d is not the one-query %s %q", c.id, c.panelType, c.title)
+			continue
+		}
+		if target := panel.Targets[0]; target.Expr != c.expr || !target.Instant || target.Format != c.format {
+			t.Errorf("egress panel %d reads %+v, want the instant %s", c.id, target, c.expr)
+		}
+	}
+}
+
+// A health-check fail rate is failed loads over the ok and failed loads, as the
+// country and destination tables compute it. A load that was not measured and
+// a canary are neither a pass nor a failure (connect/GEOMAP.md §11.3), so a
+// denominator counting every result would understate each rate.
+func TestEgressProbeDashboardRatesHealthFailuresOverOkAndFailedLoads(t *testing.T) {
+	dashboard := readTestDashboard(t, "egress-probes.json")
+	const byCountry = `urnetwork_egress_probe_health_checks_by_country_total{env="$env",class=~"$class",country=~"$country"`
+	const byDestination = `urnetwork_egress_probe_health_checks_total{env="$env",class=~"$class",destination=~"$destination"`
+	failRate := func(grouping string, selector string) string {
+		return "sum by (" + grouping + ") (rate(" + selector + `,result="fail"}[$__rate_interval]))` +
+			" / clamp_min(sum by (" + grouping + ") (rate(" + selector + `,result=~"ok|fail"}[$__rate_interval])), 1e-9)`
+	}
+	for _, c := range []struct {
+		id    int
+		title string
+		expr  string
+	}{
+		{id: 30, title: "health check fail rate by class and country (top 10)", expr: "topk(10, " + failRate("country, class", byCountry) + ")"},
+		{id: 35, title: "health check fail rate by destination (top 15)", expr: "topk(15, " + failRate("destination", byDestination) + ")"},
+		{id: 36, title: "health check fail rate by class", expr: failRate("class", byDestination)},
+	} {
+		panel := dashboardPanelById(dashboard, c.id)
+		if panel == nil || panel.Title != c.title || len(panel.Targets) != 1 {
+			t.Errorf("egress fail rate panel %d is not the one-query %q", c.id, c.title)
+			continue
+		}
+		if expression := panel.Targets[0].Expr; expression != c.expr {
+			t.Errorf("egress fail rate panel %d reads %s, want %s", c.id, expression, c.expr)
+		}
 	}
 }
 
@@ -239,6 +494,7 @@ func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
 		`archive="redis"`,
 		`archive="github-urnetwork"`,
 		`archive="github-urfoundation"`,
+		`archive="router-config"`,
 	} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("backup archive dashboard is missing %q", required)
@@ -255,10 +511,11 @@ func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
 	}
 
 	archives := map[int]string{
-		5: `archive="pg"`,
-		6: `archive="redis"`,
-		7: `archive="github-urnetwork"`,
-		8: `archive="github-urfoundation"`,
+		5:  `archive="pg"`,
+		6:  `archive="redis"`,
+		7:  `archive="github-urnetwork"`,
+		8:  `archive="github-urfoundation"`,
+		17: `archive="router-config"`,
 	}
 	for panelID, archiveSelector := range archives {
 		panel := dashboardPanelById(dashboard, panelID)
@@ -283,7 +540,7 @@ func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
 		}
 	}
 
-	for _, panelID := range []int{9, 10, 11, 12} {
+	for _, panelID := range []int{9, 10, 11, 12, 18} {
 		panel := dashboardPanelById(dashboard, panelID)
 		if panel == nil || len(panel.Targets) != 1 ||
 			!strings.Contains(panel.Targets[0].Expr, "topk(1") ||
@@ -320,7 +577,7 @@ func TestBackupArchiveDashboardFailsClosedAfterFiveDays(t *testing.T) {
 	}
 	for _, required := range []string{
 		"urnetwork_backup_archive_storage_bytes",
-		`archive=~"pg|redis|code"`,
+		`archive=~"pg|redis|code|router-config"`,
 		"urnetwork_backup_archive_volume_free_bytes",
 	} {
 		if !strings.Contains(storage.Targets[0].Expr+"\n"+storage.Targets[1].Expr, required) {
@@ -363,6 +620,7 @@ func TestRedisClusterCounterRatesCoverStaggeredScrapes(t *testing.T) {
 }
 
 type testTarget struct {
+	RefId        string `json:"refId"`
 	Expr         string `json:"expr"`
 	Instant      bool   `json:"instant"`
 	Range        *bool  `json:"range"`
@@ -444,6 +702,18 @@ func TestDefaultDashboardDocumentsAreValid(t *testing.T) {
 					t.Errorf("%s panel id %d is shared by %q and %q", entry.Name(), panel.Id, previous, panel.Title)
 				}
 				seenPanelIds[panel.Id] = panel.Title
+			}
+			// grafana returns a panel's query results keyed by refId, so a
+			// repeated one drops a series; an omitted one is assigned on load
+			seenRefIds := map[string]bool{}
+			for _, target := range panel.Targets {
+				if target.RefId == "" {
+					continue
+				}
+				if seenRefIds[target.RefId] {
+					t.Errorf("%s panel %q repeats refId %q", entry.Name(), panel.Title, target.RefId)
+				}
+				seenRefIds[target.RefId] = true
 			}
 		}
 
@@ -669,6 +939,10 @@ func TestProxyDashboardCoversBoundedServiceTrafficAndCapacity(t *testing.T) {
 		"WireGuard packets / s by direction and outcome",
 		"WireGuard queue drops and receiver failures / s",
 		"aggregate devices, peers, prewarm, and lifecycle",
+		"WireGuard sessions and peers",
+		"SOCKS sessions",
+		"mean WireGuard and SOCKS session duration",
+		"proxy devices",
 		"platform transport byte capacity",
 		"WireGuard return backpressure",
 		"caller-lock cache occupancy",
@@ -697,6 +971,11 @@ func TestProxyDashboardCoversBoundedServiceTrafficAndCapacity(t *testing.T) {
 		"urnetwork_proxy_devices_live",
 		"urnetwork_proxy_prewarmed_devices",
 		"urnetwork_proxy_wg_peers",
+		"urnetwork_proxy_wg_sessions_active",
+		"urnetwork_proxy_wg_sessions_started_total",
+		"urnetwork_proxy_wg_sessions_ended_total",
+		"urnetwork_proxy_wg_session_duration_seconds",
+		"urnetwork_proxy_devices_active",
 		"urnetwork_proxy_device_memory_tracked_used_bytes",
 		"urnetwork_proxy_platform_transports_pending_h1",
 		"urnetwork_proxy_platform_transport_slot_full_pending_h1_devices",
@@ -899,6 +1178,7 @@ func TestServiceDurationDashboardsUseSumCountAndFreshMaximumWithoutBuckets(t *te
 			file: "proxy.json",
 			durationMetrics: []string{
 				"urnetwork_proxy_session_duration_seconds",
+				"urnetwork_proxy_wg_session_duration_seconds",
 				"urnetwork_http_request_duration_seconds",
 			},
 			maximumMetrics: []string{
@@ -1226,6 +1506,9 @@ var internalMeasurementMetrics = []string{
 	"urnetwork_stats_contracts_with_extender_24h",
 	"urnetwork_stats_open_disputes",
 	"urnetwork_stats_disputes_24h",
+	"urnetwork_stats_contract_open_lower_bound",
+	"urnetwork_stats_contract_open_status",
+	"urnetwork_stats_contract_open_observed_at_seconds",
 }
 
 // the population measurements the providers dashboard shows beside them
@@ -1554,9 +1837,15 @@ func TestProvidersDashboardPinsInternalMeasurements(t *testing.T) {
 	// every read is max-wrapped and env-scoped. the selector is the prefix
 	// rather than the whole matcher because the per-family stats select their
 	// family beside the env; a matcher list continues with a comma or closes
-	// with a brace, so `{env="$env"` still pins the env as the first matcher
+	// with a brace, so `{env="$env"` still pins the env as the first matcher.
+	// The FindProviders2 answer metrics are the exception: each api process
+	// observes its own answers, so they are summed as rates across them, and
+	// TestProvidersDashboardShowsTheEgressBuckets pins those reads instead
 	for _, expression := range expressions {
 		for _, metric := range metricNamePattern.FindAllString(expression, -1) {
+			if providersPerProcessMetric(metric) {
+				continue
+			}
 			assertReplicaSafeReads(t, "providers dashboard", expression, metric, `{env="$env"`)
 		}
 	}
@@ -1873,6 +2162,49 @@ func TestProxyMemoryDescriptorsRemainInMetricInventory(t *testing.T) {
 		if !slices.Contains(metrics, name) {
 			t.Errorf("custom collector descriptor %s is absent from the metric inventory", name)
 		}
+	}
+}
+
+func TestProxyDashboardCoversPrivateDeviceMemoryTargets(t *testing.T) {
+	dashboard := readTestDashboard(t, "proxy.json")
+	documentBytes, err := dashboardsFs.ReadFile("dashboards/proxy.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(documentBytes)
+	for _, metric := range []string{
+		"urnetwork_proxy_devices_live",
+		"urnetwork_proxy_device_memory_target_bytes",
+		"urnetwork_proxy_device_memory_tracked_used_bytes",
+	} {
+		if !strings.Contains(document, metric) {
+			t.Errorf("proxy dashboard omits device ownership metric %s", metric)
+		}
+	}
+	if strings.Contains(document, "urnetwork_proxy_device_admission_refused_total") ||
+		strings.Contains(document, "urnetwork_proxy_device_memory_budget_bytes") {
+		t.Fatal("proxy dashboard still queries removed process-wide admission metrics")
+	}
+	devices := dashboardPanelById(dashboard, 27)
+	if devices == nil || len(devices.Targets) != 1 ||
+		!strings.Contains(devices.Targets[0].Expr, "urnetwork_proxy_devices_live") {
+		t.Fatal("proxy dashboard does not render current private device count")
+	}
+	usage := dashboardPanelById(dashboard, 28)
+	if usage == nil || len(usage.Targets) != 1 {
+		t.Fatal("proxy dashboard does not render private device target usage")
+	}
+	for _, required := range []string{
+		"max by (block, host, instance)",
+		"urnetwork_proxy_device_memory_tracked_used_bytes",
+		"clamp_min(urnetwork_proxy_device_memory_target_bytes",
+	} {
+		if !strings.Contains(usage.Targets[0].Expr, required) {
+			t.Errorf("private device target query omits %q: %s", required, usage.Targets[0].Expr)
+		}
+	}
+	if !strings.Contains(usage.Description, "must not be read as host spare capacity") {
+		t.Fatal("device target panel does not preserve the physical memory boundary")
 	}
 }
 

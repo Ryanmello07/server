@@ -40,16 +40,17 @@ evaluator image and round policy before opening epoch 1.
 ## Deployment sequence
 
 1. Apply the server migrations. They create encrypted round storage, the FIFO
-   queue/ACL/event log, singleton worker slot, evaluator heartbeat table, and
-   append-only ordered candidate-review records. Database triggers prevent a
-   skipped rank, an unresolved no-winner finalization, or publication of a
-   winner without that exact job's approved review.
+   queue/ACL/event log, singleton worker slot, evaluator heartbeat table,
+   append-only epoch-baseline storage, and append-only ordered candidate-review
+   records. Database triggers prevent a changed control, skipped rank,
+   unresolved no-winner finalization, or publication of a winner without that
+   exact job's approved review.
 2. Build the API and `cli/competitionworker` from one clean release. Build the
    trusted evaluator base with
    `connect/sim-latency/evaluator/container/build-base.sh`; its
    source-lock records the clean server/connect/proxy/sdk/glog/goidenticons/
-   userwireguard/sn commits and it freezes the toolchain/module cache. The API
-   Dockerfile pins the Docker Official Ubuntu index rather than a floating base
+   userwireguard/sn/operator-proxy/warp commits and it freezes the toolchain/module
+   cache. The API Dockerfile pins the Docker Official Ubuntu index rather than a floating base
    tag. Both release targets preserve BuildKit provenance, SBOM, and the pushed
    repository digest in their respective `build/image-metadata.json`; the
    worker image is `FROM scratch`. Place the exact published worker/evaluator
@@ -62,7 +63,7 @@ evaluator image and round policy before opening epoch 1.
    evaluator accepts canonical patch bytes, not miner images or URLs, and
    derives one image per `(base, patch, policy, builder)` identity with the
    fixed Dockerfile and authenticated cache reuse. Each attempt copies the
-   eight locked repositories from the authenticated base image into fresh
+   ten locked repositories from the authenticated base image into fresh
    temporary baseline/candidate checkouts, applies the patch only to the
    evaluated server surface there, and
    mounts the selected checkout read-only at `/workspace`; the main runner
@@ -84,7 +85,8 @@ evaluator image and round policy before opening epoch 1.
    record and must be derived from a successful live evaluator qualification;
    it binds the common service
    cgroup, 10+2 CPU split, management-memory reserve, resource limits, cleanup,
-   service images, 32 GiB artifact quota, successful CPU-/memory-bomb cleanup,
+   service images, 4 GiB artifact quota charged separately from the 96 GiB
+   active-container ceiling, successful CPU-/memory-bomb cleanup,
    the internal/no-published-port candidate network, networkless scorer, exact
    direct read-only local-leaf mounts and their frozen content hashes, plus the
    authenticated completion/evidence hashes.
@@ -124,7 +126,12 @@ evaluator image and round policy before opening epoch 1.
    is rebuildable from PostgreSQL, so a flush or interrupted post-commit push
    cannot lose or reorder durable work. After admission closes and the FIFO
    drains, this worker seals the epoch for honesty review and exits
-   successfully. If no significant candidate exists, it finalizes no winner.
+   successfully. The first complete attempt measures and authenticates the
+   nine-run control before any submitted build executes, then atomically freezes
+   its exact `baseline.json` and SHA-256. A terminal candidate build failure
+   still retains that valid control. Every later claim receives the same bytes
+   and skips control execution. If no significant candidate exists, it
+   finalizes no winner.
    Otherwise the external agent harness uses `sim-latency epoch-review` to
    inspect the exact patch and score, reject dishonest candidates in rank order,
    and approve the first honest candidate. The promotion loop can merge only
@@ -163,13 +170,15 @@ the file before serving it and returns the digest in `ETag` and
 processing state: terminal jobs appear as `completed`, with score and failure
 results omitted.
 
-Every evaluator result must retain an authenticated `baseline.json` created
-from the same round workload and frozen replicate policy, in addition to the
-candidate score, accounting, resources, and completion marker. Production
+Every evaluator result must retain the exact authenticated epoch
+`baseline.json`, created from the same round workload and frozen replicate
+policy, in addition to the candidate score, accounting, resources, and
+completion marker. Its digest is recorded in every completed score. Production
 evaluation additionally requires the fresh host self-check to name that exact
-round in `rebaseline_round_id`. Fee-free staging evaluation retains the
-per-job same-round baseline but deliberately omits this separate production
-launch gate so several integration epochs can run without promotion work.
+round in `rebaseline_round_id`. That host-readiness marker is distinct from the
+score control: it proves the qualified host is ready, but it cannot replace or
+redraw the append-only epoch baseline. Fee-free staging omits only the separate
+production launch marker; it uses the same one-control-per-epoch scoring path.
 
 ## Verification
 
@@ -201,6 +210,12 @@ throughput p50/p95 values with provisional one-sided significance coloring.
 The progress record is retained with the attempt, but it is not served by the
 public competition API; public results still appear only after post-review
 epoch finalization, and the completed sealed score remains authoritative.
+
+The worker repeats the full host self-check after every job before claiming the
+next FIFO item. Identity or policy drift stops evaluation instead of measuring
+a more favorable replacement control. Since the host is dedicated, this
+continuous identity check plus the immutable control is the week-long drift
+boundary.
 
 The public Apex sandbox/spec contract does not directly expose an external
 scoring-service adapter and its standard resource ceilings are below this

@@ -19,23 +19,34 @@ submission. There is no per-epoch submission-count cap. A duplicate canonical
 patch reuses the existing immutable job/cache identity and must not collect a
 second fee.
 
-A continuously available evaluator host has 56 full three-hour slots per
-seven-day admission window. The first complete 18-replicate staging pass
-reached scoring in about 2 hours 33 minutes (about 65 theoretical slots before
-scoring and operational overhead), but admission is intentionally unbounded:
-the FIFO continues in a private grading period after close until every
-accepted job is terminal.
+A continuously available evaluator host has 56 conservative full three-hour
+slots per seven-day admission window. The first job also establishes the
+nine-run epoch control. At the observed staging rate, later candidate-only jobs
+are projected around 1 hour 16 minutes, for roughly 130 theoretical slots
+before build, scoring, transition, and recovery overhead. Admission is
+intentionally unbounded: the FIFO continues in a private grading period after
+close until every accepted job is terminal.
 
 Before production epoch 1, `GET /competition/info` may expose the current
 `staging_round`. The staging era begins at epoch zero and can advance through
 multiple sequential epochs. A response carrying `staging: true` is fee-free
 and follows the production admission, cache, FIFO, isolated evaluation,
 scoring, embargo, and authenticated polling paths against frozen source epoch
-zero. After close and complete drain, it finalizes automatically with no winner
-and makes each job's score or typed failure visible through its status URL.
+zero. After admission closes and every accepted job is terminal, it finalizes
+automatically and makes each job's score or typed failure visible through its
+status URL. The highest-ranked placeable candidate passing every gate is the
+named staging winner, without a statistical-significance or takeover-margin
+requirement; if none qualifies, there is no winner. Staging never pauses for
+honesty review before finalization.
 `GET /competition/leaderboard?include_staging=true` also publishes a clearly
-marked, null-winner staging entry for exact adapter-path testing. It does not
-create a production leaderboard row, candidate review, or promotion.
+marked staging epoch with the same `winner_job_id` and winning entry for
+adapter-path testing. A staging winner starts `honesty_review: not_reviewed`;
+an operator may explicitly approve it after inspecting the exact finalized
+patch and evidence, at which point its leaderboard entry becomes `approved`.
+This never promotes source or creates a production winner. Future staging
+rounds freeze a zero takeover margin; historical rounds retain their original
+margin. See the dated
+[epoch-5 release record](STAGING-5-RELEASE.md).
 
 UR creates or retrieves each identity with `run-main.sh staging`, then uses
 `run-main.sh advance-staging` to stop admission, drain all accepted work,
@@ -135,14 +146,17 @@ format and submit the intended canonical patch.
 ## What is scored
 
 Each candidate is applied to the source commits frozen for that epoch and gets
-a new content-addressed evaluation image. Nine independently reset candidate
-runs are compared with nine same-round baseline runs. Lower p95 end-to-end
-latency is better. Placeability requires every correctness, traffic-volume,
+a new content-addressed evaluation image. Before the first submitted build, the
+evaluator freezes one authenticated sample of nine independently reset control
+runs for the epoch. Every candidate contributes nine independently reset runs
+and is compared with those exact same control bytes. Lower absolute p95
+end-to-end latency is better and determines ranking; normalized score is
+display-only. Placeability requires every correctness, traffic-volume,
 path-integrity, matchmaking, stability, and resource gate to pass. Takeover
 also requires the epoch margin and a one-sided Welch result at `p <= 0.05`.
 
-Statistical eligibility enters the private honesty-review ranking; it does not
-guarantee a win. A dishonest or unsafe candidate is rejected and review moves
+In production, statistical eligibility enters the private honesty-review
+ranking; it does not guarantee a win. A dishonest or unsafe candidate is rejected and review moves
 to the next ranked significant candidate. If none remains, the epoch has no
 winner and the incumbent code and threshold carry forward unchanged.
 

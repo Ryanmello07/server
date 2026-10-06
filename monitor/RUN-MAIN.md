@@ -16,28 +16,36 @@ and continue until the operator ends the run or its requested duration expires.
 Use two explicit, long-lived agent roles for every pass; reuse the same agents
 so their evidence context and open causal boundaries remain intact:
 
-- A `gpt-5.6-terra` agent at `max` reasoning owns monitor execution: preflight,
-  immutable binary, authoritative watcher and tails, alert capture, focused
-  reruns, source identity, and every verification gate. The Go watcher remains
-  model-neutral; Terra operates and interprets it. The primary agent must retain
-  the actual durable execution-session handle unless Terra remains active for
+- A `gpt-6-sol` agent at `medium` reasoning ("Sol Medium") owns monitor execution,
+  the monitor-test gates, and initial evidence work: preflight, immutable binary,
+  authoritative watcher and tails, alert capture, bounded read-only failure
+  fact collection, initial triage, evidence-authority checks, focused reruns,
+  source identity, and every verification gate. The Go watcher remains
+  model-neutral; Sol operates and interprets it. The primary agent must retain
+  the actual durable execution-session handle unless Sol remains active for
   the entire watcher lifetime. Process ownership is not session ownership: a
   watcher started inside a sub-agent tool session can disappear when that agent
   returns even after its PID and tails passed a liveness check.
-- A `gpt-5.6-sol` agent at `max` reasoning owns diagnosis and repair for every
-  new, changed, or unresolved causal boundary. It may run bounded read-only
-  discriminators, but Terra remains the runner and verifier.
+- A `gpt-6-astra` agent at `max` reasoning ("Astra Max") owns all
+  post-triage root-cause debugging, bounded read-only discriminator collection,
+  and repair for every new, changed, or unresolved causal boundary. Astra
+  consumes Sol's initial alert/triage manifest, inspects bounded relevant
+  source, collects only the precise missing production fact under the same
+  authority and privacy rules, and runs local deterministic controls. Every
+  self-improvement fix to the probes, shared monitoring utilities, signal
+  catalog, or this harness also belongs to Astra Max.
 
-For each such boundary, Terra sends a deterministic delta manifest referencing
-the prior ledger record and object hashes described below; group shared
-dependency/artifact/rollout failures and keep unrelated causes separate. Never
-paste full all-signal Markdown, logs, raw evidence, or test output into a model
-handoff. Sol pulls the complete Alert and only bounded relevant source objects
-by hash on demand, then returns cause/patch/regressions/prerequisites/window;
-Terra returns gate manifests. Keep both agents and the watcher alive unless
-safe promotion requires a handoff.
+For each such boundary, Sol sends an initial deterministic delta and triage
+manifest referencing the prior ledger record and object hashes described below;
+group shared dependency/artifact/rollout failures and keep unrelated causes
+separate. Never paste full all-signal Markdown, logs, raw evidence, or test
+output into a model handoff. Astra pulls the complete Alert and only bounded
+relevant source objects by hash on demand, then records any precise additional
+fact it collects. Astra returns cause/patch/regressions/prerequisites/window;
+Sol returns independent gate manifests. Keep both agents and the watcher
+alive unless safe promotion requires a handoff.
 
-The primary agent owns the append-only run ledger. Terra and Sol produce
+The primary agent owns the append-only run ledger. Sol and Astra produce
 immutable, privacy-reviewed manifests and name the intended `prior_record`, but
 must not append ledger records themselves. This keeps process/session ownership,
 production mutation authority, and the single-writer chain in one place.
@@ -49,7 +57,25 @@ make the smallest owning fix with synthetic coverage and catalog updates; pass
 all gates; then verify the exact production boundary, checkpoint, promote
 without an observation gap, and continue.
 
-This is context-delivery optimization only: never substitute a cheaper model,
+Every investigation and root-cause handoff must explicitly report
+`false_positive_qualifiers` and `false_negative_qualifiers`. Sol records
+initial authority/source-completeness boundaries; Astra records the
+post-triage candidate discriminator, its observation authority, source
+completeness, and healthy control, then decides whether the evidence establishes
+a real probe boundary. When it does, update the owning numbered
+`SIGNALS.md` entry and the probe reducer/tests in the same correction. Cover
+the misleading-but-healthy input, the true failure, and unavailable,
+partial, stale, corrected, or ambiguous evidence as applicable. Missing
+authority must remain unknown or `cannot-observe`, never healthy. Do not add a
+qualifier from speculation, suppress the original symptom, or wait for the
+daily research pass to record a discriminator learned during an active
+incident.
+
+This is context-delivery optimization only: use Sol at medium to run the
+monitor tests, deterministic monitoring, initial failure fact collection, and
+triage; retain Astra at max for all post-triage debugging, bounded fact
+collection, and repair. Monitor tests are harness gates, never an implicit part
+of a production probe invocation. Never silently change those roles or efforts,
 skip a severity, lose warnings or `cannot-observe`, or delete/truncate evidence.
 Do not raise production `runLoopMaxConcurrentSignals`, add watchers outside
 bounded promotion, shorten windows, or persist sustain counters/ticket state.
@@ -77,6 +103,17 @@ bounded promotion, shorten windows, or persist sustain counters/ticket state.
   customer identifiers, balances, contract IDs, or stream labels into a shell
   transcript, alert, test failure, commit, or agent response. Feed credentials
   on stdin through the existing monitor transports.
+- Bind diagnostic-request fields by JSON name or a NUL-safe typed encoding;
+  never unpack optional or secret-bearing fields with whitespace/TSV `read`.
+  Before contact, assert the rendered argv separately from execution: an empty
+  optional identity list emits no `-i`, the target equals the inventory-owned
+  `user@endpoint`, and a password can appear only in the intended remote stdin
+  or environment channel, never a local argv, address, filename, or DNS lookup.
+  A binding mismatch, missing result schema, or nonzero transport exit stops
+  the discriminator without retry and leaves the production fact unknown. If
+  a secret may have entered an unintended channel, restrict the evidence,
+  report the exposure without quoting it, and require credential disposition
+  before issuing a fresh request.
 - Treat dashboards as navigation aids, not proof. Deployment state comes from
   the running unit/container and its immutable artifact identity; database,
   Redis, network, kernel, and process state come from those systems directly.
@@ -85,6 +122,10 @@ bounded promotion, shorten windows, or persist sustain counters/ticket state.
 - Do not use a restart, larger timeout, larger queue, broader retry, alert
   suppression, or manual data correction as a root-cause fix without evidence
   that it repairs the causal mechanism and preserves correctness.
+- Runtime PAGE thresholds are observation criteria, not service-enforced caps.
+  Do not add process-wide hard limits to Main services as an incident response;
+  identify the responsible per-instance work and capacity constraint while
+  retaining the alert for parallel diagnosis.
 - Preserve unrelated and pre-existing working-tree changes. Do not amend,
   force-push, rebase, or push by default. Keep changes in different repositories
   in separate tested commits.
@@ -107,8 +148,19 @@ Run from the server repository and make the target explicit:
 
 ```sh
 cd /path/to/urnetwork/server
+export WARP_HOME="${WARP_HOME:-$BRINGYOUR_HOME}"
 export WARP_ENV=main
+test -d "$WARP_HOME/config"
+test -d "$WARP_HOME/vault"
 ```
+
+`WARP_HOME`, not `BRINGYOUR_HOME`, is the configuration authority consumed by
+the Go monitor. `BRINGYOUR_HOME` may organize local evidence and workspaces,
+but it does not select Config or Vault. A detached session, LaunchAgent, or
+other scheduler does not inherit the interactive shell environment: explicitly
+set `WARP_HOME`, `WARP_ENV`, the working directory, and any required tool
+`PATH` in its own launch contract. A fallback to `/srv/warp` on a workstation
+is a failed preflight, not a valid production observation.
 
 Before the first production command:
 
@@ -122,7 +174,10 @@ Before the first production command:
    topology; and
 5. resolve each host endpoint from its current owning inventory and verify its
    remote hostname before any privileged action; and
-6. run the local monitor tests before trusting a newly built detector.
+6. have Sol run the local monitor tests before trusting a newly built
+   detector; and
+7. have Sol capture and triage bounded initial facts for every failed gate or
+   alert before handing its manifest to Astra Max for debugging and repair.
 
 The normal workstation mode is `overlay`; use `lan` only from a host with the
 configured LAN routes. An explicit `-ssh-key` may be repeated when the SSH
@@ -130,10 +185,15 @@ configuration does not already select the identities.
 
 ```sh
 test -n "$BRINGYOUR_HOME"
+test -n "$WARP_HOME"
+test -d "$WARP_HOME/config"
+test -d "$WARP_HOME/vault"
 install -d -m 700 "$BRINGYOUR_HOME/monitor"
 umask 077
-go test ./monitor
-go test -race ./monitor
+bash -c \
+  'unset WARP_ENV; source ./test-env.sh && exec go test ./monitor'
+bash -c \
+  'unset WARP_ENV; source ./test-env.sh && exec go test -race ./monitor'
 go vet ./monitor
 monitor_preflight_dir=$(mktemp -d "$BRINGYOUR_HOME/monitor/server-monitor.preflight.XXXXXXXX")
 go build -o "$monitor_preflight_dir/monitor" ./cli/monitor
@@ -206,18 +266,52 @@ monitor_snapshot_dir=$(mktemp -d "$BRINGYOUR_HOME/monitor/server-monitor.snapsho
 go build -o "$monitor_snapshot_dir/monitor" ./cli/monitor
 chmod 700 "$monitor_snapshot_dir/monitor"
 test -x "$monitor_snapshot_dir/monitor"
+monitor_exit=0
 WARP_ENV=main "$monitor_snapshot_dir/monitor" -mode overlay -once \
-  >"$monitor_snapshot_dir/alerts.md" \
-  2>"$monitor_snapshot_dir/stderr.log"
+  -output "$monitor_snapshot_dir/alerts.partial.md" \
+  2>"$monitor_snapshot_dir/stderr.log" || monitor_exit=$?
+if rg -qx '<!-- monitor-alerts-complete -->' "$monitor_snapshot_dir/alerts.partial.md"; then
+  mv "$monitor_snapshot_dir/alerts.partial.md" "$monitor_snapshot_dir/alerts.md"
+else
+  printf '%s\n' 'monitor output was incomplete; retaining alerts.partial.md' >&2
+  monitor_exit=1
+fi
+test "$monitor_exit" -eq 0
 ```
 
 `-once` runs selected signals serially, emits every current violation, bypasses
 sustain gating, and exits nonzero on probe failure. Preserve stdout and stderr
 even then: visibility alerts retain findings and stderr distinguishes an
-observation-path failure. Label this a snapshot, not a page.
+observation-path failure. The command promotes `alerts.md` only after a
+successful complete write and the terminal completion marker, independently of
+the monitor's probe exit status; a complete report can contain a
+`monitor/visibility` Alert while the command correctly exits nonzero. A
+remaining `alerts.partial.md` is incomplete evidence and must never be parsed
+as a snapshot. Label this a snapshot, not a page.
 
-`monitor -list-signals` lists selector values without loading the environment,
-Vault, or settings. After required full coverage, use focused reruns by
+Start full one-shot snapshots no more often than once every 15 minutes. Record
+the actual monitor execution start in UTC and calculate the next eligible start
+from that timestamp, not from completion. A common delayed shell pattern uses
+`sleep ...; exec monitor ...`; `exec` retains the shell PID and its process
+start time, so `ps etime` includes the delay and cannot prove that the monitor
+started early. Use the first monitor stderr timestamp (or a separately recorded
+post-`exec` UTC timestamp) to prove the actual start. Do not launch a second
+snapshot while an existing one is live; preserve its bounded evidence and
+investigate its active child/stage before calling it stalled.
+
+`monitor -list-signals` lists selector values without invoking the CLI settings
+loader or running probes; package initialization retains its ordinary settings
+resolution, so synthetic subprocess controls use an empty private `WARP_HOME`.
+A short `-list-signals | wc -l` count is incomplete output evidence, not proof
+of missing registrations. Older monitor entrypoints discarded the asynchronous
+address scrubber's drain function, allowing normal and error exits to truncate
+queued stdout or stderr. The CLI now drains both descriptors before returning
+its exit status to `os.Exit`. Validate the exact tested binary, complete captured
+listing (header plus every registered signal), and terminal status; do not infer
+catalog coverage from a truncated pipeline. Keep one-shot direct-file output
+and its completion-marker validation above.
+
+After required full coverage, use focused reruns by
 repeating `-include-signal` with a key, number, or probe ID. Include and exclude
 selectors are mutually exclusive; empty, unknown, or ambiguous includes fail
 closed. Repeated `-exclude-signal` remains diagnostic and cannot certify health.
@@ -225,12 +319,14 @@ closed. Repeated `-exclude-signal` remains diagnostic and cannot certify health.
 ```sh
 WARP_ENV=main "$monitor_snapshot_dir/monitor" -mode overlay -once \
   -include-signal edge-ipv6 -include-signal 20.2 \
-  -format jsonl >"$monitor_snapshot_dir/alerts.jsonl"
+  -format jsonl -output "$monitor_snapshot_dir/alerts.partial.jsonl" \
+  && mv "$monitor_snapshot_dir/alerts.partial.jsonl" "$monitor_snapshot_dir/alerts.jsonl"
 ```
 
 `-format markdown` is the default. `-format jsonl` writes one complete alert
 object per line in deterministic severity/identity order; a healthy JSONL
-snapshot is an empty file.
+snapshot is an empty file. As with Markdown, parse only the promoted
+`alerts.jsonl`; a remaining `alerts.partial.jsonl` is not a valid snapshot.
 
 ## Start the authoritative continuous watcher
 
@@ -245,10 +341,103 @@ go build -o "$monitor_run_dir/monitor" ./cli/monitor
 chmod 700 "$monitor_run_dir/monitor"
 test -x "$monitor_run_dir/monitor"
 shasum -a 256 "$monitor_run_dir/monitor" >"$monitor_run_dir/binary.sha256"
-WARP_ENV=main "$monitor_run_dir/monitor" -mode overlay \
+monitor_warpctl=$(command -v warpctl)
+test -n "$monitor_warpctl"
+test -x "$monitor_warpctl"
+go version -m "$monitor_warpctl" >"$monitor_run_dir/warpctl.version.txt"
+rg -q 'vcs\.revision=[0-9a-f]{40}$' "$monitor_run_dir/warpctl.version.txt"
+rg -q 'vcs\.modified=(true|false)$' "$monitor_run_dir/warpctl.version.txt"
+shasum -a 256 "$monitor_warpctl" >"$monitor_run_dir/warpctl.sha256"
+monitor_warpctl_dir=$(dirname "$monitor_warpctl")
+PATH="$monitor_warpctl_dir:$PATH" WARP_HOME="$WARP_HOME" WARP_ENV=main \
+  "$monitor_run_dir/monitor" -mode overlay -min-probe-cadence=15m \
   >"$monitor_run_dir/alerts.md" \
   2>"$monitor_run_dir/stderr.log"
 ```
+
+Treat the exact Warpctl resolved by the watcher as part of the immutable
+observation boundary. Before launch, require its `go version -m` output to carry
+a full `vcs.revision` and Boolean `vcs.modified`, record its hash, and verify
+that its source revision contains every collector capability assumed by the
+active catalog. In particular, §1.5 requires the Loki live-tail cursor guard at
+Warp commit `d857872c4cae8e4768ed2314fdb53fc96b4fdbdb`. Do not infer capability
+from the HEAD of a nearby checkout while an older executable appears first on
+ambient `PATH`. Build through the existing local Warp checkout convention when
+the resolved executable is stale, then pin only this watcher invocation's
+`PATH` to the validated executable directory. This does not alter Warpctl's
+release/build architecture or install anything on managed hosts.
+
+Check support for the effective `services.yml` schema as well as collector
+capabilities, both before launch and after a settings-generation change. A
+current checkout does not update a pinned older executable. The long-lived
+tails may keep their already-loaded configuration while fresh reconciliation
+children read a changed file and fail. A demonstrated local pre-query
+configuration failure is not a Loki outage or periodic WebSocket rotation;
+exit status 2 alone cannot distinguish configuration, query, and runtime errors.
+If needed, authorize one bounded invocation of the exact dependency with the
+same effective settings. Keep raw child output private, expose only fixed
+error/status markers, and never copy it into Alerts.
+
+For a confirmed schema mismatch, validate a compatible dependency from the
+existing local Warp checkout and use the controlled handoff below. Do not
+overwrite the attested executable in place, weaken validation, change valid
+inventory, or restart product services. This adds no build-admission policy.
+Before claiming recovery, require two fresh same-generation reconciliation
+windows for the complete intended collector inventory, with post-boundary
+advancing receipts and the independent stream/source-time controls below.
+A successful build, a live tail, or one capped query is insufficient; missing
+or partial evidence remains unknown.
+
+During candidate validation, inspect the executable image of every standing
+`warpctl logs ... -f` child, not only its abbreviated process command, and
+require it to match the recorded watcher-side Warpctl hash. A candidate that
+silently resolves a different copy cannot be promoted.
+
+On macOS, lsof ORs selection options unless `-a` is present: `-p PID -d txt`
+can include every process's text images, not just that PID. Never select an
+image with `head -n1`; an unrelated older watcher can appear first. Retain the
+PID and `txt` association in the raw field output. Before and after reading it,
+confirm the child's parent ownership and process start identity, plus its
+standing `logs ... -f` arguments. A disappeared or replaced child, failed
+command, or missing or ambiguous result is unknown, not proof of either the
+expected or a wrong binary.
+
+For each confirmed child, set `monitor_tail_pid` to its numeric PID and
+`monitor_image_evidence` to a new private file in this run's evidence directory.
+Run this selector in Bash under a bounded command deadline, preserving its exit
+status and raw output:
+
+```sh
+# monitor-warpctl-image-selector
+set -euo pipefail
+umask 077
+test ! -e "$monitor_image_evidence"
+lsof -nP -a -p "$monitor_tail_pid" -d txt -Fpcfn >"$monitor_image_evidence"
+awk -v expected_pid="$monitor_tail_pid" '
+  /^p/ { pid = substr($0, 2); fd = ""; if (pid != expected_pid) invalid = 1; next }
+  /^f/ { fd = substr($0, 2); next }
+  /^n/ && fd == "txt" && substr($0, 2) ~ /\/warpctl$/ {
+    if (pid != expected_pid) invalid = 1
+    images[substr($0, 2)] = 1
+  }
+  END {
+    for (path in images) { image = path; count++ }
+    if (invalid || count != 1) {
+      print "unknown: missing, foreign, or ambiguous executable image" > "/dev/stderr"
+      exit 1
+    }
+    print image
+  }
+' "$monitor_image_evidence"
+```
+
+Only a successful selector plus the unchanged process identity permits hashing
+that exact image and comparing it with the immutable collector manifest. A
+wrapper's `command -v`/hash preflight alone proves intended selection, not the
+loaded child image. Retain the raw PID-scoped evidence alongside the hash; do
+not infer a PATH or launcher defect from an unscoped census. The documentation
+regression executes this selector with synthetic target/decoy records and
+missing, ambiguous, malformed, and command-error controls, never a live census.
 
 Run the final command in a durable attached session. Give the run a stable ID
 and append only to `$BRINGYOUR_HOME/monitor/runs/<run-id>/ledger.jsonl`. Keep
@@ -265,6 +454,36 @@ environment/mode/start timezone, alert/stderr objects, server commit/dirty
 state, expected tails, exclusions/reasons, boundaries, and deadlines. The
 session must support polling, graceful stop, and liveness proof.
 
+Delta reducers must use the exact monitor identity returned by
+`Alert.Identity()`: `SignalID + Class + Target + Frame`. Severity is not part
+of that identity. Report a WARN-to-PAGE or PAGE-to-WARN transition only when
+all four identity fields match exactly before and after; never pair alerts by
+`signal_key`, family, sort position, timestamp adjacency, or latest row. Two
+concurrent findings from one signal remain distinct even when they alternate in
+the JSONL stream. A diagnostic relationship between different classes may be
+reported separately as a semantic reassignment only with both complete
+before/after identities and `causal_or_recovery_claim=false`; it is not a
+severity transition, a resolution, or a new identity replacement.
+
+Gate the severity comparison on authoritative predecessor existence. A
+missing, null, empty, or default prior severity is not a transition state:
+classify that exact identity as new and do not also increment transition or
+downgrade counts. If the prior prefix is incomplete or unsealed, newness and
+transition absence are unknown rather than zero. Every reducer regression must
+include prior `A/PAGE` with window `B/WARN, A/PAGE`
+(`new=1, transitions=0, downgrades=0`) and prior `A/PAGE` with window `A/WARN`
+(`new=0, transitions=1, downgrades=1`). This existence gate must run before
+evaluating `before_severity != after_severity`.
+
+The alert artifact is append-only while the watcher is live. Snapshot the
+inclusive ending row once, then extract with both lower and upper row bounds
+and verify the exact expected row count before hashing or reducing it. Never
+hash `tail -n +START` or another open-ended reader: rows appended during that
+pipeline produce a digest that cannot describe the recorded window. JSONL
+identity reducers use the lowercase wire keys `signal_id`, `class`, `target`,
+and `frame`; record the canonicalization algorithm alongside its digest so the
+primary agent can reproduce it without reading private evidence into a handoff.
+
 The ledger has one writer: the primary agent that owns the authoritative watcher
 session and production-mutation boundary. Each record is exactly one complete
 compact JSON object on one physical line. Canonicalize a prepared,
@@ -275,12 +494,12 @@ historical producer already appended pretty-printed records, preserve those
 bytes: `jq -c . ledger.jsonl` can stream the whitespace-separated objects for
 recovery. Append a compact format-defect/correction record and use compact
 records thereafter; never rewrite or truncate the evidence ledger merely to
-make its old physical layout valid JSONL. Terra and Sol may prepare manifests;
+make its old physical layout valid JSONL. Sol and Astra may prepare manifests;
 they do not append. Do not allow two agents to append in parallel.
 
 The agent that owns the attached execution session must not return, complete,
 or release that session while its watcher is authoritative. Prefer a
-primary-agent-owned session handle with Terra validating the binary, parent,
+primary-agent-owned session handle with Sol validating the binary, parent,
 tails, files, and cadence through read-only checks. A handoff is complete only
 after the receiver can poll the exact session handle; sharing a PID, run
 directory, lock file, or narrative status is insufficient. If this execution
@@ -289,11 +508,41 @@ promote a receiver-owned candidate with the overlap procedure below before the
 owner exits. Record any interval without a pollable authoritative handle as an
 observation gap rather than silently recreating the watcher.
 
-Continuous mode runs signals at their own cadences, limits ordinary probe
-concurrency, applies each alert's sustain count, and replaces the bounded log
+The explicit `-min-probe-cadence=15m` invocation above enforces a per-watcher
+15-minute active-probe floor when the operator requests that interval. The
+first active probe waits 15 minutes; subsequent probes wait the greater of
+15 minutes or their native cadence after the previous observation and handler
+complete. Zero/omitted leaves existing immediate active startup and native
+cadences unchanged. Slower native probes stay slower. Do not substitute a
+shell loop of one-shots: preserve the running watcher's Sustain/PageSustain
+state. Those counters still require consecutive actual observations; the floor
+lengthens active-alert maturation, not the number of observations required.
+Negative/malformed floors and nonzero floors with `-once` or `-list-signals`
+are rejected before settings or probe contact.
+
+Standing streams start immediately, and standing-log drains plus independent
+overlap reconciliation keep their native cadence. The floor therefore does not
+discard the first 15 minutes of logs. It is not global coordination across
+watchers: use one of the explicit promotion procedures below and record its
+overlap or collection gap separately.
+Do not claim a delayed candidate's active coverage before its first observation.
+
+Continuous mode limits ordinary probe concurrency, applies each alert's sustain
+count, and replaces the bounded log
 probe with one standing `warpctl logs ... -f` stream per active service. Confirm
 the watcher is alive and owns every expected standing stream. A live parent
 with missing children is not healthy observation coverage.
+
+Classify standing tails by the exact child command containing `logs` and `-f`,
+not by the `warpctl logs` prefix alone. The independent bounded overlap
+reconciliation also creates short-lived `warpctl logs --since ... --limit ...`
+children without `-f`; those and transient SSH helpers are dynamic context, not
+additional standing tails. Process enumeration can race their normal exit, so
+an ended non-tail child does not invalidate otherwise matching parent, binary,
+stdout/stderr descriptors, zero standing-tail zombies, and one live `-f` child
+per expected service. A missing standing service, or a persistent duplicate
+`-f` stream for one service, remains an observation defect; investigate it
+rather than weakening the expected-tail invariant.
 
 When recovering or auditing an existing watcher, resolve its actual stdout and
 stderr file descriptors before checking file age. The immutable binary's
@@ -304,6 +553,7 @@ For a temporary exact-edge pause, preserve all other coverage:
 
 ```sh
 WARP_ENV=main "$monitor_run_dir/monitor" -mode overlay \
+  -min-probe-cadence=15m \
   -exclude-edge-ipv6-host HOSTNAME
 ```
 
@@ -315,6 +565,7 @@ For a whole-host pause, use repeatable exact inventory names:
 
 ```sh
 WARP_ENV=main "$monitor_run_dir/monitor" -mode overlay \
+  -min-probe-cadence=15m \
   -exclude-host HOSTNAME
 ```
 
@@ -334,16 +585,63 @@ transfer that proof to the current authoritative watcher. Re-enable a paused
 host only when its recorded operator condition is met and a current-generation
 validation and controlled handoff succeed.
 
+### Explicitly authorized bounded process pause
+
+The standing watcher remains continuous by default. If Root has explicit
+authority for a brief process pause to admit one diagnostic or maintenance
+owner, record the reason, exact watcher generation, UTC pause/resume times,
+maximum pause and coverage gap in the single-writer ledger. This is separate
+from a host exclusion. Preserve the archive and every existing global/per-host
+SSH limit; a quiet observation is not a reservation.
+
+Before pausing, independently gate the exact emergency continuation helper.
+Compile its embedded Python bytes as well as its outer launcher, then use a
+harmless owned local process to prove the same user-unit invocation actually
+delivers the delayed `SIGCONT` and survives its submitting command's exit.
+`systemd-run` success or an instantaneous `active` state does not prove that
+the helper body parses or that the delayed action works. Retain source hashes,
+unit InvocationID, PID/start ticks/cgroup/boot ID and the control outcome.
+
+Refuse a new pause while any prior continuation helper remains live. Arm the
+new independently owned, bounded helper before the final zero-child wait.
+Within the existing sample/deadline limits, use the first admissible audit
+showing zero watcher SSH children to signal the verified watcher immediately;
+do not insert another running-watcher audit or unit launch between that audit
+and `SIGSTOP`. Then audit again while stopped and refuse contact if any child
+remains. A stopped parent cannot reap an exiting SSH child. Preserve enough
+time before emergency continuation for the reviewed contact boundary; expiry
+or a busy window consumes that local attempt without an automatic Main retry.
+
+Normal cleanup must continue the exact watcher generation and then disarm
+only its own helper after verifying the helper's current unit InvocationID and
+native process generation. Never stop a reused or unrelated unit. Otherwise an
+earlier successful operation's still-armed helper can resume the watcher during
+the next operation's pause. Record fallback arming, deadline, normal
+continuation, disarm outcome and any overlap in the timing ledger; reconcile
+missing cleanup evidence before another pause.
+
+Persist typed admission phase/cause/budget alongside Main-contact, forward-spawn
+and CLI-spawn attempt flags. All three false establishes a local precontact
+refusal; preserve the current catalog/capacity authority and its original age
+instead of inventing an interrupted database operation. Any true or uncertain
+spawn flag requires actual native progress/catalog/owner reconciliation. A
+later local audit cannot recover an older rejection's exact cause. Keep raw
+SQL, process argv and credentials out of public evidence. See `SIGNALS.md`
+§8.10 for the observed embedded-code and delayed-continuation failures.
+
 ## Safe watcher promotion
 
 Any monitor code, catalog, inventory-loading, tailer, alert-rendering, or
 effective Config/Vault settings-generation change requires a newly built
 watcher. A `settings-freshness` finding means this boundary has already been
 crossed; validate the current generation with a fresh one-shot before
-promotion. Promote it as a controlled handoff:
+promotion. Such a one-shot must also respect the operator's observation interval;
+do not add an immediate diagnostic merely to satisfy a handoff checklist.
+The normal bounded-overlap handoff is:
 
-1. run focused tests, `go test ./monitor`, `go test -race ./monitor`, and
-   `go vet ./monitor`;
+1. run focused tests, the attested-local sequential package and race gates, and
+   `go vet ./monitor` exactly as described under Deterministic verification
+   gates below;
 2. build a new uniquely named binary and record its hash;
 3. start it alongside the old watcher;
 4. prove the new parent remains alive, loads the expected signals, and starts
@@ -365,6 +663,22 @@ Overlap is allowed only for this bounded handoff. Prolonged duplicate watchers
 distort log coverage and add production load; stopping the old watcher before
 the new one is proven creates an observation gap.
 
+When the operator explicitly prioritizes a no-overlap active-probe interval,
+use this alternative instead of waiting 15 minutes beside an active predecessor:
+finish the same tests/build/hash preflight, resolve the exact owned predecessor
+PID/session/binary, and gracefully stop it through its durable session. Confirm
+that its parent and all standing-tail children have exited, then immediately
+launch one receiver-owned successor with `-min-probe-cadence=15m`. No parallel
+watchers are permitted in this alternative. Prove the new session is pollable,
+the expected tails start immediately, and the native drain/reconciliation
+receipts advance. Record the brief log-collection gap and the Sustain reset;
+do not claim gap-free continuity or active-probe coverage before the first
+delayed observation. Because the old watcher is stopped before the new one
+starts its first-probe floor, this handoff does not create an immediate second
+active observation. The default zero-floor startup still runs immediately and
+cannot substitute for this explicit invocation. A failed successor remains an
+observation incident, not permission to silently restart another watcher.
+
 Sustain counters and alert gates are process-local. During overlap, compare the
 candidate's raw probe observations and direct source measurements with every
 mature predecessor alert; absence from the candidate before its required number
@@ -374,6 +688,25 @@ evidence until the candidate either re-emits the identity or completes the
 documented healthy resolution window. Do not persist sustain counters or
 introduce persistent ticket state as part of a watcher handoff without a
 separate design decision.
+
+Record an authorized replacement command's actual exit and boundary time
+durably before its postconditions are evaluated. Keep `replacement completed`
+separate from `process verification unavailable`: an unprivileged proc-exe
+permission failure after a successful unit restart is not authority to repeat
+that restart. Recover only the missing bounded read-only identity evidence,
+preserving the prior attempt, unit, launcher, cadence and predecessor-retirement
+facts. A recovery receipt supplements the original; it does not overwrite it.
+
+Fresh staged Python reader successors use the reviewed
+`monitor/diagnostics/process_identity.py` helper (or a byte-identical pinned
+copy), with exact unit/PID/boot/start-ticks/executable authority. Its only sudo
+operation is a fixed, noninteractive, timeout-supervised hash of that process's
+proc executable; it cannot restart or signal the watcher. Unknown authority
+stops before contact. Do not reopen historical readers just to replace their
+audit. Gate this helper with the actual tested interpreter:
+`/usr/bin/python3 -m unittest discover -s monitor/diagnostics -v`, then run the
+consumer's own admission/privacy/transport controls on its frozen successor.
+These local controls add no Main request or automatic activation.
 
 ## Alert validation loop
 
@@ -412,13 +745,28 @@ Useful source-of-truth pairings are:
 | Redis state | each node's own `INFO`, `CLUSTER NODES`, and key metadata | host listener/process/cgroup state and PostgreSQL durable owner state |
 | host memory, OOM, or UDP loss | kernel journal, `/proc`, cgroup files, `nstat`, and socket queues | process generations, overlap timeline, swap and application metrics |
 | host or edge address | live interface and policy-routing state | active `services.yml`, host config, router path, and exact-origin probes |
-| log loss | standing tail health and privacy-safe drop summaries | bounded absolute-window reconciliation per service/block and direct host journal |
+| log loss | standing tail health and privacy-safe drop summaries | current-watcher `monitor-log-reconcile ` diagnostic receipt, bounded absolute-window reconciliation per service/block, and direct host journal |
 | metrics identity | fresh process-emitted series with host/block/instance labels | live process start, listener, ring membership, and scrape age |
 | metrics restart durability | exact loopback Mimir `/config`, reduced remotely to `flush_blocks_on_shutdown`, `query_store_after`, `query_ingesters_within`, blocks-storage `ignore_blocks_within`, bucket-store `sync_interval`, and compactor `cleanup_interval` | separate exact-process lifecycle proof plus a controlled replacement with no new bounded §11.20 gap through the complete handoff and discovery window; config and sustain state are process-local |
 
 Use the existing SSH and Warpctl transports and the commands documented in
 `SIGNALS.md`; do not improvise a less safe secret path. Never contact a disabled
 host while trying to improve denominator coverage.
+
+For a two-reconciliation closure gate, retain the exact `monitor-log-reconcile `
+prefix plus schema-1 JSON from the current watcher generation's stderr artifact.
+Require `collectors=enabled=fresh=consecutive_two > 0`, matching the intended
+collector inventory. Check `collector_started_at`, `previous_window_start`,
+`latest_window_start`, `previous_completed_at`, and `latest_completed_at`:
+their oldest/newest ranges must be non-null, ordered, advancing, and meet the
+incident's post-boundary window. Bind the receipt to the immutable binary,
+durable session, and stderr object; never combine predecessor and candidate
+histories. Query lower bounds and local completions do not establish fresh
+source-record timestamps or live-stream liveness; retain those independent
+controls and the required no-loss window. Missing, malformed, stale, or
+partial-scope receipts leave completion unknown; alert absence alone is
+insufficient. This diagnostic does not change alert-only JSONL or invent
+healthy Alerts. See `SIGNALS.md` §1.5 and `MONITOR.md` §3.7 for the fixed schema.
 
 ## Daily three-way improvement research
 
@@ -458,14 +806,22 @@ Research all three directions:
    prerequisite, or escaped failure class, either update the owning catalog and
    probe with a deterministic regression or record why an existing probe
    already covers it. Historical class names remain documented as aliases when
-   removing them would make old evidence uninterpretable.
+   removing them would make old evidence uninterpretable. Review each causal
+   finding for both false-positive and false-negative qualifiers: aggregation,
+   denominator, timing, stale or corrected data, partial source coverage, and
+   observation failure are explicit candidates, but become probe rules only
+   when a bounded discriminator and healthy control establish them.
 
-Terra owns the reproducible crosswalk, registry/test inventory, current watcher
-delta, and verification manifests. Sol owns semantic review of observation
-authority, causal discrimination, false-positive/false-negative boundaries,
-and the smallest source/test corrections. The primary agent reviews their
-manifests, writes the single chained ledger record, and owns all source and
-production authority decisions.
+Sol Medium owns the reproducible crosswalk, registry/test inventory, current
+watcher delta, initial failure fact collection and triage, and independent test
+and verification manifests. Astra Max owns all post-triage bounded
+investigation/fact collection, root-cause debugging, causal discrimination,
+false-positive/false-negative boundaries, and every self-improvement repair to
+a probe, shared monitoring utility, signal catalog, or this harness. Astra
+writes the smallest source and deterministic-test correction; Sol reruns the
+relevant tests and verifies the repaired observation boundary independently.
+The primary agent reviews their manifests, writes the single chained ledger
+record, and owns all source and production authority decisions.
 
 The pass is complete only when every catalog signal is implemented or remains
 an explicit active coverage finding with a named missing source prerequisite;
@@ -500,6 +856,16 @@ For a product defect, change the owning repository and add a deterministic test
 that fails for the reproduced mechanism and passes for the fix. Keep a monitor
 probe as the production guard; do not move application behavior into
 `server/monitor`.
+
+A RED receipt must show that the exact expected causal assertion was reached;
+an expected test name with `action=fail`, or native exit 1 alone, is insufficient.
+Separately classify preflight, missing synthetic fixtures, compile failures,
+retry-wrapped setup panics and outer timeouts, and preserve those failed attempts
+without calling them reproductions. Pin the complete local-only resource profile
+and expose the first failure with the existing fail-fast gate setting; never use
+production resources to make a fixture pass. Any derived metric in an evidence
+receipt must carry its unit and expression so rates per second and per minute
+cannot be silently exchanged.
 
 For every iOS/Apple issue, cross-validate the same failure mechanism on Android,
 Windows, Linux, macOS, `mmm/ur.io`, and `extension` before closing the finding.
@@ -606,11 +972,66 @@ operator work.
 Update the Go alert text and deterministic expectations in the same change when
 the catalog changes an automated diagnosis, action, or verification contract.
 
+## Continuous PostgreSQL query observation
+
+A resource alert requires fresh query context, not an expired diagnostic arm.
+The authoritative watcher should explicitly select `-pg-query-sample-continuous`
+with its existing private state root and `-min-probe-cadence 15m` or longer.
+Remove the mutually exclusive one-shot `-pg-query-sample-until` option only in
+the reviewed replacement command. `pg-query-sample` stays registered; retain
+all other signals, URL floors, exclusions, host concurrency and standing tails.
+A disabled/expired sample is coverage failure, not a healthy database.
+
+Before promotion, Sol independently verifies focused reducer/cadence/CLI
+controls and the full sequential monitor/package, race and vet gates below.
+Verify actual SQL classification and authority guards against the attested
+local fixture; never use Main to test a query. The recurring state must survive
+watcher replacement: precontact fsync, process lock, crash reservation, terminal
+15-minute floor, success/failure clocks and malformed-state rejection all need
+controls. Preserve the existing state directory and `pg-query-sample` files
+through the bounded singleton handoff; do not reset clocks to obtain a sample.
+Do not overlap old and new sampler ownership. Keep the alert ledger and standing
+log observation continuous using the existing promotion procedure.
+
+After activation, record exact binary/argv/PID and the first actual sampler
+terminal receipt; then require a second eligible attempt to prove recurring
+coverage. `continuous.json` records last attempted/completed/terminal clocks,
+next eligible clock and outcome. Due age comes from the current clock minus
+that next eligible clock. Inspect the immutable content-addressed receipt named by the cadence index
+and its explicit source clocks/caps. Preserve every original body referenced
+by an alert or ledger record; the sampler never overwrites or deletes receipt
+bodies. Global archival/retention needs an explicit policy. A source/queue
+failure consumes its admission reservation; no immediate manual retry or
+second watcher is allowed. Monitor tests are not a sampler runtime action.
+An unacquired shared slot has no database attempt to record; its first-cadence
+coverage alert must say so and preserve any older durable clocks. Test the real
+RunLoop with a startup bulk wave and a later saturated queue: the enabled
+sampler must complete its finite startup turn and receive a released recurring
+slot without exceeding global four or host two. Keep its 40-second budget
+inclusive of shared-slot/host admission. Existing active work can still exhaust
+that budget; require an immediate qualified coverage failure, never an invented
+completion. Startup priority must leave standing log ingestion running and
+delay ordinary active probes by at most the same finite owner. Recurring
+priority must include an ordinary-work fairness control.
+Gate the actual remote adapter against bounded local executable/connection,
+SQL authority/schema/PGSS, statement-timeout, capped-stderr/output and stalled
+child controls, with a complete12-frame healthy parser control. Psql phase
+markers are source comments only; verify the owning SQL workload is unchanged
+apart from those comments against the attested local PGSS fixture. Require a
+fixed phase/cause in failed immutable receipts without raw diagnostic text.
+Do not infer the cause of older coarse source-unavailable receipts from a
+later classifier result or promote queue fairness as proof that SQL now runs.
+PGSS1.10 lifetime counters remain interval-unqualified; query activity and
+execution wall time are not CPU shares. Preserve resource incidents while
+triaging absent, stale, partial, disabled or overdue query evidence.
+
 ## Deterministic verification gates
 
-Every confirmed problem needs a synthetic regression. The test should construct
-the smallest input that reproduces the causal failure without production access
-or wall-clock sleeps. Cover, as applicable:
+Every confirmed problem needs an Astra Max-authored synthetic regression. The
+test should construct the smallest input that reproduces the causal failure
+without production access or wall-clock sleeps. Sol Medium runs the narrow,
+package, race, and vet gates below and supplies the initial failure facts and
+triage manifest before Astra begins the repair. Cover, as applicable:
 
 - the failing observation and exact alert identity;
 - a healthy boundary and threshold edge;
@@ -624,12 +1045,28 @@ or wall-clock sleeps. Cover, as applicable:
 Run the narrow test first, then the package and race suite:
 
 ```sh
-go test ./monitor -run 'TestRelevantName' -count=1
-go test ./monitor
-go test -race ./monitor
+bash -c \
+  'unset WARP_ENV; source ./test-env.sh && exec go test ./monitor -run "TestRelevantName" -count=1'
+bash -c \
+  'unset WARP_ENV; source ./test-env.sh && exec go test ./monitor'
+bash -c \
+  'unset WARP_ENV; source ./test-env.sh && exec go test -race ./monitor'
 go vet ./monitor
 git diff --check
 ```
+
+`WARP_ENV=main` selects the production probe target; it is not a Go-test
+environment. Run the monitor package and race gates sequentially in separate
+attested Bash subshells as shown above. An unset or `main` test environment must fail
+closed on SQL fixtures and is a test-harness failure, not a production probe
+alert. Never label that result a probe failure or use it to diagnose main.
+Source `test-env.sh` separately for each gate so its authority and resource
+attestations are current; setting bare
+`WARP_ENV=local` is not equivalent. Keep `WARP_ENV=main` in the parent shell for
+the watcher, and let each subshell leave that parent state unchanged on exit.
+Do not overlap the package and race gates: although no fixed-path collision is
+established, they share local PostgreSQL, proxy, CPU, and process capacity, so
+overlap can create load-dependent failures and is not formal gate evidence.
 
 Run the owning repository's full release-relevant tests for product fixes. A
 focused test is not sufficient when the change affects generated service

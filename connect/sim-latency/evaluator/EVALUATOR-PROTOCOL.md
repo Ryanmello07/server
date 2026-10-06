@@ -30,7 +30,7 @@ Before any candidate process runs, the pinned evaluator must:
   file, then build a candidate with the fixed `Dockerfile.submission`; every
   candidate `RUN` has `network=none`, `GOPROXY=off`, and `GOSUMDB=off`, and uses
   only the base image's read-only warmed module cache;
-- mount the complete untrusted work/evidence tree on a root-created 32 GiB
+- mount the complete untrusted work/evidence tree on a root-created 4 GiB
   tmpfs with `nosuid,nodev,noexec`. Candidate output and intermediate evidence
   share this aggregate ENOSPC boundary; only the bounded, sanitized tree is
   copied to durable retention after candidate execution has ended;
@@ -52,15 +52,21 @@ Before any candidate process runs, the pinned evaluator must:
   separately, and read-only; authenticate their policy-pinned sorted-file
   digests before and after each run; never bind their parents or any `main`,
   `all`, or `site` tree;
-- run the pristine baseline image and candidate image in different Compose
-  projects and artifact directories. Both use the authenticated per-round
-  providers file and identical replicate policy. The candidate receives no
-  baseline artifact, scorer output, production credential, Docker socket, or
-  host path beyond its explicit read-only local-leaf/input and writable
-  output;
-- construct `baseline.json` and score in later pristine-base scorer projects
-  with `network_mode: none`, so candidate code never controls the scorer or
-  baseline evidence;
+- before the first submitted build in a round, run the pristine image nine
+  times in separate fresh Compose projects and construct `baseline.json` in a
+  pristine-base, `network_mode: none` scorer project. Atomically freeze the
+  exact bytes and SHA-256 in PostgreSQL after durable attempt retention. A
+  terminal candidate build failure may freeze that already completed control;
+- on every later attempt, authenticate and materialize that exact frozen
+  `baseline.json` instead of running the pristine image again. Run only the
+  candidate in fresh Compose projects with the same authenticated per-round
+  providers file and replicate policy. The candidate receives no baseline
+  artifact, scorer output, production credential, Docker socket, or host path
+  beyond its explicit read-only local-leaf/input and writable output;
+- score in a later pristine-base project with `network_mode: none`, bind the
+  score diagnostics to the epoch-baseline SHA-256, and rank completed
+  candidates by absolute raw latency rather than normalized score, so candidate
+  code never controls either the scorer or control evidence;
 - sample the live runner cgroup while it exists, because a short-lived
   one-shot container's leaf cgroup may disappear immediately after exit;
   authenticate the sample against the resolved container cgroup id;
@@ -77,7 +83,11 @@ the authoritative host's SMT/governor/turbo/NUMA/IRQ/kernel/microcode and
 user-namespace or rootless-Docker policy. The 12-core host exposes only 10
 physical cores to builds and evaluation; the worker, Docker control plane, and
 cleanup execute on the other 2. The active runner/PostgreSQL/Redis ceilings
-total 96 GiB and must leave at least 24 GiB outside the active stack.
+total 96 GiB. The retained host evidence tmpfs adds a separately budgeted
+4 GiB, and at least 24 GiB must remain after both ceilings. Evidence pages and
+copies outlive individual stage cgroups; container limits alone do not reserve
+this management memory. Historical baseline artifacts retain their original
+limits; this changed boundary requires fresh qualification before activation.
 
 `worker-result.json` is strict JSON:
 
@@ -140,6 +150,34 @@ infrastructure failure. It hashes its own request, patch, stderr, and result,
 seals the attempt tree read-only, stores the manifest once behind a DB
 immutability trigger, and retains every attempt through the season.
 
+An interrupted or nonzero-exit command has a separate failure-retention path;
+it does not manufacture `worker-result.json`, a score, or passed security gates.
+The worker authenticates the sanitizer's `failed-evidence-manifest.json`, binds
+each permitted regular file by size and digest, and archives the failure through
+`server/blob`. If the command stopped before it produced a sanitized manifest,
+only trusted worker diagnostics and the canonical patch may be retained. The
+hidden-seed request, workload inputs, credentials, links, and unlisted files do
+not cross this boundary. Retention gets a separate bounded two-minute cleanup
+context after the evaluation process has stopped, including on cancellation;
+this does not extend the three-hour scoring deadline.
+
+A candidate run that exits unsuccessfully, with authenticated containment and
+healthy backing services, writes a trusted `evaluator-failure.json` outside the
+candidate mounts before cleanup. Only this strict candidate/run record, an
+authenticated sanitized evidence manifest, and successful durable archival can
+classify the command failure as terminal `submission/run_process_failed`.
+This includes a nonzero exit attributable only to the candidate's memory
+limit; the dedicated parent and PostgreSQL/Redis counters must prove the
+attribution. Missing or inconsistent counters remain infrastructure failures.
+The terminal record is invalidated if Docker or evidence-mount cleanup fails.
+Baseline, backing-service, cancellation, and malformed-evidence failures remain
+infrastructure failures. PostgreSQL/Redis OOM, exit, restart, or unhealthy state
+must never produce a clean resource report just because the runner exited zero.
+Each attempt uses its own project/cgroup identity so an earlier attempt's
+retained counters cannot contaminate it. Before allocating any new attempt,
+the single-job evaluator must reject leftover evaluator containers, networks,
+or evidence tmpfs mounts; it must not stack new work onto failed cleanup.
+
 The self-check result uses `HostSelfCheck` from `types.go`. The trusted
 self-check executable derives those booleans from root-owned provisioning state
 and live kernel/cgroup/network/storage probes; it must not copy a caller-written
@@ -148,8 +186,9 @@ host image, BIOS/microcode, kernel, SMT, governor/turbo, NUMA/affinity, IRQ,
 cgroup/sysctl, and backing-service facts. `kernel_release`,
 `microcode_revision`, the `irq_affinity_sha256` and `irq_policy_sha256`
 digests, and every named `checks` entry are mandatory.
-`rebaseline_passed` binds a recent same-round re-baseline on that specific host
-and image. A host may heartbeat as containment-eligible before a round exists;
+`rebaseline_passed` binds a recent same-round host-readiness check on that
+specific host and image. It is not the score's append-only epoch baseline. A
+host may heartbeat as containment-eligible before a round exists;
 round generation ignores this one round-scoped field, while queue admission
 and the worker both require it to name the active round. One fresh, eligible
 row for the season's authoritative host is required.
@@ -231,9 +270,9 @@ hash-consistent adversarial chain containing a parent `/runtime/config` mount
 and proves that no marker is written.
 
 The stronger `connect/sim-latency/evaluator/container/evaluator.sh` gate
-consumes the exact
-worker request, derives the candidate, runs separate baseline/candidate and
-scorer projects, emits the strict result above, and produces a hash manifest
+consumes the exact worker request, authenticates or establishes the one round
+baseline, derives the candidate afterward, runs isolated candidate and scorer
+projects, emits the strict result above, and produces a hash manifest
 for every retained evidence file. Its local end-to-end pass is required before
 host qualification, but likewise cannot replace the official calibration campaign.
 The latest rebuilt-boundary full-scale local execution rechecked the strict builder record,

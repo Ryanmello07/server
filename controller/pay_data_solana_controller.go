@@ -20,12 +20,16 @@ import (
 //
 // POST /pay/data/solana-intent quotes a data pack for a NAMED network and records
 // the payment intent the Helius webhook (POST /pay/solana) credits when the USDC
-// arrives at one of our receiving addresses. The buyer sends exactly the quoted
-// amount either through a Solana Pay url, whose wallet attaches the reference as
-// an account key of the transfer, or by hand from any wallet or exchange with the
+// arrives at one of our receiving addresses. The quote names where to pay (the
+// receiver and the mint, the same ones a plan intent names), so the page keeps
+// no merchant address of its own. The buyer sends exactly the quoted amount
+// either through a Solana Pay url, whose wallet attaches the reference as an
+// account key of the transfer, or by hand from any wallet or exchange with the
 // reference as the transfer MEMO. The webhook matches both
 // (solanaReferenceCandidates), so there is no email, no hosted checkout and no
-// code: the data lands on the network.
+// code: the data lands on the network. A wallet that cannot add a memo still
+// works: the quoted amount is unique, and a transfer of exactly that amount
+// within the intent's window is matched by it (solana_memoless_match.go).
 //
 // POST /pay/data/solana-status is what the buy-data page polls while it waits.
 //
@@ -63,16 +67,23 @@ type PayDataSolanaIntentArgs struct {
 }
 
 type PayDataSolanaIntentResult struct {
-	// the exact USDC amount to send, quoted from pro.yml
+	// the exact USDC amount to send: the pro.yml price plus a unique sub-cent
+	// suffix (up to 6 decimals) that identifies a payment sent without the memo
 	AmountUsd float64 `json:"amount_usd,omitempty"`
 	Reference string  `json:"reference,omitempty"`
 	// what to put in the transfer memo when paying by hand: the reference
 	Memo      string     `json:"memo,omitempty"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	// the resolved network
-	NetworkName string                `json:"network_name,omitempty"`
-	NetworkId   *server.Id            `json:"network_id,omitempty"`
-	Error       *PayDataCheckoutError `json:"error,omitempty"`
+	NetworkName string     `json:"network_name,omitempty"`
+	NetworkId   *server.Id `json:"network_id,omitempty"`
+	// where to pay: the merchant address and the SPL token mint (USDC), both
+	// base58, the same as a plan intent's. Empty from a server that predates
+	// them, and then a client has nowhere to pay: it must not substitute an
+	// address of its own.
+	Recipient    string                `json:"recipient,omitempty"`
+	SplTokenMint string                `json:"spl_token_mint,omitempty"`
+	Error        *PayDataCheckoutError `json:"error,omitempty"`
 }
 
 func payDataSolanaIntentError(message string) *PayDataSolanaIntentResult {
@@ -172,14 +183,17 @@ func PayDataSolanaIntent(
 		return payDataSolanaIntentError(fmt.Sprintf("No network named %s", networkName)), nil
 	}
 
+	// the quote carries a reserved sub-cent suffix, so a payment sent without
+	// the memo is still identified by its exact amount
 	expiresAt := server.NowUtc().Add(payDataSolanaIntentDuration)
-	err := model.CreateSolanaPaymentIntentForNetwork(
+	amountUsd, err := model.CreateSolanaPaymentIntentWithUniqueAmount(
 		clientSession.Ctx,
 		reference,
 		*networkId,
 		priceUsd,
 		itemId,
 		expiresAt,
+		solanaPickAmountSuffixMicro,
 	)
 	if err != nil {
 		// a duplicate reference or a failed insert must not send the buyer off to
@@ -189,17 +203,19 @@ func PayDataSolanaIntent(
 	}
 
 	glog.Infof(
-		"[paydata]solana intent %s: %s for network %s, %.2f USDC\n",
-		reference, itemId, *networkId, priceUsd,
+		"[paydata]solana intent %s: %s for network %s, %.6f USDC\n",
+		reference, itemId, *networkId, amountUsd,
 	)
 
 	return &PayDataSolanaIntentResult{
-		AmountUsd:   priceUsd,
-		Reference:   reference,
-		Memo:        reference,
-		ExpiresAt:   &expiresAt,
-		NetworkName: storedName,
-		NetworkId:   networkId,
+		AmountUsd:    amountUsd,
+		Reference:    reference,
+		Memo:         reference,
+		ExpiresAt:    &expiresAt,
+		NetworkName:  storedName,
+		NetworkId:    networkId,
+		Recipient:    solanaPaymentRecipient(),
+		SplTokenMint: solanaUsdcMint,
 	}, nil
 }
 

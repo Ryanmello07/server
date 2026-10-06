@@ -24,6 +24,7 @@ type HostSettings struct {
 	LANAddress     string
 	OverlayAddress string
 	Roles          []string
+	scopeEndpoints []string
 
 	// SSHUser and SSHKeyPaths override the environment-wide SSH identity for
 	// infrastructure hosts whose administrative account is deliberately
@@ -360,6 +361,10 @@ type SignalSettings struct {
 	// overlap uses it for bounded per-block continuation when the result cap is
 	// reached.
 	LogServiceBlocks map[string][]string
+	// LogServiceHosts is active services.yml placement, independent of monitor
+	// host exclusions. Hosts × blocks is the desired service-slot inventory;
+	// missing placement remains unknown rather than an observed-series count.
+	LogServiceHosts map[string][]string
 	// ProxyPathExpectedHosts is the active services.yml proxy-host count. It
 	// lets §14.5 distinguish an environment with no proxy service from a
 	// broken inventory join that would otherwise produce a silent green run.
@@ -386,6 +391,12 @@ type SignalSettings struct {
 	AddressMode AddressMode
 
 	Hosts []HostSettings
+	// Routers are explicitly enrolled read-only targets, never Linux hosts.
+	Routers       []RouterSettings
+	PublicUdp     PublicUdpSettings
+	disabledHosts []HostSettings
+	// Private desired-input identity participates only in in-memory generation checks.
+	routerDesiredGeneration [32]byte
 	// ExcludedHosts is an exact, process-owned observation policy. Hosts remain
 	// authoritative topology; exclusions never remove placements or capacity.
 	ExcludedHosts     []string
@@ -397,7 +408,14 @@ type SignalSettings struct {
 	SourceAttribution SourceAttributionSettings
 	DNSAliases        DNSAliasSettings
 	MimirPublishers   MimirPublisherSettings
-	StateDir          string
+	// APIReleaseProof is an explicit, finite local release expectation. Nil
+	// leaves the optional release diagnostic off without remote contact.
+	APIReleaseProof *APIReleaseProofSettings
+	// PGQuerySampleContinuous schedules bounded catalog samples indefinitely.
+	// PGQuerySampleUntil instead arms one expiring sample; modes are exclusive.
+	PGQuerySampleContinuous bool
+	PGQuerySampleUntil      time.Time
+	StateDir                string
 	// SettingsGenerationCheck is armed by LoadSignalSettings. Embedders that
 	// assemble SignalSettings directly may omit it; synthetic tests inject it
 	// without touching Config or Vault.
@@ -445,6 +463,10 @@ func ExcludeEdgeIPv6Hosts(settings SignalSettings, names ...string) (SignalSetti
 }
 
 func (s SignalSettings) withDefaults() SignalSettings {
+	s.APIReleaseProof = cloneAPIReleaseProofSettings(s.APIReleaseProof)
+	s.Routers = cloneRouterSettings(s.Routers)
+	s.PublicUdp = clonePublicUdpSettings(s.PublicUdp)
+	s.disabledHosts = cloneRouterScopeHosts(s.disabledHosts)
 	if s.AddressMode == "" {
 		s.AddressMode = AddressModeOverlay
 	}
@@ -489,6 +511,23 @@ func (s SignalSettings) withRuntime() SignalSettings {
 func (s SignalSettings) Validate() error { return s.withDefaults().validate() }
 
 func (s SignalSettings) validate() error {
+	if !s.PGQuerySampleUntil.IsZero() && s.PGQuerySampleUntil.After(s.Now().Add(24*time.Hour)) {
+		return fmt.Errorf("monitor: bounded PG query sample expiry exceeds 24 hours")
+	}
+	if s.PGQuerySampleContinuous && !s.PGQuerySampleUntil.IsZero() {
+		return fmt.Errorf("monitor: continuous and expiring PG sample modes are mutually exclusive")
+	}
+	if (s.PGQuerySampleContinuous || !s.PGQuerySampleUntil.IsZero()) && s.StateDir == "" {
+		return fmt.Errorf("monitor: bounded PG query sample requires a private state directory")
+	}
+	if s.APIReleaseProof != nil {
+		if err := s.APIReleaseProof.validate(); err != nil {
+			return err
+		}
+		if s.StateDir == "" {
+			return fmt.Errorf("monitor: API release proof requires a private state directory")
+		}
+	}
 	if s.AddressMode != AddressModeLAN && s.AddressMode != AddressModeOverlay {
 		return fmt.Errorf("monitor: unsupported address mode %q", s.AddressMode)
 	}
@@ -520,7 +559,22 @@ func (s SignalSettings) validate() error {
 			seenBlocks[block] = struct{}{}
 		}
 	}
+	for service, hosts := range s.LogServiceHosts {
+		if _, ok := seenLogServices[service]; !ok {
+			return fmt.Errorf("monitor: log hosts configured for unknown service %q", service)
+		}
+		seen := map[string]bool{}
+		for _, name := range hosts {
+			if name == "" || strings.TrimSpace(name) != name || seen[name] {
+				return fmt.Errorf("monitor: invalid or duplicate service host")
+			}
+			seen[name] = true
+		}
+	}
 	if _, err := ExcludeHosts(s); err != nil {
+		return err
+	}
+	if err := validateRouterSettings(s); err != nil {
 		return err
 	}
 	if s.Source != nil {
@@ -529,7 +583,7 @@ func (s SignalSettings) validate() error {
 	if s.SSHUser == "" && s.SSHDevUser == "" {
 		return fmt.Errorf("monitor: SSH user is required")
 	}
-	if len(s.Hosts) == 0 {
+	if len(s.Hosts) == 0 && len(s.Routers) == 0 {
 		return fmt.Errorf("monitor: at least one host is required")
 	}
 	return nil
@@ -543,7 +597,7 @@ func newProbeEnv(settings SignalSettings) (*probeEnv, error) {
 	} else {
 		transport = newRunner(cfg)
 	}
-	if len(settings.ExcludedHosts) != 0 {
+	if len(settings.ExcludedHosts) != 0 || len(cfg.disabledHosts) != 0 || cfg.hasDisabledRouter() {
 		transport = newHostScopeRunner(transport, cfg, settings.ExcludedHosts)
 	}
 
@@ -563,38 +617,64 @@ func newProbeEnv(settings SignalSettings) (*probeEnv, error) {
 
 func configFromSignalSettings(settings SignalSettings) *monitorConfig {
 	cfg := &monitorConfig{
-		env:                    settings.Environment,
-		publicDomain:           settings.PublicDomain,
-		websiteDomain:          settings.WebsiteDomain,
-		managerHostname:        settings.ManagerHostname,
-		logServices:            append([]string(nil), settings.LogServices...),
-		logServiceBlocks:       cloneLogServiceBlocks(settings.LogServiceBlocks),
-		proxyPathExpectedHosts: settings.ProxyPathExpectedHosts,
-		verificationEnabled:    settings.VerificationEnabled,
-		stConfigStatus:         settings.STConfigStatus.normalized(),
-		stDeploymentKey:        settings.STDeploymentKey,
-		sshUser:                settings.SSHUser,
-		sshDevUser:             settings.SSHDevUser,
-		sshKeyPaths:            append([]string(nil), settings.SSHKeyPaths...),
-		addressMode:            string(settings.AddressMode),
-		pgPort:                 settings.PostgreSQL.Port,
-		pgbouncerPort:          settings.PostgreSQL.PgBouncerPort,
-		pgUser:                 settings.PostgreSQL.User,
-		pgPassword:             settings.PostgreSQL.Password,
-		pgDb:                   settings.PostgreSQL.Database,
-		grafanaAdminPassword:   settings.Grafana.AdminPassword,
-		sourceIPv4URL:          settings.SourceAttribution.IPv4URL,
-		sourceIPv6URL:          settings.SourceAttribution.IPv6URL,
-		expectedSourceIPv4:     settings.SourceAttribution.ExpectedIPv4,
-		expectedSourceIPv6:     settings.SourceAttribution.ExpectedIPv6,
-		dnsAliases:             cloneDNSAliasSettings(settings.DNSAliases),
-		mimirPublishers:        cloneMimirPublisherSettings(settings.MimirPublishers),
-		stateDir:               settings.StateDir,
-		sshConnectTimeout:      settings.SSHConnectTimeout,
-		commandTimeout:         settings.CommandTimeout,
+		env:                     settings.Environment,
+		publicDomain:            settings.PublicDomain,
+		websiteDomain:           settings.WebsiteDomain,
+		managerHostname:         settings.ManagerHostname,
+		logServices:             append([]string(nil), settings.LogServices...),
+		logServiceBlocks:        cloneLogServiceBlocks(settings.LogServiceBlocks),
+		logServiceHosts:         cloneLogServiceBlocks(settings.LogServiceHosts),
+		proxyPathExpectedHosts:  settings.ProxyPathExpectedHosts,
+		verificationEnabled:     settings.VerificationEnabled,
+		stConfigStatus:          settings.STConfigStatus.normalized(),
+		stDeploymentKey:         settings.STDeploymentKey,
+		sshUser:                 settings.SSHUser,
+		sshDevUser:              settings.SSHDevUser,
+		sshKeyPaths:             append([]string(nil), settings.SSHKeyPaths...),
+		addressMode:             string(settings.AddressMode),
+		pgPort:                  settings.PostgreSQL.Port,
+		pgbouncerPort:           settings.PostgreSQL.PgBouncerPort,
+		pgUser:                  settings.PostgreSQL.User,
+		pgPassword:              settings.PostgreSQL.Password,
+		pgDb:                    settings.PostgreSQL.Database,
+		grafanaAdminPassword:    settings.Grafana.AdminPassword,
+		sourceIPv4URL:           settings.SourceAttribution.IPv4URL,
+		sourceIPv6URL:           settings.SourceAttribution.IPv6URL,
+		expectedSourceIPv4:      settings.SourceAttribution.ExpectedIPv4,
+		expectedSourceIPv6:      settings.SourceAttribution.ExpectedIPv6,
+		dnsAliases:              cloneDNSAliasSettings(settings.DNSAliases),
+		mimirPublishers:         cloneMimirPublisherSettings(settings.MimirPublishers),
+		apiReleaseProof:         cloneAPIReleaseProofSettings(settings.APIReleaseProof),
+		pgQuerySampleUntil:      settings.PGQuerySampleUntil,
+		pgQuerySampleContinuous: settings.PGQuerySampleContinuous,
+		publicUdp:               clonePublicUdpSettings(settings.PublicUdp),
+		stateDir:                settings.StateDir,
+		sshConnectTimeout:       settings.SSHConnectTimeout,
+		commandTimeout:          settings.CommandTimeout,
 	}
 	if settings.runtime != nil {
 		cfg.remoteCommands = settings.runtime.remoteCommands
+	}
+	if settings.SettingsGenerationCheck != nil {
+		startup := settings
+		startup.Routers = cloneRouterSettings(settings.Routers)
+		startup.PublicUdp = clonePublicUdpSettings(settings.PublicUdp)
+		cfg.routerGenerationCheck = func(ctx context.Context) (bool, error) {
+			return startup.SettingsGenerationCheck(ctx, startup)
+		}
+	}
+	for _, configured := range settings.Routers {
+		cfg.routers = append(cfg.routers, &host{
+			name: configured.Name, lanIp: configured.LANAddress, overlayIp: configured.OverlayAddress,
+			sshUser: configured.SSHUser, sshKeyPaths: append([]string(nil), configured.SSHKeyPaths...), disabled: configured.Disabled,
+		})
+	}
+	for _, configured := range settings.disabledHosts {
+		cfg.disabledHosts = append(cfg.disabledHosts, &host{
+			name: configured.Name, lanIp: configured.LANAddress, overlayIp: configured.OverlayAddress, disabled: true,
+			edgeIPv6: cloneEdgeIPv6Settings(configured.EdgeIPv6), publicLB: clonePublicLBSettings(configured.PublicLB), proxy: cloneProxyHostSettings(configured.Proxy),
+			scopeEndpoints: append([]string(nil), configured.scopeEndpoints...),
+		})
 	}
 	for _, configured := range settings.Hosts {
 		h := &host{

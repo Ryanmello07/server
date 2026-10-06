@@ -24,18 +24,19 @@ package work
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/urnetwork/operator-proxy/egresshealth"
-	"github.com/urnetwork/operator-proxy/geolocate"
-	"github.com/urnetwork/operator-proxy/ingest"
-	"github.com/urnetwork/operator-proxy/prober"
 	"github.com/urnetwork/server"
+	"github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/qualityprobe/egresshealth"
+	"github.com/urnetwork/server/qualityprobe/ingest"
+	"github.com/urnetwork/server/qualityprobe/prober"
 )
 
 // egressProbeUnknownCountry labels an outcome whose provider has no known
@@ -46,62 +47,145 @@ const egressProbeUnknownCountry = "unknown"
 // fleet tables for the gauges.
 const egressProbeFleetRefreshInterval = time.Minute
 
+// egressProbeHealthLatencyInterval is the wall-clock bucket owned by the
+// paired maximum and timestamp. The sum/count summary remains cumulative.
+const egressProbeHealthLatencyInterval = time.Minute
+
+// Only completed reporter calls are counted here. Existing attempt and health
+// result counters above the call remain measurement events, not acknowledgments.
+var egressProbeSubmissionOutcomesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "urnetwork_egress_probe_submission_outcomes_total",
+	Help: "Completed health and attempt reporter calls by acknowledged, unsupported, canceled, or error_or_unknown outcome; not durable history or provider identity",
+}, []string{"kind", "outcome"})
+
+var egressProbeSubmissionObservationEnabled = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+	Name: "urnetwork_egress_probe_submission_observation_enabled",
+	Help: "Executable-owned capability for identity-free post-call submission outcomes",
+}, func() float64 { return 1 })
+
 var egressProbeAttemptsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "urnetwork",
 	Subsystem: "egress_probe",
 	Name:      "attempts_total",
-	Help:      "Full probe attempts by outcome: result is ok or the probe_failure class (tunnel_failed, no_consensus, locate_failed, not_confident, submit_failed); country is the provider's egress country, unknown when it was never located",
+	Help:      "Full probe attempts by outcome: result is ok or the probe_failure class (tunnel_failed, health_not_run, run_not_measured, no_exit_ip, submit_failed, run_batch_guard); country is the provider's egress country, unknown when it was never located",
 }, []string{"result", "country"})
 
 var egressProbeLocationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "urnetwork",
 	Subsystem: "egress_probe",
 	Name:      "locations_total",
-	Help:      "Egress locations submitted by the prober, by consensus country and whether the city reached two-source confidence",
+	Help:      "Exit addresses submitted by the prober, by the GeoLite2 country the server places them in (unknown when GeoLite2 has none) and whether GeoLite2 placed them to a city within the confident radius",
 }, []string{"country", "city_confident"})
-
-var egressProbeLocationFlagsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Namespace: "urnetwork",
-	Subsystem: "egress_probe",
-	Name:      "location_flags_total",
-	Help:      "Egress locations submitted with a network flag set (hosting, proxy, mobile), by country",
-}, []string{"flag", "country"})
-
-var egressProbeGeolocationSourcesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Namespace: "urnetwork",
-	Subsystem: "egress_probe",
-	Name:      "geolocation_sources_total",
-	Help:      "Geolocation source lookups behind each submitted location, by source and result (ok or error)",
-}, []string{"source", "result"})
-
-var egressProbeGeolocationDiagnosticsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Namespace: "urnetwork",
-	Subsystem: "egress_probe",
-	Name:      "geolocation_diagnostics_total",
-	Help:      "Geolocation source failure diagnostics behind no_consensus outcomes, by source, failure class and stage",
-}, []string{"source", "class", "stage"})
 
 var egressProbeHealthChecksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "urnetwork",
 	Subsystem: "egress_probe",
 	Name:      "health_checks_total",
-	Help:      "Egress health checks by destination (probe target), class (dns, connectivity, cdn, site, reputation) and result (ok or fail)",
+	Help:      "Egress health loads by destination (probe target), class (dns, connectivity, cdn, site) and result after retries: ok, fail, not_measured (the tunnel was gone and could not be re-created), or canary_ok/canary_fail (an unscored load from a place the site is marked incompatible with)",
 }, []string{"destination", "class", "result"})
 
 var egressProbeHealthChecksByCountryTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "urnetwork",
 	Subsystem: "egress_probe",
 	Name:      "health_checks_by_country_total",
-	Help:      "Egress health checks by provider egress country, class and result (ok or fail)",
+	Help:      "Egress health loads by provider egress country, class and result after retries (ok, fail, not_measured, canary_ok, canary_fail)",
 }, []string{"country", "class", "result"})
 
-var egressProbeHealthCheckSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-	Namespace: "urnetwork",
-	Subsystem: "egress_probe",
-	Name:      "health_check_seconds",
-	Help:      "Latency of successful egress health checks through the provider tunnel, by destination and class",
-	Buckets:   prometheus.ExponentialBuckets(0.05, 2, 10),
-}, []string{"destination", "class"})
+// egressProbeHealthLatencySample is the exact largest observation for one
+// destination/class in one wall-clock interval.
+type egressProbeHealthLatencySample struct {
+	bucket     int64
+	seconds    float64
+	observedAt time.Time
+}
+
+type egressProbeHealthLatencyKey struct {
+	destination string
+	class       string
+}
+
+// egressProbeHealthLatencyMetrics retains aggregate mean inputs plus a fresh
+// exact maximum without a classic histogram bucket multiplier. Destination is
+// a finite configured probe target, but crossing it with 11 histogram buckets
+// and every process generation previously occupied thousands of Mimir series.
+type egressProbeHealthLatencyMetrics struct {
+	duration      *prometheus.SummaryVec
+	maximumDesc   *prometheus.Desc
+	timestampDesc *prometheus.Desc
+	stateLock     sync.Mutex
+	maximums      map[egressProbeHealthLatencyKey]egressProbeHealthLatencySample
+	now           func() time.Time
+}
+
+func newEgressProbeHealthLatencyMetrics() *egressProbeHealthLatencyMetrics {
+	return &egressProbeHealthLatencyMetrics{
+		duration: prometheus.NewSummaryVec(prometheus.SummaryOpts{
+			Namespace:  "urnetwork",
+			Subsystem:  "egress_probe",
+			Name:       "health_check_seconds",
+			Help:       "Successful egress health-check latency by finite configured destination and class.",
+			Objectives: nil,
+		}, []string{"destination", "class"}),
+		maximumDesc: prometheus.NewDesc(
+			"urnetwork_egress_probe_health_check_interval_max_seconds",
+			"Maximum successful egress health-check latency in the latest one-minute interval with an observation.",
+			[]string{"destination", "class"}, nil,
+		),
+		timestampDesc: prometheus.NewDesc(
+			"urnetwork_egress_probe_health_check_interval_max_timestamp_seconds",
+			"Unix time of the observation backing the latest one-minute egress health-check maximum.",
+			[]string{"destination", "class"}, nil,
+		),
+		maximums: map[egressProbeHealthLatencyKey]egressProbeHealthLatencySample{},
+		now:      time.Now,
+	}
+}
+
+var egressProbeHealthCheckSeconds = newEgressProbeHealthLatencyMetrics()
+
+func (self *egressProbeHealthLatencyMetrics) Describe(descriptions chan<- *prometheus.Desc) {
+	self.duration.Describe(descriptions)
+	descriptions <- self.maximumDesc
+	descriptions <- self.timestampDesc
+}
+
+func (self *egressProbeHealthLatencyMetrics) Collect(metrics chan<- prometheus.Metric) {
+	self.duration.Collect(metrics)
+
+	self.stateLock.Lock()
+	maximums := make(map[egressProbeHealthLatencyKey]egressProbeHealthLatencySample, len(self.maximums))
+	for key, sample := range self.maximums {
+		maximums[key] = sample
+	}
+	self.stateLock.Unlock()
+
+	for key, sample := range maximums {
+		labels := []string{key.destination, key.class}
+		metrics <- prometheus.MustNewConstMetric(
+			self.maximumDesc, prometheus.GaugeValue, sample.seconds, labels...,
+		)
+		metrics <- prometheus.MustNewConstMetric(
+			self.timestampDesc, prometheus.GaugeValue,
+			float64(sample.observedAt.UnixNano())/float64(time.Second), labels...,
+		)
+	}
+}
+
+func (self *egressProbeHealthLatencyMetrics) observe(destination string, class string, seconds float64) {
+	self.duration.WithLabelValues(destination, class).Observe(seconds)
+	now := self.now()
+	bucket := now.UnixNano() / egressProbeHealthLatencyInterval.Nanoseconds()
+	key := egressProbeHealthLatencyKey{destination: destination, class: class}
+
+	self.stateLock.Lock()
+	current, ok := self.maximums[key]
+	if !ok || current.bucket != bucket || current.seconds < seconds {
+		self.maximums[key] = egressProbeHealthLatencySample{
+			bucket: bucket, seconds: seconds, observedAt: now,
+		}
+	}
+	self.stateLock.Unlock()
+}
 
 var egressProbeHealthResultsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "urnetwork",
@@ -159,7 +243,7 @@ var egressProbePassDue = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Namespace: "urnetwork",
 	Subsystem: "egress_probe",
 	Name:      "pass_due",
-	Help:      "Providers the server handed to the last batch of each schedule; equal to the batch limit means the due queue is not drained",
+	Help:      "Providers selected from the most recent due response by schedule; blackhole excludes locally selected IDs, and a full cohort does not prove additional backlog",
 }, []string{"schedule"})
 
 var egressProbePassProvidersTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -168,6 +252,39 @@ var egressProbePassProvidersTotal = prometheus.NewCounterVec(prometheus.CounterO
 	Name:      "pass_providers_total",
 	Help:      "Providers handled per schedule by batch result: full = attempted, submitted, skipped, failed; blackhole = checked, dark, tunnel_failed",
 }, []string{"schedule", "result"})
+
+// The label domains of pass_providers_total{schedule="full"} and
+// pass_errors_total are fixed contracts of the §2.19a admission signal, which
+// treats an unknown child as an incoherent process. What GEOMAP step 7 adds is
+// therefore in families of its own.
+
+var egressProbePassNotMeasuredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "urnetwork",
+	Subsystem: "egress_probe",
+	Name:      "pass_not_measured_total",
+	Help:      "Providers per schedule whose run or check measured nothing because the tunnel died and could not be re-created: the prober's lost path, never a verdict on the provider",
+}, []string{"schedule"})
+
+var egressProbeBatchGuardTripsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "urnetwork",
+	Subsystem: "egress_probe",
+	Name:      "batch_guard_trips_total",
+	Help:      "Batches the prober held to be its own fault (connect/GEOMAP.md §11.3): blackhole = dark share above dark_batch_guard, negatives discarded and re-checked after the backoff; full = scored-load failure share above run_batch_guard, not submitted and re-queued",
+}, []string{"schedule"})
+
+var egressProbeBatchShare = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: "urnetwork",
+	Subsystem: "egress_probe",
+	Name:      "batch_share",
+	Help:      "The share the batch guard judged in this process's latest guarded batch: blackhole = dark checks over measured checks, full = failed scored loads over scored loads",
+}, []string{"schedule"})
+
+var egressProbePoolFetchesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "urnetwork",
+	Subsystem: "egress_probe",
+	Name:      "pool_fetches_total",
+	Help:      "Destination-pool fetches at the start of a pass by result: server (the served pool) or builtin (the fetch failed and the built-in table was probed instead)",
+}, []string{"result"})
 
 var egressProbePassErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "urnetwork",
@@ -211,6 +328,20 @@ var egressProbeFleetDominantShare = prometheus.NewGauge(prometheus.GaugeOpts{
 	Help:      "Share of the complete current eligible population covered by the dominant known failure class; 0 when no class dominates",
 })
 
+var egressProbeFleetDarkShare = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "urnetwork",
+	Subsystem: "egress_probe",
+	Name:      "fleet_dark_share",
+	Help:      "Share of the providers with a current measured blackhole check that are dark by the consecutive-failure rule (connect/GEOMAP.md §11.3)",
+})
+
+var egressProbeFleetFailureShare = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: "urnetwork",
+	Subsystem: "egress_probe",
+	Name:      "fleet_failure_share",
+	Help:      "Failed share of the scored loads, after retries, of the health runs measured within the prober-fault window, by class (dns, connectivity, cdn, site, all); 0 with no loads",
+}, []string{"class"})
+
 var egressProbeFleetSnapshotTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
 	Namespace: "urnetwork",
 	Subsystem: "egress_probe",
@@ -219,12 +350,17 @@ var egressProbeFleetSnapshotTimestamp = prometheus.NewGauge(prometheus.GaugeOpts
 })
 
 func init() {
+	for _, kind := range []string{"health", "attempt"} {
+		for _, outcome := range []string{"acknowledged", "unsupported", "canceled", "error_or_unknown"} {
+			egressProbeSubmissionOutcomesTotal.WithLabelValues(kind, outcome)
+		}
+	}
+	preseedEgressProbePassMetrics()
 	prometheus.MustRegister(
+		egressProbeSubmissionOutcomesTotal,
+		egressProbeSubmissionObservationEnabled,
 		egressProbeAttemptsTotal,
 		egressProbeLocationsTotal,
-		egressProbeLocationFlagsTotal,
-		egressProbeGeolocationSourcesTotal,
-		egressProbeGeolocationDiagnosticsTotal,
 		egressProbeHealthChecksTotal,
 		egressProbeHealthChecksByCountryTotal,
 		egressProbeHealthCheckSeconds,
@@ -238,13 +374,41 @@ func init() {
 		egressProbePassDue,
 		egressProbePassProvidersTotal,
 		egressProbePassErrorsTotal,
+		egressProbePassNotMeasuredTotal,
+		egressProbeBatchGuardTripsTotal,
+		egressProbeBatchShare,
+		egressProbePoolFetchesTotal,
 		egressProbeFleetAttemptProviders,
 		egressProbeFleetHealthProviders,
 		egressProbeFleetFlaggedProviders,
 		egressProbeFleetDominantFailure,
 		egressProbeFleetDominantShare,
+		egressProbeFleetDarkShare,
+		egressProbeFleetFailureShare,
 		egressProbeFleetSnapshotTimestamp,
 	)
+}
+
+// preseedEgressProbePassMetrics is kept separate so deterministic metric tests
+// can prove the executable observation contract after resetting a CounterVec.
+func preseedEgressProbePassMetrics() {
+	// These fixed zero children are an observation contract. A full pass can
+	// fail before it opens any provider tunnel, so without them an executable
+	// that is precisely in the control-plane outage state would omit the
+	// submitted/failed counters and look merely unobservable to the monitor.
+	for _, result := range []string{"attempted", "submitted", "skipped", "failed"} {
+		egressProbePassProvidersTotal.WithLabelValues("full", result)
+	}
+	for _, step := range []string{"blackhole_due", "full_due", "pins", "blackhole_run", "blackhole_submit", "full_run", "canceled", "funding_unavailable", "funding_unknown"} {
+		egressProbePassErrorsTotal.WithLabelValues(step)
+	}
+	for _, schedule := range []string{"full", "blackhole"} {
+		egressProbePassNotMeasuredTotal.WithLabelValues(schedule)
+		egressProbeBatchGuardTripsTotal.WithLabelValues(schedule)
+	}
+	for _, result := range []string{"server", "builtin"} {
+		egressProbePoolFetchesTotal.WithLabelValues(result)
+	}
 }
 
 // egressProbeCountryLabel normalizes a country code for a label: lowercased
@@ -303,15 +467,18 @@ type egressProbeIngest interface {
 // never changes the outcome of a submission: a metrics error cannot exist, and
 // the inner error is returned as is.
 //
-// The country of a provider is learned from its own submitted location during
-// the pass (the freshest value), and otherwise from the durable table through
-// lookupCountry, so failures of providers that were located on an earlier pass
-// still land under their country.
+// URL turns use the current due claim's country snapshot, matching the place
+// that selected their URL catalog. Their publication never reads a database
+// solely to label a metric. Other callers learn a country from a submitted
+// location or the durable optional egress table through lookupCountry.
 type egressProbeMetricsReporter struct {
 	inner egressProbeIngest
 	// lookupCountry returns the last recorded egress country code of a provider
 	// ("" when none). nil means never look up.
 	lookupCountry func(ctx context.Context, providerClientId string) string
+	// resolveExit places a submitted exit address, for its label. nil labels
+	// every submission unknown.
+	resolveExit func(exitIp string) (*controller.ProviderEgressExit, error)
 
 	stateLock sync.Mutex
 	countries map[string]string
@@ -324,14 +491,44 @@ func newEgressProbeMetricsReporter(
 	return &egressProbeMetricsReporter{
 		inner:         inner,
 		lookupCountry: lookupCountry,
+		resolveExit:   resolveProviderEgressExitLabel,
 		countries:     map[string]string{},
 	}
 }
 
-// country resolves the label for a provider: the country it submitted during
-// this pass, else the durable one, else unknown. The durable lookup result is
-// cached so a provider is looked up at most once per pass.
+// The production exit resolution: the ingest's own, at the deployment's
+// confident radius.
+func resolveProviderEgressExitLabel(exitIp string) (*controller.ProviderEgressExit, error) {
+	return controller.ResolveProviderEgressExit(exitIp, model.GetProviderEgressRules().CityConfidentRadiusKm)
+}
+
+type providerEgressClaimCountryKey struct{}
+
+type providerEgressClaimCountry struct {
+	clientId string
+	country  string
+}
+
+// Keep the label on this claim's context, not a pass-wide provider cache: a
+// later claim may select a changed place while an earlier turn is publishing.
+// The snapshot contains only the due country, never an address or a metric
+// label from arbitrary input. An absent/invalid country remains unknown and
+// does not require an optional location query before durable publication.
+func withProviderEgressClaimCountry(ctx context.Context, clientId, country string) context.Context {
+	country = egressProbeCountryLabel(country)
+	if len(country) != 2 || country[0] < 'a' || country[0] > 'z' || country[1] < 'a' || country[1] > 'z' {
+		country = egressProbeUnknownCountry
+	}
+	return context.WithValue(ctx, providerEgressClaimCountryKey{}, providerEgressClaimCountry{clientId: clientId, country: country})
+}
+
+// The exact URL claim's place owns its label, including unknown. Legacy and
+// manual callers retain submitted/durable egress attribution, cached once per
+// provider per pass. A claim snapshot never labels an unrelated provider.
 func (self *egressProbeMetricsReporter) country(ctx context.Context, providerClientId string) string {
+	if claim, ok := ctx.Value(providerEgressClaimCountryKey{}).(providerEgressClaimCountry); ok && claim.clientId == providerClientId {
+		return claim.country
+	}
 	self.stateLock.Lock()
 	country, ok := self.countries[providerClientId]
 	self.stateLock.Unlock()
@@ -358,29 +555,21 @@ func (self *egressProbeMetricsReporter) rememberCountry(providerClientId string,
 	self.countries[providerClientId] = country
 }
 
-func (self *egressProbeMetricsReporter) Submit(ctx context.Context, providerClientId string, loc *geolocate.ConsensusLocation) error {
-	if loc != nil {
-		country := egressProbeCountryLabel(loc.CountryCode)
-		self.rememberCountry(providerClientId, country)
-		egressProbeLocationsTotal.WithLabelValues(country, egressProbeBoolLabel(loc.CityConfident)).Inc()
-		if loc.Hosting {
-			egressProbeLocationFlagsTotal.WithLabelValues("hosting", country).Inc()
-		}
-		if loc.Proxy {
-			egressProbeLocationFlagsTotal.WithLabelValues("proxy", country).Inc()
-		}
-		if loc.Mobile {
-			egressProbeLocationFlagsTotal.WithLabelValues("mobile", country).Inc()
-		}
-		for _, source := range loc.Sources {
-			result := "error"
-			if source.OK {
-				result = "ok"
-			}
-			egressProbeGeolocationSourcesTotal.WithLabelValues(source.Name, result).Inc()
+// Labels the exit address with the country the server will place it in
+// -- the same GeoLite2 resolution the ingest applies, controller.
+// ResolveProviderEgressExit, so the label and the stored row cannot disagree --
+// before forwarding it unchanged. The address is not kept.
+func (self *egressProbeMetricsReporter) Submit(ctx context.Context, providerClientId string, exitIp string, observedAt time.Time) error {
+	country, cityConfident := egressProbeUnknownCountry, false
+	if self.resolveExit != nil {
+		if exit, err := self.resolveExit(exitIp); err == nil {
+			country = egressProbeCountryLabel(exit.CountryCode)
+			cityConfident = exit.CityConfident
+			self.rememberCountry(providerClientId, country)
 		}
 	}
-	return self.inner.Submit(ctx, providerClientId, loc)
+	egressProbeLocationsTotal.WithLabelValues(country, egressProbeBoolLabel(cityConfident)).Inc()
+	return self.inner.Submit(ctx, providerClientId, exitIp, observedAt)
 }
 
 func (self *egressProbeMetricsReporter) ReportAttempt(ctx context.Context, providerClientId string, probeFailure string) error {
@@ -388,31 +577,89 @@ func (self *egressProbeMetricsReporter) ReportAttempt(ctx context.Context, provi
 		egressProbeResultLabel(probeFailure),
 		self.country(ctx, providerClientId),
 	).Inc()
-	return self.inner.ReportAttempt(ctx, providerClientId, probeFailure)
+	err := self.inner.ReportAttempt(ctx, providerClientId, probeFailure)
+	egressProbeSubmissionOutcomesTotal.WithLabelValues("attempt", egressProbeSubmissionOutcome(err, ingest.ErrAttemptUnsupported)).Inc()
+	return err
 }
 
 func (self *egressProbeMetricsReporter) SubmitEgressHealth(ctx context.Context, providerClientId string, res *egresshealth.Result) error {
-	if res != nil {
+	return self.submitEgressHealthScored(ctx, providerClientId, res, res)
+}
+
+// Records the metrics of every load the run made -- measured, a site on
+// probation included -- and forwards scored, the run as it may count
+// (scoreEgressHealthResult). The per-destination series are how a site on
+// probation is watched before its loads count; the per-provider state and
+// ratio describe the run the provider is judged by.
+func (self *egressProbeMetricsReporter) submitEgressHealthScored(
+	ctx context.Context,
+	providerClientId string,
+	measured *egresshealth.Result,
+	scored *egresshealth.Result,
+) error {
+	if measured != nil && scored != nil {
+		res := scored
 		country := self.country(ctx, providerClientId)
-		for _, check := range res.Checks {
+		// a load that was not measured and a canary are neither a pass nor a
+		// failure of the scored sample, and counting either as "fail" would
+		// read as the provider failing a site it was never measured against
+		resultLabel := func(check egresshealth.CheckResult) string {
+			switch {
+			case check.Canary && check.Ok:
+				return "canary_ok"
+			case check.NotMeasured:
+				return "not_measured"
+			case check.Canary:
+				return "canary_fail"
+			case check.Ok:
+				return "ok"
+			default:
+				return "fail"
+			}
+		}
+		for _, check := range measured.Checks {
 			class := string(check.Class)
-			result := "fail"
-			if check.OK {
-				result = "ok"
-				egressProbeHealthCheckSeconds.WithLabelValues(check.Name, class).Observe(check.Latency.Seconds())
+			result := resultLabel(check)
+			if result == "ok" {
+				egressProbeHealthCheckSeconds.observe(check.Name, class, check.Latency.Seconds())
 			}
 			egressProbeHealthChecksTotal.WithLabelValues(check.Name, class, result).Inc()
 			egressProbeHealthChecksByCountryTotal.WithLabelValues(country, class, result).Inc()
-			if check.TLSAuthenticationFailure {
+			if check.TlsAuthenticationFailure {
 				egressProbeHealthTLSFailuresTotal.WithLabelValues(check.Name).Inc()
 			}
 		}
-		egressProbeHealthResultsTotal.WithLabelValues(country, egressProbeHealthState(res.OKCount, res.Total)).Inc()
+		egressProbeHealthResultsTotal.WithLabelValues(country, egressProbeHealthState(res.OkCount, res.Total)).Inc()
 		if 0 < res.Total {
-			egressProbeHealthRatio.Observe(float64(res.OKCount) / float64(res.Total))
+			egressProbeHealthRatio.Observe(float64(res.OkCount) / float64(res.Total))
 		}
 	}
-	return self.inner.SubmitEgressHealth(ctx, providerClientId, res)
+	err := self.inner.SubmitEgressHealth(ctx, providerClientId, scored)
+	if err == nil && scored != nil && !scored.CycleStartedAt.IsZero() {
+		urlProbeOutcomes.WithLabelValues("success").Add(float64(scored.OkCount))
+		urlProbeOutcomes.WithLabelValues("error").Add(float64(scored.Total - scored.OkCount))
+	}
+	// A nil result is the ingest client's intentional no-request path.
+	if scored != nil {
+		egressProbeSubmissionOutcomesTotal.WithLabelValues("health", egressProbeSubmissionOutcome(err, egresshealth.ErrUnsupported)).Inc()
+	}
+	return err
+}
+
+// Classifies returned errors only; a concurrent context cancellation must not
+// relabel an acknowledged call or an unrelated failure. The original error is
+// returned unchanged, preserving the prober's existing non-fatal semantics.
+func egressProbeSubmissionOutcome(err error, unsupported error) string {
+	switch {
+	case err == nil:
+		return "acknowledged"
+	case errors.Is(err, unsupported):
+		return "unsupported"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "canceled"
+	default:
+		return "error_or_unknown"
+	}
 }
 
 func (self *egressProbeMetricsReporter) ReserveBandwidth(ctx context.Context, providerClientId string, byteCount int64) error {
@@ -431,29 +678,28 @@ func (self *egressProbeMetricsReporter) SubmitBandwidth(
 }
 
 func (self *egressProbeMetricsReporter) SubmitBlackholeChecks(ctx context.Context, checks []ingest.BlackholeCheck) error {
+	var counts [4]uint64
+	for _, check := range checks {
+		counts[providerEgressBlackholeResultOf(check)]++
+	}
+	egressProbeBlackholeResults.publication(counts, blackholePublicationAttempted)
 	for _, check := range checks {
 		result := "dark"
 		switch {
-		case check.OK:
+		case check.Ok:
 			result = "ok"
 		case strings.TrimSpace(check.Failure) != "":
 			result = check.Failure
 		}
 		egressProbeBlackholeChecksTotal.WithLabelValues(result).Inc()
 	}
-	return self.inner.SubmitBlackholeChecks(ctx, checks)
-}
-
-// recordEgressProbeGeolocationDiagnostics exports the bounded no_consensus
-// diagnostics a full batch summary carries.
-func recordEgressProbeGeolocationDiagnostics(summary prober.Summary) {
-	for _, outcome := range summary.GeolocationSourceOutcomes {
-		egressProbeGeolocationDiagnosticsTotal.WithLabelValues(
-			outcome.Source,
-			outcome.Class,
-			outcome.Stage,
-		).Add(float64(outcome.Count))
+	err := self.inner.SubmitBlackholeChecks(ctx, checks)
+	egressProbeBlackholeResults.publication(counts, providerEgressBlackholePublicationOf(err))
+	if len(checks) != 0 {
+		// This is a returned request outcome, not a measured or replaced row.
+		egressProbeBlackholeProgress.submitted(err)
 	}
+	return err
 }
 
 // lookupProviderEgressCountry is the production country lookup: the durable
@@ -479,17 +725,23 @@ type egressProbeFleetSnapshot struct {
 	dominantClass    string
 	dominantShare    float64
 	knownFailClasses []string
-	refreshedAt      time.Time
+	// darkShare is the dark set over the providers with a current measured
+	// check; failureShares the failed share of recent scored loads per class,
+	// "all" over every class
+	darkShare     float64
+	failureShares map[string]float64
+	refreshedAt   time.Time
 }
 
 // egressProbeKnownFailureClasses are the classes the dominant-failure gauge
 // always carries, so a cleared diagnosis reads 0 instead of disappearing.
 var egressProbeKnownFailureClasses = []string{
 	prober.FailureTunnel,
-	prober.FailureNoConsensus,
-	prober.FailureLocate,
-	prober.FailureNotConfident,
+	prober.FailureHealthNotRun,
+	prober.FailureNotMeasured,
+	prober.FailureNoExitIp,
 	prober.FailureSubmit,
+	model.ProbeRunBatchGuardClass,
 	"contract_failed",
 }
 
@@ -497,14 +749,23 @@ var egressProbeKnownFailureClasses = []string{
 // refresh. Pre-seeding the bounded label set distinguishes a live exporter
 // reporting zero providers in one state from an absent exporter, which must
 // remain no-data in Prometheus and Grafana.
+//
+// The three consensus-era classes (no_consensus, locate_failed, not_confident)
+// stay in the set until the attempts that carry them age out: the prober no
+// longer reports them, and they read zero rather than vanish from a panel
+// that still names them.
 var egressProbeFleetOutcomeClasses = []string{
 	model.ProbeAttemptSuccessClass,
 	prober.FailureTunnel,
 	"contract_failed",
-	prober.FailureNoConsensus,
-	prober.FailureLocate,
-	prober.FailureNotConfident,
+	prober.FailureHealthNotRun,
+	prober.FailureNotMeasured,
+	prober.FailureNoExitIp,
 	prober.FailureSubmit,
+	model.ProbeRunBatchGuardClass,
+	"no_consensus",
+	"locate_failed",
+	"not_confident",
 	model.ProbeFleetUnknownFailureClass,
 	model.ProbeFleetInconsistentClass,
 	model.ProbeFleetUnobservedClass,
@@ -537,6 +798,10 @@ func setEgressProbeFleetGauges(snapshot egressProbeFleetSnapshot) {
 		egressProbeFleetDominantFailure.WithLabelValues(class).Set(value)
 	}
 	egressProbeFleetDominantShare.Set(snapshot.dominantShare)
+	egressProbeFleetDarkShare.Set(snapshot.darkShare)
+	for _, class := range append(append([]string{}, model.ProviderEgressSiteClasses...), "all") {
+		egressProbeFleetFailureShare.WithLabelValues(class).Set(snapshot.failureShares[class])
+	}
 	egressProbeFleetSnapshotTimestamp.Set(float64(snapshot.refreshedAt.Unix()))
 }
 
@@ -573,6 +838,25 @@ func refreshEgressProbeFleetMetrics(ctx context.Context) {
 		snapshot.healthStates[egressProbeHealthState(counts.OKCount, counts.Total)] += 1
 	}
 	snapshot.blackholed = len(model.GetAllProviderBlackholedClientIds(ctx))
+	if checked := model.CountCurrentProviderBlackholeChecks(ctx); 0 < checked {
+		snapshot.darkShare = float64(snapshot.blackholed) / float64(checked)
+	}
+	siteSettings, err := model.GetProviderEgressSiteSettings()
+	if err != nil {
+		siteSettings = model.DefaultProviderEgressSiteSettings()
+	}
+	// the failed share of each class's scored loads, and of all of them as
+	// "all", over the prober-fault window
+	snapshot.failureShares = map[string]float64{}
+	classTotals := model.GetProviderEgressHealthClassTotals(ctx, server.NowUtc().Add(-siteSettings.SiteProberFaultWindow()))
+	for class, total := range classTotals {
+		if class == "" {
+			class = "all"
+		}
+		if 0 < total.Total {
+			snapshot.failureShares[class] = float64(total.Total-total.Ok) / float64(total.Total)
+		}
+	}
 	snapshot.tlsAuthFailed = len(model.GetAllProviderEgressTLSAuthenticationFailedClientIds(ctx))
 	if diagnosis := model.AssessProbeFleetOutcomes(tally).Dominant; diagnosis != nil && 0 < diagnosis.Eligible {
 		snapshot.dominantClass = diagnosis.DominantClass

@@ -2,11 +2,292 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 )
+
+// Mirrors ErrorJson's array schema with deliberately private synthetic material
+// before the stack, in arguments, and in source paths that must never be retained.
+func panicOwnerTestLine(t *testing.T, errorText string, functions ...string) string {
+	t.Helper()
+	stack := []string{"goroutine 42 [running]:", "runtime/debug.Stack()", "/synthetic-private-path/stack.go:12345 +0x99"}
+	for _, function := range append([]string{
+		"github.com/urnetwork/server.HandleError.func1",
+		"github.com/urnetwork/server.dbWithPool.func1.1",
+		"github.com/urnetwork/server.Raise",
+		"github.com/urnetwork/server.RaisePgResult[...]",
+	}, functions...) {
+		stack = append(stack, function+"(0x12345678, {0x87654321, 0x33})", "/synthetic-private-path/owner.go:12345 +0x99")
+	}
+	body, err := json.Marshal(map[string]any{"error": errorText, "stack": stack})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "[synthetic-private-host][api][synthetic-generation][cid:synthetic-correlation] metadata={ignored} Unexpected error: " + string(body)
+}
+
+// Keeps only actionable panic findings; aggregate and owner views deliberately
+// overlap and are keyed by their distinct, stable frames.
+func panicOwnerTestAlerts(t *testing.T, tailer *logTailer) map[string]Alert {
+	t.Helper()
+	alerts := map[string]Alert{}
+	for _, finding := range tailer.drainWindow() {
+		if finding.class != "panic" || finding.healthy {
+			continue
+		}
+		alert := alertFromFinding(syntheticSettings(nil), "1.5", "log-errors", "Log error-class rates", finding)
+		if _, duplicate := alerts[alert.Frame]; duplicate {
+			t.Fatal("duplicate panic frame")
+		}
+		if alert.Severity != SeverityPage || alert.Target != "api" || alert.SignalID != "logs/panic" {
+			t.Fatal("panic aggregate/owner changed its existing service, signal or page tier")
+		}
+		if len(tailer.classSamples) != 0 {
+			t.Fatal("drain retained prior window samples")
+		}
+		for _, private := range []string{
+			"synthetic-private-host", "synthetic-generation", "synthetic-correlation", "cid:",
+			"synthetic-private-path", "owner.go", "12345", "0x12345678", "0x87654321",
+			"synthetic-secret", "synthetic-customer", "192.0.2.88", "2001:db8::88", "@private.example",
+		} {
+			requireAlertOmits(t, alert, private)
+		}
+		alerts[alert.Frame] = alert
+	}
+	return alerts
+}
+
+// A long error used to consume the entire sample before the owning stack. Both
+// views must now retain the same bounded discriminator without private content.
+func TestPanicOwnerLongErrorRetainsPrivateSafeDiscriminator(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	line := panicOwnerTestLine(t,
+		"*pgconn.PgError=ERROR: "+strings.Repeat("synthetic-secret synthetic-customer 192.0.2.88:443 ", 20)+"(SQLSTATE 25006)",
+		"github.com/urnetwork/server/model.StampTopLevelClientContractTime.func1.1",
+	)
+	for range 5 {
+		tailer.classify(line)
+	}
+	if len(tailer.classSamples["panic"]) > 200 {
+		t.Fatal("redacted sample exceeded its existing budget")
+	}
+	alerts := panicOwnerTestAlerts(t, tailer)
+	if len(alerts) != 2 {
+		t.Fatal("five owning diagnostics must preserve aggregate plus owner pages")
+	}
+	for _, frame := range []string{"", "server/model.StampTopLevelClientContractTime"} {
+		alert, ok := alerts[frame]
+		if !ok || !strings.Contains(alert.Observed, "rate=5/min") {
+			t.Fatal("aggregate or owning five-line page disappeared")
+		}
+		if frame == "" && strings.Contains(alert.Observed, "frame=") {
+			t.Fatal("service-wide aggregate rendered an empty owner frame")
+		}
+		for _, want := range []string{"owner=server/model.StampTopLevelClientContractTime", "error_type=*pgconn.PgError", "sqlstate=25006", "counts overlap"} {
+			if !strings.Contains(alert.Markdown(), want) {
+				t.Fatalf("bounded panic evidence omitted %q", want)
+			}
+		}
+	}
+}
+
+// Independent owner thresholds cannot split the original service-wide page.
+func TestPanicOwnerMixedThreePlusTwoPreservesAggregate(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	for index, owner := range []string{"SyntheticFirst", "SyntheticSecond"} {
+		line := panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/server/model."+owner)
+		for range 3 - index {
+			tailer.classify(line)
+		}
+	}
+	alerts := panicOwnerTestAlerts(t, tailer)
+	if len(alerts) != 1 || !strings.Contains(alerts[""].Observed, "rate=5/min") {
+		t.Fatal("3+2 owner split hid or duplicated the original aggregate page")
+	}
+}
+
+// Compiler closure numbers and receiver notation do not create new identities;
+// different application owners still retain their own matching samples.
+func TestPanicOwnerNormalizationAndSampleSeparation(t *testing.T) {
+	for _, test := range []struct{ function, owner string }{
+		{function: "server/model.SyntheticWrite.func12.3", owner: "server/model.SyntheticWrite"},
+		{function: "connect.(*SyntheticResident).Forward.func2", owner: "connect.SyntheticResident.Forward"},
+		{function: "sdk.SyntheticDevice.Load-fm", owner: "sdk.SyntheticDevice.Load"},
+		{function: "proxy.SyntheticStart.gowrap2", owner: "proxy.SyntheticStart"},
+		{function: "operator-proxy/ingest.(*SyntheticClient).Submit", owner: "operator-proxy/ingest.SyntheticClient.Submit"},
+		{function: "userwireguard.SyntheticRun", owner: "userwireguard.SyntheticRun"},
+		{function: "warp/services.SyntheticRun.func1.2", owner: "warp/services.SyntheticRun"},
+		{function: "server/model.SyntheticWrite[...].func1", owner: "server/model.SyntheticWrite"},
+		{function: "connect.(*SyntheticResident[...]).Forward.func2", owner: "connect.SyntheticResident.Forward"},
+	} {
+		line := panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/"+test.function)
+		if got := panicLogOwner(line); got != test.owner {
+			t.Fatalf("normalized owner = %q, want %q", got, test.owner)
+		}
+	}
+	for _, wrapper := range []string{
+		"server.HandleError1[...].func1", "server.HandleError2[...].func2", "server.HandleErrorWithReturn[...]",
+		"connect.HandleError1[...].func1", "connect.HandleError2[...].func2",
+	} {
+		line := panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/"+wrapper,
+			"github.com/urnetwork/server/model.SyntheticWrite")
+		if got := panicLogOwner(line); got != "server/model.SyntheticWrite" {
+			t.Fatalf("generic recovery wrapper became owner %q", got)
+		}
+	}
+	tailer := newLogTailer("api", nil)
+	for _, owner := range []string{"SyntheticFirst", "SyntheticSecond"} {
+		for index := range 5 {
+			tailer.classify(panicOwnerTestLine(t, "*errors.errorString=synthetic-secret",
+				fmt.Sprintf("github.com/urnetwork/server/model.%s.func%d.1", owner, index+1)))
+		}
+	}
+	alerts := panicOwnerTestAlerts(t, tailer)
+	if len(alerts) != 3 || !strings.Contains(alerts[""].Observed, "rate=10/min") {
+		t.Fatal("separate owners lost the aggregate or their own buckets")
+	}
+	for _, owner := range []string{"SyntheticFirst", "SyntheticSecond"} {
+		frame := "server/model." + owner
+		if !strings.Contains(alerts[frame].Evidence, "owner="+frame) || !strings.Contains(alerts[frame].Observed, "rate=5/min") {
+			t.Fatal("owner bucket borrowed another owner's sample or rate")
+		}
+	}
+}
+
+// Malformed/unknown/oversized records keep aggregate visibility and fixed safe
+// samples. An error message cannot inject ownership in place of a stack.
+func TestPanicOwnerMalformedAndOversizedStayAggregateOnly(t *testing.T) {
+	valid := panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/server/model.SyntheticWrite")
+	for _, line := range []string{
+		"panic: synthetic-secret 192.0.2.88:443",
+		"Unexpected error: {",
+		valid[:len(valid)-1],
+		strings.Repeat("x", panicLogMaxBytes) + valid,
+		`Unexpected error: {"error":"synthetic-secret","stack":"synthetic-private-path"}`,
+		`Unexpected error: {"error":"synthetic-secret","stack":[]}`,
+		`Unexpected error: {"error":"synthetic-secret","stack":["github.com/urnetwork/server/model.SyntheticWrite(0x12345678)"]}`,
+		strings.Replace(valid, `"error":`, `"error":"synthetic-secret","error":`, 1),
+		strings.Replace(valid, `"error":"*errors.errorString=synthetic-secret"`, `"error":null`, 1),
+		strings.Replace(valid, `"stack":[`, `"stack":[null,`, 1),
+		strings.Replace(valid, `"stack":[`, `"stack":[{},`, 1),
+		panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/unlisted.SyntheticWrite"),
+		panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/server/model.SyntheticWrite[unrecognized]",
+			"github.com/urnetwork/server/model.SyntheticCaller"),
+		panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/server/model."+strings.Repeat("Synthetic", 30)),
+		`Unexpected error: {"error":"*errors.errorString=github.com/urnetwork/server/model.SyntheticWrite(0x12345678)","stack":["goroutine 42 [running]"]}`,
+	} {
+		tailer := newLogTailer("api", nil)
+		for range 5 {
+			tailer.classify(line)
+		}
+		alerts := panicOwnerTestAlerts(t, tailer)
+		if len(alerts) != 1 || !strings.Contains(alerts[""].Observed, "rate=5/min") {
+			t.Fatal("unrecognized stack lost aggregate visibility or invented an owner")
+		}
+	}
+	stack := make([]string, panicLogMaxStackLines+1)
+	for index := range stack {
+		stack[index] = "runtime.synthetic()"
+	}
+	stack[0] = "github.com/urnetwork/server/model.SyntheticWrite(0x12345678)"
+	stack[1] = "/synthetic-private-path/owner.go:12345 +0x99"
+	body, err := json.Marshal(map[string]any{"error": "*errors.errorString=synthetic-secret", "stack": stack})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := panicLogOwner("Unexpected error: " + string(body)); got != "" {
+		t.Fatal("oversized stack array gained an owner")
+	}
+}
+
+// Unknown first samples must not leak endpoint attribution; raw Go type text and
+// SQLSTATE-like message substrings cannot escape their allowlists.
+func TestPanicOwnerUnknownFirstSampleAndTypeGuards(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	for range 4 {
+		tailer.classify("panic: synthetic-secret 192.0.2.88:443")
+	}
+	tailer.classify(panicOwnerTestLine(t, "*errors.errorString=synthetic-secret", "github.com/urnetwork/server/model.SyntheticWrite"))
+	alerts := panicOwnerTestAlerts(t, tailer)
+	if len(alerts) != 1 || !strings.Contains(alerts[""].Evidence, "owner=unknown error_type=unknown sqlstate=unknown") {
+		t.Fatal("unknown first sample was replaced with invented ownership or raw text")
+	}
+	for _, errorText := range []string{
+		"*synthetic-secret.Error=synthetic-secret (SQLSTATE 25006)",
+		"*errors.errorString=synthetic-secret (SQLSTATE 25006)",
+		"*pgconn.PgError=synthetic-secret (SQLSTATE 25006) trailing",
+		"*pgconn.PgError=synthetic-secret (SQLSTATE secret)",
+	} {
+		observation := parsePanicLogObservation(panicOwnerTestLine(t, errorText, "github.com/urnetwork/server/model.SyntheticWrite"))
+		if observation.sqlstate != "unknown" || strings.Contains(observation.errorType, "synthetic-secret") {
+			t.Fatal("unvalidated Go error type or SQLSTATE escaped")
+		}
+	}
+}
+
+// Overflow is aggregate-only, existing owners remain admitted, and the next
+// minute starts with an empty owner budget rather than permanent suppression.
+func TestPanicOwnerCardinalityCapResetsWithoutSuppressingAggregate(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	lineForOwner := func(index int) string {
+		return panicOwnerTestLine(t, "*errors.errorString=synthetic-secret",
+			fmt.Sprintf("github.com/urnetwork/server/model.SyntheticOwner%d", index))
+	}
+	for index := range logClassMaxOwnerGroups {
+		tailer.classify(lineForOwner(index))
+	}
+	for range 4 {
+		tailer.classify(lineForOwner(0))
+	}
+	for range 5 {
+		tailer.classify(lineForOwner(logClassMaxOwnerGroups))
+	}
+	if tailer.classGroupCounts["panic"] != logClassMaxOwnerGroups || len(tailer.classCounts) != logClassMaxOwnerGroups+1 {
+		t.Fatal("owner state exceeded the bounded per-window cardinality")
+	}
+	alerts := panicOwnerTestAlerts(t, tailer)
+	if len(alerts) != 2 || !strings.Contains(alerts[""].Observed, fmt.Sprintf("rate=%d/min", logClassMaxOwnerGroups+9)) ||
+		!strings.Contains(alerts["server/model.SyntheticOwner0"].Observed, "rate=5/min") {
+		t.Fatal("overflow suppressed aggregate events or an already-known owner")
+	}
+	if len(tailer.classGroupCounts) != 0 {
+		t.Fatal("drain retained an exhausted owner budget")
+	}
+	for range 5 {
+		tailer.classify(lineForOwner(logClassMaxOwnerGroups))
+	}
+	if len(panicOwnerTestAlerts(t, tailer)) != 2 {
+		t.Fatal("previous overflow owner was not admitted in a fresh window")
+	}
+	if len(panicOwnerTestAlerts(t, tailer)) != 0 {
+		t.Fatal("empty window retained a prior panic page")
+	}
+}
+
+// A known typed failure still wins before generic panic accounting, even when
+// its structured stack could otherwise produce an owner bucket.
+func TestPanicOwnerPreservesTypedClassPrecedence(t *testing.T) {
+	tailer := newLogTailer("api", nil)
+	line := panicOwnerTestLine(t,
+		"*pgconn.PgError=FATAL: server login has been failing, cached error: sorry, too many clients already (server_login_retry) (SQLSTATE 08P01)",
+		"github.com/urnetwork/server/model.SyntheticWrite",
+	)
+	for range 5 {
+		tailer.classify(line)
+	}
+	findings := tailer.drainWindow()
+	if finding := findingByClass(t, findings, "pg-client-capacity"); finding.healthy {
+		t.Fatal("typed database-capacity class lost precedence")
+	}
+	for _, finding := range findings {
+		if finding.class == "panic" && !finding.healthy {
+			t.Fatal("typed error also entered generic aggregate or owner buckets")
+		}
+	}
+}
 
 func TestLogErrorsSignalSyntheticLogRate(t *testing.T) {
 	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
@@ -20,6 +301,253 @@ func TestLogErrorsSignalSyntheticLogRate(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireAlertClass(t, alerts, "pubsub-drops")
+}
+
+// Resolver-leg diagnostics retain the page guard without claiming a lookup
+// failed or copying the endpoint, domain, or correlation identity.
+func TestLogErrorsSignalDohDialTimeoutIsPrivateAttemptEvidence(t *testing.T) {
+	testCases := []struct {
+		name string
+		line string
+	}{
+		{name: "family IPv4", line: "[family]dial tag=doh net=tcp family=? policy=force4 demoted=none err=dial tcp 192.0.2.53:443: i/o timeout"},
+		{name: "family IPv6", line: "[family]dial tag=doh net=tcp6 family=? policy=force6 demoted=none err=dial tcp6 [2001:db8::53]:443: i/o timeout"},
+		{name: "endpoint-free family", line: "[family]dial tag=doh net=tcp family=? policy=force4 demoted=none err=i/o timeout"},
+		{name: "bound egress", line: "[egress]dial tag=doh tcp 192.0.2.53:443 if=4:2/6:0 bound=yes err=dial tcp 192.0.2.53:443: i/o timeout (2 suppressed)"},
+	}
+	for _, testCase := range testCases {
+		line := "[synthetic-proxy.example][proxy][synthetic-block][cid:synthetic-private-correlation]" +
+			"[I][2026-01-01T00:00:00Z][egress_dial.go:306]" + testCase.line + " domain=private-query.example"
+		source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+			if len(args) > 1 && args[0] == "ls" {
+				return "repo names synthetic-proxy", nil
+			}
+			return strings.Repeat(line+"\n", 10), nil
+		}}
+		alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.name, err)
+		}
+		alert := requireAlertClass(t, alerts, "doh-dial-timeout")
+		if alert.Severity != SeverityPage || alert.Frame != "doh-attempt" {
+			t.Fatalf("%s: resolver attempt lost its page or fixed frame", testCase.name)
+		}
+		markdown := alert.Markdown()
+		for _, want := range []string{
+			"rate=10/min", "logical DNS outcome is unknown",
+			"sampled outbound dial-leg lines are neither resolver-call failures nor user-request failures",
+			"fanout, hedging, and replacement ownership can add legs",
+			"path=unknown attempted_family=unknown resolver_outcome=unknown",
+			"count neither unique attempts nor failed logical DNS queries",
+			"success-only DoH result callback", "Do not restart Redis",
+			"independent final-query or end-to-end outcome", "10 minutes",
+		} {
+			if !strings.Contains(markdown, want) {
+				t.Errorf("%s: resolver attempt guidance omitted %q", testCase.name, want)
+			}
+		}
+		if strings.Contains(markdown, "volume is retry amplification") {
+			t.Errorf("%s: DoH leg volume was mislabeled as retry amplification", testCase.name)
+		}
+		for _, private := range []string{
+			"synthetic-proxy.example", "synthetic-block", "synthetic-private-correlation",
+			"cid:", "private-query.example", "192.0.2.53", "2001:db8::53", "if=4:2",
+			"node accept path starving", "event loop wedged",
+		} {
+			if strings.Contains(markdown, private) {
+				t.Errorf("%s: alert retained private data or the old wedge claim", testCase.name)
+			}
+		}
+		for _, other := range alerts {
+			if other.Class == "dial-io-timeout" || other.Class == "novel" {
+				t.Errorf("%s: resolver attempt fell through to %s", testCase.name, other.Class)
+			}
+		}
+	}
+}
+
+// A losing transport dial can complete after its initiating resolver call has
+// answered. Keep the timeout page and terminal discriminator independently.
+func TestDohDialTimeoutRetainsFiniteTerminalProvenance(t *testing.T) {
+	tailer := newLogTailer("proxy", nil)
+	line := "[synthetic-host.example][proxy][synthetic-block][cid:private-fixture] " +
+		"[family]dial tag=doh observable=v1 path=tun attempted_family=6 result=timeout resolver_owner=tun resolver_scope=address resolver_outcome=answer err=i/o timeout"
+	for range 10 {
+		tailer.classify(line)
+	}
+	finding := findingByClass(t, tailer.drainWindow(), "doh-dial-timeout")
+	if finding.healthy || finding.tier != tierPage || finding.frame != "doh-attempt" {
+		t.Fatal("finite provenance weakened or split the timeout page")
+	}
+	for _, want := range []string{"path=tun", "attempted_family=6", "resolver_outcome=answer"} {
+		if !strings.Contains(finding.evidence, want) {
+			t.Errorf("bounded sample omitted %s: %s", want, finding.evidence)
+		}
+	}
+	if !strings.Contains(finding.context, "detached losing HTTP hedge") || !strings.Contains(finding.context, "pending and legacy unknown") {
+		t.Fatal("terminal result guidance lost its ordering or unknown qualifier")
+	}
+	for _, private := range []string{"synthetic-host.example", "synthetic-block", "private-fixture", "cid:"} {
+		if strings.Contains(finding.evidence, private) {
+			t.Fatal("outer identity entered bounded DoH evidence")
+		}
+	}
+}
+
+// Taskworker also measures selected remote providers. A TUN timeout in that
+// service does not establish its control-plane DNS failed or inherit Proxy MTU.
+func TestDohDialTimeoutTaskworkerMeasurementQualifier(t *testing.T) {
+	tailer := newLogTailer("taskworker", nil)
+	for range 10 {
+		tailer.classify("[family]dial tag=doh observable=v1 path=tun attempted_family=4 result=timeout resolver_owner=tun resolver_scope=address resolver_outcome=pending")
+	}
+	finding := findingByClass(t, tailer.drainWindow(), "doh-dial-timeout")
+	if finding.healthy || finding.target != "taskworker" {
+		t.Fatal("taskworker timeout page was dropped or attributed to another service")
+	}
+	for _, want := range []string{"measuring a selected provider", "dual-stack TUN", "does not establish task control-plane DNS failure", "Proxy-only MTU defect"} {
+		if !strings.Contains(finding.context, want) {
+			t.Errorf("taskworker context omitted %q", want)
+		}
+	}
+	if !strings.Contains(finding.evidence, "resolver_outcome=pending") || !strings.Contains(finding.action, "Cache calls, waiters, raw forwarding and multi-name one-shot calls") {
+		t.Fatal("pending outcome or resolver-call denominator qualifier was lost")
+	}
+}
+
+// Exact counter records are observations, not a new error each time a nonzero
+// cumulative failure total is sampled. Malformed provenance cannot be trusted.
+func TestDohObservationsDoNotManufactureTimeouts(t *testing.T) {
+	tailer := newLogTailer("proxy", nil)
+	for _, result := range []string{"success", "canceled", "unsupported_family", "refused", "error"} {
+		for range 10 {
+			tailer.classify("[family]dial tag=doh observable=v1 path=caller attempted_family=unknown result=" + result + " resolver_owner=unknown resolver_scope=unknown resolver_outcome=unknown")
+		}
+	}
+	for range 10 {
+		tailer.classify("[doh]resolver observable=v1 owner_path=tun scope=address answer=100 authoritative_empty=2 stale=3 failed=4 canceled=5 timeout=6")
+	}
+	findings := tailer.drainWindow()
+	if finding := findingByClass(t, findings, "doh-dial-timeout"); !finding.healthy {
+		t.Fatal("a different terminal kind became a timeout")
+	}
+	for _, finding := range findings {
+		if !finding.healthy && finding.class == "novel" {
+			t.Fatal("finite observations became novel errors")
+		}
+	}
+	for _, malformed := range []string{
+		"[family]dial tag=doh observable=v1 path=private.example attempted_family=6 result=timeout resolver_owner=tun resolver_scope=address resolver_outcome=answer",
+		"[family]dial tag=doh observable=v1 path=tun attempted_family=6 result=timeout resolver_owner=tun resolver_scope=address resolver_outcome=answer query=private.example",
+		"[family]dial tag=doh observable=v1 path=tun attempted_family=6 result=timeout resolver_owner=tun resolver_scope=address resolver_outcome=arbitrary",
+		"[family]dial tag=doh observable=v2 path=tun attempted_family=6 result=timeout resolver_owner=tun resolver_scope=address resolver_outcome=answer",
+		"[doh]resolver observable=v1 owner_path=tun scope=address answer=99999999999999999999 authoritative_empty=2 stale=3 failed=4 canceled=5 timeout=6",
+		"[family]dial tag=doh observable=v1 path=tun attempted_family=6 result=success resolver_owner=tun resolver_scope=address resolver_outcome=answer err=i/o timeout",
+	} {
+		if dohDialTimeoutObserved(malformed) {
+			t.Fatal("malformed or unbounded fields became trusted provenance")
+		}
+		if strings.Contains(dohDialTimeoutSample(malformed), "private.example") {
+			t.Fatal("malformed schema copied identity into fallback sample")
+		}
+		invalid := newLogTailer("proxy", nil)
+		invalid.classify(malformed)
+		finding := findingByClass(t, invalid.drainWindow(), "doh-observation-schema")
+		if finding.healthy || finding.tier != tierWarn || strings.Contains(finding.evidence, "private.example") {
+			t.Fatal("malformed provenance lost its private visibility warning")
+		}
+	}
+}
+
+// Sanitizing the DoH error must preserve the existing refusal page and the
+// unknown-error safety net rather than silently classifying failures as metrics.
+func TestDohNonTimeoutFailuresRetainAlertPaths(t *testing.T) {
+	refused := newLogTailer("proxy", nil)
+	for range 10 {
+		refused.classify("[family]dial tag=doh observable=v1 path=tun attempted_family=4 result=refused resolver_owner=tun resolver_scope=address resolver_outcome=pending")
+	}
+	if finding := findingByClass(t, refused.drainWindow(), "connection-refused"); finding.healthy || finding.tier != tierPage {
+		t.Fatal("finite refusal lost its existing ten-line page")
+	}
+	unknown := newLogTailer("proxy", nil)
+	for range novelRateThreshold {
+		unknown.classify("[family]dial tag=doh observable=v1 path=caller attempted_family=unknown result=error resolver_owner=unknown resolver_scope=unknown resolver_outcome=unknown")
+	}
+	if finding := findingByClass(t, unknown.drainWindow(), "novel"); finding.healthy {
+		t.Fatal("finite unknown error lost the novelty safety net")
+	}
+}
+
+// The retained threshold counts diagnostic lines across resolver legs. Empty
+// windows and process replacement must not carry the prior minute's rate.
+func TestDohDialTimeoutThresholdAndWindowReset(t *testing.T) {
+	tailer := newLogTailer("proxy", nil)
+	line := "[family]dial tag=doh net=tcp family=? policy=force4 demoted=none err=i/o timeout"
+	for range 9 {
+		tailer.classify(line)
+	}
+	if finding := findingByClass(t, tailer.drainWindow(), "doh-dial-timeout"); !finding.healthy {
+		t.Fatal("nine diagnostic lines crossed the unchanged ten-line threshold")
+	}
+	for index := range 10 {
+		tailer.classify(fmt.Sprintf("[family]dial tag=doh net=tcp family=? policy=force4 demoted=none err=dial tcp 192.0.2.%d:443: i/o timeout", index+1))
+	}
+	finding := findingByClass(t, tailer.drainWindow(), "doh-dial-timeout")
+	if finding.healthy || finding.tier != tierPage || finding.frame != "doh-attempt" || finding.target != "proxy" {
+		t.Fatal("mixed resolver endpoints split or weakened the diagnostic page")
+	}
+	if finding := findingByClass(t, tailer.drainWindow(), "doh-dial-timeout"); !finding.healthy {
+		t.Fatal("an empty window retained the prior diagnostic page")
+	}
+	replacement := newLogTailer("proxy", nil)
+	if finding := findingByClass(t, replacement.drainWindow(), "doh-dial-timeout"); !finding.healthy {
+		t.Fatal("a replacement collector inherited diagnostic counts")
+	}
+}
+
+// Only the exact DoH producer shape gains attempt attribution; unrelated
+// targets retain the generic timeout page without a Redis-cause assertion.
+func TestDohDialTimeoutDoesNotCaptureOtherDialOwners(t *testing.T) {
+	for _, line := range []string{
+		"dial tcp 192.0.2.80:6380: i/o timeout",
+		"[family]dial tag=api net=tcp err=dial tcp 192.0.2.80:443: i/o timeout",
+		"[family]dial tag=doh-other net=tcp err=dial tcp 192.0.2.80:443: i/o timeout",
+		"[other]dial tag=doh net=tcp err=dial tcp 192.0.2.80:443: i/o timeout",
+	} {
+		tailer := newLogTailer("proxy", nil)
+		for range 10 {
+			tailer.classify("[synthetic-host.example][proxy][synthetic-block][cid:synthetic-private-correlation] " + line)
+		}
+		findings := tailer.drainWindow()
+		generic := findingByClass(t, findings, "dial-io-timeout")
+		if generic.healthy || generic.tier != tierPage || generic.frame == "" {
+			t.Fatal("generic endpoint timeout lost its page or endpoint frame")
+		}
+		if !strings.Contains(generic.mechanism, "remain alternatives") ||
+			!strings.Contains(generic.action, "corroborating local PING hang") ||
+			strings.Contains(generic.evidence, "synthetic-private-correlation") ||
+			strings.Contains(generic.evidence, "event loop wedged") {
+			t.Fatal("generic timeout retained unsupported attribution or private correlation data")
+		}
+		if doh := findingByClass(t, findings, "doh-dial-timeout"); !doh.healthy {
+			t.Fatal("an unrelated dial owner was classified as DoH")
+		}
+	}
+	for _, line := range []string{
+		"[family]dial tag=doh net=tcp family=4 policy=force4 demoted=none local=192.0.2.80:12345",
+		"[family]dial tag=doh net=tcp err=context canceled",
+		"[family]dial tag=doh net=tcp family=? policy=force4 demoted=none err=address family not supported by protocol",
+		"[family]dial tag=doh net=tcp err=dial tcp 192.0.2.80:443: connect: connection refused",
+		"err=i/o timeout",
+	} {
+		tailer := newLogTailer("proxy", nil)
+		for range 10 {
+			tailer.classify(line)
+		}
+		if finding := findingByClass(t, tailer.drainWindow(), "doh-dial-timeout"); !finding.healthy {
+			t.Fatal("a non-timeout or ownerless line gained DoH timeout attribution")
+		}
+	}
 }
 
 func TestLogErrorsSignalSyntheticStructuredProblemClasses(t *testing.T) {
@@ -169,7 +697,13 @@ func TestLogErrorsSignalClassifiesStructuredSignalSendReasons(t *testing.T) {
 			t.Fatal(err)
 		}
 		alert := requireAlertClass(t, alerts, test.class)
-		if !strings.Contains(alert.Observed, "frame="+test.mode) {
+		modeObserved := false
+		for _, candidate := range alerts {
+			if candidate.Class == test.class && strings.Contains(candidate.Observed, "frame="+test.mode) {
+				modeObserved = true
+			}
+		}
+		if !modeObserved {
 			t.Errorf("%s alert omitted bounded mode: %+v", test.class, alert)
 		}
 		if !strings.Contains(alert.Markdown(), "mode="+test.mode+" reason="+test.reason) {
@@ -580,24 +1114,33 @@ func TestLogErrorsSignalExplainsLegacyDatabaseMaintenanceReindex(t *testing.T) {
 		"client_reliability",
 		"client_reliability_p20260901",
 		"contract_close",
+		"network_client",
 		"network_client_location_reliability",
 		"network_client_connection",
 		"transfer_contract",
 		"transfer_escrow",
 		"transfer_escrow_sweep",
 	} {
-		line := "[db]maintenance reindex[1/22] " + tableName
-		if !dbMaintenanceLegacyReindexRe.MatchString(line) {
-			t.Fatalf("excluded table %s is not recognized in the legacy start format", tableName)
-		}
-		if got := dbMaintenanceLegacyReindexLogGroup(line); got != "table="+tableName {
-			t.Fatalf("excluded table %s has frame %q", tableName, got)
+		for _, prefix := range []string{"[db]maintenance reindex[1/22] ", "[db]maintenance table[1/22] reindex "} {
+			line := prefix + tableName
+			if !dbMaintenanceLegacyReindexRe.MatchString(line) {
+				t.Fatalf("excluded table %s is not recognized with prefix %q", tableName, prefix)
+			}
+			if got := dbMaintenanceLegacyReindexLogGroup(line); got != "table="+tableName {
+				t.Fatalf("excluded table %s has frame %q", tableName, got)
+			}
 		}
 	}
 
 	queryLines := strings.Join([]string{
-		// The fixed table/step state machine and an ordinary old-format table
-		// are not evidence that an excluded full-table rebuild was selected.
+		`[db]maintenance table[1/22] cleanup-before network_client`,
+		`[db]maintenance table[1/22] cleanup-after network_client`,
+		`[db]maintenance table[1/22] reindex account_feedback`,
+		`[db]maintenance table[1/22] reindex network_client took 300.00s`,
+		`[db]maintenance table[1/22] reindex network_client_ccnew`,
+		`[db]maintenance table[1/22] reindex`,
+		// Cleanup, ordinary tables, incomplete lines, and completion messages
+		// do not prove a new excluded-table rebuild was selected.
 		`[edge-3][taskworker][g2][cid:fixed][I][2026-09-01T11:50:38.900708-05:00][db_maintenance.go:300][db]maintenance table[16/22] cleanup-before transfer_escrow`,
 		`[edge-3][taskworker][g2][cid:ordinary][I][2026-09-01T11:50:38.900708-05:00][db_maintenance.go:225][db]maintenance reindex[1/22] st_epoch`,
 		// A completion line is not a second launch event.
@@ -633,7 +1176,9 @@ func TestLogErrorsSignalExplainsLegacyDatabaseMaintenanceReindex(t *testing.T) {
 	}
 	for _, detail := range []string{
 		"frame=table=contract_close",
-		"legacy full-table concurrent-reindex path",
+		"excluded from scheduled whole-table concurrent reindexing",
+		"Log format alone does not identify a worker revision",
+		"measure native process CPU separately",
 		"908a8b2c",
 		"d8392c83",
 		"patch-identical",
@@ -645,12 +1190,22 @@ func TestLogErrorsSignalExplainsLegacyDatabaseMaintenanceReindex(t *testing.T) {
 		"cancellation is a database mutation and requires authorization",
 		"supported cleanup-only maintenance command",
 		"never wildcard-drop _ccnew/_ccold indexes",
-		"one complete maintenance epoch emits no legacy start line",
+		"one complete maintenance epoch emits no excluded-table start line in either format",
 	} {
 		if !strings.Contains(alert.Markdown(), detail) {
 			t.Fatalf("legacy maintenance alert missing %q:\n%s", detail, alert.Markdown())
 		}
 	}
+	queryLines = `[edge-3][taskworker][g2][cid:current][I][2026-10-05T04:00:00Z][db_maintenance.go:291][db]maintenance table[1/22] reindex network_client`
+	alerts, err = NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert = requireAlertClass(t, alerts, "db-maintenance-legacy-reindex")
+	if alert.Frame != "table=network_client" || alert.Severity != SeverityPage {
+		t.Fatalf("current-format network_client alert = %s", alert.Markdown())
+	}
+
 }
 
 func TestLogErrorsSignalSeparatesPostgresClientExhaustionFromPanic(t *testing.T) {
@@ -826,7 +1381,11 @@ func TestLogErrorsSignalExplainsDirectLokiTailDroppedEntries(t *testing.T) {
 		"exact affected-service attribution",
 		"privacy-safe",
 		"does not distinguish the two stages",
-		"same-window ingester reset identifies the earlier path",
+		"same-window ingester reset corroborates ingester-side loss",
+		"cannot assign the reset to this exact service summary",
+		"rate counts summary lines",
+		"one response's bounded descriptor count",
+		"understate loss magnitude",
 		"Warp 35453fd contains that forwarding",
 		"prevents sub-processing-bound bursts",
 		"genuine sustained blockage still produces bounded descriptors",
@@ -837,6 +1396,29 @@ func TestLogErrorsSignalExplainsDirectLokiTailDroppedEntries(t *testing.T) {
 	} {
 		if !strings.Contains(markdown, detail) {
 			t.Fatalf("direct Loki dropped-entry alert missing %q:\n%s", detail, markdown)
+		}
+	}
+}
+
+func TestLogErrorsSignalHidesMalformedDirectLokiTailDroppedEntrySuffix(t *testing.T) {
+	line := `[warpctl][loki-tail-dropped-entries] service=fixture-service count=2 error=fixture-sensitive-suffix`
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names fixture-service", nil
+		}
+		return line + "\n", nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility := requireAlertClass(t, alerts, "loki-tail-dropped-entries-unobservable")
+	if strings.Contains(visibility.Markdown(), "fixture-sensitive-suffix") {
+		t.Fatal("malformed summary suffix reached Markdown")
+	}
+	for _, alert := range alerts {
+		if alert.Class == "loki-tail-dropped-entries" {
+			t.Fatal("malformed summary became affirmative loss evidence")
 		}
 	}
 }
@@ -968,9 +1550,11 @@ func TestLogErrorsSignalExplainsLokiTailBackendEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyMarkdown := requireAlertClass(t, alerts, "loki-tail-backend-eof").Markdown()
-	if !strings.Contains(legacyMarkdown, "frame=") || strings.Contains(legacyMarkdown, "frame=backend=") {
-		t.Fatalf("legacy Loki EOF should remain un-attributed during rollout:\n%s", legacyMarkdown)
+	legacyAlert := requireAlertClass(t, alerts, "loki-tail-backend-eof")
+	legacyMarkdown := legacyAlert.Markdown()
+	if legacyAlert.Frame != "" || strings.Contains(legacyAlert.Observed, "frame=") ||
+		!strings.Contains(legacyAlert.Observed, "target=grafana") {
+		t.Fatalf("legacy Loki EOF should remain service-attributed without an invented backend frame:\n%s", legacyMarkdown)
 	}
 }
 
@@ -996,7 +1580,8 @@ func TestLogErrorsSignalExplainsInvalidPayoutDestination(t *testing.T) {
 	for _, detail := range []string{
 		"invalid for its declared chain",
 		"safely releases only that pre-chain submit attempt",
-		"selects the same invalid payout_wallet configuration",
+		"when its guarded reset succeeds",
+		"select the same invalid payout_wallet configuration",
 		"Historical bounded controls on a pre-dispersion taskworker",
 		"same six payments recurring at the same minute",
 		"not a statement about the currently deployed artifact",
@@ -1030,6 +1615,89 @@ func TestLogErrorsSignalExplainsInvalidPayoutDestination(t *testing.T) {
 		if strings.Contains(markdown, id) {
 			t.Fatalf("invalid-destination alert leaked id %s:\n%s", id, markdown)
 		}
+	}
+	if requireAlertClassCount(alerts, "payout-invalid-destination-reset-failed") != 0 {
+		t.Fatal("ordinary invalid-destination control produced a reset-failure alert")
+	}
+}
+
+func TestLogErrorsSignalSeparatesInvalidDestinationResetFailure(t *testing.T) {
+	const paymentId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const taskId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	line := `[synthetic-host][taskworker][synthetic-block][cid:fixture][I][2026-09-01T12:00:00Z][task.go:1930][` + taskId + `]eval error = AdvancePayment({"payment_id":"` + paymentId + `"}) = [` + paymentId + `]Payment create transaction error = Bad status: 400 Bad Request {"code":155219,"message":"Invalid destination address."}; invalid destination reset error = private.fixture.example dial tcp 192.0.2.83:5432 i/o timeout wallet=2001:db8::83 goroutine 123 [synthetic.Stack]`
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-taskworker", nil
+		}
+		return line + "\n" + line + "\n", nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := requireAlertClass(t, alerts, "payout-invalid-destination-reset-failed")
+	for _, want := range []string{
+		"failed guarded attempt reset", "Concurrent, terminal, or on-chain payment state",
+		"Preserve the existing idempotency key", "Do not infer unchanged wallet configuration",
+		"invalid_destination_reset_failed_events=1", "diagnostic_lines=2",
+		"frame=phase=guarded-reset", "without duplicate transfers",
+	} {
+		if !strings.Contains(alert.Markdown(), want) {
+			t.Errorf("reset-failure log alert missing %q", want)
+		}
+	}
+	requireAlertOmits(t, alert, paymentId, taskId, "private.fixture.example", "192.0.2.83", "2001:db8::83", "synthetic.Stack", "selects the same invalid", "account-owner/operations action only")
+	for _, class := range []string{"payout-invalid-destination", "dial-io-timeout", "panic"} {
+		if requireAlertClassCount(alerts, class) != 0 {
+			t.Errorf("reset failure was also attributed to %q", class)
+		}
+	}
+}
+
+func TestInvalidDestinationResetLogRequiresExactComposedMarker(t *testing.T) {
+	var resetClass *logClass
+	for i := range logClasses {
+		if logClasses[i].name == "payout-invalid-destination-reset-failed" {
+			resetClass = &logClasses[i]
+			break
+		}
+	}
+	if resetClass == nil {
+		t.Fatal("missing reset-failure log class")
+	}
+	for _, line := range []string{
+		"Bad status: 400 Bad Request Invalid destination address.",
+		"Payment create transaction error = Invalid destination address.; invalid destination reset error: synthetic",
+		"Payment create transaction error = Invalid destination address.; invalid destination reset error = ",
+		"unrelated failure; invalid destination reset error = synthetic",
+	} {
+		if resetClass.re.MatchString(line) {
+			t.Errorf("non-composed control matched reset-failure class: %q", line)
+		}
+	}
+	for _, line := range []string{
+		"Payment create transaction error = Invalid destination address.; invalid destination reset error = Invalid payment.",
+		"Payment create transaction error = processor code 155219; invalid destination reset error = context canceled",
+	} {
+		if !resetClass.re.MatchString(line) {
+			t.Errorf("owned reset-failure marker was not classified: %q", line)
+		}
+	}
+}
+
+func TestLogErrorsSignalHealthyWindowHasNoResetFailure(t *testing.T) {
+	source := &syntheticSource{localFn: func(_ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "ls" {
+			return "repo names synthetic-taskworker", nil
+		}
+		return "", nil
+	}}
+	alerts, err := NewLogErrorsSignal().Run(context.Background(), syntheticSettings(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requireAlertClassCount(alerts, "payout-invalid-destination-reset-failed") != 0 {
+		t.Fatal("healthy log window produced a reset-failure alert")
 	}
 }
 

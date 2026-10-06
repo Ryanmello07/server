@@ -471,6 +471,9 @@ const taskFailureSummarySQL = `
 		       left(coalesce(reschedule_error,''),160) AS last_error,
 		       run_max_time_seconds,
 		       CASE
+		         WHEN split_part(function_name,'.',3) = 'AdvancePayment'
+		           AND lower(coalesce(reschedule_error,'')) LIKE '%; invalid destination reset error = %'
+		           THEN 'invalid-destination-reset-failed'
 		         WHEN lower(coalesce(reschedule_error,'')) LIKE '%statement timeout%'
 		           AND lower(coalesce(reschedule_error,'')) LIKE '%sqlstate 57014%'
 		           THEN 'postgres-statement-timeout'
@@ -509,6 +512,9 @@ const taskFailureSummarySQL = `
 		           THEN 'context-canceled'
 		         WHEN lower(coalesce(reschedule_error,'')) LIKE '%target not found%'
 		           THEN 'target-not-found'
+		         WHEN split_part(function_name,'.',3) = '(*TaskWorker)'
+		           AND lower(coalesce(reschedule_error,'')) LIKE '%missing user auth.%'
+		           THEN 'post-missing-recipient'
 		         ELSE 'other'
 		       END AS error_class
 		FROM pending_task
@@ -580,9 +586,12 @@ func advancePaymentMixedGuidance(causeSummary string) (string, string, string) {
 	add("connection-cleanup-deadline",
 		"deploy the queued, cursor-batched CompletePayment retention path for connection-cleanup-deadline rows",
 		"the legacy retention query and new 120-second cleanup failures disappear")
+	add("invalid-destination-reset-failed",
+		"investigate the guarded attempt reset for invalid-destination-reset-failed rows: distinguish concurrent, terminal, or on-chain payment state from a persistence failure; preserve the existing idempotency key and reconcile the outcome before any new submission; do not infer unchanged wallet configuration or manually clear payment rows or keys",
+		"the guarded reset succeeds when eligible or the existing attempt reaches a reconciled terminal outcome, invalid-destination-reset-failed clears, and ambiguous submissions retain their keys without duplicate transfers")
 	add("processor-invalid-destination",
-		"verify typed-reset commit b8af229f in every active taskworker artifact and deploy it only to blocks whose artifact predates it; on already-current blocks, repeated rejection means the invalid configured wallet is still selected, so correct chain-mismatched payout wallets through the supported account API; never clear payment rows or keys manually",
-		"every active taskworker contains typed-reset commit b8af229f, the next retry selects the corrected wallet with a fresh key, completes without a duplicate transfer, and processor-invalid-destination clears")
+		"verify typed-reset commit b8af229f in every active taskworker artifact and deploy it only to blocks whose artifact predates it; confirm the typed pre-chain rejection, successful guarded reset, and current wallet selection before attributing recurrence to unchanged wallet configuration; correct a proven chain-mismatched payout wallet through the supported account API; never clear payment rows or keys manually",
+		"every active taskworker contains typed-reset commit b8af229f, a confirmed safe reset lets the next retry select the corrected wallet with a fresh key, it completes without a duplicate transfer, and processor-invalid-destination clears")
 	add("processor-bad-request",
 		"inspect processor-bad-request rows while preserving ambiguous-submit idempotency keys",
 		"processor-bad-request rows reach a definitive safe outcome")
@@ -648,7 +657,11 @@ func (self taskCanaryProbe) check(ctx context.Context, env *probeEnv) ([]finding
 	if err != nil {
 		return nil, err
 	}
-	completions := atoiRow(rows[0], 0)
+	row, err := pgAggregateRow(rows, 1)
+	if err != nil {
+		return nil, err
+	}
+	completions := atoiRow(row, 0)
 	if completions == 0 {
 		findings = append(findings, finding{
 			probeId: "pg/canary-dead", tier: tierPage,
@@ -913,6 +926,7 @@ func (self taskCanaryProbe) check(ctx context.Context, env *probeEnv) ([]finding
 		lastError, maxTimeSeconds := r.str(6), r.str(7)
 		causeClassCount, causeSummary := atoiRow(r, 8), r.str(9)
 		lastErrorClass := representativeTaskErrorClass(task, lastError, causeClassCount, causeSummary)
+		invalidDestinationResetFailed := task == "AdvancePayment" && lastErrorClass == taskErrorClassInvalidDestinationResetFailed
 		mixedCauses := 1 < causeClassCount
 		lowerError := strings.ToLower(lastError)
 		closeExpiredAlreadySettled := task == "CloseExpiredContracts" &&
@@ -941,9 +955,12 @@ func (self taskCanaryProbe) check(ctx context.Context, env *probeEnv) ([]finding
 		alertMechanism, alertAction, alertVerify := "", "", ""
 		alertPlaybook := "SIGNALS.md 5.7"
 		alertContext := "Each task function is grouped before reporting; another noisy function cannot consume a global row limit and hide this failure. Parked and fresh-claim counts are independent predicates and can overlap briefly during reschedule handoff; do not add them together."
+		if task == "CloseExpiredContracts" {
+			alertContext += " For CloseExpiredContracts, max_errors is a cumulative stored retry count, not a failed-contract count or matched-window execution rate. Current source can deliberately retain a failing task while independently terminal-verified siblings make useful progress; this query does not observe that batch proof. Batch progress, typed retry authority, selected retry delay and executor lineage remain unobserved here. A missing summary does not mean zero progress, and a nearby completed-batch summary does not establish a same-attempt join. The other/unclassified class does not distinguish ordinary backoff from an explicitly retained cadence. Parked and fresh-claim values describe scheduling and lease state, not successful or zero batch progress. Keep any separately observed terminal_verified, unresolved_accounting and quarantined_accounting counts separate until exact private task/run correlation and complete error authority establish their scope. Do not clear the financial warning, release reservations or weaken the escrow guard from a prompt retry or partial sibling progress."
+		}
 		if strings.EqualFold(strings.TrimSpace(lastError), "Timeout") {
 			alertContext += fmt.Sprintf(" This literal Timeout is the task evaluator's configured deadline of %ss. Compare the matching eval-error duration; an exact match means the task needs a smaller checkpointed batch or a justified task-specific MaxTime, not a database restart.", maxTimeSeconds)
-		} else if strings.Contains(lowerError, "context canceled") && !strings.Contains(lastError, "Drained:") && !disabledVerifyRetry && !reconcileNetEscrowDeadline && !clockBackfillDeadline {
+		} else if strings.Contains(lowerError, "context canceled") && !strings.Contains(lastError, "Drained:") && !disabledVerifyRetry && !reconcileNetEscrowDeadline && !clockBackfillDeadline && !invalidDestinationResetFailed {
 			alertContext += fmt.Sprintf(" This is a non-drain context cancellation with a configured task deadline of %ss; compare the taskworker eval-error duration with that deadline. An exact match identifies an undersized task-specific MaxTime, not a deploy drain.", maxTimeSeconds)
 		}
 		if mixedCauses {
@@ -955,6 +972,11 @@ func (self taskCanaryProbe) check(ctx context.Context, env *probeEnv) ([]finding
 				alertAction = "Investigate and remediate each listed cause class independently; do not apply the private representative error's action to the entire mixed family or delete task rows to hide it."
 				alertVerify = "Each cause-class count converges to zero or its explicitly documented background state, and no minority class remains hidden behind the former dominant sample."
 			}
+		} else if invalidDestinationResetFailed {
+			alertMechanism = "AdvancePayment reported an invalid-destination rejection followed by a failed guarded attempt reset. The reset can fail because payment state became terminal or on-chain, because another attempt changed it, or because persistence failed. The original rejection does not prove that the configured wallet remains unchanged or that the idempotency key was released."
+			alertAction = "Inspect the guarded reset and current payment state privately: distinguish concurrent, terminal, or on-chain state from a persistence failure, and reconcile any existing processor attempt before a new submission. Preserve the existing idempotency key. Do not infer unchanged wallet configuration, change wallet data solely from this class, manually release an attempt, or clear payment/task rows."
+			alertVerify = "The guarded reset succeeds only for an eligible pre-chain attempt, or the existing attempt reaches a reconciled terminal outcome. The reset-failed cohort clears on natural retries without duplicate transfers; keys remain stable for ambiguous submissions. Observe the normal 30–90-minute retry window plus ingestion delay after the authorized correction."
+			alertPlaybook = "SIGNALS.md §1.2 and §5.7"
 		} else if closeExpiredAlreadySettled {
 			alertMechanism = "CloseExpiredContracts selected an open snapshot immediately before a live or concurrent close settled the same contract. The sweep then observed the exact already-terminal settled outcome. That is successful convergence, not malformed escrow and not a conflicting terminal result."
 			alertContext += " Current source distinguishes this exact settled duplicate, skips quarantine, and clears it only after the existing terminal-row verification and Redis stream cleanup both succeed. Other close errors and other terminal outcomes remain failures."
@@ -996,10 +1018,10 @@ func (self taskCanaryProbe) check(ctx context.Context, env *probeEnv) ([]finding
 			alertAction = "Correlate the exact terminal evaluator line and successor, then use the bounded reliability phase, marker, and index diagnostic to select the active root cause. Do not redeploy a historical cadence/checkpoint fix, raise the deadline, or manually kick the fresh retry from the cleanup error alone."
 			alertVerify = "The terminal evaluator duration and successor identity are correlated, the active phase receives its demonstrated repair boundary, and the retry reaches a bounded successful result without repeating the diagnosed cause."
 		} else if task == "CloseExpiredContracts" && strings.EqualFold(strings.TrimSpace(lastError), "Timeout") {
-			alertMechanism = "A close checkpoint reached the exact 30-minute task boundary. Its per-contract commits made durable progress, but the scheduler did not checkpoint task success, so the retry must rescan the remaining ordered cohort while old contracts accumulate. The task row does not contain the selected cohort size; use the matching live selection log before distinguishing an older 100,000-contract generation from the current 25,000 cap."
+			alertMechanism = "A close checkpoint reached the exact 30-minute task boundary. Its per-contract commits made durable progress, but the scheduler did not checkpoint task success, so the retry must rescan the remaining ordered cohort while old contracts accumulate. The task row does not contain the selected cohort size; the matching live selection log reports a merged set, not each scan's cap. Current source independently selects up to 25,000 open and 25,000 disputed rows, so a merged count above 25,000 does not prove an older generation."
 			alertContext += " A distinct successor attempt after the retry is evidence that per-contract work survived; it does not make that scheduler boundary safe under recurring write/vacuum pressure."
-			alertAction = "Read the matching `found <n> contracts to close` journal line. If n exceeds 25,000, roll out the 25,000 cap while retaining the 92-worker inner pool; if n is already at or below 25,000, retain it and attribute the remaining overrun to the active retention, vacuum, storage, or executor phase before reducing the checkpoint further. Do not raise the 30-minute deadline or add task-level shards."
-			alertVerify = "Live selection stays at or below 25,000, each full cohort acknowledges task success before the deadline and schedules its immediate successor, and the older-than-five-minute open set falls on consecutive samples without another Timeout."
+			alertAction = "Read the matching `found <n> contracts to close` journal line, then verify the actual executor artifact and per-scan cap/count authority before prescribing a cap change. If the artifact still uses the older 100,000 per-scan limit, roll out the existing 25,000 per-scan cap while retaining the 92-worker inner pool; otherwise retain it and attribute the remaining overrun to the active retention, vacuum, storage, or executor phase before reducing the checkpoint further. Do not raise either scan to 50,000, the 30-minute deadline, or the number of task-level shards."
+			alertVerify = "Each independent scan stays at or below 25,000 and their deduplicated union at or below 50,000. Successful full cohorts acknowledge task success before the deadline and schedule their successor; independently verified accounting-rejected batches remain failed tasks with bounded retry. The older-than-five-minute open set falls on consecutive samples without another Timeout."
 		} else if task == "Payout" && strings.Contains(lowerError, "connlockerror=conn closed") {
 			alertMechanism = "The bounded payment-plan transaction remained intentionally idle while a separate reliability-maintenance transaction ran longer than PostgreSQL's five-minute idle-in-transaction timeout, so PostgreSQL closed the outer connection before it could commit."
 			alertContext += " Scope the exception to this payment-plan transaction with SET LOCAL; the task MaxTime and bounded plan slice remain the safety limits, while every unrelated session keeps the global timeout."
@@ -1009,10 +1031,15 @@ func (self taskCanaryProbe) check(ctx context.Context, env *probeEnv) ([]finding
 			alertMechanism = "The external payout wallet does not own enough of the requested asset to fund pending payouts. Task retries cannot create that balance; repeated HTTP 400 responses only move the rows through backoff."
 			alertAction = "Finance/operations must fund the named payout wallet with the required asset, or explicitly pause payouts. Do not treat this as an API, PostgreSQL, or Redis availability incident."
 			alertVerify = "After funding, AdvancePayment retries succeed and the family count converges to zero without manual row deletion."
-		} else if task == "AdvancePayment" && strings.Contains(lowerError, "invalid destination address") {
-			alertMechanism = "The payout wallet address is invalid for its declared chain. A pre-fix chain-blind validator allowed a Solana base58 key to be stored as MATIC, then Circle definitively rejects the destination before creating a transfer. The current taskworker clears only that typed pre-chain attempt automatically; if the configured payout wallet is not corrected, UpdatePaymentWallet selects the same invalid wallet on the next retry and the row persists on its one-hour-mean backoff. Saturated retries are dispersed across 30–90 minutes after the proportional-jitter taskworker is deployed."
-			alertAction = "Correct the network's payout wallet through the supported account API. Do not manually release the attempt, edit payment rows, or rotate idempotency keys: the current taskworker already releases this exact typed rejection while preserving keys for transport errors, rate limits, and ambiguous submits."
-			alertVerify = "The next retry selects the corrected chain-compatible wallet with a fresh key, completes without a duplicate transfer, and processor-invalid-destination converges to zero after at most 90 minutes plus ingestion delay."
+		} else if task == "AdvancePayment" && lastErrorClass == taskErrorClassProcessorInvalidDestination {
+			alertMechanism = "The stored task error reports an invalid payout destination. Historically, a pre-fix chain-blind validator allowed a Solana base58 key to be stored as MATIC, invalid for its declared chain. A typed definitive pre-chain rejection permits the guarded attempt reset; after a successful reset, an unchanged payout-wallet selection repeats the failure on its one-hour-mean backoff. Saturated retries are dispersed across 30–90 minutes after the proportional-jitter taskworker is deployed. This text class alone does not prove typed status, successful reset, or current wallet selection."
+			alertAction = "Verify typed-reset commit b8af229f in every active artifact, then confirm the typed pre-chain rejection, successful guarded reset, and current wallet selection. Correct a proven chain-mismatched payout wallet through the supported account API. Do not manually release the attempt, edit payment rows, or rotate idempotency keys; retain the reset's safety guard while preserving keys for transport errors, rate limits, and ambiguous submits."
+			alertVerify = "After a confirmed safe reset and authorized wallet correction, the next retry selects the corrected chain-compatible wallet with a fresh key, completes without a duplicate transfer, and processor-invalid-destination converges to zero after at most 90 minutes plus ingestion delay."
+		} else if task == "(*TaskWorker)" && lastErrorClass == taskErrorClassPostMissingRecipient {
+			alertMechanism = "A wrapped task post hook could not resolve an account-notice recipient because the network admin has no email or phone auth. The fixed error class alone does not identify the wrapped task, establish that its notice is optional, or prove the underlying task failed."
+			alertAction = "Join the wrapper's validated task reference to its finished original task in a protected read-only diagnostic. If it is terminal PlaySubscriptionRenewal, deploy the typed missing-recipient skip while preserving real database errors; do not edit the subscription, task row, or payment state. For another wrapped task, inspect its notification contract before changing it."
+			alertVerify = "For terminal PlaySubscriptionRenewal, the exact wrapped post completes on its natural retry, without sending to an absent recipient or scheduling another renewal; unrelated post hooks and database errors remain visible."
+			alertPlaybook = "SIGNALS.md §1.2"
 		}
 		symptom := fmt.Sprintf("task family %s has %d failing row(s) on %s (%d parked >5m; %d with a fresh claim heartbeat; sets may overlap)",
 			task, familyCount, target, parkedCount, freshClaimCount)

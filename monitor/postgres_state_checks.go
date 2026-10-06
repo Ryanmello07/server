@@ -5,6 +5,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 // tier-0 read of pg load and the redis-latency mirror. It emits two signals:
 // active-pileup (page, §7) and idle-in-tx (warn, §7). When either trips it
 // runs the 1.3 / 5.8 escalation batteries — once per trip, not per tick
-// (batteryLatch) — so the ticket names the real query load without the
+// (batteryLatch) — so the ticket retains bounded workload diagnostics without the
 // batteries themselves landing load on the sick target every minute.
 type pgStateProbe struct {
 	batteries *batteryLatch
@@ -44,13 +45,11 @@ func (self *pgStateProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return nil, fmt.Errorf("pg state query returned no rows")
+	values, err := pgAggregateIntegers(rows, 4)
+	if err != nil {
+		return nil, err
 	}
-	active := atoiRow(rows[0], 0)
-	idleInTx := atoiRow(rows[0], 1)
-	oldestIdleS := atoiRow(rows[0], 2)
-	totalClient := atoiRow(rows[0], 3)
+	active, idleInTx, oldestIdleS, totalClient := values[0], values[1], values[2], values[3]
 
 	findings := []finding{}
 
@@ -68,6 +67,7 @@ func (self *pgStateProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 			baseline: "active 2–6 healthy; real active backends were ~6 even during past incidents (1.3)",
 			observed: fmt.Sprintf("active=%d idle_in_tx=%d total_client=%d", active, idleInTx, totalClient),
 			evidence: evidence,
+			context:  pgStateBatteryFrameContext(evidence),
 			playbook: "SIGNALS.md 5.8",
 		})
 	} else {
@@ -77,6 +77,9 @@ func (self *pgStateProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 
 	// idle-in-tx (warn): count > 100 or oldest > 30 min (SIGNALS.md §7 / 1.3 / 5.6)
 	if idleInTx > 100 || oldestIdleS > 30*60 {
+		evidence := self.batteries.broken("idle-in-tx", func() string {
+			return idleTxBattery(ctx, env)
+		})
 		findings = append(findings, finding{
 			probeId: "pg/idle-in-tx", tier: tierWarn,
 			class: "idle-in-tx", target: target, sustain: 2,
@@ -84,13 +87,11 @@ func (self *pgStateProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 			mechanism: "The count and oldest age can have different owners. A bounded close cohort can put many workers briefly between statements while one payment planner or leaked transaction supplies the old xact; tx-scoped Redis latency is supported only when the same grouped query shape also remains continuously idle.",
 			baseline:  "idle_in_tx < 30 healthy (2 when healthy); above 100 requires query-shape and continuous-idle attribution before calling it Redis leakage (1.3)",
 			observed:  fmt.Sprintf("idle_in_tx=%d oldest_xact_s=%d active=%d", idleInTx, oldestIdleS, active),
-			evidence: self.batteries.broken("idle-in-tx", func() string {
-				return idleTxBattery(ctx, env)
-			}),
-			context:  "The explicit oldest line uses state_change for continuous idle time; the summary age uses xact_start because that is the MVCC-horizon risk. The following grouped shapes are ordered by backend count and need not contain the singleton oldest transaction.",
-			action:   "Attribute the explicit oldest transaction separately from the high-count shapes. For the subsidy payment planner, follow the Payout canary and transaction-local idle-timeout fix; for young per-contract closers, follow open-contract drain. Do not mass-terminate the pool.",
-			verify:   "The oldest owner reaches its bounded outcome, continuously idle ages return below one minute, and the idle-in-transaction count falls below 100 without canceling healthy close workers.",
-			playbook: "SIGNALS.md 5.6",
+			evidence:  evidence,
+			context:   "The explicit oldest line uses state_change for continuous idle time; the summary age uses xact_start because that is the MVCC-horizon risk. The following grouped shapes are ordered by backend count and need not contain the singleton oldest transaction. " + pgStateBatteryFrameContext(evidence),
+			action:    "Attribute the explicit oldest transaction separately from the high-count shapes. For the subsidy payment planner, follow the Payout canary and transaction-local idle-timeout fix; for young per-contract closers, follow open-contract drain. Do not mass-terminate the pool.",
+			verify:    "The oldest owner reaches its bounded outcome, continuously idle ages return below one minute, and the idle-in-transaction count falls below 100 without canceling healthy close workers.",
+			playbook:  "SIGNALS.md 5.6",
 		})
 	} else {
 		self.batteries.healthy("idle-in-tx")
@@ -120,8 +121,17 @@ func (self *pgStateProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 	return findings, nil
 }
 
-// activeBattery groups active backends by query_id (SIGNALS.md 5.8 step 1) —
-// if 1–3 shapes own the pile it is a plan problem, not organic load.
+func pgStateBatteryFrameContext(evidence string) string {
+	frame := "The state summary and diagnostic battery are separate snapshots. Grouped top-N counts, waits, and statement deltas are attribution context, not an arithmetic partition of the observed total; an empty statement delta is unknown rather than healthy."
+	if strings.Contains(evidence, "battery collected once at trip") {
+		return "The cached battery was collected on the first failing tick and precedes this later sustained state summary. " + frame
+	}
+	return "In a one-shot run, the battery begins after the state summary and may span a bounded delta interval. " + frame
+}
+
+// Groups active backends by query_id (SIGNALS.md 5.8 step 1). Concentration
+// alone does not prove a plan defect. SQL and arbitrary wait labels are
+// withheld before caching; a protected lookup can resolve the numeric IDs.
 func activeBattery(ctx context.Context, env *probeEnv) string {
 	rows, err := env.runner.pg(ctx, `
 		SELECT query_id, count(*) AS backends,
@@ -132,18 +142,38 @@ func activeBattery(ctx context.Context, env *probeEnv) string {
 		GROUP BY query_id ORDER BY backends DESC LIMIT 5;
 	`)
 	if err != nil {
-		return "active battery failed: " + err.Error()
+		return "active battery failed: error_class=" + classifyObservationError(err)
 	}
 	lines := []string{"top active query_ids:"}
 	for _, r := range rows {
-		lines = append(lines, fmt.Sprintf("  qid=%s backends=%s waits=%s :: %s",
-			r.str(0), r.str(1), r.str(2), r.str(3)))
+		if len(r) != 4 {
+			return "active battery failed: error_class=" + observationErrorClassInvalidResponse
+		}
+		queryId := "uncomputed"
+		if r.str(0) != "" {
+			value, err := strconv.ParseInt(r.str(0), 10, 64)
+			if err != nil {
+				return "active battery failed: error_class=" + observationErrorClassInvalidResponse
+			}
+			queryId = strconv.FormatInt(value, 10)
+		}
+		backends, err := strconv.ParseInt(r.str(1), 10, 64)
+		if err != nil || backends < 0 {
+			return "active battery failed: error_class=" + observationErrorClassInvalidResponse
+		}
+		waits := "withheld"
+		if r.str(2) == "-:-" {
+			waits = "none"
+		}
+		lines = append(lines, fmt.Sprintf("  qid=%s backends=%d waits=%s query=withheld",
+			queryId, backends, waits))
 	}
 	return strings.Join(lines, "\n")
 }
 
 // idleTxBattery groups idle-in-tx backends by last query shape (SIGNALS.md
-// 5.6) — names the tx-scoped redis coupling sites that are stalling.
+// 5.6). Only validated numeric diagnostics leave this helper, before caching;
+// SQL and application text can contain literals or durable identities.
 func idleTxBattery(ctx context.Context, env *probeEnv) string {
 	rows, err := env.runner.pg(ctx, `
 		WITH idle AS MATERIALIZED (
@@ -170,15 +200,26 @@ func idleTxBattery(ctx context.Context, env *probeEnv) string {
 		ORDER BY sort_key, backends DESC, oldest_s DESC;
 	`)
 	if err != nil {
-		return "idle-tx battery failed: " + err.Error()
+		return "idle-tx battery failed: error_class=" + classifyObservationError(err)
 	}
 	lines := []string{"idle-in-tx by last query shape:"}
 	for _, r := range rows {
+		if len(r) != 7 || (r.str(1) != "oldest" && r.str(1) != "shape") {
+			return "idle-tx battery failed: error_class=invalid-response"
+		}
+		var numeric [3]int64
+		for i, column := range []int{2, 3, 4} {
+			value, err := strconv.ParseInt(r.str(column), 10, 64)
+			if err != nil || value < 0 {
+				return "idle-tx battery failed: error_class=invalid-response"
+			}
+			numeric[i] = value
+		}
 		if r.str(1) == "oldest" {
-			lines = append(lines, fmt.Sprintf("  oldest transaction: pid=%s continuously_idle=%ss application=%s :: %s", r.str(4), r.str(3), r.str(5), r.str(6)))
+			lines = append(lines, fmt.Sprintf("  oldest transaction: pid=%d continuously_idle=%ds application=withheld query=withheld", numeric[2], numeric[1]))
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("  backends=%s oldest_continuous_idle=%ss :: %s", r.str(2), r.str(3), r.str(6)))
+		lines = append(lines, fmt.Sprintf("  backends=%d oldest_continuous_idle=%ds query=withheld", numeric[0], numeric[1]))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -209,7 +250,11 @@ func (self pgContractRateProbe) check(ctx context.Context, env *probeEnv) ([]fin
 	if err != nil {
 		return nil, err
 	}
-	rate := atoiRow(rows[0], 0)
+	values, err := pgAggregateIntegers(rows, 1)
+	if err != nil {
+		return nil, err
+	}
+	rate := values[0]
 
 	// learned band: trailing-hour median (needs >= 30 samples). Read before
 	// recording so the median reflects history, not this reading's own
@@ -267,4 +312,31 @@ func (self pgContractRateProbe) check(ctx context.Context, env *probeEnv) ([]fin
 		}}, nil
 	}
 	return []finding{healthyFinding("pg/contracts-collapse", tierPage, "contracts-collapse", target)}, nil
+}
+
+// Required scalar aggregates return one complete row, unlike optional GROUP BY
+// batteries. Check shape before indexing, converting values or changing state.
+func pgAggregateRow(rows []pgRow, columns int) (pgRow, error) {
+	if len(rows) != 1 || len(rows[0]) != columns {
+		return nil, fmt.Errorf("invalid response for PostgreSQL aggregate: expected one row with %d columns", columns)
+	}
+	return rows[0], nil
+}
+
+// These two scalar aggregates additionally require nonnegative integers. Keep
+// numeric validation separate from owners with a legitimate signed sentinel.
+func pgAggregateIntegers(rows []pgRow, columns int) ([]int64, error) {
+	row, err := pgAggregateRow(rows, columns)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]int64, columns)
+	for i := range values {
+		value, err := strconv.ParseInt(row.str(i), 10, 64)
+		if err != nil || value < 0 {
+			return nil, fmt.Errorf("invalid response for PostgreSQL aggregate: expected nonnegative integers")
+		}
+		values[i] = value
+	}
+	return values, nil
 }

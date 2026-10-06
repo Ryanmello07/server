@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -16,71 +15,17 @@ import (
 	"github.com/urnetwork/sdk"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/jwt"
+	"github.com/urnetwork/server/localclient"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/proxy/flowtrace"
 )
 
 func DefaultProxyDeviceManagerSettings() *ProxyDeviceManagerSettings {
 	return &ProxyDeviceManagerSettings{
-		CheckProxyDeviceIdleTimeout:        1 * time.Minute,
-		SequenceBufferSize:                 2048,
-		DeviceMemoryTargetByteCount:        proxyDeviceMemoryTargetByteCountFromConfig(),
-		ProcessDeviceMemoryBudgetByteCount: ProxyProcessDeviceMemoryBudgetByteCountFromConfig(),
+		CheckProxyDeviceIdleTimeout: 1 * time.Minute,
+		SequenceBufferSize:          2048,
+		DeviceMemoryTargetByteCount: proxyDeviceMemoryTargetByteCountFromConfig(),
 	}
-}
-
-// defaultProxyProcessDeviceMemoryBudgetByteCount bounds the SUM of installed
-// device targets in this process. It is derived from the deployment rather
-// than chosen round: vault/main/services.yml runs the proxy as ten blocks on
-// each of two hosts with no container memory_limit (so warp exports no
-// GOMEMLIMIT either), and the only per-instance memory ceiling this process
-// already declares for itself is the 8 GiB message-pool budget in
-// cli/proxy/main.go. Matching that gives the device plane an equal, explicit
-// second ceiling: 8 GiB / 24 MiB = 341 devices per instance, 3,410 per host,
-// and a declared per-instance envelope of about 16 GiB plus overhead against
-// the 80 GiB per host the pool budget alone already assumes.
-//
-// If the number is wrong for a host it is wrong in a visible, recoverable
-// direction. Too large for a small host: the aggregate never binds and the
-// host can still overcommit, exactly as it does today, so this is never worse
-// than the status quo. Too small for demand: admission refuses new devices
-// while existing ones keep running, which shows up as
-// urnetwork_proxy_device_admission_refused_total rising with
-// urnetwork_proxy_device_memory_budget_used_bytes pinned at the total. Both
-// are tunable per environment with process_device_memory_budget in proxy.yml
-// without a code change; 0 disables the budget and restores today's unbounded
-// admission.
-const defaultProxyProcessDeviceMemoryBudgetByteCount = model.ByteCount(8 * model.Gib)
-
-// ProxyProcessDeviceMemoryBudgetByteCountFromConfig loads the aggregate device
-// budget. An explicit 0 disables admission control; a negative or unparseable
-// value fails startup, matching device_memory_budget.
-func ProxyProcessDeviceMemoryBudgetByteCountFromConfig() model.ByteCount {
-	resource, err := server.Config.SimpleResource("proxy.yml")
-	if err != nil {
-		return defaultProxyProcessDeviceMemoryBudgetByteCount
-	}
-	values := resource.String("process_device_memory_budget")
-	if len(values) == 0 {
-		return defaultProxyProcessDeviceMemoryBudgetByteCount
-	}
-	if len(values) != 1 {
-		panic(fmt.Errorf("proxy.yml: process_device_memory_budget must have exactly one value"))
-	}
-	byteCount, err := model.ParseByteCount(values[0])
-	if err != nil {
-		panic(fmt.Errorf(
-			"proxy.yml: invalid process_device_memory_budget %q: %w",
-			values[0],
-			err,
-		))
-	}
-	if byteCount < 0 {
-		panic(fmt.Errorf(
-			"proxy.yml: process_device_memory_budget must not be negative, got %q",
-			values[0],
-		))
-	}
-	return byteCount
 }
 
 const defaultProxyDeviceMemoryTargetByteCount = model.ByteCount(24 * model.Mib)
@@ -88,7 +33,7 @@ const defaultProxyDeviceMemoryTargetByteCount = model.ByteCount(24 * model.Mib)
 // proxyDeviceMemoryTargetByteCountFromConfig loads the single DeviceLocal
 // steady-state target. Older environments without proxy.yml retain the 24 MiB
 // default; a present but invalid value fails startup instead of silently
-// restoring the process-global carrier budget.
+// changing each hosted device's private target.
 func proxyDeviceMemoryTargetByteCountFromConfig() model.ByteCount {
 	resource, err := server.Config.SimpleResource("proxy.yml")
 	if err != nil {
@@ -122,9 +67,6 @@ type ProxyDeviceManagerSettings struct {
 	CheckProxyDeviceIdleTimeout time.Duration
 	SequenceBufferSize          int
 	DeviceMemoryTargetByteCount model.ByteCount
-	// ProcessDeviceMemoryBudgetByteCount bounds the sum of installed device
-	// targets. 0 disables admission control.
-	ProcessDeviceMemoryBudgetByteCount model.ByteCount
 	// HoldWindowIdentityRestore keeps a replacement from restoring identities
 	// while its predecessor is still draining. Fresh lazy-open identities are
 	// buffered and become durable when ReleaseWindowIdentityRestore runs.
@@ -158,20 +100,16 @@ type ProxyDeviceManager struct {
 	joinOnce      sync.Once
 	closeDone     chan struct{}
 
-	// Every production device borrows one manager-owned NetworkSpace. Its API
-	// request core and client strategy are shared; sdk.DeviceLocal isolates the
-	// mutable hosted credential session and all memory budgets per device.
+	// Every production device borrows one manager-owned NetworkSpace for
+	// immutable network metadata and discovery. sdk.DeviceLocal owns its API
+	// credential session, control strategy, and memory budgets per device.
 	networkSpaceOnce    sync.Once
 	networkSpace        *sdk.NetworkSpace
 	networkSpaceBuilder func(context.Context) *sdk.NetworkSpace
 	networkSpaceCloser  func(*sdk.NetworkSpace)
 	ownsNetworkSpace    bool
 	proxyDeviceBuilder  func(server.Id) (*ProxyDevice, error)
-	// deviceMemoryBudget bounds the aggregate of installed device targets.
-	// One fixed reservation per device is taken before construction and
-	// released when the device closes. nil disables admission control.
-	deviceMemoryBudget *connect.TransferMemoryBudget
-	windowIdentityGate *windowIdentityRestoreGate
+	windowIdentityGate  *windowIdentityRestoreGate
 
 	// stateLock guards the proxyDevices map. It is read-mostly: every
 	// OpenProxyDevice looks up an existing pdState (RLock, concurrent), and only
@@ -184,7 +122,8 @@ type ProxyDeviceManager struct {
 	// The ip lock, memoized. ValidCaller runs on EVERY accepted connection, so reading
 	// the device config from redis each time would put a round-trip on the accept path.
 	// The bounded TTL+LRU cache keeps that fast path without retaining every proxy id
-	// observed during the whole process lifetime.
+	// observed during the whole process lifetime. Its capacity only evicts memoized
+	// lookups; it never admits or rejects a hosted device or its traffic.
 	lockCache *proxyLockCache
 
 	// Converts observed device lifetime counters into identity-free process
@@ -229,13 +168,6 @@ func NewProxyDeviceManager(ctx context.Context, settings *ProxyDeviceManagerSett
 		networkSpace.Close()
 	}
 	manager.proxyDeviceBuilder = manager.newProxyDevice
-	if 0 < settings.ProcessDeviceMemoryBudgetByteCount {
-		manager.deviceMemoryBudget = connect.NewTransferMemoryBudget(
-			connect.ByteCount(settings.ProcessDeviceMemoryBudgetByteCount),
-		)
-		proxyDeviceMemoryBudgetBytesGauge.Set(float64(settings.ProcessDeviceMemoryBudgetByteCount))
-		proxyDeviceMemoryBudgetUsedBytesGauge.Set(0)
-	}
 	return manager
 }
 
@@ -252,6 +184,7 @@ func newProxyDeviceManagerNetworkSpace(ctx context.Context) *sdk.NetworkSpace {
 	connectSettings := connect.DefaultConnectSettings()
 	// Embedded devices must be silent: this host runs thousands of clients.
 	connectSettings.Log = connect.NewNoopLogger()
+	forceIpv4ProxyDeviceTransport(connectSettings)
 	return sdk.NewPlatformNetworkSpace(
 		ctx,
 		server.RequireEnv(),
@@ -260,8 +193,19 @@ func newProxyDeviceManagerNetworkSpace(ctx context.Context) *sdk.NetworkSpace {
 	)
 }
 
+// Main's hosted proxy clients use IPv4 for their API and Connect carriers.
+// Public IPv6 listeners remain independent of this private SDK dial path.
+// Copy before installing the wrapper so calling the original settings cannot
+// recurse through the new DialContextSettings.
+func forceIpv4ProxyDeviceTransport(settings *connect.ConnectSettings) {
+	server.ForceIPv4ConnectSettings(settings)
+}
+
 // networkSpaceForDevice returns the single manager-owned NetworkSpace. sync.Once
-// makes simultaneous cold device opens share exactly one strategy/API core.
+// makes simultaneous cold device opens reuse its metadata and directory. The
+// space still owns its own background strategy, but hosted DeviceLocal gives
+// every proxy device a private control strategy (including DoH cache and
+// admission state) and a private API session.
 func (self *ProxyDeviceManager) networkSpaceForDevice() *sdk.NetworkSpace {
 	self.networkSpaceOnce.Do(func() {
 		if self.networkSpace == nil {
@@ -274,49 +218,6 @@ func (self *ProxyDeviceManager) networkSpaceForDevice() *sdk.NetworkSpace {
 		}
 	})
 	return self.networkSpace
-}
-
-// ErrProxyDeviceMemoryBudget is returned when admitting another device would
-// exceed the aggregate device memory budget for this process. The device is
-// not created; existing devices are never evicted to make room (see
-// tryReserveDeviceMemory).
-var ErrProxyDeviceMemoryBudget = errors.New("proxy device memory budget exhausted")
-
-// tryReserveDeviceMemory takes one device-sized reservation from the aggregate
-// budget. Admission REFUSES rather than evicting: a hosted device carries a
-// live tunnel (wg peer flows, established socks/http connections, an attached
-// device-rpc session), and the manager cannot distinguish a device that is
-// merely quiet between bursts from one that is finished. The idle reaper
-// (CheckProxyDeviceIdleTimeout, see startProxyDevice) already reclaims
-// genuinely idle devices and releases their reservation, so capacity recovers
-// on its own without a second eviction policy that could cut live traffic.
-func (self *ProxyDeviceManager) tryReserveDeviceMemory() bool {
-	budget := self.deviceMemoryBudget
-	if budget == nil {
-		return true
-	}
-	if !budget.TryReserve(connect.ByteCount(self.deviceMemoryReservationByteCount())) {
-		proxyDeviceAdmissionRefusedCounter.Inc()
-		return false
-	}
-	proxyDeviceMemoryBudgetUsedBytesGauge.Set(float64(budget.UsedByteCount()))
-	return true
-}
-
-// releaseDeviceMemory returns one device-sized reservation.
-func (self *ProxyDeviceManager) releaseDeviceMemory() {
-	budget := self.deviceMemoryBudget
-	if budget == nil {
-		return
-	}
-	budget.Release(connect.ByteCount(self.deviceMemoryReservationByteCount()))
-	proxyDeviceMemoryBudgetUsedBytesGauge.Set(float64(budget.UsedByteCount()))
-}
-
-// deviceMemoryReservationByteCount is the per-device target, the same value
-// each DeviceLocal is given, so the aggregate is exactly the sum of targets.
-func (self *ProxyDeviceManager) deviceMemoryReservationByteCount() model.ByteCount {
-	return self.settings.DeviceMemoryTargetByteCount
 }
 
 func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice, error) {
@@ -333,6 +234,9 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 		// fast path: an existing entry, read concurrently (the common case)
 		self.stateLock.RLock()
 		pdState, ok := self.proxyDevices[proxyId]
+		if ok {
+			pdState.users.Add(1)
+		}
 		self.stateLock.RUnlock()
 		if ok {
 			return pdState
@@ -345,8 +249,10 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 			pdState = &proxyDeviceState{}
 			self.proxyDevices[proxyId] = pdState
 		}
+		pdState.users.Add(1)
 		return pdState
 	}()
+	defer self.releaseProxyDeviceState(proxyId, pdState)
 
 	for {
 		pdState.StateLock.Lock()
@@ -388,16 +294,9 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 		pdState.creating = c
 		pdState.StateLock.Unlock()
 
-		// Admission precedes construction: a device that cannot be afforded is
-		// never built, so no gVisor stack or tun is allocated for it.
-		var pd *ProxyDevice
-		var err error
-		reserved := self.tryReserveDeviceMemory()
-		if reserved {
-			pd, err = self.proxyDeviceBuilder(proxyId)
-		} else {
-			err = ErrProxyDeviceMemoryBudget
-		}
+		// Each new device owns the configured 24 MiB target. Other devices
+		// cannot consume or reject this device's admission budget.
+		pd, err := self.proxyDeviceBuilder(proxyId)
 
 		accepted := false
 		pdState.StateLock.Lock()
@@ -421,10 +320,6 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 			if pd != nil {
 				_ = pd.Close()
 			}
-			// the reservation outlives construction only for an installed device
-			if reserved {
-				self.releaseDeviceMemory()
-			}
 		}
 
 		// waiters re-read pdState.ProxyDevice (re-validating liveness) on wake, so
@@ -436,6 +331,23 @@ func (self *ProxyDeviceManager) OpenProxyDevice(proxyId server.Id) (*ProxyDevice
 			return nil, err
 		}
 		return pd, nil
+	}
+}
+
+// An opener may retain a state pointer while construction or teardown runs
+// without the manager map lock. Remove an empty entry only after the last such
+// opener releases it; otherwise another opener could publish a device into a
+// detached state that the manager can no longer close.
+func (self *ProxyDeviceManager) releaseProxyDeviceState(proxyId server.Id, pdState *proxyDeviceState) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if pdState.users.Add(-1) != 0 || self.proxyDevices[proxyId] != pdState {
+		return
+	}
+	pdState.StateLock.Lock()
+	defer pdState.StateLock.Unlock()
+	if pdState.ProxyDevice == nil && pdState.creating == nil {
+		delete(self.proxyDevices, proxyId)
 	}
 }
 
@@ -488,13 +400,12 @@ func (self *ProxyDeviceManager) startProxyDevice(proxyId server.Id, pd *ProxyDev
 					// drop the empty entry to keep the map bounded under churn, but
 					// only when nothing is installed and no creation is in flight (a
 					// concurrent opener may hold this pdState, about to publish).
-					if pdState.ProxyDevice == nil && pdState.creating == nil {
+					if pdState.ProxyDevice == nil && pdState.creating == nil && pdState.users.Load() == 0 {
 						delete(self.proxyDevices, proxyId)
 					}
 				}
 			}()
 			pd.Close()
-			self.releaseDeviceMemory()
 		}()
 		pd.Run()
 	})
@@ -719,6 +630,10 @@ func (self *ProxyDeviceManager) CloseAndWait(ctx context.Context) error {
 type proxyDeviceState struct {
 	StateLock   sync.Mutex
 	ProxyDevice *ProxyDevice
+	// users counts OpenProxyDevice callers retaining this state pointer. A
+	// lookup increments it under manager.stateLock before teardown may remove
+	// the map entry; its zero check is performed with that lock held.
+	users atomic.Int64
 	// creating is non-nil while an opener is creating a device for this proxy id.
 	// Other openers wait on it instead of creating a duplicate, and without
 	// holding StateLock across the (slow) creation.
@@ -766,15 +681,21 @@ type ProxyDeviceSettings struct {
 	windowIdentityGate               *windowIdentityRestoreGate
 }
 
+// Packet routing can overlap owner-driven teardown. The NAT identity is immutable;
+// peer attachments use stateLock, and concurrent Close calls share one completion.
 type ProxyDevice struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
+	flowTrace atomic.Pointer[flowtrace.Recorder]
 
 	clientId          server.Id
 	instanceId        server.Id
 	proxyDeviceConfig *model.ProxyDeviceConfig
 
-	deviceLocal *sdk.DeviceLocal
+	deviceLocal  *sdk.DeviceLocal
+	localControl *localclient.Authority
 	// deviceState is the lifecycle/readiness surface used by selection and
 	// readiness. Production points it at deviceLocal; tests replace it with an
 	// exact transition source.
@@ -801,6 +722,26 @@ type ProxyDevice struct {
 	receive        chan []byte
 	receiveAddr    netip.Addr
 
+	// WireGuard source NAT (threat model §9.4). A wg peer's tunnel address is
+	// allocated from a durable pool and written into its config, so it is
+	// stable across sessions AND identical at every provider in the peer's
+	// window -- which lets colluding providers tell that those flows belong to
+	// one client. natAddr is a per-device address from the same 169.254/16 pool
+	// the app path's tun uses; egress packets are rewritten to it and return
+	// packets are rewritten back. Taken once at construction and returned on
+	// close after device callbacks join. Like the app path's tun address, it is
+	// per session and never persisted.
+	// The value stays immutable after construction, even after its lease is returned.
+	//
+	// Invalid when no address was available, which disables the rewrite rather
+	// than dropping traffic: the fallback is the pre-NAT behavior, not an
+	// outage.
+	natAddr netip.Addr
+	// natClientAddr is the peer's own tunnel address, learned from
+	// SetReceiveForAddress. Invalid until a wg peer attaches, which is what
+	// leaves the HTTP and SOCKS paths (no wg address) untouched.
+	natClientAddr netip.Addr
+
 	// Nil in production. Ownership tests replace the final asynchronous sends
 	// while retaining the same borrowed-to-owned copy boundary.
 	sendOwnedPacketForTest  func([]byte) bool
@@ -808,6 +749,8 @@ type ProxyDevice struct {
 	// Stops a forced-full receive delivery immediately before its blocking
 	// handoff, allowing a deterministic backpressure regression test.
 	receiveBackpressureForTest func()
+	// Replaces the device-worker join with a deterministic lifecycle barrier.
+	closeDeviceLocalForTest func()
 }
 
 func NewProxyDeviceWithDefaults(
@@ -836,12 +779,28 @@ func NewProxyDevice(
 	}
 
 	cancelCtx, cancel := context.WithCancel(ctx)
+	signedByJwt := byJwt.Sign()
+	localControl, err := localclient.New(ctx, signedByJwt, networkSpace.GetApiUrl())
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	transferredControl := false
+	defer func() {
+		if !transferredControl {
+			localControl.Close()
+		}
+	}()
 
 	deviceLocalSettings := newProxyDeviceLocalSettings(ctx, proxyDeviceConfig, settings)
+	deviceLocalSettings.ClientCredentials = localControl
+	deviceLocalSettings.ClientControl = localControl
+	deviceLocalSettings.ProviderDiscovery = localControl
+	deviceLocalSettings.LocalApi = localControl
 	deviceLocal, err := sdk.NewPlatformDeviceLocal(
 		nil,
 		networkSpace,
-		byJwt.Sign(),
+		signedByJwt,
 		settings.ProxyDeviceDescription,
 		settings.ProxyDeviceSpec,
 		server.RequireVersion(),
@@ -868,8 +827,7 @@ func NewProxyDevice(
 	// Each Tun owns a private gVisor stack that Close() destroys, so a disconnecting
 	// client fully reclaims its connections' endpoints. TCP buffers come from these
 	// settings (auto-tuned up to 4MiB per direction per connection).
-	tunSettings := connect.DefaultTunSettingsWithBufferSize(settings.SequenceBufferSize)
-	tunSettings.Mtu = settings.Mtu
+	tunSettings := proxyDeviceTunSettings(settings)
 
 	// gVisor buffer sizes are LIMITS on what may be queued, not preallocations, so
 	// they cost nothing while a connection is idle and everything while it is
@@ -894,9 +852,6 @@ func NewProxyDevice(
 	//	64KiB  -> 142 KiB/flow         32KiB ->  76 KiB/flow
 	//
 	// 128kib is still ~90 MTU-sized datagrams of burst headroom.
-	tunSettings.UdpReceiveBufferByteCount = 128 * 1024
-	tunSettings.UdpSendBufferByteCount = 128 * 1024
-
 	tun, err := connect.CreateTunWithResolver(
 		cancelCtx,
 		tunSettings,
@@ -924,6 +879,7 @@ func NewProxyDevice(
 		instanceId:        proxyDeviceConfig.InstanceId,
 		proxyDeviceConfig: proxyDeviceConfig,
 		deviceLocal:       deviceLocal,
+		localControl:      localControl,
 		deviceState:       deviceLocal,
 		tun:               tun,
 		settings:          settings,
@@ -931,11 +887,30 @@ func NewProxyDevice(
 		rpcListener:       rpcListener,
 		deviceGeneration:  deviceGeneration,
 	}
+	// One NAT address per device, held for its lifetime (see natAddr).
+	if natAddr, ok := connect.TakeLocalIpv4Address(); ok {
+		proxyDevice.natAddr = natAddr
+	} else {
+		glog.Infof("[pd]no local nat address available; wg source is not rewritten\n")
+	}
 	proxyDevice.lastActivityNanos.Store(time.Now().UnixNano())
 
 	glog.Infof("[pd]using api=%s connect=%s\n", networkSpace.GetApiUrl(), networkSpace.GetPlatformUrl())
 
+	transferredControl = true
 	return proxyDevice, nil
+}
+
+// Preserve a caller's lower MTU but never enable the gVisor IPv6 address and
+// ::/0 route. The inner data-center path is IPv4-only even when a caller asks
+// for the dual-stack Connect default of 1280 bytes.
+func proxyDeviceTunSettings(settings *ProxyDeviceSettings) *connect.TunSettings {
+	tunSettings := connect.DefaultTunSettingsWithBufferSize(settings.SequenceBufferSize)
+	tunSettings.Mtu = settings.Mtu
+	server.CapServerTunIPv4(tunSettings)
+	tunSettings.UdpReceiveBufferByteCount = 128 * 1024
+	tunSettings.UdpSendBufferByteCount = 128 * 1024
+	return tunSettings
 }
 
 // newProxyDeviceLocalSettings builds the immutable hosted-device policy used
@@ -1018,6 +993,9 @@ func (self *ProxyDevice) Run() {
 		ipPath *connect.IpPath,
 		packets [][]byte,
 	) {
+		if recorder := self.flowTrace.Load(); recorder != nil {
+			recorder.Return(source, packets, time.Now())
+		}
 		self.deliverReturnPackets(packets)
 	}
 	sub := self.deviceLocal.AddReceivePacketsCallback(receivePacketsCallback)
@@ -1050,7 +1028,7 @@ func (self *ProxyDevice) deliverReturnPackets(packets [][]byte) {
 	if !self.UpdateActivity() {
 		return
 	}
-	receive, receiveAddr, receiveNotify := self.receiveWithNotify()
+	receive, receiveAddr, natClientAddr, receiveNotify := self.receiveWithNotifyNat()
 	if receive == nil {
 		_, _ = self.tun.WriteBatch(packets)
 		self.UpdateActivity()
@@ -1083,6 +1061,14 @@ func (self *ProxyDevice) deliverReturnPackets(packets [][]byte) {
 		if !proxyPacketMatchesReceiveAddress(packet, receiveAddr) {
 			continue
 		}
+		// Restore the peer's own address before it reaches WireGuard. The
+		// packet is this batch's borrowed buffer and is about to be shared
+		// read-only, so the rewrite happens here, after the partition has
+		// finished reading destinations and before anything takes a reference.
+		if !self.natRewriteReturn(packet, natClientAddr) {
+			observeWireGuardPacket("destination_to_client", "dropped", len(packet))
+			continue
+		}
 		if !self.deliverWireGuardReturn(receive, receiveNotify, packet) {
 			return
 		}
@@ -1093,7 +1079,7 @@ func (self *ProxyDevice) deliverReturnPackets(packets [][]byte) {
 // deliverWireGuardReturn preserves the device-side Tun loss model: provider
 // NAT has already consumed upstream TCP bytes and cannot reconstruct a segment
 // dropped here. This callback belongs to one DeviceLocal, so waiting on the
-// fixed process queue propagates bounded backpressure only into that device;
+// peer receive queue propagates bounded backpressure only into that device;
 // cancellation or an attachment change still releases it immediately.
 func observeElapsedSeconds(start time.Time, now func() time.Time, observe func(float64)) {
 	observe(now().Sub(start).Seconds())
@@ -1146,11 +1132,27 @@ func (self *ProxyDevice) Send(packet []byte) bool {
 		return false
 	}
 	ownedPacket := connect.MessagePoolCopy(packet)
+	// Rewrite the owned copy, never the borrowed input. A refusal drops rather
+	// than forwards: emitting the peer's tunnel address to a provider is the
+	// linkability this removes (threat model §9.4).
+	if !self.natRewriteEgress(ownedPacket) {
+		connect.MessagePoolReturn(ownedPacket)
+		observeWireGuardPacket("client_to_destination", "dropped", len(packet))
+		return false
+	}
+	recorder := self.flowTrace.Load()
+	var dnsEvent flowtrace.Event
+	if recorder != nil {
+		dnsEvent = recorder.CaptureDnsEgress(ownedPacket, time.Now())
+	}
 	sent := false
 	if self.sendOwnedPacketForTest != nil {
 		sent = self.sendOwnedPacketForTest(ownedPacket)
 	} else {
 		sent = self.deviceLocal.SendPacketNoCopy(ownedPacket, int32(len(ownedPacket)))
+	}
+	if recorder != nil {
+		recorder.CompleteDnsEgress(dnsEvent, sent)
 	}
 	if sent {
 		observeWireGuardPacket("client_to_destination", "delivered", len(packet))
@@ -1168,15 +1170,38 @@ func (self *ProxyDevice) SendBorrowedBatch(packets [][]byte, offset int) int {
 		observeWireGuardPackets("client_to_destination", "dropped", packets, offset)
 		return 0
 	}
-	ownedPackets := make([][]byte, len(packets))
-	for packetIndex, packet := range packets {
-		ownedPackets[packetIndex] = connect.MessagePoolCopy(packet[offset:])
+	// The owned copies stay 1:1 with the input, because the count returned
+	// below is a PREFIX of the caller's packets. A packet the rewrite cannot
+	// repair therefore ends the batch instead of being skipped over: skipping
+	// would shift every later index and silently mis-report which of the
+	// caller's packets were consumed. The remainder is reported not-sent and
+	// the caller re-offers it.
+	ownedPackets := make([][]byte, 0, len(packets))
+	for _, packet := range packets {
+		ownedPacket := connect.MessagePoolCopy(packet[offset:])
+		if !self.natRewriteEgress(ownedPacket) {
+			connect.MessagePoolReturn(ownedPacket)
+			break
+		}
+		ownedPackets = append(ownedPackets, ownedPacket)
+	}
+	if len(ownedPackets) == 0 {
+		observeWireGuardPackets("client_to_destination", "dropped", packets, offset)
+		return 0
+	}
+	recorder := self.flowTrace.Load()
+	var dnsEvents map[int]flowtrace.Event
+	if recorder != nil {
+		dnsEvents = recorder.CaptureDnsBatch(ownedPackets, time.Now())
 	}
 	if self.sendOwnedPacketsForTest != nil {
 		sentPacketCount := min(
 			max(0, self.sendOwnedPacketsForTest(ownedPackets)),
 			len(ownedPackets),
 		)
+		if recorder != nil {
+			recorder.CompleteDnsBatch(dnsEvents, sentPacketCount, len(ownedPackets))
+		}
 		for _, ownedPacket := range ownedPackets[sentPacketCount:] {
 			connect.MessagePoolReturn(ownedPacket)
 		}
@@ -1186,7 +1211,10 @@ func (self *ProxyDevice) SendBorrowedBatch(packets [][]byte, offset int) int {
 	}
 	// DeviceLocal's batch contract consumes every pooled packet, including
 	// members rejected by the selected route.
-	sentPacketCount := min(max(0, self.deviceLocal.SendPacketsNoCopy(ownedPackets)), len(packets))
+	sentPacketCount := min(max(0, self.deviceLocal.SendPacketsNoCopy(ownedPackets)), len(ownedPackets))
+	if recorder != nil {
+		recorder.CompleteDnsBatch(dnsEvents, sentPacketCount, len(ownedPackets))
+	}
 	observeWireGuardPackets("client_to_destination", "delivered", packets[:sentPacketCount], offset)
 	observeWireGuardPackets("client_to_destination", "dropped", packets[sentPacketCount:], offset)
 	return sentPacketCount
@@ -1212,13 +1240,84 @@ func (self *ProxyDevice) SetReceiveForAddress(receiveAddr netip.Addr, receive ch
 	self.receiveMonitor.NotifyAll()
 	self.receive = receive
 	self.receiveAddr = receiveAddr
+	// The wg peer's own address, which egress packets are rewritten FROM and
+	// return packets are rewritten back TO. HTTP and SOCKS attach no address,
+	// so they leave this invalid and the rewrite never engages for them.
+	self.natClientAddr = receiveAddr
 	self.receiveNotify = self.receiveMonitor.NotifyChannel()
 }
 
-func (self *ProxyDevice) receiveWithNotify() (chan []byte, netip.Addr, chan struct{}) {
+// natActiveWithLock reports whether the source rewrite is engaged: a wg peer is
+// attached and this device holds a NAT address. Callers hold stateLock.
+func (self *ProxyDevice) natActiveWithLock() bool {
+	return self.natAddr.IsValid() && self.natClientAddr.IsValid()
+}
+
+// natAddrs snapshots the rewrite pair. The wg send path runs per packet and
+// must not hold stateLock across a send, so it reads the pair once.
+func (self *ProxyDevice) natAddrs() (natAddr netip.Addr, clientAddr netip.Addr, active bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.receive, self.receiveAddr, self.receiveNotify
+	return self.natAddr, self.natClientAddr, self.natActiveWithLock()
+}
+
+// natRewriteEgress substitutes the NAT address for the peer's tunnel address on
+// a packet leaving for a provider. Reports whether the packet may be sent:
+// false means the rewrite could not be completed and the packet must be
+// dropped rather than forwarded with the peer's address on it, which is the
+// linkability this exists to remove.
+func (self *ProxyDevice) natRewriteEgress(packet []byte) bool {
+	natAddr, clientAddr, active := self.natAddrs()
+	if !active {
+		return true
+	}
+	// only the attached peer's own traffic is rewritten; anything else on this
+	// device is left exactly as it was
+	source, ok := netip.AddrFromSlice(packetIpv4Source(packet))
+	if !ok || source != clientAddr {
+		return true
+	}
+	return connect.RewriteIpv4Source(packet, natAddr)
+}
+
+// natRewriteReturn restores the peer's tunnel address on a return packet, which
+// the provider addressed to the NAT address. Reports whether the packet may be
+// delivered.
+func (self *ProxyDevice) natRewriteReturn(packet []byte, clientAddr netip.Addr) bool {
+	if !clientAddr.IsValid() {
+		return true
+	}
+	return connect.RewriteIpv4Destination(packet, clientAddr)
+}
+
+// packetIpv4Source returns the source field of an IPv4 packet, or nil. Kept
+// allocation-free: it runs once per egress packet.
+func packetIpv4Source(packet []byte) []byte {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return nil
+	}
+	return packet[12:16]
+}
+
+// receiveWithNotify returns the attachment plus the address return packets are
+// MATCHED on. With the rewrite engaged that is the NAT address, because that is
+// what the provider addressed them to; the peer's own address is returned
+// separately so the match can be undone before delivery.
+func (self *ProxyDevice) receiveWithNotify() (chan []byte, netip.Addr, chan struct{}) {
+	receive, matchAddr, _, receiveNotify := self.receiveWithNotifyNat()
+	return receive, matchAddr, receiveNotify
+}
+
+func (self *ProxyDevice) receiveWithNotifyNat() (chan []byte, netip.Addr, netip.Addr, chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	matchAddr := self.receiveAddr
+	clientAddr := netip.Addr{}
+	if self.natActiveWithLock() {
+		matchAddr = self.natAddr
+		clientAddr = self.natClientAddr
+	}
+	return self.receive, matchAddr, clientAddr, self.receiveNotify
 }
 
 // proxyPacketMatchesReceiveAddress is allocation-free because it runs once per
@@ -1415,17 +1514,28 @@ func (self *ProxyDevice) Cancel() {
 	self.cancel()
 }
 
+// Called by the owner, never from a receive callback: cancellation stops new
+// traffic, then joins finish before the immutable NAT lease returns exactly once.
 func (self *ProxyDevice) Close() error {
-	if self.cancel != nil {
-		self.cancel()
-	}
-
-	if self.deviceLocal != nil {
-		_ = self.deviceLocal.CloseAndWait(context.Background())
-	}
-	var closeErr error
-	if self.tun != nil {
-		closeErr = self.tun.Close()
-	}
-	return closeErr
+	self.closeOnce.Do(func() {
+		if self.cancel != nil {
+			self.cancel()
+		}
+		// No receive state lock may be held while callbacks drain.
+		if self.closeDeviceLocalForTest != nil {
+			self.closeDeviceLocalForTest()
+		} else if self.deviceLocal != nil {
+			_ = self.deviceLocal.CloseAndWait(context.Background())
+		}
+		if self.localControl != nil {
+			self.localControl.Close()
+		}
+		if self.tun != nil {
+			self.closeErr = self.tun.Close()
+		}
+		if self.natAddr.IsValid() {
+			connect.ReturnLocalIpv4Address(self.natAddr)
+		}
+	})
+	return self.closeErr
 }

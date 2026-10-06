@@ -9,9 +9,6 @@ import (
 	"testing"
 	"time"
 
-	// "math"
-	mathrand "math/rand"
-
 	"maps"
 
 	"github.com/urnetwork/connect"
@@ -143,6 +140,11 @@ func TestEscrow(t *testing.T) {
 
 		connect.AssertEqual(t, err, nil)
 		testingRedeemPaymentBalanceCode(t, ctx, sourceSession.ByJwt.NetworkId, balanceCode.Secret)
+		funding := GetActiveTransferBalances(ctx, sourceNetworkId)
+		if len(funding) != 1 || funding[0].BalanceByteCount != netTransferByteCount {
+			t.Fatal("escrow fixture does not own its exact initial grant")
+		}
+		balanceId := funding[0].BalanceId
 
 		contractIds := GetOpenContractIds(ctx, sourceId, destinationId)
 		connect.AssertEqual(t, len(contractIds), 0)
@@ -163,8 +165,8 @@ func TestEscrow(t *testing.T) {
 		_, err = CreateTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, netTransferByteCount)
 		connect.AssertNotEqual(t, err, nil)
 
-		CloseContract(ctx, transferEscrow.ContractId, sourceId, 0, false)
-		CloseContract(ctx, transferEscrow.ContractId, destinationId, 0, false)
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, sourceId, 0, false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, destinationId, 0, false))
 
 		transferBalances = GetActiveTransferBalances(ctx, sourceNetworkId)
 		netBalanceByteCount = ByteCount(0)
@@ -182,8 +184,8 @@ func TestEscrow(t *testing.T) {
 		})
 
 		usedTransferByteCount := ByteCount(1024)
-		CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false)
-		CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false)
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false))
 		paidByteCount := usedTransferByteCount
 		paid := UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(usedTransferByteCount) / float64(netTransferByteCount))
 
@@ -237,14 +239,17 @@ func TestEscrow(t *testing.T) {
 		usedTransferByteCount = ByteCount(1024 * 1024 * 1024)
 		for paid < UsdToNanoCents(EnvSubsidyConfig().MinWalletPayoutUsd) {
 			transferEscrow, err := CreateTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, usedTransferByteCount)
-			connect.AssertEqual(t, err, nil)
+			if err != nil || transferEscrow == nil || transferEscrow.TransferByteCount <= 0 || transferEscrow.TransferByteCount > usedTransferByteCount {
+				t.Fatal("escrow fixture did not receive a valid positive grant", transferEscrow, err)
+			}
+			granted := transferEscrow.TransferByteCount
 
-			err = CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false)
+			err = CloseContract(ctx, transferEscrow.ContractId, sourceId, granted, false)
 			connect.AssertEqual(t, err, nil)
-			err = CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false)
+			err = CloseContract(ctx, transferEscrow.ContractId, destinationId, granted, false)
 			connect.AssertEqual(t, err, nil)
-			paidByteCount += usedTransferByteCount
-			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(usedTransferByteCount) / float64(netTransferByteCount))
+			paidByteCount += granted
+			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(granted) / float64(netTransferByteCount))
 		}
 
 		contractIds = GetOpenContractIds(ctx, sourceId, destinationId)
@@ -283,25 +288,32 @@ func TestEscrow(t *testing.T) {
 		usedTransferByteCount = ByteCount(1024 * 1024 * 1024)
 		for {
 			transferEscrow, err := CreateTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, usedTransferByteCount)
+			if paidByteCount == netTransferByteCount {
+				if err == nil || transferEscrow != nil {
+					t.Fatal("consumed grant admitted another contract", transferEscrow, err)
+				}
+				break
+			}
 			if err != nil && 1024 < usedTransferByteCount {
 				usedTransferByteCount = usedTransferByteCount / 1024
 				glog.Infof("Step down contract size to %d bytes.\n", usedTransferByteCount)
 				continue
 			}
-			if netTransferByteCount <= paidByteCount {
-				connect.AssertNotEqual(t, err, nil)
-				break
-			} else {
-				connect.AssertEqual(t, err, nil)
+			if err != nil || transferEscrow == nil || transferEscrow.TransferByteCount <= 0 ||
+				transferEscrow.TransferByteCount > usedTransferByteCount || transferEscrow.TransferByteCount > netTransferByteCount-paidByteCount {
+				t.Fatal("escrow exhaustion lost its exact remaining grant", transferEscrow, err)
 			}
 
-			CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false)
-			CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false)
-			paidByteCount += usedTransferByteCount
-			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(usedTransferByteCount) / float64(netTransferByteCount))
+			granted := transferEscrow.TransferByteCount
+			connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, sourceId, granted, false))
+			connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, destinationId, granted, false))
+			paidByteCount += granted
+			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(granted) / float64(netTransferByteCount))
 			contractCount += 1
 		}
-		// at this point the balance should be fully used up
+		// Prove zero public credit while the exact debit is still queued, then
+		// run the production worker before expecting the raw active row to vanish.
+		assertPayoutDebitTestConsumedAndDrained(t, ctx, balanceId, netTransferByteCount)
 
 		transferBalances = GetActiveTransferBalances(ctx, sourceNetworkId)
 		connect.AssertEqual(t, transferBalances, []*TransferBalance{})
@@ -393,6 +405,11 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 
 		connect.AssertEqual(t, err, nil)
 		testingRedeemPaymentBalanceCode(t, ctx, destinationSession.ByJwt.NetworkId, balanceCode.Secret)
+		funding := GetActiveTransferBalances(ctx, destinationNetworkId)
+		if len(funding) != 1 || funding[0].BalanceByteCount != 2*netTransferByteCount {
+			t.Fatal("companion fixture does not own its exact initial grant")
+		}
+		balanceId := funding[0].BalanceId
 
 		contractIds := GetOpenContractIds(ctx, sourceId, destinationId)
 		connect.AssertEqual(t, len(contractIds), 0)
@@ -417,11 +434,11 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 		_, err = CreateCompanionTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, netTransferByteCount, 1*time.Hour)
 		connect.AssertNotEqual(t, err, nil)
 
-		CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, 0, false)
-		CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, 0, false)
+		connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, 0, false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, 0, false))
 
-		CloseContract(ctx, transferEscrow.ContractId, sourceId, 0, false)
-		CloseContract(ctx, transferEscrow.ContractId, destinationId, 0, false)
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, sourceId, 0, false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, destinationId, 0, false))
 
 		transferBalances = GetActiveTransferBalances(ctx, destinationNetworkId)
 		netBalanceByteCount = ByteCount(0)
@@ -441,10 +458,10 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 		})
 
 		usedTransferByteCount := ByteCount(1024)
-		CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false)
-		CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false)
-		CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false)
-		CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false)
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false))
+		connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false))
 		paidByteCount := usedTransferByteCount
 		paid := UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(usedTransferByteCount) / float64(netTransferByteCount))
 
@@ -497,17 +514,20 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 			companionTransferEscrow, err := CreateTransferEscrow(ctx, destinationNetworkId, destinationId, sourceNetworkId, sourceId, usedTransferByteCount)
 			connect.AssertEqual(t, err, nil)
 			transferEscrow, err := CreateCompanionTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, usedTransferByteCount, 1*time.Hour)
-			connect.AssertEqual(t, err, nil)
+			if err != nil || transferEscrow == nil || transferEscrow.TransferByteCount <= 0 || transferEscrow.TransferByteCount > usedTransferByteCount {
+				t.Fatal("companion fixture did not receive a valid positive grant", transferEscrow, err)
+			}
+			granted := transferEscrow.TransferByteCount
 
-			err = CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, false)
+			err = CloseContract(ctx, transferEscrow.ContractId, sourceId, granted, false)
 			connect.AssertEqual(t, err, nil)
-			err = CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, false)
+			err = CloseContract(ctx, transferEscrow.ContractId, destinationId, granted, false)
 			connect.AssertEqual(t, err, nil)
-			CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false)
-			CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false)
+			connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false))
+			connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false))
 
-			paidByteCount += usedTransferByteCount
-			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(usedTransferByteCount) / float64(netTransferByteCount))
+			paidByteCount += granted
+			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(granted) / float64(netTransferByteCount))
 		}
 
 		contractIds = GetOpenContractIds(ctx, sourceId, destinationId)
@@ -550,32 +570,41 @@ func TestCompanionEscrowAndCheckpoint(t *testing.T) {
 			companionTransferEscrow, err := CreateTransferEscrow(ctx, destinationNetworkId, destinationId, sourceNetworkId, sourceId, netTransferByteCount)
 			connect.AssertEqual(t, err, nil)
 			transferEscrow, err := CreateCompanionTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, usedTransferByteCount, 1*time.Hour)
+			if paidByteCount == netTransferByteCount {
+				if err == nil || transferEscrow != nil {
+					t.Fatal("fully reserved companion grant admitted another contract", transferEscrow, err)
+				}
+				connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, 0, false))
+				connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, 0, false))
+				break
+			}
 			if err != nil && 1024 < usedTransferByteCount {
 				usedTransferByteCount = usedTransferByteCount / 1024
 				glog.Infof("Step down contract size to %d bytes.\n", usedTransferByteCount)
-				CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false)
-				CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false)
+				connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false))
+				connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false))
 				continue
 			}
-			if netTransferByteCount <= paidByteCount {
-				connect.AssertNotEqual(t, err, nil)
-				CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false)
-				CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false)
-				break
-			} else {
-				connect.AssertEqual(t, err, nil)
+			if err != nil || transferEscrow == nil || transferEscrow.TransferByteCount <= 0 ||
+				transferEscrow.TransferByteCount > usedTransferByteCount || transferEscrow.TransferByteCount > netTransferByteCount-paidByteCount {
+				t.Fatal("companion exhaustion lost its exact remaining grant", transferEscrow, err)
 			}
 
-			CloseContract(ctx, transferEscrow.ContractId, sourceId, usedTransferByteCount, 0 == mathrand.Intn(2))
-			CloseContract(ctx, transferEscrow.ContractId, destinationId, usedTransferByteCount, 0 == mathrand.Intn(2))
-			CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false)
-			CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false)
-			paidByteCount += usedTransferByteCount
-			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(usedTransferByteCount) / float64(netTransferByteCount))
+			granted := transferEscrow.TransferByteCount
+			// Cover every checkpoint orientation deterministically. The final
+			// sweep must settle the same exact granted bytes in all four cases.
+			connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, sourceId, granted, contractCount%4&1 != 0))
+			connect.AssertEqual(t, nil, CloseContract(ctx, transferEscrow.ContractId, destinationId, granted, contractCount%4&2 != 0))
+			connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, sourceId, ByteCount(0), false))
+			connect.AssertEqual(t, nil, CloseContract(ctx, companionTransferEscrow.ContractId, destinationId, ByteCount(0), false))
+			paidByteCount += granted
+			paid += UsdToNanoCents(ProviderRevenueShare * NanoCentsToUsd(netRevenue) * float64(granted) / float64(netTransferByteCount))
 			contractCount += 1
 		}
 
-		ForceCloseAllOpenContractIds(ctx, time.Now())
+		connect.AssertEqual(t, nil, ForceCloseAllOpenContractIds(ctx, time.Now()))
+		connect.AssertEqual(t, netTransferByteCount, paidByteCount)
+		assertPayoutDebitTestConsumptionAndDrain(t, ctx, balanceId, 2*netTransferByteCount, netTransferByteCount)
 
 		// at this point the balance should be half used up
 
@@ -1037,7 +1066,8 @@ func TestClosePartialCompanionContractWithCheckpoint(t *testing.T) {
 						ByteCount(1024*1024),
 					)
 				} else {
-					_, _, err := CreateContract(
+					// the origin contract of the companion
+					_, _, err = CreateContract(
 						ctx,
 						destinationNetworkId,
 						destinationId,
@@ -2079,6 +2109,14 @@ func TestForceCloseMalformedContractRemovesStreamAndReturnsError(t *testing.T) {
 		connect.AssertEqual(t, string(ContractOutcomeSettled), contractClose.Outcome)
 		_, _, streamFound = GetStream(ctx, contractId)
 		connect.AssertEqual(t, false, streamFound)
+		var usageData []byte
+		server.Db(ctx, func(conn server.PgConn) {
+			server.Raise(conn.QueryRow(ctx, `SELECT provider_usage FROM transfer_contract WHERE contract_id=$1`, contractId).Scan(&usageData))
+		})
+		snapshot, usageErr := decodeContractUsageSnapshot(usageData)
+		if usageErr != nil || snapshot.ByteCount != escrowByteCount || snapshot.Expiry == nil || snapshot.ExcludedReason != "" {
+			t.Fatalf("billing quarantine changed bounded original usage: %s, %v", usageData, usageErr)
+		}
 	})
 }
 
@@ -2119,8 +2157,6 @@ func TestReconcileNetEscrowCorrectsDrift(t *testing.T) {
 		})
 		// the drift makes the full balance appear unavailable
 		connect.AssertEqual(t, ByteCount(0), GetActiveTransferBalanceByteCount(ctx, networkId))
-		_, _, err := CreateContract(ctx, networkId, clientId, networkIdB, clientIdB, ByteCount(1024*1024))
-		connect.AssertNotEqual(t, nil, err)
 
 		// a dry run reports the drift but does not change anything
 		driftByNetworkId, _ := ReconcileNetEscrow(ctx, false)
@@ -2134,21 +2170,125 @@ func TestReconcileNetEscrowCorrectsDrift(t *testing.T) {
 		connect.AssertEqual(t, ByteCount(0), Testing_NetEscrowByteCount(ctx, balanceId))
 		connect.AssertEqual(t, initialBalance, GetActiveTransferBalanceByteCount(ctx, networkId))
 
-		// contracts work again, and the new reservation is mirrored in the counter
-		_, _, err = CreateContract(ctx, networkId, clientId, networkIdB, clientIdB, ByteCount(1024*1024))
+		// Public Redis admission does not invent authority to erase unexplained
+		// legacy debt. Explicit SQL reconciliation repairs that separate mirror.
+		server.Redis(ctx, func(r server.RedisClient) {
+			server.Raise(r.IncrBy(ctx, netEscrowKey(balanceId), int64(initialBalance)).Err())
+		})
+		connect.AssertEqual(t, ByteCount(0), GetActiveTransferBalanceByteCount(ctx, networkId))
+		_, held, err := CreateContract(ctx, networkId, clientId, networkIdB, clientIdB, ByteCount(1024*1024))
+		if held != nil || !errors.Is(err, errRedisReservationInsufficient) {
+			t.Fatal("public admission erased unreviewed legacy debt", held, err)
+		}
+		server.Redis(ctx, func(r server.RedisClient) {
+			value, err := r.Get(ctx, netEscrowKey(balanceId)).Int64()
+			server.Raise(err)
+			if value != initialBalance {
+				t.Fatal("refused public admission changed legacy debt", value)
+			}
+		})
+		drift, balanceCount := ReconcileNetEscrowForNetwork(ctx, networkId, true)
+		if drift != initialBalance || balanceCount != 1 {
+			t.Fatal("explicit reconciliation lost legacy drift", drift, balanceCount)
+		}
+		contractId, _, err := CreateContract(ctx, networkId, clientId, networkIdB, clientIdB, ByteCount(1024*1024))
 		connect.AssertEqual(t, nil, err)
 		connect.AssertEqual(t, ByteCount(1024*1024), Testing_NetEscrowByteCount(ctx, balanceId))
+		keys := redisContractReservationKeys(balanceId)
+		var originalExpiry float64
+		server.Redis(ctx, func(r server.RedisClient) {
+			amount, err := r.HGet(ctx, keys[1], contractId.String()).Int64()
+			server.Raise(err)
+			if amount != Mib {
+				t.Fatal("public admission did not preserve its exact request token", amount)
+			}
+			originalExpiry, err = r.ZScore(ctx, keys[2], contractId.String()).Result()
+			server.Raise(err)
+		})
 
 		// drift on top of a live reservation: reconcile removes only the drift and
 		// keeps the open contract's reservation (the targeted per-network form)
 		server.Redis(ctx, func(r server.RedisClient) {
 			r.IncrBy(ctx, netEscrowKey(balanceId), int64(5*1024*1024))
 		})
-		drift, balanceCount := ReconcileNetEscrowForNetwork(ctx, networkId, true)
+		drift, balanceCount = ReconcileNetEscrowForNetwork(ctx, networkId, true)
 		connect.AssertEqual(t, 1, balanceCount)
 		connect.AssertEqual(t, ByteCount(5*1024*1024), drift)
 		connect.AssertEqual(t, ByteCount(1024*1024), Testing_NetEscrowByteCount(ctx, balanceId))
 		connect.AssertEqual(t, initialBalance-ByteCount(1024*1024), GetActiveTransferBalanceByteCount(ctx, networkId))
+		server.Redis(ctx, func(r server.RedisClient) {
+			amount, err := r.HGet(ctx, keys[1], contractId.String()).Int64()
+			server.Raise(err)
+			expiry, err := r.ZScore(ctx, keys[2], contractId.String()).Result()
+			server.Raise(err)
+			if amount != Mib || expiry != originalExpiry {
+				t.Fatal("legacy reconciliation changed a public request's amount or lease", amount, expiry, originalExpiry)
+			}
+		})
+	})
+}
+
+// A fully reserved grant can remain active in PostgreSQL while its open
+// reservations leave zero available bytes. It must not produce a zero-byte
+// escrow row for every new contract before the next usable grant is reached.
+func TestCreateTransferEscrowSkipsFullyReservedBalances(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		payerNetworkId := server.NewId()
+		payerId := server.NewId()
+		providerNetworkId := server.NewId()
+		providerId := server.NewId()
+		insertContractLifecycleTestClients(t, ctx, map[server.Id]server.Id{
+			payerId: payerNetworkId, providerId: providerNetworkId,
+		})
+		now := server.NowUtc()
+		for index := 0; index < 3; index++ {
+			AddBasicTransferBalance(ctx, payerNetworkId, ByteCount((index+1)*1024*1024),
+				now.Add(-time.Minute), now.Add(time.Duration(index+1)*24*time.Hour))
+		}
+		balances := GetActiveTransferBalances(ctx, payerNetworkId)
+		if len(balances) != 3 {
+			t.Fatalf("active balances = %d, want 3", len(balances))
+		}
+		var usableId server.Id
+		for _, balance := range balances {
+			if balance.StartBalanceByteCount == 3*1024*1024 {
+				usableId = balance.BalanceId
+			}
+		}
+		if _, err := CreateTransferEscrow(ctx, payerNetworkId, payerId, providerNetworkId, providerId, 3*1024*1024); err != nil {
+			t.Fatal(err)
+		}
+		const contractBytes = ByteCount(1024)
+		escrow, err := CreateTransferEscrow(ctx, payerNetworkId, payerId, providerNetworkId, providerId, contractBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := 0
+		zeroRows := 0
+		var recordedId server.Id
+		var recordedBytes ByteCount
+		server.Db(ctx, func(conn server.PgConn) {
+			result, err := conn.Query(ctx, `SELECT balance_id, balance_byte_count FROM transfer_escrow WHERE contract_id = $1`, escrow.ContractId)
+			server.WithPgResult(result, err, func() {
+				for result.Next() {
+					var balanceId server.Id
+					var byteCount ByteCount
+					if err := result.Scan(&balanceId, &byteCount); err != nil {
+						t.Fatal(err)
+					}
+					rows++
+					if byteCount == 0 {
+						zeroRows++
+					}
+					recordedId, recordedBytes = balanceId, byteCount
+				}
+			})
+		})
+		if rows != 1 || zeroRows != 0 || recordedId != usableId || recordedBytes != contractBytes {
+			t.Fatalf("escrow rows=%d zero=%d usable=%t bytes=%d, want one positive row on the usable grant",
+				rows, zeroRows, recordedId == usableId, recordedBytes)
+		}
 	})
 }
 
@@ -2205,7 +2345,8 @@ func TestNetEscrowKeyFormatAndTtl(t *testing.T) {
 		// escrow creation mirrors the reservation and stamps the
 		// end_time-based ttl
 		contractByteCount := ByteCount(1024 * 1024)
-		contractId, _, err := CreateContract(ctx, networkId, clientId, networkIdB, clientIdB, contractByteCount)
+		escrow, err := createTransferEscrow(ctx, networkId, clientId, networkIdB, clientIdB, contractByteCount)
+		contractId := escrow.ContractId
 		connect.AssertEqual(t, nil, err)
 		connect.AssertEqual(t, contractByteCount, Testing_NetEscrowByteCount(ctx, balanceId))
 		// the real read path (multi-balance pipeline) reflects the reservation
@@ -2216,8 +2357,8 @@ func TestNetEscrowKeyFormatAndTtl(t *testing.T) {
 			connect.AssertEqual(t, true, 59*day < ttl && ttl <= 60*day)
 		})
 
-		// reconcile apply rewrites the counter with the fallback ttl even if
-		// the ttl was lost
+		// Reconciliation restores the same precise deadline as creation when
+		// a counter loses its ttl, still capped by the rolling horizon.
 		server.Redis(ctx, func(r server.RedisClient) {
 			r.Persist(ctx, key)
 			r.IncrBy(ctx, key, int64(5*1024*1024))
@@ -2228,17 +2369,33 @@ func TestNetEscrowKeyFormatAndTtl(t *testing.T) {
 		connect.AssertEqual(t, contractByteCount, Testing_NetEscrowByteCount(ctx, balanceId))
 		server.Redis(ctx, func(r server.RedisClient) {
 			ttl := r.TTL(ctx, key).Val()
-			connect.AssertEqual(t, true, 89*day < ttl && ttl <= 90*day)
+			connect.AssertEqual(t, true, 59*day < ttl && ttl <= 60*day)
 		})
 
-		// A settle release against a missing mirror returns a negative value for
-		// diagnostics, but atomically deletes the recreated counter. A missing
-		// counter reads as zero and cannot overstate the available balance.
+		// Settlement against a missing mirror publishes current zero with its
+		// revision fence, without replaying an unowned negative delta.
 		Testing_DeleteNetEscrow(ctx, balanceId)
 		err = CloseContract(ctx, contractId, clientId, 0, false)
 		connect.AssertEqual(t, nil, err)
 		err = CloseContract(ctx, contractId, clientIdB, 0, false)
 		connect.AssertEqual(t, nil, err)
+		// A legacy close now queues durable work. The contract must retain
+		// its reservation until the actual bounded worker commits settlement;
+		// an acknowledged close alone cannot justify a final mirror check.
+		server.Db(ctx, func(conn server.PgConn) {
+			var pending, open, unsettled bool
+			server.Raise(conn.QueryRow(ctx, `
+				SELECT EXISTS(SELECT 1 FROM legacy_settlement_intent WHERE contract_id=$1),
+				       (SELECT outcome IS NULL FROM transfer_contract WHERE contract_id=$1),
+				       EXISTS(SELECT 1 FROM transfer_escrow WHERE contract_id=$1 AND NOT settled)
+			`, contractId).Scan(&pending, &open, &unsettled))
+			connect.AssertEqual(t, true, pending && open && unsettled)
+		})
+		flushed, err := FlushLegacySettlements(ctx, int(contractId[15])%LegacySettlementShardCount, nil, 1)
+		connect.AssertEqual(t, nil, err)
+		connect.AssertEqual(t, 1, flushed.Visited)
+		connect.AssertEqual(t, 1, flushed.Completed)
+		connect.AssertEqual(t, 0, flushed.Failed)
 		connect.AssertEqual(t, ByteCount(0), Testing_NetEscrowByteCount(ctx, balanceId))
 		connect.AssertEqual(t, initialBalanceA+initialBalanceB, GetActiveTransferBalanceByteCount(ctx, networkId))
 		server.Redis(ctx, func(r server.RedisClient) {
@@ -2269,7 +2426,8 @@ func TestNetEscrowKeyFormatAndTtl(t *testing.T) {
 // A durable balance may intentionally be valid for decades, but its Redis
 // reservation mirror must remain rolling state. Before the cap, every contract
 // on a 100-year balance issued EXPIREAT for 2126 and retained the key for the
-// balance's full lifetime.
+// balance's full lifetime. This root pins the legacy mirror; the separate
+// public request-lease root pins the unconditional Redis admission contract.
 func TestNetEscrowLongLivedBalanceTtlIsCapped(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
@@ -2300,14 +2458,7 @@ func TestNetEscrowLongLivedBalanceTtlIsCapped(t *testing.T) {
 		balances := GetActiveTransferBalances(ctx, sourceNetworkId)
 		connect.AssertEqual(t, len(balances), 1)
 
-		_, _, err = CreateContract(
-			ctx,
-			sourceNetworkId,
-			sourceClientId,
-			destinationNetworkId,
-			destinationClientId,
-			Mib,
-		)
+		_, err = createTransferEscrow(ctx, sourceNetworkId, sourceClientId, destinationNetworkId, destinationClientId, Mib)
 		connect.AssertEqual(t, err, nil)
 		server.Redis(ctx, func(r server.RedisClient) {
 			ttl := r.TTL(ctx, netEscrowKey(balances[0].BalanceId)).Val()

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"strconv"
@@ -36,8 +37,9 @@ func main() {
 	usage := `BringYour control.
 
 Usage:
+    bringyourctl sn-transition-status
     bringyourctl db version
-    bringyourctl db migrate
+    bringyourctl db migrate [--sn-schedule-sha256=<sha256>]
     bringyourctl db vacuum [--exclude=<table>...]
     bringyourctl db maintenance (all|<epoch>) [--reindex] [--cleanup] [--analyze]
     bringyourctl db audit [--fix [--force-drop-indexes]]
@@ -83,12 +85,15 @@ Usage:
     bringyourctl payout single --account_payment_id=<account_payment_id>
     bringyourctl payout pending
     bringyourctl payouts list-pending [--plan_id=<plan_id>]
-    bringyourctl payouts apply-bonus --plan_id=<plan_id> --amount_usd=<amount_usd>
+    bringyourctl payouts apply-bonus --plan_id=<plan_id> --amount_usd=<amount_usd> --adjustment_id=<adjustment_id> --reason=<reason>
     bringyourctl payouts plan [--send] [--dry-run] [--max_duration=<max_duration>]
     bringyourctl payouts populate-tx-hashes
     bringyourctl wallet estimate-fee --amount_usd=<amount_usd> --destination_address=<destination_address> --blockchain=<blockchain>
     bringyourctl wallet transfer --amount_usd=<amount_usd> --destination_address=<destination_address> --blockchain=<blockchain>
 		bringyourctl wallets sync-circle
+    bringyourctl contracts repair-expiry-route-check
+    bringyourctl contracts repair-expiry --private-stdin [--apply]
+    bringyourctl contracts drain-legacy --private-stdin [--apply]
     bringyourctl contracts close-expired [-c <count>]
     bringyourctl contracts close --contract_id=<contract_id> --target_id=<target_id> --used_transfer_byte_count=<used_transfer_byte_count>
     bringyourctl contracts reconcile-net-escrow [--network_id=<network_id>] [--dry-run]
@@ -109,6 +114,7 @@ Usage:
     bringyourctl proxy keygen
     bringyourctl proxy reset-client-ipv4
     bringyourctl proxy inspect <proxy_id>
+    bringyourctl provider inspect --client_id=<client_id>
     bringyourctl model migrate provide-mode
     bringyourctl model migrate proxy-device-config
     bringyourctl model migrate client-reliability-partition [--dry-run] [--finalize] [--parallel=<n>] [--oneshot]
@@ -121,6 +127,7 @@ Usage:
     bringyourctl grafana load-defaults [--grafana_url=<grafana_url>]
 
 Options:
+    --sn-schedule-sha256=<sha256>  Prepare the immutable earning boundary from this exact reviewed sn.yml after migrations.
     -h --help     Show this screen.
     --version     Show version.
     -r --realm=<realm>  Search realm.
@@ -133,6 +140,8 @@ Options:
     --user_id=<user_id>
     --secret=<secret>
 
+    --private-stdin  Read the bounded private expiry request from stdin.
+    --apply          Apply the scoped expiry request; omission is a read-only preview.
     --contract_id=<contract_id> The contract to close
     --target_id=<target_id>     The contract_close.party (either "destination" or "source")
     --used_transfer_byte_count=<used_transfer_byte_count>   Bytes used
@@ -148,7 +157,17 @@ Options:
 		panic(err)
 	}
 
-	if db, _ := opts.Bool("db"); db {
+	if transitionStatus, _ := opts.Bool("sn-transition-status"); transitionStatus {
+		status, err := controller.GetProviderPayoutTransitionStatus(context.Background())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(status); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	} else if db, _ := opts.Bool("db"); db {
 		if version, _ := opts.Bool("version"); version {
 			dbVersion(opts)
 		} else if migrate, _ := opts.Bool("migrate"); migrate {
@@ -266,7 +285,7 @@ Options:
 		} else if plan, _ := opts.Bool("plan"); plan {
 			planPayouts(opts)
 		} else if applyBonus, _ := opts.Bool("apply-bonus"); applyBonus {
-			payoutPlanApplyBonus(opts)
+			server.Raise(payoutPlanApplyBonus(opts))
 		} else if ptxh, _ := opts.Bool("populate-tx-hashes"); ptxh {
 			populateTxHashes()
 		}
@@ -278,6 +297,17 @@ Options:
 			adminWalletEstimateFee(opts)
 		}
 	} else if contracts, _ := opts.Bool("contracts"); contracts {
+		if drainLegacy, _ := opts.Bool("drain-legacy"); drainLegacy {
+			apply, _ := opts.Bool("--apply")
+			os.Exit(runPrivateLegacySettlementDrain(context.Background(), os.Stdin, os.Stdout, apply, invokeLegacySettlementDrain))
+		}
+		if routeCheck, _ := opts.Bool("repair-expiry-route-check"); routeCheck {
+			os.Exit(runContractExpiryRouteCheck(context.Background(), os.Stdout, inspectContractExpiryRoute))
+		}
+		if repairExpiry, _ := opts.Bool("repair-expiry"); repairExpiry {
+			apply, _ := opts.Bool("--apply")
+			os.Exit(runPrivateContractExpiryRepair(context.Background(), os.Stdin, os.Stdout, apply, invokeContractExpiryRepair))
+		}
 		if closeExpired, _ := opts.Bool("close-expired"); closeExpired {
 			closeExpiredContracts(opts)
 		}
@@ -344,6 +374,10 @@ Options:
 		} else if inspect, _ := opts.Bool("inspect"); inspect {
 			proxyInspect(opts)
 		}
+	} else if provider, _ := opts.Bool("provider"); provider {
+		if inspect, _ := opts.Bool("inspect"); inspect {
+			providerInspect(opts)
+		}
 	} else if model_, _ := opts.Bool("model"); model_ {
 		if migrate, _ := opts.Bool("migrate"); migrate {
 			if provideMode, _ := opts.Bool("provide-mode"); provideMode {
@@ -386,7 +420,7 @@ func dbVersion(opts docopt.Opts) {
 func dbMigrate(opts docopt.Opts) {
 	fmt.Printf("Applying DB migrations ...\n")
 	server.DbMigrationVerbose = true
-	server.ApplyDbMigrations(context.Background())
+	server.Raise(migrateWithPayoutBoundary(context.Background(), opts, os.Stdout, server.ApplyDbMigrations))
 }
 
 // dbScrubClientAddresses re-runs the 20260807 raw-client-address scrub
@@ -1005,7 +1039,15 @@ func networkRemove(opts docopt.Opts) {
 	if err != nil {
 		panic(err)
 	}
-	model.RemoveNetwork(ctx, networkId, &userId)
+	// No store steps run here, so this passes no store snapshot: any active
+	// Stripe, App Store or Google Play renewal refuses the removal. Cancel it
+	// at the store (or let it end) first.
+	outcome, _ := model.RemoveNetworkWithStoreSnapshot(ctx, networkId, &userId, nil)
+	if outcome != model.RemoveNetworkRemoved {
+		fmt.Printf("network %s was not removed: %s\n", networkId, outcome)
+		os.Exit(1)
+	}
+	fmt.Printf("network %s removed\n", networkId)
 }
 
 func balanceCodeCreate(opts docopt.Opts) {
@@ -1460,27 +1502,41 @@ func payoutByPaymentId(opts docopt.Opts) {
 	fmt.Println("Complete Status: ", res.Complete)
 }
 
-func payoutPlanApplyBonus(opts docopt.Opts) {
+func payoutPlanApplyBonus(opts docopt.Opts) error {
 	ctx := context.Background()
 
 	planIdStr, err := opts.String("--plan_id")
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	amountUsd, err := opts.Float64("--amount_usd")
 	if err != nil {
-		panic(err)
+		return err
+	}
+	if math.IsNaN(amountUsd) || math.IsInf(amountUsd, 0) || amountUsd <= 0 || amountUsd >= float64(math.MaxInt64)/1e9 {
+		return errors.New("bonus amount must be positive and within NanoCents range")
 	}
 
 	amountNanoCents := model.UsdToNanoCents(amountUsd)
 
 	planId, err := server.ParseId(planIdStr)
 	if err != nil {
-		panic(err)
+		return err
 	}
-
-	model.PayoutPlanApplyBonus(ctx, planId, amountNanoCents)
+	operationText, err := opts.String("--adjustment_id")
+	if err != nil {
+		return err
+	}
+	operationId, err := server.ParseId(operationText)
+	if err != nil {
+		return err
+	}
+	reason, err := opts.String("--reason")
+	if err != nil {
+		return err
+	}
+	return model.PayoutPlanApplyBonus(ctx, planId, amountNanoCents, operationId, reason)
 }
 
 // paymentsReconcile runs one payment reconciliation pass (UPGRADE.md §8) by
@@ -1506,11 +1562,12 @@ func paymentsReconcile(opts docopt.Opts) {
 		model.SubscriptionMarketApple,
 		model.SubscriptionMarketGoogle,
 		model.SubscriptionMarketSolana,
+		model.SubscriptionMarketX402,
 	}
 	stores := allStores
 	if store, _ := opts.String("--store"); store != "" {
 		if !slices.Contains(allStores, store) {
-			fmt.Printf("unknown store %q (expected stripe, apple, google, or solana)\n", store)
+			fmt.Printf("unknown store %q (expected stripe, apple, google, solana, or x402)\n", store)
 			os.Exit(1)
 		}
 		options.Stores = []string{store}
@@ -1553,9 +1610,6 @@ func paymentsReconcile(opts docopt.Opts) {
 		if summary.BudgetExhausted {
 			notes = append(notes, "api budget exhausted (next run continues)")
 		}
-		if 0 < summary.EmailFallbacks {
-			notes = append(notes, fmt.Sprintf("email fallbacks: %d", summary.EmailFallbacks))
-		}
 		fmt.Printf(
 			"%-8s %9d %13d %10d %14d %7d  %s\n",
 			store, summary.Examined, summary.Credited, summary.Ended, summary.EntitlementsRepaired, summary.Errors,
@@ -1588,33 +1642,6 @@ func paymentsReconcile(opts docopt.Opts) {
 			"  [%s] %-12s network=%s evidence=%s %s\n",
 			event.Store, event.Action, networkStr, event.Evidence, detailsStr,
 		)
-	}
-
-	// S11: every invoice.paid credit since the last watermark that resolved
-	// its network by the LEGACY customer-email fallback -- surfaced so any use
-	// is explicit, until the fallback can be retired
-	if 0 < len(result.EmailFallbackEvents) {
-		fmt.Println()
-		fmt.Printf(
-			"stripe email-fallback credits since the last watermark (%d) -- legacy invoices resolved by customer email (UPGRADE.md S11):\n",
-			len(result.EmailFallbackEvents),
-		)
-		for _, event := range result.EmailFallbackEvents {
-			networkStr := "-"
-			if event.NetworkId != nil {
-				networkStr = event.NetworkId.String()
-			}
-			detailsStr := ""
-			if 0 < len(event.Details) {
-				if detailsJson, err := json.Marshal(event.Details); err == nil {
-					detailsStr = string(detailsJson)
-				}
-			}
-			fmt.Printf(
-				"  [%s] invoice=%s network=%s %s\n",
-				event.EventTime.UTC().Format(time.RFC3339), event.Evidence, networkStr, detailsStr,
-			)
-		}
 	}
 
 	fmt.Println()
@@ -1878,13 +1905,13 @@ func taskLs(opts docopt.Opts) {
 	fmt.Printf("%d pending tasks:\n", len(tasks))
 	now := server.NowUtc()
 	for _, taskId := range orderedTaskIds {
-		task := tasks[taskId]
-		remaining := (task.RunAt.Sub(now) / time.Second) * time.Second
+		pending := tasks[taskId]
+		remaining := (pending.RunAt.Sub(now) / time.Second) * time.Second
 		runAtStr := fmt.Sprintf("%s", remaining)
-		if task.RescheduleError != "" {
-			fmt.Printf("[%8s]  %s %s: rescheduled err = %s (%s)\n", runAtStr, taskId, task.FunctionName, task.RescheduleError, task.ArgsJson)
+		if pending.RescheduleError != "" {
+			fmt.Printf("[%8s]  %s %s: rescheduled err = %s (%s)\n", runAtStr, taskId, pending.FunctionName, pending.RescheduleError, task.ArgumentsForLog(pending.ArgsJson))
 		} else {
-			fmt.Printf("[%8s]  %s %s\n", runAtStr, taskId, task.FunctionName)
+			fmt.Printf("[%8s]  %s %s\n", runAtStr, taskId, pending.FunctionName)
 		}
 	}
 
@@ -2121,6 +2148,77 @@ func proxyInspect(opts docopt.Opts) {
 	fmt.Printf("%v\n", proxyDeviceConfig.InitialDeviceState.DnsResolverSettings)
 }
 
+// Prints one provider as the egress rules of connect/GEOMAP.md §10.3 decide
+// it: the index, quality verdict and evidence time the rollup stored, the
+// index its latest health run gives now (what the next rollup will store), the
+// evidence behind the exclusions, and the reason, if any, it is out of a
+// bucket.
+func providerInspect(opts docopt.Opts) {
+	ctx := context.Background()
+
+	clientIdStr, _ := opts.String("--client_id")
+	clientId := server.RequireParseId(clientIdStr)
+
+	inspection := model.InspectProviderEgress(ctx, clientId)
+	if inspection == nil {
+		fmt.Printf("Provider %s has no location reliability row.\n", clientId)
+		return
+	}
+	now := server.NowUtc()
+
+	optionalInt := func(value *int) string {
+		if value == nil {
+			return "none (the rollup has not written it; ranked on the net-type score)"
+		}
+		return strconv.Itoa(*value)
+	}
+	optionalBool := func(value *bool) string {
+		if value == nil {
+			return "none (no evidence)"
+		}
+		return strconv.FormatBool(*value)
+	}
+	optionalTime := func(value *time.Time) string {
+		if value == nil {
+			return "none"
+		}
+		return fmt.Sprintf("%s (%s ago)", value.UTC().Format(time.RFC3339), now.Sub(*value).Round(time.Minute))
+	}
+	optionalString := func(value string) string {
+		if value == "" {
+			return "none"
+		}
+		return value
+	}
+
+	fmt.Printf("provider %s\n", inspection.ClientId)
+	fmt.Printf("  connected %t, valid %t, published country %s\n", inspection.Connected, inspection.Valid, optionalString(inspection.PublishedCountryCode))
+	fmt.Printf("  net-type score %d, speed %d\n", inspection.MaxNetTypeScore, inspection.MaxNetTypeScoreSpeed)
+	fmt.Printf("  egress index %s\n", optionalInt(inspection.EgressIndex))
+	fmt.Printf("  egress quality %s\n", optionalBool(inspection.EgressQuality))
+	fmt.Printf("  egress evidence time %s\n", optionalTime(inspection.EgressEvidenceTime))
+	if run := inspection.HealthRun; run != nil {
+		classTallies := []string{}
+		for class, tally := range run.ClassResults {
+			classTallies = append(classTallies, fmt.Sprintf("%s=%d/%d", class, tally.OK, tally.Total))
+		}
+		slices.Sort(classTallies)
+		fmt.Printf("  latest health run %s, ok %d/%d [%s], tls failure %t\n", optionalTime(&run.MeasuredAt), run.OKCount, run.Total, strings.Join(classTallies, " "), run.TLSAuthenticationFailure)
+	} else {
+		fmt.Printf("  latest health run none\n")
+	}
+	evidence := "no evidence"
+	if inspection.CurrentIndex.Evidence {
+		evidence = fmt.Sprintf("quality %t", inspection.CurrentIndex.Quality)
+	}
+	fmt.Printf("  index from the latest run now %d (%s; evidence is %d or more loads within %s)\n", inspection.CurrentIndex.Index, evidence, inspection.Settings.MinScoredLoads, inspection.Settings.EvidenceMaxAge)
+	fmt.Printf("  fresh probe country %s\n", optionalString(inspection.ObservedCountryCode))
+	fmt.Printf("  blackholed %t, tls authentication failure %t\n", inspection.Blackholed, inspection.TlsAuthenticationFailed)
+	fmt.Printf("  rollout flag (enable_egress_test, rows before the index only) %t, country gate %t\n", inspection.EgressTestEnabled, inspection.Settings.CountryGate)
+	fmt.Printf("  quality %t, speed %t, online %t (the score cache also requires the reliability floors and the speed-mode score maximum, so a provider no client has measured is not online), counted %t, hard excluded %t\n", inspection.Quality, inspection.Speed, inspection.Online, inspection.Counted, inspection.HardExcluded)
+	fmt.Printf("  exclusion reason %s\n", optionalString(inspection.Reason))
+}
+
 func refreshTransferBalances(opts docopt.Opts) {
 	ctx := context.Background()
 	clientSession := session.NewLocalClientSession(ctx, "0.0.0.0:0", nil)
@@ -2275,6 +2373,27 @@ func stStatus(opts docopt.Opts) {
 	fmt.Printf("  deposits:        %s rao (Deposited events)\n", model.SumStDepositedRao(ctx, deploymentKey, epoch, depositNoId))
 	fmt.Printf("  pool total:      %s rao\n", pool.PoolTotalRao)
 	fmt.Printf("  claimed:         %s rao\n", pool.ClaimedRao)
+
+	// what StDeposit sizes for the open epoch: the previous epoch's signed
+	// artifact totals at the conviction-snapshot tier, or the zero-price mode
+	if sizing, err := controller.StGetDepositSizing(ctx, state.PendingEpoch); err != nil {
+		fmt.Printf("epoch %d deposit sizing: unavailable (%s)\n", state.PendingEpoch, err)
+	} else {
+		fmt.Printf("epoch %d deposit sizing:\n", state.PendingEpoch)
+		if sizing.ZeroPrice {
+			fmt.Printf("  price:           zero (no demand deposit is required; nothing is sent)\n")
+		} else if sizing.Epoch == 0 {
+			fmt.Printf("  price:           epoch 0 has no prior usage artifact; nothing is sent\n")
+		} else {
+			fmt.Printf("  tier:            conviction >= %d rao: %d rao/GiB, %d rao/user, over %d\n", sizing.Tier.MinConvictionRao, sizing.Tier.RateNumeratorRaoPerGiB, sizing.Tier.RateNumeratorRaoPerUser, sizing.Tier.RateDenominator)
+		}
+		fmt.Printf("  source usage:    epoch %d artifact: %d bytes, %d users\n", sizing.SourceEpoch, sizing.UsageBytes, sizing.Users)
+		if sizing.Note != "" {
+			fmt.Printf("  note:            %s\n", sizing.Note)
+		}
+		fmt.Printf("  conviction:      %s rao (before epoch %d)\n", sizing.ConvictionRao, sizing.Epoch)
+		fmt.Printf("  required:        %s rao\n", sizing.RequiredRao)
+	}
 
 	if stEpoch := model.GetStEpoch(ctx, deploymentKey, epoch); stEpoch != nil {
 		fmt.Printf("epoch %d mirror:\n", epoch)

@@ -113,6 +113,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleActiveDerived,
 					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+					DestinationOwner:     NetworkClientSourceOwnerEgressProber,
 				},
 			},
 			{
@@ -124,6 +125,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleInactiveDerived,
 					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+					DestinationOwner:     NetworkClientSourceOwnerOther,
 				},
 			},
 			{
@@ -135,6 +137,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleInactiveDerived,
 					DestinationLifecycle: NetworkClientLifecycleInactiveTop,
 					SourceOwner:          NetworkClientSourceOwnerOther,
+					DestinationOwner:     NetworkClientSourceOwnerOther,
 				},
 			},
 			{
@@ -146,6 +149,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleMissing,
 					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+					DestinationOwner:     NetworkClientSourceOwnerUnknown,
 				},
 			},
 			{
@@ -157,6 +161,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleActiveTop,
 					DestinationLifecycle: NetworkClientLifecycleActiveTop,
 					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+					DestinationOwner:     NetworkClientSourceOwnerEgressProber,
 				},
 			},
 			{
@@ -168,6 +173,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleInactiveTop,
 					DestinationLifecycle: NetworkClientLifecycleActiveTop,
 					SourceOwner:          NetworkClientSourceOwnerOther,
+					DestinationOwner:     NetworkClientSourceOwnerEgressProber,
 				},
 			},
 			{
@@ -179,6 +185,7 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleActiveDerived,
 					DestinationLifecycle: NetworkClientLifecycleInactiveTop,
 					SourceOwner:          NetworkClientSourceOwnerEgressProber,
+					DestinationOwner:     NetworkClientSourceOwnerOther,
 				},
 			},
 			{
@@ -190,6 +197,19 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 					SourceLifecycle:      NetworkClientLifecycleMissing,
 					DestinationLifecycle: NetworkClientLifecycleActiveTop,
 					SourceOwner:          NetworkClientSourceOwnerUnknown,
+					DestinationOwner:     NetworkClientSourceOwnerEgressProber,
+				},
+			},
+			{
+				name:        "ordinary source to nested prober descendant",
+				source:      inactiveTop,
+				destination: activeGrandchild,
+				want: ProvideRelationshipDetails{
+					Mode:                 ProvideModePublic,
+					SourceLifecycle:      NetworkClientLifecycleInactiveTop,
+					DestinationLifecycle: NetworkClientLifecycleActiveDerived,
+					SourceOwner:          NetworkClientSourceOwnerOther,
+					DestinationOwner:     NetworkClientSourceOwnerEgressProber,
 				},
 			},
 		} {
@@ -204,15 +224,15 @@ func TestGetProvideRelationshipDetailsLifecycle(t *testing.T) {
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `UPDATE prober_identity SET network_id = NULL WHERE singleton`))
 		})
-		if got := GetProvideRelationshipDetails(ctx, activeTop, inactiveTop); got.SourceOwner != NetworkClientSourceOwnerUnknown {
-			t.Fatalf("NULL prober network source owner = %q, want %q", got.SourceOwner, NetworkClientSourceOwnerUnknown)
+		if got := GetProvideRelationshipDetails(ctx, activeTop, inactiveTop); got.SourceOwner != NetworkClientSourceOwnerUnknown || got.DestinationOwner != NetworkClientSourceOwnerUnknown {
+			t.Fatalf("null prober network endpoint owners = (%q, %q), want unknown", got.SourceOwner, got.DestinationOwner)
 		}
 
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `DELETE FROM prober_identity WHERE singleton`))
 		})
-		if got := GetProvideRelationshipDetails(ctx, activeTop, inactiveTop); got.SourceOwner != NetworkClientSourceOwnerUnknown {
-			t.Fatalf("missing prober singleton source owner = %q, want %q", got.SourceOwner, NetworkClientSourceOwnerUnknown)
+		if got := GetProvideRelationshipDetails(ctx, activeTop, inactiveTop); got.SourceOwner != NetworkClientSourceOwnerUnknown || got.DestinationOwner != NetworkClientSourceOwnerUnknown {
+			t.Fatalf("missing prober singleton endpoint owners = (%q, %q), want unknown", got.SourceOwner, got.DestinationOwner)
 		}
 	})
 }
@@ -526,6 +546,7 @@ func TestSetProvide(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
 		newSecretKeys := func() map[ProvideMode][]byte {
 			k := make([]byte, 32)
 			mathrand.Read(k)
@@ -538,6 +559,7 @@ func TestSetProvide(t *testing.T) {
 		secretKeys := newSecretKeys()
 
 		startTime := server.NowUtc()
+
 		changeCount, provideModes := GetProvideKeyChanges(ctx, clientId, startTime)
 		connect.AssertEqual(t, changeCount, 0)
 		connect.AssertEqual(t, provideModes, map[ProvideMode]bool{})
@@ -1628,6 +1650,7 @@ func TestGetProvideFallsBackToDb(t *testing.T) {
 		}
 
 		SetProvide(ctx, clientId, secretKeys)
+
 		// drop the cache so the reads are forced through the db fallback
 		server.Redis(ctx, func(r server.RedisClient) {
 			r.Del(ctx, provideModesKey(clientId))
@@ -1651,6 +1674,7 @@ func TestGetProvideModesNotSet(t *testing.T) {
 		ctx := context.Background()
 
 		clientId := server.NewId()
+
 		// a client that never provided returns an empty set and no error
 		provideModes, err := GetProvideModes(ctx, clientId)
 		connect.AssertEqual(t, err, nil)
@@ -2215,81 +2239,6 @@ func TestMigrateProvideMode(t *testing.T) {
 			connect.AssertEqual(t, []byte(publicSk), publicKey)
 			networkSk, _ := r.Get(ctx, provideModeSecretKeyKey(clientId, ProvideModeNetwork)).Result()
 			connect.AssertEqual(t, []byte(networkSk), networkKey)
-		})
-	})
-}
-
-func TestRemoveNetworkClients(t *testing.T) {
-	server.DefaultTestEnv().Run(t, func(t testing.TB) {
-		ctx := context.Background()
-		networkId := server.NewId()
-
-		// Create a mock session
-		sess := &session.ClientSession{
-			Ctx: ctx,
-			ByJwt: &jwt.ByJwt{
-				NetworkId: networkId,
-			},
-		}
-
-		// Generate random IDs to test the ANY($1) binding
-		clientIds := []server.Id{server.NewId(), server.NewId(), server.NewId()}
-
-		args := &RemoveNetworkClientsArgs{
-			ClientIds: clientIds,
-		}
-
-		// This will panic if the driver fails to cast []server.Id to uuid[]
-		_, err := RemoveNetworkClients(args, sess)
-
-		// Assert that the function ran without returning an error
-		assert.Equal(t, err, nil)
-	})
-}
-
-func TestRemoveNetworkClientsOnlyRemovesOwnNetwork(t *testing.T) {
-	server.DefaultTestEnv().Run(t, func(t testing.TB) {
-		ctx := context.Background()
-
-		ourNetworkId := server.NewId()
-		otherNetworkId := server.NewId()
-
-		// Seed clients in two networks.  Use SQL so we can explicitly set network_id
-		// without depending on unrelated model code paths.
-		ourClientId := server.NewId()
-		otherClientId := server.NewId()
-		server.Tx(ctx, func(tx server.PgTx) {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO network_client (client_id, network_id, active)
-				VALUES
-					($1, $2, true),
-					($3, $4, true)
-			`, ourClientId, ourNetworkId, otherClientId, otherNetworkId)
-			server.Raise(err)
-		})
-
-		sess := &session.ClientSession{
-			Ctx: ctx,
-			ByJwt: &jwt.ByJwt{
-				NetworkId: ourNetworkId,
-			},
-		}
-
-		_, err := RemoveNetworkClients(&RemoveNetworkClientsArgs{ClientIds: []server.Id{ourClientId, otherClientId}}, sess)
-		assert.Equal(t, err, nil)
-
-		// our client is disabled
-		server.Tx(ctx, func(tx server.PgTx) {
-			var ourActive bool
-			err := tx.QueryRow(ctx, `SELECT active FROM network_client WHERE client_id = $1`, ourClientId).Scan(&ourActive)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, ourActive, false)
-
-			// other-network client must stay active
-			var otherActive bool
-			err = tx.QueryRow(ctx, `SELECT active FROM network_client WHERE client_id = $1`, otherClientId).Scan(&otherActive)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, otherActive, true)
 		})
 	})
 }

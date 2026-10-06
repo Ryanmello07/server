@@ -220,6 +220,54 @@ var residentClientsGauge = prometheus.NewGauge(
 	},
 )
 
+// This artifact capability is intentionally identity-free. The monitor joins
+// it to the exact process identity supplied by the metrics transport. A value
+// of one proves that resident forward-ingress queues and workers are created
+// on first destination use instead of eagerly multiplying every resident by
+// the configured shard count.
+var residentLazyForwardIngressEnabledGauge = prometheus.NewGaugeFunc(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "resident_lazy_forward_ingress_enabled",
+		Help:      "Whether resident forward-ingress queues and workers start lazily on first destination use",
+	},
+	func() float64 { return 1 },
+)
+
+// These aggregate ownership gauges make a large Connect runtime attributable
+// without exposing a client, destination, network, or transport identity.
+// They count the goroutines directly owned by Resident callback lanes and
+// exchange-forward loops.  A high total Go goroutine count with low values
+// here points investigation at another owner; high values here quantify the
+// resident/forward contribution before changing capacity or limits.
+var residentCallbackWorkersGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "resident_callback_workers",
+		Help:      "Live Resident control and lazy forward-ingress callback workers",
+	},
+)
+
+var residentForwardWorkersGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "resident_forward_workers",
+		Help:      "Live Resident destination-forward workers",
+	},
+)
+
+var residentForwardIdleWatchersGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "urnetwork",
+		Subsystem: "connect",
+		Name:      "resident_forward_idle_watchers",
+		Help:      "Live Resident destination-forward idle-timeout watchers",
+	},
+)
+
 // drainResidentsRemainingGauge is the drain progress without ssh-ing to find
 // the `docker stop` child: the remaining resident/connection count while the
 // service drains, 0 once the drain completes (CONNECTDRAIN2.md §3.5)
@@ -267,6 +315,10 @@ func init() {
 	prometheus.MustRegister(exchangeIOBytesCounter)
 	prometheus.MustRegister(exchangeActiveConnectionsGauge)
 	prometheus.MustRegister(residentClientsGauge)
+	prometheus.MustRegister(residentLazyForwardIngressEnabledGauge)
+	prometheus.MustRegister(residentCallbackWorkersGauge)
+	prometheus.MustRegister(residentForwardWorkersGauge)
+	prometheus.MustRegister(residentForwardIdleWatchersGauge)
 	prometheus.MustRegister(drainResidentsRemainingGauge)
 	prometheus.MustRegister(drainExcusesWrittenCounter)
 	prometheus.MustRegister(nominationRefusedCounter)
@@ -335,6 +387,13 @@ type ExchangeSettings struct {
 	ConnectHandlerSettings
 
 	ExchangeBufferSize int
+	// Optional fixed ledger shared by resident SDK clients. Captured once by
+	// the Exchange; nil leaves SDK lifecycle accounting disabled.
+	MemoryOwnerLedger  *connect.TransferMemoryOwnerLedger
+	payloadOwnerLedger *residentPayloadLedger
+	// Optional private diagnostic scope, independent of lifecycle metrics.
+	// Captured once; nil leaves SDK packet-path accounting disabled.
+	SDKPayloadOwnerLedger *connect.TransferPayloadOwnerLedger
 
 	// `send` queue depth of a `ResidentForward` to a peer resident. Kept
 	// separate from `ExchangeBufferSize` so production can hold a deep queue
@@ -600,7 +659,10 @@ type Exchange struct {
 	hostToServicePorts map[int]int
 	routes             map[string]string
 
-	settings *ExchangeSettings
+	settings              *ExchangeSettings
+	memoryOwnerLedger     *connect.TransferMemoryOwnerLedger
+	payloadOwnerLedger    *residentPayloadLedger
+	sdkPayloadOwnerLedger *connect.TransferPayloadOwnerLedger
 	// Optional already-bound sockets keyed by service port. Tests use these to
 	// eliminate release-to-rebind races and cross-process SO_REUSEPORT
 	// interference. The Exchange owns and closes every supplied listener.
@@ -612,10 +674,14 @@ type Exchange struct {
 	// Nil in production; generation tests observe the exact point at which an
 	// accepted header has found no local resident and is about to wait.
 	afterResidentMissingForTest func()
+	// Nil in production; constructor tests inject failure after child ownership
+	// exists but before the fallible peer-profile lookup publishes callbacks.
+	beforeResidentProfileForTest func(*Resident)
 
 	// the shared key-event subscriber (PEERSSTREAMS2.md); nil unless
 	// KeyEventDelivery.Enabled
-	keyEventSubscriber *keyEventSubscriber
+	keyEventSubscriber          *keyEventSubscriber
+	contractOriginNotifications *model.ContractOriginNotifications
 
 	// set once `Drain` starts. While draining, new connections are refused
 	// (`ConnectHandler.Connect` 503s and `NominateLocalResident` declines) so
@@ -705,19 +771,22 @@ func newExchange(
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	exchange := &Exchange{
-		ctx:                  cancelCtx,
-		cancel:               cancel,
-		host:                 host,
-		service:              service,
-		block:                block,
-		hostToServicePorts:   hostToServicePorts,
-		routes:               routes,
-		settings:             settings,
-		servicePortListeners: servicePortListeners,
-		residents:            map[server.Id]*Resident{},
-		residentChanges:      map[server.Id]chan struct{}{},
-		connections:          map[server.Id]map[server.Id]context.CancelFunc{},
-		drainedClients:       map[server.Id]struct{}{},
+		ctx:                   cancelCtx,
+		cancel:                cancel,
+		host:                  host,
+		service:               service,
+		block:                 block,
+		hostToServicePorts:    hostToServicePorts,
+		routes:                routes,
+		settings:              settings,
+		memoryOwnerLedger:     settings.MemoryOwnerLedger,
+		payloadOwnerLedger:    settings.payloadOwnerLedger,
+		sdkPayloadOwnerLedger: settings.SDKPayloadOwnerLedger,
+		servicePortListeners:  servicePortListeners,
+		residents:             map[server.Id]*Resident{},
+		residentChanges:       map[server.Id]chan struct{}{},
+		connections:           map[server.Id]map[server.Id]context.CancelFunc{},
+		drainedClients:        map[server.Id]struct{}{},
 	}
 
 	if settings.KeyEventDelivery.Enabled {
@@ -725,6 +794,7 @@ func newExchange(
 		// residents register their listeners with it in `Resident.Run`
 		exchange.keyEventSubscriber = newKeyEventSubscriber(cancelCtx, &settings.KeyEventDelivery)
 	}
+	exchange.contractOriginNotifications = model.NewContractOriginNotifications(cancelCtx, model.DefaultContractOriginNotificationSettings())
 
 	go server.HandleError(exchange.Run, cancel)
 
@@ -812,6 +882,27 @@ func (self *Exchange) NominateLocalResident(
 	instanceId server.Id,
 	residentIdToReplace *server.Id,
 ) bool {
+	return self.NominateLocalResidentWithContext(self.ctx, clientId, instanceId, residentIdToReplace)
+}
+
+// The requesting transport owns admission through metadata lookup and resident
+// construction. A successfully installed resident belongs to the exchange and
+// can serve other transports after this caller disconnects.
+func (self *Exchange) NominateLocalResidentWithContext(
+	callerCtx context.Context,
+	clientId server.Id,
+	instanceId server.Id,
+	residentIdToReplace *server.Id,
+) bool {
+	admissionCtx, admissionCancel := context.WithCancel(callerCtx)
+	stopExchangeCancel := context.AfterFunc(self.ctx, admissionCancel)
+	defer func() {
+		stopExchangeCancel()
+		admissionCancel()
+	}()
+	if admissionCtx.Err() != nil || self.ctx.Err() != nil {
+		return false
+	}
 	// Admit before any model work. Close takes the same lock, so WaitForIdle
 	// cannot observe a zero worker count while a pre-close nomination is still
 	// between its database work and goroutine handoff.
@@ -823,9 +914,20 @@ func (self *Exchange) NominateLocalResident(
 	self.residentWorkers.Add(1)
 	self.residentWorkerLock.Unlock()
 	workerStarted := false
+	var abandonedNomination *model.NetworkClientResident
 	defer func() {
 		if !workerStarted {
-			self.residentWorkers.Done()
+			defer self.residentWorkers.Done()
+			if abandonedNomination != nil {
+				// A reservation may have committed before the caller vanished.
+				// Remove only our generation, with a finite best-effort budget;
+				// the existing Redis TTL remains the unavailable-store backstop.
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(admissionCtx), time.Second)
+				defer cleanupCancel()
+				if err := model.RemoveResidentForClientWithDeadline(cleanupCtx, clientId, abandonedNomination.ResidentId); err != nil {
+					glog.V(1).Infof("[r]abandoned nomination cleanup = %s\n", err)
+				}
+			}
 		}
 	}()
 
@@ -845,7 +947,7 @@ func (self *Exchange) NominateLocalResident(
 	// exempt and a re-nomination of an already-connected client is not a new
 	// connection (see model.CanConnectNetworkPeer). This is a no-op while
 	// enforce_concurrent_clients is false in pro.yml.
-	if !model.CanConnectNetworkPeer(self.ctx, clientId) {
+	if !model.CanConnectNetworkPeer(admissionCtx, clientId) {
 		nominationRefusedCounter.WithLabelValues("concurrent_client_limit").Inc()
 		if glog.V(1) {
 			glog.Infof(
@@ -856,6 +958,9 @@ func (self *Exchange) NominateLocalResident(
 		return false
 	}
 
+	if admissionCtx.Err() != nil {
+		return false
+	}
 	residentId := server.NewId()
 
 	nomination := &model.NetworkClientResident{
@@ -867,23 +972,39 @@ func (self *Exchange) NominateLocalResident(
 		ResidentBlock:         self.block,
 		ResidentInternalPorts: slices.Collect(maps.Keys(self.hostToServicePorts)),
 	}
+	// Cleanup also covers an ambiguous canceled Redis command whose write may
+	// already have succeeded. Generation comparison preserves replacements.
+	abandonedNomination = nomination
 	nominated := model.NominateResident(
-		self.ctx,
+		admissionCtx,
 		residentIdToReplace,
 		nomination,
 		self.settings.ExchangeResidentTtl,
 	)
 	if !nominated {
+		if admissionCtx.Err() == nil {
+			abandonedNomination = nil
+		}
+		return false
+	}
+	if admissionCtx.Err() != nil {
 		return false
 	}
 
-	resident := NewResident(
+	resident := newResidentDuringAdmission(
 		self.ctx,
+		admissionCtx,
 		self,
 		clientId,
 		instanceId,
 		residentId,
 	)
+	if admissionCtx.Err() != nil || self.ctx.Err() != nil {
+		if err := resident.CloseAndWait(context.Background()); err != nil {
+			glog.Errorf("[r]abandoned resident close wait = %s\n", err)
+		}
+		return false
+	}
 	workerStarted = true
 	// note: initial peer registration happens in ConnectionAnnounce.run once
 	// the connection survives the announce window (2026-07-15: registration
@@ -931,23 +1052,7 @@ func (self *Exchange) NominateLocalResident(
 			glog.Infof("[r]close %s\n", clientId)
 		}
 	})
-	go server.HandleError(func() {
-		defer resident.Cancel()
-		for {
-			if resident.CancelIfIdle() {
-				if glog.V(1) {
-					glog.Infof("[r]idle %s\n", clientId)
-				}
-				return
-			}
-
-			select {
-			case <-resident.Done():
-				return
-			case <-time.After(self.settings.ExchangeResidentTtl):
-			}
-		}
-	})
+	go server.HandleError(resident.runIdleWatcher)
 	// poll the resident the same as exchange connections
 	go server.HandleError(func() {
 		defer resident.Cancel()
@@ -958,50 +1063,8 @@ func (self *Exchange) NominateLocalResident(
 			case <-time.After(self.settings.ExchangeResidentTtl / 4):
 			}
 
-			pollResident := func() bool {
-				return server.HandleErrorWithReturn(func() bool {
-					currentResident := model.GetResidentForClientWithInstance(self.ctx, clientId, instanceId, self.settings.ExchangeResidentTtl)
-					if currentResident == nil {
-						return false
-					}
-					return residentId == currentResident.ResidentId
-				})
-			}
-
-			if !pollResident() {
-				if glog.V(1) {
-					glog.Infof("[r]not current %s\n", clientId)
-				}
+			if !self.refreshResidentRegistration(resident) {
 				return
-			}
-
-			// heartbeat the network peer registration on the same poll.
-			// Refresh only while the client holds a transport to this
-			// resident: a resident can outlive its client's connection
-			// (e.g. kept active by inbound forward pings up to
-			// `ForwardIdleTimeout`), and without a refresh the registration
-			// expires after `ExchangeResidentTtl` and other residents prune
-			// it to a disconnect marker, bounding disconnect detection.
-			if self.settings.EnableNetworkPeers && resident.peerNetworkId != nil && 0 < resident.TransportCount() {
-				server.HandleError(func() {
-					if resident.peerCategory == model.NetworkPeerCategoryProxy {
-						// AddNetworkProxyPeer doubles as the heartbeat, and is
-						// also the initial proxy registration (proxy clients
-						// do not pass through ConnectionAnnounce)
-						model.AddNetworkProxyPeer(self.ctx, *resident.peerNetworkId, clientId, self.settings.ExchangeResidentTtl)
-						return
-					}
-					if !model.RefreshNetworkPeer(self.ctx, *resident.peerNetworkId, clientId, residentId, self.settings.ExchangeResidentTtl) {
-						// the registration was lost (e.g. expired while the
-						// client was disconnected, or pruned at an expiry
-						// race); re-add with a fresh profile
-						// peersEnabled is not re-checked: peerNetworkId set means
-						// the network was enabled when the resident was created
-						if _, topLevel, _, peerProfile, _ := model.GetNetworkPeerProfile(self.ctx, clientId); topLevel && peerProfile != nil {
-							model.AddNetworkPeer(self.ctx, *resident.peerNetworkId, peerProfile, residentId, self.settings.ExchangeResidentTtl)
-						}
-					}
-				})
 			}
 		}
 	})
@@ -1022,6 +1085,65 @@ func (self *Exchange) NominateLocalResident(
 		glog.Infof("[r]open %s\n", clientId)
 	}
 
+	return true
+}
+
+// Refreshes metadata for one resident. Transport cancellation must not change
+// the lifetime of another resident or of the serving exchange.
+func (self *Exchange) refreshResidentRegistration(resident *Resident) bool {
+	if resident.ctx.Err() != nil {
+		return false
+	}
+	clientId, instanceId, residentId := resident.clientId, resident.instanceId, resident.residentId
+	pollResident := func() bool {
+		return server.HandleErrorWithReturn(func() bool {
+			currentResident := model.GetResidentForClientWithInstance(resident.ctx, clientId, instanceId, self.settings.ExchangeResidentTtl)
+			if currentResident == nil {
+				return false
+			}
+			return residentId == currentResident.ResidentId
+		})
+	}
+
+	if !pollResident() {
+		if glog.V(1) {
+			glog.Infof("[r]not current %s\n", clientId)
+		}
+		return false
+	}
+
+	// heartbeat the network peer registration on the same poll.
+	// Refresh only while the client holds a transport to this
+	// resident: a resident can outlive its client's connection
+	// (e.g. kept active by inbound forward pings up to
+	// `ForwardIdleTimeout`), and without a refresh the registration
+	// expires after `ExchangeResidentTtl` and other residents prune
+	// it to a disconnect marker, bounding disconnect detection.
+	if self.settings.EnableNetworkPeers && resident.peerNetworkId != nil && 0 < resident.TransportCount() {
+		// Give optional peer metadata one poll interval of caller time.
+		// Keep this context separate from resident and control lifetimes.
+		peerCtx, peerCancel := context.WithTimeout(resident.ctx, self.settings.ExchangeResidentTtl/4)
+		defer peerCancel()
+		server.HandleError(func() {
+			if resident.peerCategory == model.NetworkPeerCategoryProxy {
+				// AddNetworkProxyPeer doubles as the heartbeat, and is
+				// also the initial proxy registration (proxy clients
+				// do not pass through ConnectionAnnounce)
+				model.AddNetworkProxyPeer(peerCtx, *resident.peerNetworkId, clientId, self.settings.ExchangeResidentTtl)
+				return
+			}
+			if !model.RefreshNetworkPeer(peerCtx, *resident.peerNetworkId, clientId, residentId, self.settings.ExchangeResidentTtl) {
+				// the registration was lost (e.g. expired while the
+				// client was disconnected, or pruned at an expiry
+				// race); re-add with a fresh profile
+				// peersEnabled is not re-checked: peerNetworkId set means
+				// the network was enabled when the resident was created
+				if _, topLevel, _, peerProfile, _ := model.GetNetworkPeerProfile(peerCtx, clientId); topLevel && peerProfile != nil {
+					model.AddNetworkPeer(peerCtx, *resident.peerNetworkId, peerProfile, residentId, self.settings.ExchangeResidentTtl)
+				}
+			}
+		})
+	}
 	return true
 }
 
@@ -1333,7 +1455,18 @@ func (self *Exchange) handleExchangeConnection(conn net.Conn) {
 						break gather
 					}
 				}
+				var trace []h1RelayLineageSpan
+				if h1RelayLineageTraceEnabled {
+					trace = beginH1RelayLineageBatch("exchange_client_write_begin", header.ClientId, header.ResidentId, batch)
+				}
 				err := sendBuffer.WriteMessages(conn, batch)
+				if h1RelayLineageTraceEnabled {
+					endH1RelayLineageBatch(trace, "exchange_client_write_end", err == nil)
+				}
+				// WriteMessages releases pool ownership. Drop the writer's stale
+				// slice references too, so idle or smaller later batches cannot
+				// keep completed payload backing arrays reachable.
+				clear(batch)
 				batch = batch[:0]
 				if err != nil {
 					return false
@@ -1402,6 +1535,10 @@ func (self *Exchange) handleExchangeConnection(conn net.Conn) {
 				}
 
 				messageByteCount := len(message)
+				var trace h1RelayLineageSpan
+				if h1RelayLineageTraceEnabled {
+					trace = beginH1RelayLineage("exchange_transport_read", header.ClientId, header.ResidentId, message, len(receive), cap(receive))
+				}
 				sendResult := sendPooledReceive(
 					handleCtx.Done(),
 					nil,
@@ -1409,6 +1546,9 @@ func (self *Exchange) handleExchangeConnection(conn net.Conn) {
 					message,
 					connect.CarrierReliabilityReliable,
 				)
+				if h1RelayLineageTraceEnabled {
+					trace.end("exchange_transport_admit", sendResult == pooledMessageSendDelivered, len(receive), cap(receive))
+				}
 				switch sendResult {
 				case pooledMessageSendDelivered:
 					resident.UpdateActivity()
@@ -1499,6 +1639,10 @@ func (self *Exchange) handleExchangeConnection(conn net.Conn) {
 				}
 
 				messageByteCount := len(message)
+				var trace h1RelayLineageSpan
+				if h1RelayLineageTraceEnabled {
+					trace = beginH1RelayLineage("exchange_forward_read", header.ClientId, header.ResidentId, message, len(forward), cap(forward))
+				}
 				sendResult := sendPooledReceive(
 					handleCtx.Done(),
 					nil,
@@ -1506,6 +1650,9 @@ func (self *Exchange) handleExchangeConnection(conn net.Conn) {
 					message,
 					connect.CarrierReliabilityReliable,
 				)
+				if h1RelayLineageTraceEnabled {
+					trace.end("exchange_forward_admit", sendResult == pooledMessageSendDelivered, len(forward), cap(forward))
+				}
 				switch sendResult {
 				case pooledMessageSendDelivered:
 					resident.UpdateActivity()
@@ -1937,6 +2084,9 @@ func (self *Exchange) Close() {
 	self.connectionWorkerLock.Lock()
 	self.connectionWorkersClosed = true
 	self.connectionWorkerLock.Unlock()
+	// Stop active resident work before any socket or notification-owner join;
+	// a slow Redis close must not postpone the exchange's cancellation edge.
+	self.cancel()
 	// Close supplied sockets synchronously. Cancellation cannot own this edge:
 	// Close can win before Run admits the listener worker, in which case no
 	// worker exists to observe cancellation or execute its deferred Close.
@@ -1950,7 +2100,9 @@ func (self *Exchange) Close() {
 	if self.keyEventSubscriber != nil {
 		self.keyEventSubscriber.Close()
 	}
-	self.cancel()
+	if self.contractOriginNotifications != nil {
+		self.contractOriginNotifications.Close()
+	}
 }
 
 // WaitForIdle waits until every admitted resident, listener, and accepted
@@ -1971,6 +2123,10 @@ func (self *Exchange) WaitForIdle(ctx context.Context) bool {
 	}
 }
 
+// Packet-sized singleton scratch avoids two TCP writes without retaining a
+// full 16 KiB batch for every sparse exchange sender.
+const exchangeSingletonWriteStorageByteCount = 2 * 1024
+
 // each call overwrites the internal buffer
 type ExchangeBuffer struct {
 	settings *ExchangeSettings
@@ -1982,11 +2138,17 @@ type ExchangeBuffer struct {
 	// (header and messages), or buffered bytes would be lost.
 	reader     *bufio.Reader
 	readerConn net.Conn
+	// A ping-only outbound forward can cap scratch without changing framing.
+	// Zero preserves the configured transport read buffer.
+	readBufferLimit int
 
 	// reusable writev iovec backing for WriteMessages. like the reader, a
 	// buffer writes from a single goroutine, so the backing is reused across
 	// batches instead of allocating one per flush.
 	writeBuffers net.Buffers
+	// The single writer allocates this only for a non-empty message that fits.
+	// Receive-only, idle, and oversized-only senders retain no payload scratch.
+	writeStorage []byte
 }
 
 func NewDefaultExchangeBuffer(settings *ExchangeSettings) *ExchangeBuffer {
@@ -2004,7 +2166,11 @@ func NewReceiveOnlyExchangeBuffer(settings *ExchangeSettings) *ExchangeBuffer {
 
 func (self *ExchangeBuffer) connReader(conn net.Conn) *bufio.Reader {
 	if self.readerConn != conn {
-		self.reader = bufio.NewReaderSize(conn, self.settings.ExchangeReadBufferByteCount)
+		readBufferByteCount := self.settings.ExchangeReadBufferByteCount
+		if 0 < self.readBufferLimit {
+			readBufferByteCount = min(readBufferByteCount, self.readBufferLimit)
+		}
+		self.reader = bufio.NewReaderSize(conn, readBufferByteCount)
 		self.readerConn = conn
 	}
 	return self.reader
@@ -2016,7 +2182,9 @@ func (self *ExchangeBuffer) WriteHeader(ctx context.Context, conn net.Conn, head
 	e.Encode(header)
 	headerBytes := b.Bytes()
 
-	conn.SetWriteDeadline(time.Now().Add(self.settings.ExchangeWriteHeaderTimeout))
+	if err := conn.SetWriteDeadline(time.Now().Add(self.settings.ExchangeWriteHeaderTimeout)); err != nil {
+		return err
+	}
 	if err := self.framer.Write(conn, headerBytes); err != nil {
 		return err
 	}
@@ -2025,7 +2193,9 @@ func (self *ExchangeBuffer) WriteHeader(ctx context.Context, conn net.Conn, head
 }
 
 func (self *ExchangeBuffer) ReadHeader(ctx context.Context, conn net.Conn) (*ExchangeHeader, error) {
-	conn.SetReadDeadline(time.Now().Add(self.settings.ExchangeReadHeaderTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(self.settings.ExchangeReadHeaderTimeout)); err != nil {
+		return nil, err
+	}
 	headerBytes, err := self.framer.Read(self.connReader(conn))
 	if err != nil {
 		return nil, err
@@ -2047,8 +2217,25 @@ func (self *ExchangeBuffer) ReadHeader(ctx context.Context, conn net.Conn) (*Exc
 // FIXME resident transport can have write backpressure timeout
 
 func (self *ExchangeBuffer) WriteMessage(conn net.Conn, transferFrameBytes []byte) error {
-	conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-	err := self.framer.Write(conn, transferFrameBytes)
+	if self.writeStorage == nil &&
+		0 < len(transferFrameBytes) &&
+		len(transferFrameBytes) <= exchangeSingletonWriteStorageByteCount-4 &&
+		len(transferFrameBytes) <= self.settings.FramerSettings.MaxMessageLen {
+		storageByteCount := exchangeSingletonWriteStorageByteCount
+		if self.settings.FramerSettings.MaxMessageLen < storageByteCount-4 {
+			storageByteCount = self.settings.FramerSettings.MaxMessageLen + 4
+		}
+		self.writeStorage = make([]byte, storageByteCount)
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+		connect.MessagePoolReturn(transferFrameBytes)
+		return err
+	}
+	err := self.framer.WriteBatchWithStorage(
+		conn,
+		[][]byte{transferFrameBytes},
+		self.writeStorage,
+	)
 	if err == nil {
 		recordExchangeIO(exchangeIODirectionSent, exchangeIOMessageKind(transferFrameBytes), len(transferFrameBytes))
 	}
@@ -2085,7 +2272,12 @@ func (self *ExchangeBuffer) WriteMessages(conn net.Conn, transferFrameBytesBatch
 		}
 	}
 
-	conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+	if err := conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+		for _, message := range transferFrameBytesBatch {
+			connect.MessagePoolReturn(message)
+		}
+		return err
+	}
 
 	headers := connect.MessagePoolGet(exchangeIOFrameHeaderByteCount * len(transferFrameBytesBatch))
 	defer connect.MessagePoolReturn(headers)
@@ -2117,7 +2309,9 @@ func (self *ExchangeBuffer) WriteMessages(conn net.Conn, transferFrameBytesBatch
 }
 
 func (self *ExchangeBuffer) ReadMessage(conn net.Conn) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(self.settings.ExchangeReadTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(self.settings.ExchangeReadTimeout)); err != nil {
+		return nil, err
+	}
 	transferFrameBytes, err := self.framer.Read(self.connReader(conn))
 	if err != nil {
 		return nil, err
@@ -2252,6 +2446,15 @@ func NewExchangeConnection(
 
 	sendBuffer := NewDefaultExchangeBuffer(settings)
 	receiveBuffer := NewReceiveOnlyExchangeBuffer(settings)
+	receiveQueueSize := settings.ExchangeBufferSize
+	if header.Op == ExchangeOpForward {
+		// Forward endpoints only read pings and discard unexpected payloads.
+		// Run closes receive without ever queueing a message, so it needs no
+		// payload ring. Keep one reader from header through close to preserve
+		// any bytes read ahead by the handshake.
+		receiveQueueSize = 0
+		receiveBuffer.readBufferLimit = 4 * 1024
+	}
 
 	// write header
 	err = sendBuffer.WriteHeader(ctx, conn, &header)
@@ -2279,7 +2482,7 @@ func NewExchangeConnection(
 		sendBuffer:        sendBuffer,
 		receiveBuffer:     receiveBuffer,
 		send:              make(chan []byte, settings.ExchangeBufferSize),
-		receive:           make(chan []byte, settings.ExchangeBufferSize),
+		receive:           make(chan []byte, receiveQueueSize),
 		settings:          settings,
 		header:            header,
 		host:              host,
@@ -2423,7 +2626,17 @@ func (self *ExchangeConnection) Run() {
 				}
 			}
 			self.notifySendDequeuedForTest()
+			var trace []h1RelayLineageSpan
+			if h1RelayLineageTraceEnabled {
+				trace = beginH1RelayLineageBatch("exchange_socket_write_begin", self.header.ClientId, self.header.ResidentId, batch)
+			}
 			err := self.sendBuffer.WriteMessages(self.conn, batch)
+			if h1RelayLineageTraceEnabled {
+				endH1RelayLineageBatch(trace, "exchange_socket_write_end", err == nil)
+			}
+			// A zero length preserves backing-array references. Release each
+			// completed payload before retaining the batch index for reuse.
+			clear(batch)
 			batch = batch[:0]
 			if err != nil {
 				return false
@@ -2876,12 +3089,19 @@ func (self *ResidentTransport) Run() {
 							self.cancel()
 							return
 						}
+						var trace h1RelayLineageSpan
+						if h1RelayLineageTraceEnabled {
+							trace = beginH1RelayLineage("resident_transport_dequeue", self.clientId, self.instanceId, message, len(self.send), cap(self.send))
+						}
 						sendResult := connection.sendMessage(
 							handleCtx.Done(),
 							message,
 							writeTimer,
 							self.exchange.settings.WriteTimeout,
 						)
+						if h1RelayLineageTraceEnabled {
+							trace.end("resident_transport_socket_admit", sendResult == pooledMessageSendDelivered, len(connection.send), cap(connection.send))
+						}
 						if !pooledMessageSendKeepsGeneration(sendResult) {
 							return
 						}
@@ -2928,7 +3148,9 @@ func (self *ResidentTransport) Run() {
 	skippedReconnectWait := false
 	for {
 		reconnect := connect.NewReconnect(self.exchange.settings.ExchangeReconnectAfterErrorTimeout)
-		resident := model.GetResidentForClientWithInstance(self.ctx, self.clientId, self.instanceId, self.exchange.settings.ExchangeResidentTtl)
+		// Routing does not own the registration heartbeat. Failed dialing must
+		// not keep a departed resident's registration alive.
+		resident := model.GetResidentForClientWithInstance(self.ctx, self.clientId, self.instanceId, 0)
 		if resident != nil && 0 < len(resident.ResidentInternalPorts) {
 			port := resident.ResidentInternalPorts[rand.Intn(len(resident.ResidentInternalPorts))]
 			headerCopy := self.header
@@ -2991,7 +3213,8 @@ func (self *ResidentTransport) Run() {
 		}
 
 		c := func() bool {
-			return self.exchange.NominateLocalResident(
+			return self.exchange.NominateLocalResidentWithContext(
+				self.ctx,
 				self.clientId,
 				self.instanceId,
 				residentIdToReplace,
@@ -3088,11 +3311,27 @@ func NewResidentForward(
 }
 
 func (self *ResidentForward) Run() {
+	self.runWithResidentLookup(model.GetResidentForClient)
+}
+
+// Keep resident discovery at the forward owner; the argument permits isolated
+// lifecycle tests without a shared global hook or a live Redis connection.
+func (self *ResidentForward) runWithResidentLookup(
+	lookup func(context.Context, server.Id, time.Duration) *model.NetworkClientResident,
+) {
+	// A disconnected forward owns at most one dequeued packet while looking
+	// for its destination. No packet means no reason to refresh or redial a
+	// departed resident. The idle reaper remains the lifetime authority.
+	var pending []byte
+	var hasPending bool
 	defer func() {
+		if hasPending {
+			self.releasePayload(pending)
+		}
 		self.sendAdmission.close()
 		self.cancel()
 		self.sendAdmission.wait()
-		returnReadyPooledMessages(self.send)
+		self.drainPayloads()
 	}()
 
 	handle := func(connection *ExchangeConnection) {
@@ -3117,33 +3356,65 @@ func (self *ResidentForward) Run() {
 		writeTimer := time.NewTimer(0)
 		defer writeTimer.Stop()
 		for {
-			select {
-			case <-handleCtx.Done():
-				return
-			case message, ok := <-self.send:
-				if !ok {
-					// transport closed
+			var message []byte
+			if hasPending {
+				message, pending, hasPending = pending, nil, false
+			} else {
+				select {
+				case <-handleCtx.Done():
 					return
-				}
-				sendResult := connection.sendMessage(
-					handleCtx.Done(),
-					message,
-					writeTimer,
-					self.exchange.settings.WriteTimeout,
-				)
-				if !pooledMessageSendKeepsGeneration(sendResult) {
-					if sendResult == pooledMessageSendDropped && glog.V(1) {
-						glog.Infof("[rf]retire saturated exchange %s->\n", self.clientId)
+				case next, ok := <-self.send:
+					if !ok {
+						return
 					}
-					return
+					message = next
 				}
+			}
+			// Capture the scalar charge while this stage still owns the frame.
+			// sendMessage consumes this exact owner on every outcome.
+			ledger := self.exchange.residentPayloadLedger()
+			var charge residentPayloadCharge
+			if ledger != nil {
+				charge = payloadCharge(message)
+			}
+			sendResult := connection.sendMessage(
+				handleCtx.Done(), message, writeTimer, self.exchange.settings.WriteTimeout,
+			)
+			if ledger != nil {
+				ledger.update(residentPayloadForwardOutput, self.clientId[15], charge, false)
+			}
+			if !pooledMessageSendKeepsGeneration(sendResult) {
+				if sendResult == pooledMessageSendDropped && glog.V(1) {
+					glog.Infof("[rf]retire saturated exchange %s->\n", self.clientId)
+				}
+				return
 			}
 		}
 	}
 
+	initialLookup := true
 	for {
+		if !hasPending {
+			select {
+			case <-self.ctx.Done():
+				return
+			case message, ok := <-self.send:
+				if !ok {
+					return
+				}
+				pending, hasPending = message, true
+			}
+		}
+		// A ready queue must not win over a completed owner and start fresh I/O.
+		if self.ctx.Err() != nil {
+			return
+		}
 		reconnect := connect.NewReconnect(self.exchange.settings.ExchangeReconnectAfterErrorTimeout)
-		resident := model.GetResidentForClient(self.ctx, self.clientId, self.exchange.settings.ExchangeResidentTtl)
+		resident := defaultResidentForwardLookupMetrics.observe(initialLookup, hasPending || len(self.send) > 0, func() *model.NetworkClientResident {
+			// Pending traffic must not prolong a departed registration.
+			return lookup(self.ctx, self.clientId, 0)
+		})
+		initialLookup = false
 		if resident != nil && 0 < len(resident.ResidentInternalPorts) {
 			port := resident.ResidentInternalPorts[rand.Intn(len(resident.ResidentInternalPorts))]
 			header := ExchangeHeader{
@@ -3211,6 +3482,30 @@ func (self *ResidentForward) CancelIfIdle() bool {
 	return false
 }
 
+// Owns idle expiry independently from socket liveness. Forward activity is
+// payload admission; exchange keepalives do not extend this deadline.
+func (self *ResidentForward) runIdleWatcher(sourceId server.Id) {
+	timer := time.NewTimer(self.exchange.settings.ForwardIdleTimeout)
+	defer timer.Stop()
+	for {
+		if self.CancelIfIdle() {
+			if glog.V(1) {
+				glog.Infof("[rf]idle %s->%s\n", sourceId, self.clientId)
+			}
+			return
+		}
+		// Activity can move the deadline after the prior timer was armed.
+		// Recheck then wait only for the remaining existing idle allowance.
+		remaining := self.exchange.settings.ForwardIdleTimeout - time.Since(time.Unix(0, self.lastActivityNanos.Load()))
+		timer.Reset(max(0, remaining))
+		select {
+		case <-self.Done():
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 func (self *ResidentForward) IsDone() bool {
 	select {
 	case <-self.ctx.Done():
@@ -3228,7 +3523,7 @@ func (self *ResidentForward) Close() {
 	self.sendAdmission.close()
 	self.cancel()
 	self.sendAdmission.wait()
-	returnReadyPooledMessages(self.send)
+	self.drainPayloads()
 }
 
 func (self *ResidentForward) Cancel() {
@@ -3282,7 +3577,7 @@ type Resident struct {
 	controlIngressAdmission pooledMessageSendAdmission
 	forwardIngressAdmission pooledMessageSendAdmission
 	controlIngress          chan []*protocol.Frame
-	forwardIngress          []chan residentForwardIngress
+	forwardIngress          []residentForwardIngressShard
 	callbackWorkers         sync.WaitGroup
 	closeOnce               sync.Once
 
@@ -3307,6 +3602,9 @@ type Resident struct {
 	beforeForwardCloseJoinForTest func()
 	// Nil in production; tests observe the exact internal-client join boundary.
 	beforeClientCloseJoinForTest func()
+	// Nil in production; tests pause lazy shard construction before its worker
+	// is registered, while the callback still owns forward admission.
+	beforeForwardIngressWorkerStartForTest func()
 	// Nil in production; tests capture the exact listener frame before its
 	// ownership is offered to the internal client.
 	beforeListenerFrameSendForTest func(*protocol.Frame)
@@ -3325,13 +3623,33 @@ func NewResident(
 	instanceId server.Id,
 	residentId server.Id,
 ) *Resident {
+	return newResidentDuringAdmission(ctx, nil, exchange, clientId, instanceId, residentId)
+}
+
+// Construction follows the caller until its owner can publish the resident.
+// After return, the exchange is the resident's sole lifetime parent.
+func newResidentDuringAdmission(
+	ctx context.Context,
+	admissionCtx context.Context,
+	exchange *Exchange,
+	clientId server.Id,
+	instanceId server.Id,
+	residentId server.Id,
+) *Resident {
 	glog.V(1).Infof("[r]create")
 
 	cancelCtx, cancel := context.WithCancel(ctx)
+	if admissionCtx != nil {
+		stopAdmissionCancel := context.AfterFunc(admissionCtx, cancel)
+		defer stopAdmissionCancel()
+		if admissionCtx.Err() != nil {
+			cancel()
+		}
+	}
 
 	// use a tag with the client so that the logging does not show up as the control id
 	clientTag := fmt.Sprintf("c(%s)", clientId.String())
-	clientSettings := connect.DefaultClientSettingsWithBufferSize(exchange.settings.ExchangeBufferSize)
+	clientSettings := exchange.residentClientSettings()
 	client := connect.NewClientWithTag(cancelCtx, connect.ControlId, clientTag, connect.NewNoContractClientOob(), clientSettings)
 
 	// no contract is required between the platform and client
@@ -3346,7 +3664,7 @@ func NewResident(
 	)
 
 	residentController := newResidentController(
-		cancelCtx,
+		model.WithContractOriginNotifications(cancelCtx, exchange.contractOriginNotifications),
 		clientId,
 		residentContractManager,
 		exchange.settings,
@@ -3367,11 +3685,24 @@ func NewResident(
 		controlLimiter:          newLimiter(cancelCtx, exchange.settings.ControlMinTimeout),
 	}
 	resident.lastActivityNanos.Store(time.Now().UnixNano())
+	constructed := false
+	defer func() {
+		if !constructed {
+			// No owner has received this resident yet. A profile lookup panic
+			// must join its client and detached controller before unwinding.
+			if err := resident.CloseAndWait(context.Background()); err != nil {
+				glog.Errorf("[r]aborted construction close wait = %s\n", err)
+			}
+		}
+	}()
 
 	// only top-level clients are network peers and get peer subscriptions.
 	// Networks over the top-level client limit (created before the limit)
 	// are excluded (`peersEnabled`): their peer replay and event fan-out
 	// would scale with the connected top-level client count.
+	if beforeProfile := exchange.beforeResidentProfileForTest; beforeProfile != nil {
+		beforeProfile(resident)
+	}
 	if networkId, topLevel, category, peerProfile, peersEnabled := model.GetNetworkPeerProfile(cancelCtx, clientId); topLevel && peersEnabled && peerProfile != nil {
 		resident.peerNetworkId = &networkId
 		resident.peerProfile = peerProfile
@@ -3415,12 +3746,21 @@ func NewResident(
 		go server.HandleError(resident.chaos, cancel)
 	}
 
+	constructed = true
 	return resident
 }
 
 type residentForwardIngress struct {
 	path               connect.TransferPath
 	transferFrameBytes []byte
+}
+
+// One destination-stable callback lane. Its queue and sole consumer are
+// created together on first use; startOnce publishes the queue to concurrent
+// callbacks without multiplying the configured aggregate capacity.
+type residentForwardIngressShard struct {
+	startOnce sync.Once
+	queue     chan residentForwardIngress
 }
 
 func shareResidentControlFrames(frames []*protocol.Frame) []*protocol.Frame {
@@ -3449,84 +3789,131 @@ func residentControlFrameByteCount(frames []*protocol.Frame) int {
 	return byteCount
 }
 
-// Starts one ordered control consumer and destination-stable forward shards.
-// Channels remain open; cancellation stops each sole consumer, which then
-// drains and returns every queued pooled owner.
+// Returns every control-frame owner left after producers and the consumer have
+// joined. Channels remain open so an admitted callback can never send on a
+// closed channel during teardown.
+func returnReadyResidentControlIngress(queue <-chan []*protocol.Frame) {
+	for {
+		select {
+		case frames := <-queue:
+			returnResidentControlFrames(frames)
+		default:
+			return
+		}
+	}
+}
+
+// Returns every forward-frame owner left after producers and the consumer have
+// joined. The final owner can arrive after cancellation won the worker select.
+func returnReadyResidentForwardIngress(queue <-chan residentForwardIngress) {
+	for {
+		select {
+		case message := <-queue:
+			connect.MessagePoolReturn(message.transferFrameBytes)
+		default:
+			return
+		}
+	}
+}
+
+// Starts the ordered control consumer and installs lightweight descriptors for
+// destination-stable forward shards. Each forward queue and sole consumer are
+// started lazily by an admitted callback; cancellation leaves channels open.
 func (self *Resident) startClientCallbackWorkers() {
 	settings := self.exchange.settings
 	self.controlIngress = make(chan []*protocol.Frame, max(0, settings.ResidentControlQueueSize))
 
 	shardCount := max(1, settings.ResidentForwardQueueShardCount)
-	totalForwardCapacity := max(0, settings.ResidentForwardQueueSize)
-	self.forwardIngress = make([]chan residentForwardIngress, shardCount)
-	for shardIndex := range shardCount {
-		shardCapacity := totalForwardCapacity / shardCount
-		if shardIndex < totalForwardCapacity%shardCount {
-			shardCapacity++
-		}
-		self.forwardIngress[shardIndex] = make(chan residentForwardIngress, shardCapacity)
-	}
+	self.forwardIngress = make([]residentForwardIngressShard, shardCount)
 
 	self.callbackWorkers.Add(1)
+	residentCallbackWorkersGauge.Inc()
 	go server.HandleError(func() {
 		defer self.callbackWorkers.Done()
+		defer residentCallbackWorkersGauge.Dec()
 		self.runClientControlIngress()
 	}, self.cancel)
-	for shardIndex := range self.forwardIngress {
-		self.callbackWorkers.Add(1)
-		go server.HandleError(func() {
-			defer self.callbackWorkers.Done()
-			self.runClientForwardIngress(shardIndex)
-		}, self.cancel)
-	}
 }
 
 func (self *Resident) runClientControlIngress() {
-	defer func() {
+	defer self.drainControlPayloads()
+	handle := func(frames []*protocol.Frame) {
+		defer self.releaseControlPayload(frames)
+		self.controlLimiter.delay()
+		if err := self.residentController.HandleControlFrames(frames); err != nil {
+			if glog.V(1) {
+				glog.Infof("[rr]control error = %s\n", err)
+			}
+		}
+	}
+	drainAccepted := func() {
+		// The receive callback returns after enqueue and the transfer layer
+		// can then ACK. Transport cancellation cannot discard that promise.
+		// Fence and join producers before consuming the finite accepted tail;
+		// CloseAndWait keeps the detached controller alive until this joins.
+		self.controlIngressAdmission.close()
+		self.controlIngressAdmission.wait()
 		for {
 			select {
 			case frames := <-self.controlIngress:
-				returnResidentControlFrames(frames)
+				handle(frames)
 			default:
 				return
 			}
 		}
-	}()
+	}
 	for {
 		select {
 		case <-self.ctx.Done():
+			drainAccepted()
 			return
 		default:
 		}
 		select {
 		case <-self.ctx.Done():
+			drainAccepted()
 			return
 		case frames := <-self.controlIngress:
-			func() {
-				defer returnResidentControlFrames(frames)
-				self.controlLimiter.delay()
-				if err := self.residentController.HandleControlFrames(frames); err != nil {
-					if glog.V(1) {
-						glog.Infof("[rr]control error = %s\n", err)
-					}
-				}
-			}()
+			handle(frames)
 		}
 	}
 }
 
-func (self *Resident) runClientForwardIngress(shardIndex int) {
-	queue := self.forwardIngress[shardIndex]
-	defer func() {
-		for {
-			select {
-			case message := <-queue:
-				connect.MessagePoolReturn(message.transferFrameBytes)
-			default:
-				return
-			}
+// Starts one callback shard at most once. The caller must hold a successful
+// forwardIngressAdmission until this returns: CloseAndWait relies on that
+// producer fence to put every callbackWorkers.Add before callbackWorkers.Wait.
+func (self *Resident) startClientForwardIngress(shardIndex int) chan residentForwardIngress {
+	shard := &self.forwardIngress[shardIndex]
+	shard.startOnce.Do(func() {
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
 		}
-	}()
+		if self.beforeForwardIngressWorkerStartForTest != nil {
+			self.beforeForwardIngressWorkerStartForTest()
+		}
+		shardCount := len(self.forwardIngress)
+		totalCapacity := max(0, self.exchange.settings.ResidentForwardQueueSize)
+		shardCapacity := totalCapacity / shardCount
+		if shardIndex < totalCapacity%shardCount {
+			shardCapacity++
+		}
+		queue := make(chan residentForwardIngress, shardCapacity)
+		shard.queue = queue
+		self.callbackWorkers.Add(1)
+		residentCallbackWorkersGauge.Inc()
+		go server.HandleError(func() {
+			defer self.callbackWorkers.Done()
+			defer residentCallbackWorkersGauge.Dec()
+			self.runClientForwardIngress(queue)
+		}, self.cancel)
+	})
+	return shard.queue
+}
+
+func (self *Resident) runClientForwardIngress(queue <-chan residentForwardIngress) {
+	defer self.drainForwardIngress(queue)
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -3537,6 +3924,9 @@ func (self *Resident) runClientForwardIngress(shardIndex int) {
 		case <-self.ctx.Done():
 			return
 		case message := <-queue:
+			if h1RelayLineageTraceEnabled {
+				beginH1RelayLineage("resident_forward_dequeue", self.clientId, server.Id(message.path.DestinationId), message.transferFrameBytes, len(queue), cap(queue))
+			}
 			self.processClientForward(message.path, message.transferFrameBytes)
 		}
 	}
@@ -3801,6 +4191,9 @@ func (self *Resident) clientForward() {
 func (self *Resident) handleClientForward(path connect.TransferPath, transferFrameBytes []byte) {
 	sourceId := server.Id(path.SourceId)
 	destinationId := server.Id(path.DestinationId)
+	if h1RelayLineageTraceEnabled {
+		beginH1RelayLineage("resident_forward_callback", self.clientId, destinationId, transferFrameBytes, 0, 0)
+	}
 
 	self.UpdateActivity()
 
@@ -3826,19 +4219,26 @@ func (self *Resident) handleClientForward(path connect.TransferPath, transferFra
 		return
 	}
 	defer self.forwardIngressAdmission.done()
+	shardIndex := int(destinationId[len(destinationId)-1]) % len(self.forwardIngress)
+	queue := self.startClientForwardIngress(shardIndex)
+	if queue == nil {
+		return
+	}
 	shared := connect.MessagePoolShareReadOnly(transferFrameBytes)
+	if ledger := self.exchange.residentPayloadLedger(); ledger != nil {
+		ledger.update(residentPayloadForwardIngress, self.clientId[15], payloadCharge(shared), true)
+	}
 	message := residentForwardIngress{
 		path:               path,
 		transferFrameBytes: shared,
 	}
-	shardIndex := int(destinationId[len(destinationId)-1]) % len(self.forwardIngress)
 	select {
 	case <-self.ctx.Done():
-		connect.MessagePoolReturn(shared)
-	case self.forwardIngress[shardIndex] <- message:
+		self.releaseForwardIngress(shared)
+	case queue <- message:
 		return
 	default:
-		connect.MessagePoolReturn(shared)
+		self.releaseForwardIngress(shared)
 		recordReceiveQueueDrop(receiveQueueBoundaryResidentClientForward, len(transferFrameBytes))
 		// This callback carries reliable Transfer frames. It cannot block the
 		// shared client receive loop, so retire this generation on saturation;
@@ -3857,7 +4257,14 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 	sourceId := server.Id(path.SourceId)
 	destinationId := server.Id(path.DestinationId)
 	messageOwned := true
+	if h1RelayLineageTraceEnabled {
+		trace := beginH1RelayLineage("resident_forward_begin", self.clientId, destinationId, transferFrameBytes, 0, 0)
+		defer func() { trace.end("resident_forward_end", !messageOwned, 0, 0) }()
+	}
 	defer func() {
+		if ledger := self.exchange.residentPayloadLedger(); ledger != nil {
+			ledger.update(residentPayloadForwardIngress, self.clientId[15], payloadCharge(transferFrameBytes), false)
+		}
 		if messageOwned {
 			connect.MessagePoolReturn(transferFrameBytes)
 		}
@@ -3871,7 +4278,7 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 		if existing := func() *ResidentForward {
 			self.stateLock.RLock()
 			defer self.stateLock.RUnlock()
-			if f := self.forwards[destinationId]; f != nil && f.UpdateActivity() {
+			if f := self.forwards[destinationId]; f != nil && !f.IsDone() {
 				return f
 			}
 			return nil
@@ -3928,21 +4335,10 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 			forward.Close()
 			return nil
 		}
+		residentForwardIdleWatchersGauge.Inc()
 		go server.HandleError(func() {
-			for {
-				if forward.CancelIfIdle() {
-					if glog.V(1) {
-						glog.Infof("[rf]idle %s->%s\n", sourceId, destinationId)
-					}
-					return
-				}
-
-				select {
-				case <-forward.Done():
-					return
-				case <-time.After(self.exchange.settings.ForwardIdleTimeout):
-				}
-			}
+			defer residentForwardIdleWatchersGauge.Dec()
+			forward.runIdleWatcher(sourceId)
 		})
 
 		// Install. Another goroutine may have raced ahead with a live forward
@@ -3952,7 +4348,7 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
-			if existing := self.forwards[destinationId]; existing != nil && existing.UpdateActivity() {
+			if existing := self.forwards[destinationId]; existing != nil && !existing.IsDone() {
 				raceWinner = existing
 				return
 			}
@@ -3983,6 +4379,15 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 			return false
 		}
 		defer forward.sendAdmission.done()
+		outputAccepted := false
+		if ledger := self.exchange.residentPayloadLedger(); ledger != nil {
+			ledger.update(residentPayloadForwardOutput, forward.clientId[15], payloadCharge(transferFrameBytes), true)
+			defer func() {
+				if !outputAccepted {
+					ledger.update(residentPayloadForwardOutput, forward.clientId[15], payloadCharge(transferFrameBytes), false)
+				}
+			}()
+		}
 
 		// fast path: enqueue without blocking
 		select {
@@ -3990,6 +4395,10 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 			return false
 		case forward.send <- transferFrameBytes:
 			messageOwned = false
+			outputAccepted = true
+			// Refused offers must not renew a full destination queue's idle
+			// allowance. Only an accepted payload is forward activity.
+			forward.UpdateActivity()
 			return true
 		default:
 		}
@@ -4003,6 +4412,8 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 				return false
 			case forward.send <- transferFrameBytes:
 				messageOwned = false
+				outputAccepted = true
+				forward.UpdateActivity()
 				return true
 			case <-time.After(self.exchange.settings.ForwardTimeout):
 			}
@@ -4047,13 +4458,16 @@ func (self *Resident) handleClientReceive(source connect.TransferPath, frames []
 	defer self.controlIngressAdmission.done()
 	byteCount := residentControlFrameByteCount(frames)
 	shared := shareResidentControlFrames(frames)
+	if ledger := self.exchange.residentPayloadLedger(); ledger != nil {
+		ledger.update(residentPayloadControl, self.clientId[15], controlPayloadCharge(shared), true)
+	}
 	select {
 	case <-self.ctx.Done():
-		returnResidentControlFrames(shared)
+		self.releaseControlPayload(shared)
 	case self.controlIngress <- shared:
 		return
 	default:
-		returnResidentControlFrames(shared)
+		self.releaseControlPayload(shared)
 		recordReceiveQueueDrop(receiveQueueBoundaryResidentClientControl, byteCount)
 		// Control Transfer delivery has already reached its final application
 		// callback, so silently skipping a frame can acknowledge durable state
@@ -4137,15 +4551,15 @@ func (self *Resident) AddForward() (
 	closeForward func(),
 	returnErr error,
 ) {
-	return self.addForwardWithReceive(func(message []byte) bool {
-		return self.client.ForwardWithTimeout(message, self.exchange.settings.WriteTimeout)
+	return self.addForwardWithReceive(func(ctx context.Context, message []byte) bool {
+		return self.client.ForwardWithTimeout(message, self.exchange.settings.WriteTimeout, connect.Ctx(ctx))
 	})
 }
 
 // addForwardWithReceive creates the accept-side forward queue. Tests provide
 // a controlled receiver to verify teardown while a delivery is in progress.
 func (self *Resident) addForwardWithReceive(
-	receive func(message []byte) bool,
+	receive func(context.Context, []byte) bool,
 ) (
 	forward chan []byte,
 	closeForward func(),
@@ -4169,7 +4583,7 @@ func (self *Resident) addForwardWithReceive(
 				if !ok {
 					return
 				}
-				if !receive(message) {
+				if !receive(forwardCtx, message) {
 					forwardReceiveDroppedCounter.Inc()
 					if glog.V(1) {
 						glog.Infof("[rf]drop receive full %s\n", self.clientId)
@@ -4236,6 +4650,31 @@ func (self *Resident) CancelIfIdle() bool {
 	return false
 }
 
+// Retire after the existing idle allowance. A late constructor or activity
+// between timer wakes must not round that deadline up by another whole TTL.
+// Activity can move the deadline after arming; rechecking on wake preserves
+// that activity's full allowance without changing accepted control teardown.
+func (self *Resident) runIdleWatcher() {
+	defer self.Cancel()
+	timer := time.NewTimer(self.exchange.settings.ExchangeResidentTtl)
+	defer timer.Stop()
+	for {
+		if self.CancelIfIdle() {
+			if glog.V(1) {
+				glog.Infof("[r]idle %s\n", self.clientId)
+			}
+			return
+		}
+		remaining := self.exchange.settings.ExchangeResidentTtl - time.Since(time.Unix(0, self.lastActivityNanos.Load()))
+		timer.Reset(max(0, remaining))
+		select {
+		case <-self.Done():
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 func (self *Resident) IsDone() bool {
 	select {
 	case <-self.ctx.Done():
@@ -4264,8 +4703,10 @@ func (self *Resident) startForwardWorker(forward *ResidentForward, run func()) b
 		return false
 	}
 	self.forwardWorkers.Add(1)
+	residentForwardWorkersGauge.Inc()
 	go server.HandleError(func() {
 		defer self.forwardWorkers.Done()
+		defer residentForwardWorkersGauge.Dec()
 		run()
 	}, self.cancel)
 	return true
@@ -4317,6 +4758,17 @@ func (self *Resident) CloseAndWait(ctx context.Context) error {
 	self.controlIngressAdmission.wait()
 	self.forwardIngressAdmission.wait()
 	callbackErr := waitForWorkerGroup(ctx, &self.callbackWorkers, "resident callback workers")
+	if callbackErr == nil {
+		// A callback admitted before Close can win its ready queue send after a
+		// canceled worker's deferred drain. Producer and worker joins make this
+		// final drain race-free without closing callback-facing channels.
+		self.drainControlPayloads()
+		for shardIndex := range self.forwardIngress {
+			if queue := self.forwardIngress[shardIndex].queue; queue != nil {
+				self.drainForwardIngress(queue)
+			}
+		}
+	}
 	if self.residentController != nil {
 		self.residentController.Close()
 	}

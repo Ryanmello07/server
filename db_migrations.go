@@ -7872,4 +7872,1709 @@ var migrations = []any{
 		CREATE INDEX wallet_auth_challenge_attempt_client_address_hash_attempt_time
 		ON wallet_auth_challenge_attempt (client_address_hash, attempt_time)
 	`),
+
+	// One exact scorer-owned control is frozen on the first complete measured
+	// attempt in each competition round. Later jobs authenticate these bytes and
+	// skip incumbent execution, so absolute candidate latency is comparable
+	// across the epoch. Append after every published migration; never move this
+	// into the historical competition block above.
+	newSqlMigration(`
+		CREATE TABLE competition_round_baseline (
+			round_id uuid PRIMARY KEY REFERENCES competition_round(round_id),
+			baseline_json bytea NOT NULL CHECK (
+				octet_length(baseline_json) BETWEEN 1 AND 1048576
+			),
+			baseline_sha256 char(64) NOT NULL CHECK (
+				baseline_sha256 ~ '^[0-9a-f]{64}$'
+			),
+			source_job_id uuid NOT NULL REFERENCES competition_job(job_id),
+			source_attempt integer NOT NULL CHECK (source_attempt > 0),
+			source_artifact_manifest_sha256 char(64) NOT NULL CHECK (
+				source_artifact_manifest_sha256 ~ '^[0-9a-f]{64}$'
+			),
+			base_sha char(40) NOT NULL CHECK (base_sha ~ '^[0-9a-f]{40}$'),
+			providers_sha256 char(64) NOT NULL CHECK (providers_sha256 ~ '^[0-9a-f]{64}$'),
+			evaluator_image_digest varchar(71) NOT NULL CHECK (
+				evaluator_image_digest ~ '^sha256:[0-9a-f]{64}$'
+			),
+			scorer_version varchar(64) NOT NULL,
+			hardware_id varchar(128) NOT NULL,
+			host_qualification_sha256 char(64) NOT NULL CHECK (
+				host_qualification_sha256 ~ '^[0-9a-f]{64}$'
+			),
+			created_at timestamp NOT NULL
+		);
+
+		CREATE FUNCTION competition_round_baseline_insert_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_baseline_insert_guard$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM competition_job
+				WHERE job_id = NEW.source_job_id AND round_id = NEW.round_id
+				  AND attempt_count >= NEW.source_attempt
+			) THEN
+				RAISE EXCEPTION 'competition round baseline source does not belong to its round attempt';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_round_baseline_insert_guard$;
+
+		CREATE TRIGGER competition_round_baseline_source_guard
+		BEFORE INSERT ON competition_round_baseline
+		FOR EACH ROW EXECUTE FUNCTION competition_round_baseline_insert_guard();
+
+		CREATE TRIGGER competition_round_baseline_append_only
+		BEFORE UPDATE OR DELETE ON competition_round_baseline
+		FOR EACH ROW EXECUTE FUNCTION competition_append_only_guard();
+	`),
+
+	// A shared baseline makes normalized score a display transformation of the
+	// same control for every job. Make the database honesty-review order state
+	// the actual competition rule directly: lowest absolute candidate latency,
+	// then deterministic admission identity.
+	newSqlMigration(`
+		CREATE OR REPLACE FUNCTION competition_candidate_review_insert_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_candidate_review_gate$
+		DECLARE
+			epoch_round competition_round%ROWTYPE;
+			expected_rank bigint;
+			unresolved_better bigint;
+		BEGIN
+			SELECT * INTO epoch_round
+			FROM competition_round
+			WHERE round_id = NEW.round_id;
+			IF NOT FOUND OR epoch_round.canceled OR epoch_round.finalized_at IS NOT NULL OR
+			   NEW.reviewed_at < epoch_round.closes_at OR EXISTS (
+				SELECT 1 FROM competition_job
+				WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+			) OR EXISTS (
+				SELECT 1 FROM competition_candidate_review
+				WHERE round_id = NEW.round_id AND decision = 'approved'
+			) THEN
+				RAISE EXCEPTION 'competition epoch is not ready for candidate review';
+			END IF;
+
+			WITH eligible AS (
+				SELECT job_id,
+				       row_number() OVER (
+				           ORDER BY (score_json->>'raw_score')::numeric ASC,
+				                    submitted_at, job_id
+				       ) AS candidate_rank
+				FROM competition_job
+				WHERE round_id = NEW.round_id AND state = 'succeeded'
+				  AND score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+				  AND score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+				  AND jsonb_typeof(score_json->'gates') = 'object'
+				  AND score_json->'gates' <> '{}'::jsonb
+				  AND NOT EXISTS (
+				      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+				      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+				  )
+			)
+			SELECT candidate.candidate_rank,
+			       count(better.job_id) FILTER (
+			           WHERE NOT EXISTS (
+			               SELECT 1 FROM competition_candidate_review AS prior_review
+			               WHERE prior_review.round_id = NEW.round_id
+			                 AND prior_review.job_id = better.job_id
+			                 AND prior_review.decision = 'rejected'
+			           )
+			       )
+			INTO expected_rank, unresolved_better
+			FROM eligible AS candidate
+			LEFT JOIN eligible AS better ON better.candidate_rank < candidate.candidate_rank
+			WHERE candidate.job_id = NEW.job_id
+			GROUP BY candidate.candidate_rank;
+
+			IF expected_rank IS NULL OR NEW.candidate_rank <> expected_rank THEN
+				RAISE EXCEPTION 'competition review job is not an eligible ranked candidate';
+			END IF;
+			IF unresolved_better <> 0 THEN
+				RAISE EXCEPTION 'competition review skipped a higher-ranked candidate';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_candidate_review_gate$;
+	`),
+
+	// Baseline presence is the immutable ranking-policy discriminator. Preserve
+	// legacy normalized ordering and prevent a shared control from being added
+	// retroactively to scored legacy history or a terminal round.
+	newSqlMigration(`
+		CREATE OR REPLACE FUNCTION competition_round_baseline_insert_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_baseline_insert_guard$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM competition_round
+				WHERE round_id = NEW.round_id AND (canceled OR finalized_at IS NOT NULL)
+			) THEN
+				RAISE EXCEPTION 'competition round baseline cannot be attached after finalization or cancellation';
+			END IF;
+			IF NOT EXISTS (
+				SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id
+			) AND EXISTS (
+				SELECT 1 FROM competition_job WHERE round_id = NEW.round_id AND state = 'succeeded'
+			) THEN
+				RAISE EXCEPTION 'competition round baseline cannot replace legacy ranking policy';
+			END IF;
+			IF NOT EXISTS (
+				SELECT 1 FROM competition_job
+				WHERE job_id = NEW.source_job_id AND round_id = NEW.round_id
+				  AND state = 'running' AND attempt_count >= NEW.source_attempt
+			) THEN
+				RAISE EXCEPTION 'competition round baseline source does not belong to its round attempt';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_round_baseline_insert_guard$;
+
+		CREATE OR REPLACE FUNCTION competition_candidate_review_insert_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_candidate_review_gate$
+		DECLARE
+			epoch_round competition_round%ROWTYPE;
+			expected_rank bigint;
+			unresolved_better bigint;
+		BEGIN
+			SELECT * INTO epoch_round
+			FROM competition_round
+			WHERE round_id = NEW.round_id;
+			IF NOT FOUND OR epoch_round.canceled OR epoch_round.finalized_at IS NOT NULL OR
+			   NEW.reviewed_at < epoch_round.closes_at OR EXISTS (
+				SELECT 1 FROM competition_job
+				WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+			) OR EXISTS (
+				SELECT 1 FROM competition_candidate_review
+				WHERE round_id = NEW.round_id AND decision = 'approved'
+			) THEN
+				RAISE EXCEPTION 'competition epoch is not ready for candidate review';
+			END IF;
+
+			WITH eligible AS (
+				SELECT job_id,
+				       row_number() OVER (
+				           ORDER BY CASE WHEN NOT EXISTS (
+				                        SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id
+				                    ) THEN (score_json->>'normalized_score')::numeric END DESC,
+				                    (score_json->>'raw_score')::numeric ASC,
+				                    submitted_at, job_id
+				       ) AS candidate_rank
+				FROM competition_job
+				WHERE round_id = NEW.round_id AND state = 'succeeded'
+				  AND score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+				  AND score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+				  AND jsonb_typeof(score_json->'gates') = 'object'
+				  AND score_json->'gates' <> '{}'::jsonb
+				  AND NOT EXISTS (
+				      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+				      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+				  )
+			)
+			SELECT candidate.candidate_rank,
+			       count(better.job_id) FILTER (
+			           WHERE NOT EXISTS (
+				               SELECT 1 FROM competition_candidate_review AS prior_review
+				               WHERE prior_review.round_id = NEW.round_id
+				                 AND prior_review.job_id = better.job_id
+				                 AND prior_review.decision = 'rejected'
+			           )
+			       )
+			INTO expected_rank, unresolved_better
+			FROM eligible AS candidate
+			LEFT JOIN eligible AS better ON better.candidate_rank < candidate.candidate_rank
+			WHERE candidate.job_id = NEW.job_id
+			GROUP BY candidate.candidate_rank;
+
+			IF expected_rank IS NULL OR NEW.candidate_rank <> expected_rank THEN
+				RAISE EXCEPTION 'competition review job is not an eligible ranked candidate';
+			END IF;
+			IF unresolved_better <> 0 THEN
+				RAISE EXCEPTION 'competition review skipped a higher-ranked candidate';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_candidate_review_gate$;
+	`),
+
+	// Keep these published entries at their original indices even when a
+	// feature consumer is removed; activation history and later identities remain.
+	// The latency attestations providers make to extenders
+	// (connect/DESIGNNOTES4.md §3): one row per attestation the operator
+	// verified, keyed so a replayed report is a no-op. The create_time index
+	// is the retention sweep; the (extender_id, create_time) index is the per
+	// extender read.
+	newSqlMigration(`
+		CREATE TABLE network_extender_latency (
+			latency_id uuid NOT NULL,
+			extender_id uuid NOT NULL,
+			client_id uuid NOT NULL,
+			probe_nonce bytea NOT NULL,
+			rtt_ms int NOT NULL,
+			probe_time timestamp NOT NULL,
+			create_time timestamp NOT NULL DEFAULT now(),
+
+			PRIMARY KEY (latency_id),
+			UNIQUE (extender_id, client_id, probe_nonce)
+		)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_extender_latency_create_time
+		ON network_extender_latency (create_time)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_extender_latency_extender_id_create_time
+		ON network_extender_latency (extender_id, create_time)
+	`),
+
+	// The location an extender activated from, one row per activation
+	// (connect/EXTENDER.md M1), kept the way a provider's connection keeps
+	// its own: the privacy-preserving address hash and the city, region and
+	// country the activating address resolved to. The columns on
+	// network_extender are the latest activation; this is the history, which
+	// is what a provider latency attestation is later placed against.
+	newSqlMigration(`
+		CREATE TABLE network_extender_activation (
+			activation_id uuid NOT NULL,
+			extender_id uuid NOT NULL,
+			activate_time timestamp NOT NULL,
+			ip_version int NOT NULL,
+			client_address_hash bytea NULL,
+			country_code varchar NOT NULL DEFAULT '',
+			location_id uuid NULL,
+			city_location_id uuid NULL,
+			region_location_id uuid NULL,
+			country_location_id uuid NULL,
+
+			PRIMARY KEY (activation_id)
+		)
+	`),
+	newSqlMigration(`
+		CREATE INDEX network_extender_activation_extender_id_activate_time
+		ON network_extender_activation (extender_id, activate_time)
+	`),
+
+	// Staging names its best statistically eligible submission automatically,
+	// without honesty review or promotion. Keep the staging review block and
+	// production approval gate; finalized history is never rewritten.
+	newSqlMigration(`
+		CREATE OR REPLACE FUNCTION competition_round_honesty_review_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_honesty_review_gate$
+		DECLARE
+			expected_staging_winner uuid;
+		BEGIN
+			IF NEW.finalized_at IS NOT NULL AND OLD.finalized_at IS NULL THEN
+				IF EXISTS (
+					SELECT 1 FROM competition_job
+					WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+				) THEN
+					RAISE EXCEPTION 'competition epoch still has active evaluations';
+				END IF;
+				IF NEW.staging = true THEN
+					SELECT job_id INTO expected_staging_winner
+					FROM competition_job
+					WHERE round_id = NEW.round_id AND state = 'succeeded'
+					  AND score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+					  AND score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+					  AND jsonb_typeof(score_json->'gates') = 'object'
+					  AND score_json->'gates' <> '{}'::jsonb
+					  AND NOT EXISTS (
+					      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+					      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+					  )
+					ORDER BY CASE WHEN NOT EXISTS (
+					             SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id
+					         ) THEN (score_json->>'normalized_score')::numeric END DESC,
+					         (score_json->>'raw_score')::numeric ASC, submitted_at, job_id
+					LIMIT 1;
+					IF NEW.winner_job_id IS DISTINCT FROM expected_staging_winner THEN
+						RAISE EXCEPTION 'competition staging winner is not the highest-ranked eligible job';
+					END IF;
+					RETURN NEW;
+				END IF;
+				IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM competition_candidate_review
+					WHERE round_id = NEW.round_id AND job_id = NEW.winner_job_id
+					  AND decision = 'approved'
+				) THEN
+					RAISE EXCEPTION 'competition winner has not passed honesty review';
+				END IF;
+				IF NEW.winner_job_id IS NULL AND EXISTS (
+					SELECT 1
+					FROM competition_job AS candidate
+					WHERE candidate.round_id = NEW.round_id AND candidate.state = 'succeeded'
+					  AND candidate.score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+					  AND candidate.score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+					  AND jsonb_typeof(candidate.score_json->'gates') = 'object'
+					  AND candidate.score_json->'gates' <> '{}'::jsonb
+					  AND NOT EXISTS (
+					      SELECT 1 FROM jsonb_each(candidate.score_json->'gates') AS gate
+					      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+					  )
+					  AND NOT EXISTS (
+					      SELECT 1 FROM competition_candidate_review AS review
+					      WHERE review.round_id = NEW.round_id
+					        AND review.job_id = candidate.job_id
+					        AND review.decision = 'rejected'
+					  )
+				) THEN
+					RAISE EXCEPTION 'competition epoch has an unresolved significant candidate';
+				END IF;
+			END IF;
+			RETURN NEW;
+		END
+		$competition_round_honesty_review_gate$;
+	`),
+
+	// The points leaderboard's seven-day operator blocks are independent of ST
+	// epochs and of the time a payout is posted. A payment can include paid
+	// traffic from several Sunday-to-Sunday blocks, so retain each payment's
+	// qualifying paid-sweep block once instead of rescanning the large
+	// transfer_escrow_sweep table on every hourly leaderboard rebuild.
+	newSqlMigration(`
+		CREATE TABLE account_payment_block (
+			payment_id uuid NOT NULL,
+			block_number bigint NOT NULL CHECK (block_number > 0),
+			PRIMARY KEY (payment_id, block_number)
+		)
+	`),
+	newSqlMigration(`
+		ALTER TABLE account_payment
+		ADD COLUMN block_rollup_complete boolean NOT NULL DEFAULT false
+	`),
+	newSqlMigration(`
+		ALTER TABLE account_payment
+		ADD COLUMN block_rollup_cursor uuid NULL
+	`),
+	newSqlMigration(`
+		CREATE INDEX account_payment_block_number_payment
+		ON account_payment_block (block_number, payment_id)
+	`),
+	newSqlMigration(`
+		CREATE INDEX account_payment_block_rollup_pending
+		ON account_payment (create_time, payment_id)
+		WHERE NOT block_rollup_complete
+	`),
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS account_point_payment_rollup
+		 ON account_point (account_payment_id)
+		 WHERE account_payment_id IS NOT NULL AND point_value > 0`,
+		`CREATE INDEX IF NOT EXISTS account_point_payment_rollup
+		 ON account_point (account_payment_id)
+		 WHERE account_payment_id IS NOT NULL AND point_value > 0`,
+	),
+	// Staging exercises winner publication even when noise defeats significance.
+	// Production's honesty and statistical gates retain their published policy.
+	newSqlMigration(`
+		-- staging_best_safe_winner_v691
+		CREATE OR REPLACE FUNCTION competition_round_honesty_review_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_round_honesty_review_gate$
+		DECLARE
+			expected_staging_winner uuid;
+		BEGIN
+			IF NEW.finalized_at IS NOT NULL AND OLD.finalized_at IS NULL THEN
+				IF EXISTS (
+					SELECT 1 FROM competition_job
+					WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+				) THEN
+					RAISE EXCEPTION 'competition epoch still has active evaluations';
+				END IF;
+				IF NEW.staging = true THEN
+					SELECT job_id INTO expected_staging_winner
+					FROM competition_job
+					WHERE round_id = NEW.round_id AND state = 'succeeded'
+					  AND score_json @> '{"placeable":true}'::jsonb
+					  AND jsonb_typeof(score_json->'gates') = 'object'
+					  AND score_json->'gates' <> '{}'::jsonb
+					  AND NOT EXISTS (
+					      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+					      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+					  )
+					ORDER BY CASE WHEN NOT EXISTS (
+					             SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id
+					         ) THEN (score_json->>'normalized_score')::numeric END DESC,
+					         (score_json->>'raw_score')::numeric ASC, submitted_at, job_id
+					LIMIT 1;
+					IF NEW.winner_job_id IS DISTINCT FROM expected_staging_winner THEN
+						RAISE EXCEPTION 'competition staging winner is not the highest-ranked eligible job';
+					END IF;
+					RETURN NEW;
+				END IF;
+				IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM competition_candidate_review
+					WHERE round_id = NEW.round_id AND job_id = NEW.winner_job_id
+					  AND decision = 'approved'
+				) THEN
+					RAISE EXCEPTION 'competition winner has not passed honesty review';
+				END IF;
+				IF NEW.winner_job_id IS NULL AND EXISTS (
+					SELECT 1
+					FROM competition_job AS candidate
+					WHERE candidate.round_id = NEW.round_id AND candidate.state = 'succeeded'
+					  AND candidate.score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+					  AND candidate.score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+					  AND jsonb_typeof(candidate.score_json->'gates') = 'object'
+					  AND candidate.score_json->'gates' <> '{}'::jsonb
+					  AND NOT EXISTS (
+					      SELECT 1 FROM jsonb_each(candidate.score_json->'gates') AS gate
+					      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+					  )
+					  AND NOT EXISTS (
+					      SELECT 1 FROM competition_candidate_review AS review
+					      WHERE review.round_id = NEW.round_id
+					        AND review.job_id = candidate.job_id
+					        AND review.decision = 'rejected'
+					  )
+				) THEN
+					RAISE EXCEPTION 'competition epoch has an unresolved significant candidate';
+				END IF;
+			END IF;
+			RETURN NEW;
+		END
+		$competition_round_honesty_review_gate$;
+	`),
+
+	// The canonical place key (connect/GEOMAP.md §4.2, D7): the GeoNames id
+	// GeoLite2 gives the city, subdivision or country a row stands for.
+	// CreateLocation and the seeder match on it before the name, so a renamed
+	// place keeps its row. It is NULL on rows that predate it (the old city
+	// list, the older ip databases) until a seeded or looked-up place of the
+	// same name fills it in, and stays NULL on the region named for a country
+	// GeoLite2 gives no subdivision, which stands for no GeoNames place. Adding
+	// a nullable column rewrites nothing.
+	newSqlMigration(`
+		ALTER TABLE location
+		ADD COLUMN geoname_id bigint NULL
+	`),
+	// A GeoNames id names one place, so it is unique where set. Build online:
+	// CreateLocation inserts on the connect-announce path, and a plain build
+	// would hold those inserts for the scan of every location row. The drop
+	// clears the invalid index an interrupted concurrent build leaves behind.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS location_geoname_id
+	`, `
+		CREATE UNIQUE INDEX CONCURRENTLY location_geoname_id
+		ON location (geoname_id)
+		WHERE geoname_id IS NOT NULL
+	`, `
+		DROP INDEX IF EXISTS location_geoname_id;
+		CREATE UNIQUE INDEX location_geoname_id
+		ON location (geoname_id)
+		WHERE geoname_id IS NOT NULL
+	`),
+
+	// Pings as their pinger reports them (connect/GEOMAP.md §2.5, §2.6): one
+	// row per attested probe of a target extender, by a provider (pinger_kind
+	// 1, pinger_id its client id) or by an extender (pinger_kind 2, pinger_id
+	// its extender id). cosign is the operator's own verdict, recomputed at
+	// ingest under the stored keys rather than taken from the report: 1 when
+	// the target's co-signature verifies, 2 when the pinger says the target
+	// refused (cosign_reason is the reason it says the target gave), 0 when no
+	// verdict arrived. Only a co-signed row is a measurement (D8); the others
+	// are the pinger's claims, read in aggregate (§5.5). Both signatures are
+	// kept so a row can be re-verified and a dispute shown rather than
+	// argued. Rows live one day and are swept hourly (§5.7).
+	newSqlMigration(`
+		CREATE TABLE network_ping (
+			ping_id uuid NOT NULL,
+			pinger_kind smallint NOT NULL,
+			pinger_id uuid NOT NULL,
+			target_extender_id uuid NOT NULL,
+			probe_nonce bytea NOT NULL,
+			rtt_ms int NOT NULL,
+			probe_time timestamp NOT NULL,
+			cosign smallint NOT NULL,
+			cosign_reason smallint NOT NULL DEFAULT 0,
+			pinger_signature bytea NOT NULL,
+			cosignature bytea NULL,
+			create_time timestamp NOT NULL DEFAULT now(),
+
+			PRIMARY KEY (ping_id)
+		)
+	`),
+	// One row per target, pinger and nonce. The nonce is the target's, fresh
+	// per probe, so a report posted twice is a no-op at the insert rather
+	// than a second sample, which is what makes a replay count as rejected.
+	newSqlMigration(`
+		CREATE UNIQUE INDEX network_ping_target_pinger_nonce
+		ON network_ping (target_extender_id, pinger_kind, pinger_id, probe_nonce)
+	`),
+	// The retention sweep.
+	newSqlMigration(`
+		CREATE INDEX network_ping_create_time
+		ON network_ping (create_time)
+	`),
+	// The per target read: what was measured of one extender in the window,
+	// and how often it refused.
+	newSqlMigration(`
+		CREATE INDEX network_ping_target_extender_id_create_time
+		ON network_ping (target_extender_id, create_time)
+	`),
+	// The per pinger read: what one source measured in the window, which is
+	// what its reputation is scored on (§5.5).
+	newSqlMigration(`
+		CREATE INDEX network_ping_pinger_kind_pinger_id_create_time
+		ON network_ping (pinger_kind, pinger_id, create_time)
+	`),
+
+	// The genesis accuracy radius (connect/GEOMAP.md §5.1): GeoLite2's radius,
+	// in km, around the coordinates it gives the address a connection's
+	// location was looked up from -- a few km for a well placed residential
+	// prefix, 1000 for an address it can place only in its country. It is how
+	// strongly the derive phase anchors a node to its genesis. NULL when the
+	// location came from the egress probe or from an override that names no
+	// radius, and on every row written before this column; adding a nullable
+	// column with no default rewrites nothing.
+	newSqlMigration(`
+		ALTER TABLE network_client_location
+		ADD COLUMN accuracy_km real NULL
+	`),
+	// The same radius for the address an extender activated from, kept on
+	// its activation history row, which is the extender's genesis (§5.1).
+	newSqlMigration(`
+		ALTER TABLE network_extender_activation
+		ADD COLUMN accuracy_km real NULL
+	`),
+
+	// The relay depth of a ping (connect/GEOMAP.md §2.9, D22): 0 for a direct
+	// probe, else the number of NLayer relays it crossed to reach the chain
+	// end its target names. The pinger reports it outside its signature --
+	// the probe response carries it, and the claim does not -- so nothing
+	// checks it, and nothing needs to: a relayed ping is shown on the
+	// dashboard and counted as co-signature evidence but is never a solver
+	// term, since a relayed round trip overstates the distance to the chain
+	// end by the detour through the front, and a pinger that hid a relay
+	// could only put a longer round trip in front of the solver. The table is
+	// new and empty, so the constant default rewrites nothing.
+	newSqlMigration(`
+		ALTER TABLE network_ping
+		ADD COLUMN hop_count smallint NOT NULL DEFAULT 0
+	`),
+
+	// Derived locations (connect/GEOMAP.md §5.4, §5.7, §6): where the derive
+	// phase placed a provider (node_kind 1, node_id its client id) or an
+	// extender (node_kind 2, node_id its extender id) from the pings it
+	// co-signed, one row per node, rewritten whole by each derivation. The row
+	// keeps the genesis it was solved from and the radius it was anchored with,
+	// the correction as a latitude and longitude delta, the point, the pings and
+	// peers behind it, its residual and the node's reputation as a source
+	// (§5.5), and the place the point maps to, with whether that place lies
+	// outside the genesis region or country. A node the derivation does not
+	// publish has no row and keeps its genesis; a row is swept a day after its
+	// update_time, so its presence is its freshness. The table holds at most one
+	// row per node that pinged in the last day, so the sweep and the dashboard
+	// counts scan it whole and it needs no index beyond its key.
+	newSqlMigration(`
+		CREATE TABLE derived_location (
+			node_kind smallint NOT NULL,
+			node_id uuid NOT NULL,
+			genesis_latitude double precision NOT NULL,
+			genesis_longitude double precision NOT NULL,
+			genesis_accuracy_km real NOT NULL,
+			delta_latitude double precision NOT NULL,
+			delta_longitude double precision NOT NULL,
+			latitude double precision NOT NULL,
+			longitude double precision NOT NULL,
+			ping_count int NOT NULL,
+			peer_count int NOT NULL,
+			residual_km real NOT NULL,
+			reputation real NOT NULL,
+			crossed_region bool NOT NULL,
+			crossed_country bool NOT NULL,
+			location_id uuid NOT NULL,
+			city_location_id uuid NOT NULL,
+			region_location_id uuid NOT NULL,
+			country_location_id uuid NOT NULL,
+			update_time timestamp NOT NULL,
+
+			PRIMARY KEY (node_kind, node_id)
+		)
+	`),
+
+	// The genesis of a connection's location (connect/GEOMAP.md §5.1, §6): the
+	// location the connection's own address lookup resolved to, stored beside
+	// the location the connection is published at. Once a derived location is
+	// published the two differ, and the derive phase must still read the
+	// lookup as the provider's genesis, never the derived location it wrote,
+	// or each derivation would anchor to the one before it. NULL for a location
+	// the egress probe placed and on every row written before this column;
+	// adding a nullable column with no default rewrites nothing.
+	newSqlMigration(`
+		ALTER TABLE network_client_location
+		ADD COLUMN genesis_location_id uuid NULL
+	`),
+
+	// The egress index (connect/GEOMAP.md §10.4, D23), written per provider by
+	// the reliability rollup from its latest egress health run, and read by the
+	// client-score job in place of the net-type score: the weighted, capped
+	// count of the run's scored loads that failed every retry, and 0 when
+	// there is no usable run, which egress_quality then marks. NULL is a row
+	// the new rollup has not written yet -- every row before this column, or
+	// one an older binary inserted -- and the client-score job ranks such a
+	// row exactly as before, on max_net_type_score and
+	// max_net_type_score_speed. Adding a nullable column with no default
+	// rewrites nothing.
+	newSqlMigration(`
+		ALTER TABLE network_client_location_reliability
+		ADD COLUMN egress_index smallint NULL
+	`),
+	// Whether that run passes the 90 % rule over all its scored loads: true or
+	// false when the run is evidence, NULL when there is none, which puts a
+	// provider past the exclusions and the reliability minimums in the online
+	// bucket.
+	newSqlMigration(`
+		ALTER TABLE network_client_location_reliability
+		ADD COLUMN egress_quality bool NULL
+	`),
+	// The newer of the provider's health run and location probe, whatever its
+	// age, so a reader can tell stale evidence from none; NULL when there has
+	// been neither.
+	newSqlMigration(`
+		ALTER TABLE network_client_location_reliability
+		ADD COLUMN egress_evidence_time timestamp NULL
+	`),
+
+	// A failed blackhole check is a failure, not a verdict (connect/GEOMAP.md
+	// §11.3, D24): a provider is dark only after consecutive failed checks
+	// spanning a minimum time. The row carries the run: how many measured
+	// checks in a row have failed, when the first of them started, and when
+	// the provider is next due, which is a backoff step after a failure and
+	// the ordinary due age after a pass. Every existing row starts a new run
+	// at 0 -- the single-check verdicts before this were the false dark of
+	// §11.2 -- and a NULL next_due_at is due its old checked_at-based age.
+	// Adding a column with a constant default, or a nullable one, rewrites
+	// nothing.
+	newSqlMigration(`
+		ALTER TABLE provider_blackhole_check
+		ADD COLUMN consecutive_failures int NOT NULL DEFAULT 0
+	`),
+	newSqlMigration(`
+		ALTER TABLE provider_blackhole_check
+		ADD COLUMN first_failed_at timestamp NULL
+	`),
+	newSqlMigration(`
+		ALTER TABLE provider_blackhole_check
+		ADD COLUMN next_due_at timestamp NULL
+	`),
+
+	// What a health run could not score (connect/GEOMAP.md §11.3): the loads
+	// whose tunnel was gone and could not be re-created (out of ok_count and
+	// total_count, counted and named apart), the canaries loaded from a place
+	// their site is marked incompatible with, the classes too thin for the
+	// provider's place to fill their sample, and the failed loads the server
+	// itself left out of the counts -- a site on probation, or one marked
+	// incompatible with the provider's place (§11.4). Defaults describe a run
+	// with none of these, which is every run before this column.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_health
+		ADD COLUMN not_measured_count int NOT NULL DEFAULT 0,
+		ADD COLUMN not_measured_names text NOT NULL DEFAULT '',
+		ADD COLUMN canary_passed_names text NOT NULL DEFAULT '',
+		ADD COLUMN canary_failed_names text NOT NULL DEFAULT '',
+		ADD COLUMN short_classes text NOT NULL DEFAULT '',
+		ADD COLUMN unscored_failed_names text NOT NULL DEFAULT ''
+	`),
+
+	// The egress destination pool as data (connect/GEOMAP.md §11.4): every site
+	// the prober may load, active or candidate, with its load contract in the
+	// prober's own wire shape (egresshealth.Destination: expect, status,
+	// max_bytes, headers, verify -- the body check DoH and portal entries
+	// cannot run without), its category and region for representative
+	// promotion, and the places it is known not to work from. Seeded on first
+	// use from the prober's built-in table and extended from egress-sites.yml;
+	// RefreshEgressDestinations retires, promotes, marks and judges it daily.
+	// active and probation are the pool state: active and scored, active on
+	// probation (served and recorded, never scored), or a candidate.
+	// failure_share, sample_count, judged_time and above_retire_since are the
+	// last judgement, which the §2.19b monitor reads. The table holds a few
+	// hundred rows and is read whole.
+	newSqlMigration(`
+		CREATE TABLE provider_egress_destination (
+			name varchar(128) NOT NULL,
+			class varchar(32) NOT NULL,
+			url varchar(2048) NOT NULL,
+			expect varchar(16) NOT NULL DEFAULT 'body',
+			status int NOT NULL DEFAULT 0,
+			max_bytes int NOT NULL DEFAULT 0,
+			headers jsonb NOT NULL DEFAULT '{}',
+			verify jsonb NOT NULL DEFAULT '{}',
+			category varchar(32) NOT NULL DEFAULT '',
+			region varchar(64) NOT NULL DEFAULT '',
+			incompatible jsonb NOT NULL DEFAULT '[]',
+			source varchar(16) NOT NULL DEFAULT 'builtin',
+			revision int NOT NULL DEFAULT 0,
+			active bool NOT NULL DEFAULT false,
+			probation bool NOT NULL DEFAULT false,
+			added_time timestamp NOT NULL,
+			promoted_time timestamp NULL,
+			retired_time timestamp NULL,
+			retire_reason varchar(256) NOT NULL DEFAULT '',
+			retire_count int NOT NULL DEFAULT 0,
+			failure_share real NULL,
+			sample_count int NOT NULL DEFAULT 0,
+			judged_time timestamp NULL,
+			above_retire_since timestamp NULL,
+			update_time timestamp NOT NULL,
+
+			PRIMARY KEY (name)
+		)
+	`),
+
+	// Per-site load outcomes by day and by the exit's published place
+	// (connect/GEOMAP.md §11.4), written by the probe task from each run it
+	// submits. A run reports only the sites that failed, and a site is drawn
+	// in about one run in four, so the share of runs a site failed is not its
+	// failure share; the task, which holds every load of the run, records each
+	// load instead. healthy counts are loads on exits that passed nine in ten
+	// of the run's other scored sites, which is what the refresh judges sites
+	// by. The per-site, per-place concentration lives here rather than in
+	// metric labels, since sites times places is unbounded; the refresh sweeps
+	// rows past its retention.
+	newSqlMigration(`
+		CREATE TABLE provider_egress_site_tally (
+			tally_day date NOT NULL,
+			name varchar(128) NOT NULL,
+			country_code varchar(2) NOT NULL DEFAULT '',
+			region varchar(128) NOT NULL DEFAULT '',
+			load_count int NOT NULL DEFAULT 0,
+			failure_count int NOT NULL DEFAULT 0,
+			healthy_load_count int NOT NULL DEFAULT 0,
+			healthy_failure_count int NOT NULL DEFAULT 0,
+			canary_load_count int NOT NULL DEFAULT 0,
+			canary_pass_count int NOT NULL DEFAULT 0,
+			update_time timestamp NOT NULL,
+
+			PRIMARY KEY (tally_day, name, country_code, region)
+		)
+	`),
+
+	// Per-place run outcomes by day, beside the site tally: how many runs the
+	// place's exits submitted, how many of them were healthy, and how many
+	// warm-ups the operator's /ip echo never answered -- what the §2.19b
+	// country-unreachable finding needs besides the sites.
+	newSqlMigration(`
+		CREATE TABLE provider_egress_place_tally (
+			tally_day date NOT NULL,
+			country_code varchar(2) NOT NULL DEFAULT '',
+			region varchar(128) NOT NULL DEFAULT '',
+			run_count int NOT NULL DEFAULT 0,
+			healthy_run_count int NOT NULL DEFAULT 0,
+			echo_failure_count int NOT NULL DEFAULT 0,
+			update_time timestamp NOT NULL,
+
+			PRIMARY KEY (tally_day, country_code, region)
+		)
+	`),
+
+	// Pings partitioned by day (connect/GEOMAP.md §5.7, D26). At fleet scale
+	// network_ping takes hundreds of millions of rows a day and keeps about a
+	// day of them: a sweep deleting rows would leave the dead tuples, vacuum
+	// debt and index bloat that row retention left on client_reliability, at a
+	// far higher rate, where dropping a whole day's partition is a catalog
+	// change that hands its space back at once. So the table becomes
+	// range-partitioned by create_time into utc days, each partition named for
+	// its day (network_ping_p20260924 holds 2026-09-24), and the sweep drops
+	// whole days past the retention and never deletes a row.
+	//
+	// A partitioned table's unique key must carry its partition column, so the
+	// replay key gains create_time, and ping_id stops being a key: the natural
+	// key identifies a row, the id is still minted per ping, and nothing reads
+	// by it alone. With create_time in the key a copy stored at another instant
+	// no longer conflicts, so the ingest looks the target, pinger and nonce up
+	// across its replay window before it stores (AddReportedNetworkPings). The
+	// target and pinger read indexes carry over; the create_time index served
+	// only the row sweep and goes with it.
+	//
+	// The old table and its indexes are renamed network_ping_legacy first and
+	// the new table is created under the name, so every name on it is the
+	// plain one; the not null constraints are named because postgres 18
+	// catalogues them and would otherwise suffix the new table's while the old
+	// still holds the plain names. Partitions are made for yesterday, today and
+	// the next two days, which the sweep then keeps, and for every day the old
+	// table holds a row in, so the copy keeps every row; a day already past the
+	// retention goes whole at the next sweep. The following migration drops the
+	// old table.
+	newSqlMigration(`
+		ALTER TABLE network_ping RENAME TO network_ping_legacy;
+		ALTER INDEX network_ping_pkey RENAME TO network_ping_legacy_pkey;
+		ALTER INDEX network_ping_target_pinger_nonce RENAME TO network_ping_legacy_target_pinger_nonce;
+		ALTER INDEX network_ping_create_time RENAME TO network_ping_legacy_create_time;
+		ALTER INDEX network_ping_target_extender_id_create_time RENAME TO network_ping_legacy_target_extender_id_create_time;
+		ALTER INDEX network_ping_pinger_kind_pinger_id_create_time RENAME TO network_ping_legacy_pinger_kind_pinger_id_create_time;
+
+		CREATE TABLE network_ping (
+			ping_id uuid CONSTRAINT network_ping_ping_id_not_null NOT NULL,
+			pinger_kind smallint CONSTRAINT network_ping_pinger_kind_not_null NOT NULL,
+			pinger_id uuid CONSTRAINT network_ping_pinger_id_not_null NOT NULL,
+			target_extender_id uuid CONSTRAINT network_ping_target_extender_id_not_null NOT NULL,
+			probe_nonce bytea CONSTRAINT network_ping_probe_nonce_not_null NOT NULL,
+			rtt_ms int CONSTRAINT network_ping_rtt_ms_not_null NOT NULL,
+			probe_time timestamp CONSTRAINT network_ping_probe_time_not_null NOT NULL,
+			cosign smallint CONSTRAINT network_ping_cosign_not_null NOT NULL,
+			cosign_reason smallint CONSTRAINT network_ping_cosign_reason_not_null NOT NULL DEFAULT 0,
+			pinger_signature bytea CONSTRAINT network_ping_pinger_signature_not_null NOT NULL,
+			cosignature bytea NULL,
+			create_time timestamp CONSTRAINT network_ping_create_time_not_null NOT NULL DEFAULT now(),
+			hop_count smallint CONSTRAINT network_ping_hop_count_not_null NOT NULL DEFAULT 0
+		) PARTITION BY RANGE (create_time);
+
+		CREATE UNIQUE INDEX network_ping_target_pinger_nonce
+		ON network_ping (target_extender_id, pinger_kind, pinger_id, probe_nonce, create_time);
+		CREATE INDEX network_ping_target_extender_id_create_time
+		ON network_ping (target_extender_id, create_time);
+		CREATE INDEX network_ping_pinger_kind_pinger_id_create_time
+		ON network_ping (pinger_kind, pinger_id, create_time);
+
+		DO $network_ping_partitions$
+		DECLARE
+			partition_day timestamp;
+		BEGIN
+			FOR partition_day IN
+				SELECT calendar.day
+				FROM generate_series(
+					date_trunc('day', now() AT TIME ZONE 'utc') - interval '1 day',
+					date_trunc('day', now() AT TIME ZONE 'utc') + interval '2 days',
+					interval '1 day'
+				) AS calendar(day)
+				UNION
+				SELECT date_trunc('day', network_ping_legacy.create_time)
+				FROM network_ping_legacy
+			LOOP
+				EXECUTE format(
+					'CREATE TABLE %I PARTITION OF network_ping FOR VALUES FROM (%L) TO (%L)',
+					'network_ping_p' || to_char(partition_day, 'YYYYMMDD'),
+					to_char(partition_day, 'YYYY-MM-DD'),
+					to_char(partition_day + interval '1 day', 'YYYY-MM-DD')
+				);
+			END LOOP;
+		END
+		$network_ping_partitions$;
+
+		INSERT INTO network_ping (
+			ping_id,
+			pinger_kind,
+			pinger_id,
+			target_extender_id,
+			probe_nonce,
+			rtt_ms,
+			probe_time,
+			cosign,
+			cosign_reason,
+			pinger_signature,
+			cosignature,
+			create_time,
+			hop_count
+		)
+		SELECT
+			ping_id,
+			pinger_kind,
+			pinger_id,
+			target_extender_id,
+			probe_nonce,
+			rtt_ms,
+			probe_time,
+			cosign,
+			cosign_reason,
+			pinger_signature,
+			cosignature,
+			create_time,
+			hop_count
+		FROM network_ping_legacy
+	`),
+	// The table the day partitions replaced (the migration above), now that
+	// every row of it is in them.
+	newSqlMigration(`
+		DROP TABLE network_ping_legacy
+	`),
+
+	// The fleet's ping tally by hour (connect/GEOMAP.md §2.7, §5.7): what the
+	// dashboard's day of pings and the §2.19c signal read instead of the rows.
+	// At the target a day's partition of network_ping is 275 GiB, and counting
+	// it on every dashboard refresh read it whole; the ingest adds each stored
+	// batch here in the same transaction as its rows, so the counts are exact
+	// and cost a few thousand rows to read. A row is one hour, pinger kind,
+	// relay, verdict and reason, split over shards by the pinger id -- every
+	// report of the fleet adds to the same few rows of the hour, which one row
+	// each would serialize on its lock -- with the round trips the signal
+	// watches: zero, and beyond half the planet at the solver's 100 km per ms,
+	// 200 ms. It stays small, tens of thousands of rows a day, so the sweep
+	// deletes whole days of it behind the ping days it drops. The backfill
+	// counts what network_ping holds with the sixteen shards and 200 ms the
+	// ingest's defaults use.
+	newSqlMigration(`
+		CREATE TABLE network_ping_hour_tally (
+			hour timestamp NOT NULL,
+			shard smallint NOT NULL,
+			pinger_kind smallint NOT NULL,
+			relayed boolean NOT NULL,
+			cosign smallint NOT NULL,
+			cosign_reason smallint NOT NULL,
+			ping_count bigint NOT NULL,
+			zero_rtt_count bigint NOT NULL,
+			beyond_half_planet_count bigint NOT NULL,
+
+			PRIMARY KEY (hour, shard, pinger_kind, relayed, cosign, cosign_reason)
+		);
+
+		INSERT INTO network_ping_hour_tally (
+			hour,
+			shard,
+			pinger_kind,
+			relayed,
+			cosign,
+			cosign_reason,
+			ping_count,
+			zero_rtt_count,
+			beyond_half_planet_count
+		)
+		SELECT
+			date_trunc('hour', create_time),
+			get_byte(uuid_send(pinger_id), 15) % 16,
+			pinger_kind,
+			0 < hop_count,
+			cosign,
+			cosign_reason,
+			count(*),
+			count(*) FILTER (WHERE rtt_ms = 0),
+			count(*) FILTER (WHERE 200 < rtt_ms)
+		FROM network_ping
+		GROUP BY 1, 2, 3, 4, 5, 6
+	`),
+
+	// The distinct pingers of each day (connect/GEOMAP.md §2.7): one row per
+	// day, pinger kind and pinger, added at ingest in the ping's transaction
+	// and skipped when present, so a day's pingers are an index-only count
+	// where the dashboard counted them over a day of rows. A couple of million
+	// rows a day at the target, so it is partitioned by day like network_ping,
+	// on the same days, and dropped a day at a time with it.
+	newSqlMigration(`
+		CREATE TABLE network_ping_pinger_day (
+			day date NOT NULL,
+			pinger_kind smallint NOT NULL,
+			pinger_id uuid NOT NULL,
+
+			PRIMARY KEY (day, pinger_kind, pinger_id)
+		) PARTITION BY RANGE (day);
+
+		DO $network_ping_pinger_day_partitions$
+		DECLARE
+			partition_day timestamp;
+		BEGIN
+			FOR partition_day IN
+				SELECT calendar.day
+				FROM generate_series(
+					date_trunc('day', now() AT TIME ZONE 'utc') - interval '1 day',
+					date_trunc('day', now() AT TIME ZONE 'utc') + interval '2 days',
+					interval '1 day'
+				) AS calendar(day)
+				UNION
+				SELECT date_trunc('day', network_ping.create_time)
+				FROM network_ping
+			LOOP
+				EXECUTE format(
+					'CREATE TABLE %I PARTITION OF network_ping_pinger_day FOR VALUES FROM (%L) TO (%L)',
+					'network_ping_pinger_day_p' || to_char(partition_day, 'YYYYMMDD'),
+					to_char(partition_day, 'YYYY-MM-DD'),
+					to_char(partition_day + interval '1 day', 'YYYY-MM-DD')
+				);
+			END LOOP;
+		END
+		$network_ping_pinger_day_partitions$;
+
+		INSERT INTO network_ping_pinger_day (day, pinger_kind, pinger_id)
+		SELECT DISTINCT create_time::date, pinger_kind, pinger_id
+		FROM network_ping
+	`),
+
+	// The distinct targets of each day, the extenders that took a ping
+	// (connect/GEOMAP.md §2.7), kept like the pingers above: about a million
+	// rows a day at the target, partitioned by day, dropped with the pings.
+	newSqlMigration(`
+		CREATE TABLE network_ping_target_day (
+			day date NOT NULL,
+			target_extender_id uuid NOT NULL,
+
+			PRIMARY KEY (day, target_extender_id)
+		) PARTITION BY RANGE (day);
+
+		DO $network_ping_target_day_partitions$
+		DECLARE
+			partition_day timestamp;
+		BEGIN
+			FOR partition_day IN
+				SELECT calendar.day
+				FROM generate_series(
+					date_trunc('day', now() AT TIME ZONE 'utc') - interval '1 day',
+					date_trunc('day', now() AT TIME ZONE 'utc') + interval '2 days',
+					interval '1 day'
+				) AS calendar(day)
+				UNION
+				SELECT date_trunc('day', network_ping.create_time)
+				FROM network_ping
+			LOOP
+				EXECUTE format(
+					'CREATE TABLE %I PARTITION OF network_ping_target_day FOR VALUES FROM (%L) TO (%L)',
+					'network_ping_target_day_p' || to_char(partition_day, 'YYYYMMDD'),
+					to_char(partition_day, 'YYYY-MM-DD'),
+					to_char(partition_day + interval '1 day', 'YYYY-MM-DD')
+				);
+			END LOOP;
+		END
+		$network_ping_target_day_partitions$;
+
+		INSERT INTO network_ping_target_day (day, target_extender_id)
+		SELECT DISTINCT create_time::date, target_extender_id
+		FROM network_ping
+	`),
+
+	// The pings each target extender took per hour and pinger kind, and how
+	// many of them the pinger says were refused (connect/GEOMAP.md §2.7): what
+	// the per-extender counters read for each closed hour, where they scanned
+	// the hour's whole day partition of rows. Tens of millions of rows a day at
+	// the target, so partitioned by day and dropped with the ping days.
+	newSqlMigration(`
+		CREATE TABLE network_ping_target_hour_tally (
+			hour timestamp NOT NULL,
+			target_extender_id uuid NOT NULL,
+			pinger_kind smallint NOT NULL,
+			ping_count bigint NOT NULL,
+			rejection_count bigint NOT NULL,
+
+			PRIMARY KEY (hour, target_extender_id, pinger_kind)
+		) PARTITION BY RANGE (hour);
+
+		DO $network_ping_target_hour_tally_partitions$
+		DECLARE
+			partition_day timestamp;
+		BEGIN
+			FOR partition_day IN
+				SELECT calendar.day
+				FROM generate_series(
+					date_trunc('day', now() AT TIME ZONE 'utc') - interval '1 day',
+					date_trunc('day', now() AT TIME ZONE 'utc') + interval '2 days',
+					interval '1 day'
+				) AS calendar(day)
+				UNION
+				SELECT date_trunc('day', network_ping.create_time)
+				FROM network_ping
+			LOOP
+				EXECUTE format(
+					'CREATE TABLE %I PARTITION OF network_ping_target_hour_tally FOR VALUES FROM (%L) TO (%L)',
+					'network_ping_target_hour_tally_p' || to_char(partition_day, 'YYYYMMDD'),
+					to_char(partition_day, 'YYYY-MM-DD'),
+					to_char(partition_day + interval '1 day', 'YYYY-MM-DD')
+				);
+			END LOOP;
+		END
+		$network_ping_target_hour_tally_partitions$;
+
+		INSERT INTO network_ping_target_hour_tally (
+			hour,
+			target_extender_id,
+			pinger_kind,
+			ping_count,
+			rejection_count
+		)
+		SELECT
+			date_trunc('hour', create_time),
+			target_extender_id,
+			pinger_kind,
+			count(*),
+			count(*) FILTER (WHERE cosign = 2)
+		FROM network_ping
+		GROUP BY 1, 2, 3
+	`),
+
+	// The earlier staging winner migration updated the honesty-review guard,
+	// but the separate lifecycle guard still required takeover_eligible. Keep
+	// that production requirement while allowing a placeable staging winner.
+	newSqlMigration(`
+		-- staging_best_safe_winner_immutable_guard_v720
+		CREATE OR REPLACE FUNCTION competition_round_immutable_guard()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $competition_epoch_lifecycle_guard$
+		BEGIN
+			IF OLD.round_id IS DISTINCT FROM NEW.round_id OR
+			   OLD.competition_id IS DISTINCT FROM NEW.competition_id OR
+			   OLD.epoch_number IS DISTINCT FROM NEW.epoch_number OR
+			   OLD.workload_commitment IS DISTINCT FROM NEW.workload_commitment OR
+			   OLD.seed_nonce IS DISTINCT FROM NEW.seed_nonce OR
+			   OLD.seed_ciphertext IS DISTINCT FROM NEW.seed_ciphertext OR
+			   OLD.providers_sha256 IS DISTINCT FROM NEW.providers_sha256 OR
+			   OLD.providers_path IS DISTINCT FROM NEW.providers_path OR
+			   OLD.policy_json IS DISTINCT FROM NEW.policy_json OR
+			   OLD.opens_at IS DISTINCT FROM NEW.opens_at OR
+			   OLD.closes_at IS DISTINCT FROM NEW.closes_at OR
+			   OLD.reveal_at IS DISTINCT FROM NEW.reveal_at OR
+			   OLD.created_at IS DISTINCT FROM NEW.created_at OR
+			   (OLD.admission_closed_at IS NOT NULL AND
+			       OLD.admission_closed_at IS DISTINCT FROM NEW.admission_closed_at) OR
+			   (OLD.canceled AND NOT NEW.canceled) OR
+			   (OLD.finalized_at IS NOT NULL AND (
+			       OLD.finalized_at IS DISTINCT FROM NEW.finalized_at OR
+			       OLD.winner_job_id IS DISTINCT FROM NEW.winner_job_id
+			   )) OR
+			   (NEW.finalized_at IS NULL AND NEW.winner_job_id IS NOT NULL) OR
+			   (NEW.finalized_at IS NOT NULL AND
+			       NEW.finalized_at < COALESCE(NEW.admission_closed_at, NEW.closes_at))
+			THEN
+				RAISE EXCEPTION 'competition round immutable fields changed';
+			END IF;
+			IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM competition_job AS job
+				WHERE job.job_id = NEW.winner_job_id
+				  AND job.round_id = NEW.round_id
+				  AND job.state = 'succeeded'
+				  AND (job.score_json->>'placeable')::boolean
+				  AND (NEW.staging OR (job.score_json->>'takeover_eligible')::boolean)
+			) THEN
+				RAISE EXCEPTION 'competition winner is not an eligible job in this round';
+			END IF;
+			RETURN NEW;
+		END
+		$competition_epoch_lifecycle_guard$;
+	`),
+
+	// An explicit, append-only operator approval lets Apex exercise its real
+	// approved-winner path in staging without weakening production candidate
+	// review or changing an already-finalized staging winner.
+	newSqlMigration(`
+		CREATE TABLE competition_staging_winner_approval (
+			round_id uuid PRIMARY KEY REFERENCES competition_round(round_id),
+			job_id uuid NOT NULL REFERENCES competition_job(job_id),
+			reviewer_id varchar(128) NOT NULL CHECK (
+				reviewer_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+			),
+			reason text NOT NULL CHECK (octet_length(reason) BETWEEN 1 AND 4096),
+			evidence_json json NOT NULL CHECK (json_typeof(evidence_json) = 'object'),
+			evidence_sha256 varchar(64) NOT NULL CHECK (evidence_sha256 ~ '^[0-9a-f]{64}$'),
+			reviewed_at timestamp NOT NULL
+		);
+		CREATE TRIGGER competition_staging_winner_approval_append_only
+		BEFORE UPDATE OR DELETE ON competition_staging_winner_approval
+		FOR EACH ROW EXECUTE FUNCTION competition_append_only_guard();
+		CREATE FUNCTION competition_staging_winner_approval_guard()
+		RETURNS trigger LANGUAGE plpgsql AS $staging_winner_approval_guard$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM competition_round AS round
+				JOIN competition_job AS job ON job.job_id = NEW.job_id
+				WHERE round.round_id = NEW.round_id AND round.staging = true
+				  AND round.canceled = false AND round.finalized_at IS NOT NULL
+				  AND round.winner_job_id = NEW.job_id AND job.round_id = NEW.round_id
+				  AND job.state = 'succeeded'
+			) THEN
+				RAISE EXCEPTION 'staging approval requires the finalized winning job';
+			END IF;
+			RETURN NEW;
+		END
+		$staging_winner_approval_guard$;
+		CREATE TRIGGER competition_staging_winner_approval_insert_guard
+		BEFORE INSERT ON competition_staging_winner_approval
+		FOR EACH ROW EXECUTE FUNCTION competition_staging_winner_approval_guard();
+	`),
+
+	// Explicit ARIN exceptions follow connection location refreshes into the
+	// existing provider rollup. No IP address or inferred hosting flag is stored.
+	newSqlMigration(`
+		ALTER TABLE network_client_location
+			ADD COLUMN arin_risk boolean NOT NULL DEFAULT false,
+			ADD COLUMN arin_non_quality boolean NOT NULL DEFAULT false;
+		ALTER TABLE network_client_location_reliability
+			ADD COLUMN arin_risk boolean NOT NULL DEFAULT false,
+			ADD COLUMN arin_non_quality boolean NOT NULL DEFAULT false;
+	`),
+
+	// Accepted probe runs are immutable and idempotent. Quota progress belongs
+	// to durable rolling four-hour progress, separate from the eight-hour serving window.
+	newSqlMigration(`
+		CREATE TABLE provider_egress_health_history (
+			run_id uuid PRIMARY KEY,
+			client_id uuid NOT NULL,
+			measured_at timestamp NOT NULL,
+			ok_count integer NOT NULL CHECK (ok_count >= 0),
+			total_count integer NOT NULL CHECK (total_count >= ok_count),
+			class_results jsonb NOT NULL,
+			tls_authentication_failure boolean NOT NULL,
+			cycle_started_at timestamp NULL
+		);
+		CREATE INDEX provider_egress_health_history_client_time
+			ON provider_egress_health_history (client_id, measured_at);
+		CREATE INDEX provider_egress_health_history_time
+			ON provider_egress_health_history (measured_at);
+		CREATE TABLE provider_egress_probe_cycle (
+			client_id uuid PRIMARY KEY,
+			cycle_started_at timestamp NOT NULL,
+			success_count integer NOT NULL DEFAULT 0 CHECK (success_count >= 0),
+			error_count integer NOT NULL DEFAULT 0 CHECK (error_count >= 0),
+			latest_result_at timestamp NULL,
+			next_attempt_at timestamp NOT NULL
+		);
+		CREATE INDEX provider_egress_probe_cycle_next_attempt
+			ON provider_egress_probe_cycle (next_attempt_at, client_id);
+	`),
+
+	// A delayed security event must not be hidden by a newer unmeasured report.
+	// URL-specific recovery requires newer authenticated TLS evidence, even when
+	// quality fails; equal-time security findings win. Legacy unknown targets stay.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_health ADD COLUMN security_measured_at timestamp;
+		UPDATE provider_egress_health SET security_measured_at = measured_at
+			WHERE tls_authentication_failure OR ok_count > 0;
+	`),
+
+	// Admission maintains this scheduling hint once per rollup. The claim
+	// rechecks authoritative gates while its head index skips ineligible rows.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_probe_cycle ADD COLUMN eligible boolean NOT NULL DEFAULT false;
+		CREATE INDEX provider_egress_probe_cycle_eligible_next_attempt
+			ON provider_egress_probe_cycle (next_attempt_at, client_id) WHERE eligible;
+	`),
+
+	// Rolling quota reads at most ten accepted individual URL successes. Grouped
+	// legacy reports remain audit evidence but cannot satisfy this URL target.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_health_history ADD COLUMN url_probe boolean NOT NULL DEFAULT false;
+		UPDATE provider_egress_health_history SET url_probe=true
+			WHERE cycle_started_at IS NOT NULL AND total_count=1;
+		CREATE INDEX provider_egress_health_history_url_success
+			ON provider_egress_health_history(client_id, measured_at DESC)
+			WHERE url_probe AND ok_count=1;
+		ALTER TABLE provider_egress_probe_cycle ADD COLUMN outcome_count bigint NOT NULL DEFAULT 0;
+		UPDATE provider_egress_probe_cycle AS cycle SET outcome_count=history.outcomes
+		FROM (SELECT client_id,COUNT(*) AS outcomes FROM provider_egress_health_history
+			WHERE url_probe GROUP BY client_id) AS history
+		WHERE cycle.client_id=history.client_id;
+	`),
+
+	// Certificate findings are recovered only by a newer authenticated response
+	// from the exact affected URL. Legacy aggregate findings retain quarantine
+	// until their target can be reconstructed from trustworthy historical data.
+	newSqlMigration(`
+		CREATE TABLE provider_egress_url_security (
+			client_id uuid NOT NULL,
+			url_key varchar(64) NOT NULL,
+			destination jsonb NOT NULL,
+			measured_at timestamp NOT NULL,
+			tls_failure boolean NOT NULL,
+			PRIMARY KEY (client_id,url_key)
+		);
+		CREATE INDEX provider_egress_url_security_unresolved
+			ON provider_egress_url_security(client_id,url_key) WHERE tls_failure;
+		ALTER TABLE provider_egress_health ADD COLUMN legacy_tls_authentication_failure boolean NOT NULL DEFAULT false;
+		UPDATE provider_egress_health SET legacy_tls_authentication_failure=tls_authentication_failure;
+		ALTER TABLE provider_egress_health_history ADD COLUMN url_probe_evidence jsonb;
+	`),
+
+	// Stable logical routing lets an empty shard seek only its own due heads.
+	// Existing receipt tokens, pacing deadlines, and counts do not change.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_probe_cycle ADD COLUMN slot_id smallint
+			GENERATED ALWAYS AS (((hashtext(client_id::text)%1024)+1024)%1024) STORED;
+		CREATE INDEX provider_egress_probe_cycle_slot_next_attempt
+			ON provider_egress_probe_cycle(slot_id,next_attempt_at,client_id) WHERE eligible;
+	`),
+
+	// Version zero retains legacy history without asserting the real-content,
+	// redirect, timing, and wire-throughput contract of URL policy version one.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_health_history
+			ADD COLUMN url_probe_policy_version integer NOT NULL DEFAULT 0;
+		DROP INDEX provider_egress_health_history_url_success;
+		CREATE INDEX provider_egress_health_history_url_success
+			ON provider_egress_health_history(client_id, measured_at DESC)
+			WHERE url_probe AND url_probe_policy_version=1 AND ok_count=1;
+	`),
+
+	// A false exception bit is not proof a connected address was classified.
+	// Connect stamps successful lookups against the actual loaded MMDB epoch;
+	// legacy rows and explicit lookup overrides remain visibly unclassified.
+	newSqlMigration(`
+		ALTER TABLE network_client_location
+			ADD COLUMN arin_lookup_at timestamp,
+			ADD COLUMN arin_database_build_epoch bigint NOT NULL DEFAULT 0;
+	`),
+
+	// Complete exclusions include disconnected history, but default-false rows
+	// need not be read on every publication. Build the sparse covering index
+	// online; a retry first removes residue from an interrupted concurrent build.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS network_client_location_reliability_arin_exceptions
+	`, `
+		CREATE INDEX CONCURRENTLY network_client_location_reliability_arin_exceptions
+		ON network_client_location_reliability (client_id)
+		INCLUDE (arin_risk, arin_non_quality)
+		WHERE arin_risk OR arin_non_quality
+	`, `
+		DROP INDEX IF EXISTS network_client_location_reliability_arin_exceptions;
+		CREATE INDEX network_client_location_reliability_arin_exceptions
+		ON network_client_location_reliability (client_id)
+		INCLUDE (arin_risk, arin_non_quality)
+		WHERE arin_risk OR arin_non_quality
+	`),
+
+	// Durable issued claims distinguish completed URL turns from retries and
+	// abandoned leases. Four-hour priority is enabled only after writer warmup.
+	newSqlMigration(`
+		ALTER TABLE provider_egress_probe_cycle
+			ADD COLUMN claim_ordinal bigint NOT NULL DEFAULT 0 CHECK (claim_ordinal >= 0),
+			ADD COLUMN completed_run_count bigint NOT NULL DEFAULT 0 CHECK (completed_run_count >= 0),
+			ADD COLUMN completed_next_expiry_at timestamp,
+			ADD COLUMN completed_priority_ready boolean NOT NULL DEFAULT false;
+		CREATE TABLE provider_url_probe_run (
+			client_id uuid NOT NULL,
+			claim_ordinal bigint NOT NULL CHECK (claim_ordinal > 0),
+			claimed_at timestamp NOT NULL,
+			reported_completed_at timestamp,
+			completed_at timestamp,
+			received_at timestamp,
+			probe_failure varchar(64) NOT NULL DEFAULT '',
+			counted boolean NOT NULL DEFAULT false,
+			PRIMARY KEY (client_id, claim_ordinal),
+			CHECK ((completed_at IS NULL) = (received_at IS NULL)),
+			CHECK (completed_at IS NULL OR (claimed_at <= completed_at AND completed_at <= received_at)),
+			CHECK (NOT counted OR completed_at IS NOT NULL)
+		);
+		CREATE INDEX provider_url_probe_run_active
+			ON provider_url_probe_run(client_id, completed_at, claim_ordinal) WHERE counted;
+		CREATE INDEX provider_url_probe_run_retention
+			ON provider_url_probe_run(claimed_at, client_id, claim_ordinal) WHERE NOT counted;
+		CREATE FUNCTION provider_url_probe_ready_invalidate() RETURNS trigger LANGUAGE plpgsql AS $ready$
+		BEGIN
+			IF NEW.next_attempt_at IS DISTINCT FROM OLD.next_attempt_at OR NOT NEW.eligible THEN
+				NEW.completed_priority_ready := false;
+			END IF;
+			RETURN NEW;
+		END
+		$ready$;
+		CREATE TRIGGER provider_url_probe_ready_invalidate
+			BEFORE UPDATE OF next_attempt_at, eligible ON provider_egress_probe_cycle
+			FOR EACH ROW EXECUTE FUNCTION provider_url_probe_ready_invalidate();
+	`),
+
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_probe_cycle_completed_ready
+	`, `
+		CREATE INDEX CONCURRENTLY provider_probe_cycle_completed_ready
+			ON provider_egress_probe_cycle(completed_run_count,next_attempt_at,client_id) WHERE eligible AND completed_priority_ready
+	`, `
+		DROP INDEX IF EXISTS provider_probe_cycle_completed_ready;
+		CREATE INDEX provider_probe_cycle_completed_ready
+			ON provider_egress_probe_cycle(completed_run_count,next_attempt_at,client_id) WHERE eligible AND completed_priority_ready
+	`),
+
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_probe_cycle_slot_completed_ready
+	`, `
+		CREATE INDEX CONCURRENTLY provider_probe_cycle_slot_completed_ready
+			ON provider_egress_probe_cycle(slot_id,completed_run_count,next_attempt_at,client_id) WHERE eligible AND completed_priority_ready
+	`, `
+		DROP INDEX IF EXISTS provider_probe_cycle_slot_completed_ready;
+		CREATE INDEX provider_probe_cycle_slot_completed_ready
+			ON provider_egress_probe_cycle(slot_id,completed_run_count,next_attempt_at,client_id) WHERE eligible AND completed_priority_ready
+	`),
+
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_probe_cycle_completed_waiting
+	`, `
+		CREATE INDEX CONCURRENTLY provider_probe_cycle_completed_waiting
+			ON provider_egress_probe_cycle(next_attempt_at,client_id) WHERE eligible AND NOT completed_priority_ready
+	`, `
+		DROP INDEX IF EXISTS provider_probe_cycle_completed_waiting;
+		CREATE INDEX provider_probe_cycle_completed_waiting
+			ON provider_egress_probe_cycle(next_attempt_at,client_id) WHERE eligible AND NOT completed_priority_ready
+	`),
+
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_probe_cycle_slot_completed_waiting
+	`, `
+		CREATE INDEX CONCURRENTLY provider_probe_cycle_slot_completed_waiting
+			ON provider_egress_probe_cycle(slot_id,next_attempt_at,client_id) WHERE eligible AND NOT completed_priority_ready
+	`, `
+		DROP INDEX IF EXISTS provider_probe_cycle_slot_completed_waiting;
+		CREATE INDEX provider_probe_cycle_slot_completed_waiting
+			ON provider_egress_probe_cycle(slot_id,next_attempt_at,client_id) WHERE eligible AND NOT completed_priority_ready
+	`),
+
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_probe_cycle_completed_expiry
+	`, `
+		CREATE INDEX CONCURRENTLY provider_probe_cycle_completed_expiry
+			ON provider_egress_probe_cycle(completed_next_expiry_at,client_id) WHERE completed_next_expiry_at IS NOT NULL
+	`, `
+		DROP INDEX IF EXISTS provider_probe_cycle_completed_expiry;
+		CREATE INDEX provider_probe_cycle_completed_expiry
+			ON provider_egress_probe_cycle(completed_next_expiry_at,client_id) WHERE completed_next_expiry_at IS NOT NULL
+	`),
+
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_probe_cycle_slot_completed_expiry
+	`, `
+		CREATE INDEX CONCURRENTLY provider_probe_cycle_slot_completed_expiry
+			ON provider_egress_probe_cycle(slot_id,completed_next_expiry_at,client_id) WHERE completed_next_expiry_at IS NOT NULL
+	`, `
+		DROP INDEX IF EXISTS provider_probe_cycle_slot_completed_expiry;
+		CREATE INDEX provider_probe_cycle_slot_completed_expiry
+			ON provider_egress_probe_cycle(slot_id,completed_next_expiry_at,client_id) WHERE completed_next_expiry_at IS NOT NULL
+	`),
+
+	// Install before enabling ordered grant paging. The active-only index
+	// matches the payer, expiry cutoff and complete allocation order, allowing
+	// a funded page to stop without reading every eligible grant. Keep mutable
+	// balance amounts out of INCLUDE so every reservation update does not add
+	// covering-index work. Concurrent builds may await old backup snapshots;
+	// see docs/operations/grant-index-rollout.md for the deployment boundary.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS transfer_balance_active_network_end_start_id
+	`, `
+		CREATE INDEX CONCURRENTLY transfer_balance_active_network_end_start_id
+		ON transfer_balance (network_id, end_time, start_time, balance_id)
+		WHERE active
+	`, `
+		DROP INDEX IF EXISTS transfer_balance_active_network_end_start_id;
+		CREATE INDEX transfer_balance_active_network_end_start_id
+		ON transfer_balance (network_id, end_time, start_time, balance_id)
+		WHERE active
+	`),
+
+	// Observed invalid minutes must not become missing-neutral client history.
+	// Old running writers do not maintain this count; their next checkpoint
+	// invalidates its version so a new writer re-anchors before using it.
+	newSqlMigration(`
+		ALTER TABLE client_reliability_running
+			ADD COLUMN observed_row_count bigint NOT NULL DEFAULT 0 CHECK (observed_row_count >= 0);
+		ALTER TABLE client_reliability_running_window
+			ADD COLUMN observation_version smallint NOT NULL DEFAULT 0,
+			ADD COLUMN observation_write_token uuid;
+		CREATE FUNCTION client_reliability_running_window_observation_guard() RETURNS trigger LANGUAGE plpgsql AS $observations$
+		BEGIN
+			IF TG_OP = 'INSERT' THEN
+				IF NEW.observation_write_token IS NULL THEN
+					NEW.observation_version := 0;
+				END IF;
+			ELSIF NEW.observation_write_token IS NULL OR
+				NEW.observation_write_token IS NOT DISTINCT FROM OLD.observation_write_token THEN
+				NEW.observation_version := 0;
+			END IF;
+			RETURN NEW;
+		END
+		$observations$;
+		CREATE TRIGGER client_reliability_running_window_observation_guard
+			BEFORE INSERT OR UPDATE ON client_reliability_running_window
+			FOR EACH ROW EXECUTE FUNCTION client_reliability_running_window_observation_guard();
+	`),
+
+	// The rolling quota counts accepted measured URL success and failure. Keep
+	// the old success index for its diagnostic projection and rolling upgrades;
+	// this exact predicate bounds quota lookups without scanning local/legacy
+	// reports. Install before readers switch to the total measured-run target.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS provider_egress_health_history_url_run
+	`, `
+		CREATE INDEX CONCURRENTLY provider_egress_health_history_url_run
+			ON provider_egress_health_history(client_id, measured_at DESC)
+			WHERE url_probe AND url_probe_policy_version=1 AND total_count=1 AND (ok_count=0 OR ok_count=1)
+	`, `
+		DROP INDEX IF EXISTS provider_egress_health_history_url_run;
+		CREATE INDEX provider_egress_health_history_url_run
+			ON provider_egress_health_history(client_id, measured_at DESC)
+			WHERE url_probe AND url_probe_policy_version=1 AND total_count=1 AND (ok_count=0 OR ok_count=1)
+	`),
+	// Main's published catalog ends at version 741. The mainnet hardening
+	// series follows intact at 742–749; existing catalog identities stay fixed.
+	// Subnet usage is independent of escrow/payment. NULL denotes legacy
+	// direction or usage that cannot be reconstructed safely after the fact.
+	newSqlMigration(`
+		ALTER TABLE transfer_contract
+			ADD COLUMN usage_origin_is_source boolean NULL,
+			ADD COLUMN usage_unverified boolean NOT NULL DEFAULT false,
+			ADD COLUMN provider_usage jsonb NULL;
+		ALTER TABLE transfer_contract
+			ADD CONSTRAINT transfer_contract_provider_usage_shape CHECK (
+				provider_usage IS NULL OR jsonb_typeof(provider_usage) = 'object'
+			) NOT VALID;
+	`),
+	newOnlineSqlMigration(
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS transfer_contract_closed_usage
+		 ON transfer_contract (close_time, contract_id) WHERE outcome IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS transfer_contract_closed_usage
+		 ON transfer_contract (close_time, contract_id) WHERE outcome IS NOT NULL`,
+	),
+	// Policy changes start a fresh signed segment without rewriting history.
+	newSqlMigration(clientKeyPolicyHistorySchemaSql),
+	// Mixed-version writers must not create new missing usage or rewrite credit.
+	newSqlMigration(contractUsageGuardSchemaSql),
+	// Billing cleanup retains original usage atomically, without historical backfill.
+	newSqlMigration(providerUsageArchiveSchemaSql),
+	// Commit cache ordering fences with every reservation transition.
+	newSqlMigration(netEscrowRevisionSchemaSql),
+	// A missing terminal close time is retained debt, not an empty usage epoch.
+	// Keep its existence probe off the ordinary open/canceled contract history.
+	// Retry an interrupted online build rather than preserving an invalid index.
+	newRestartableOnlineSqlMigration(
+		`DROP INDEX CONCURRENTLY IF EXISTS transfer_contract_usage_missing_time`,
+		`CREATE INDEX CONCURRENTLY transfer_contract_usage_missing_time
+		 ON transfer_contract (contract_id) WHERE close_time IS NULL AND
+		 outcome IN ('settled','dispute_resolved_to_source','dispute_resolved_to_destination')`,
+		`DROP INDEX IF EXISTS transfer_contract_usage_missing_time;
+		 CREATE INDEX transfer_contract_usage_missing_time
+		 ON transfer_contract (contract_id) WHERE close_time IS NULL AND
+		 outcome IN ('settled','dispute_resolved_to_source','dispute_resolved_to_destination')`,
+	),
+	// Persist the server-issued identity atomically with resumable registration.
+	newSqlMigration(clientRegistrationSchemaSql),
+	// Positive subscriber evidence is absent on old writers and legacy rows.
+	// The rollup and Quality request guard exclude those rows until reclassified.
+	newSqlMigration(`
+		ALTER TABLE network_client_location
+			ADD COLUMN arin_quality_verified boolean NOT NULL DEFAULT false;
+	`),
+	// Old upserts omit the positive fact on conflict and would retain a previous
+	// true value. Fence every write, including schema-750 writers and no-op updates.
+	newSqlMigration(subscriberQualityWriteGuardSchemaSql),
+	// Private probe passes own their disposable network and balance atomically.
+	newSqlMigration(proberShardSchemaSql),
+	// Keep reservation-revision work proportional to the changed contracts,
+	// even when the unsettled partial index has stale false-zero statistics.
+	newSqlMigration(netEscrowContractsRevisionPointLookupSql),
+	// Cache exact admission snapshots at the guarded durable revision.
+	newSqlMigration(netEscrowAdmissionSnapshotSchemaSql),
+	// Reader compatibility only; approximate admission remains disabled.
+	newSqlMigration(redisContractAdmissionSchemaSql),
+	// Corrections retain their original earning window across safe re-planning.
+	newSqlMigration(providerPaymentBonusSchemaSql),
+	// The earning asset boundary is prepared explicitly and cannot drift with a file edit.
+	newSqlMigration(providerPayoutBoundarySchemaSql),
+	// Independent settlement records keep shared grant writes out of contract closure.
+	newSqlMigration(transferDebitJournalSchemaSql),
+	// acceptance-test balance drains (model/test_balance_drain_model.go). Each
+	// row is the audit record of one drain; rows are never deleted. The partial
+	// index keeps the in-window lookup an index probe.
+	newSqlMigration(`
+        CREATE TABLE test_balance_drain (
+            drain_id uuid NOT NULL,
+            network_id uuid NOT NULL,
+            start_time timestamp NOT NULL,
+            end_time timestamp NOT NULL,
+            restore_time timestamp NULL,
+            drained_balance_byte_count bigint NOT NULL,
+
+            PRIMARY KEY (drain_id)
+        )
+    `),
+	newSqlMigration(`
+        CREATE INDEX test_balance_drain_network_id_end_time ON test_balance_drain (network_id, end_time) WHERE restore_time IS NULL
+    `),
+
+	// Memo-less USDC payments on Solana. Each quote gets a unique amount (the
+	// price plus a sub-cent suffix of 1 to 9999 micro-USDC), so a transfer of
+	// exactly that amount identifies its intent without the reference.
+	//
+	// expected_amount_micro is the exact quote in micro-USDC; NULL for intents
+	// quoted without a suffix, which only ever match by reference.
+	//
+	// solana_payment_amount_reservation holds each amount for its intent until
+	// reserved_until (the intent's expiry plus a hold), so an amount is never
+	// quoted to a second buyer while a late payment of the first quote could
+	// still arrive -- swept intents are deleted, but their reservation stays.
+	//
+	// sender_account and match_note give support what it needs to credit a
+	// memo-less payment by hand when it could not be matched unambiguously.
+	newSqlMigration(`
+		ALTER TABLE solana_payment_intent
+			ADD COLUMN expected_amount_micro bigint NULL;
+
+		CREATE INDEX solana_payment_intent_expected_amount_micro
+			ON solana_payment_intent (expected_amount_micro, expires_at)
+			WHERE expected_amount_micro IS NOT NULL;
+
+		CREATE TABLE solana_payment_amount_reservation (
+			amount_micro bigint NOT NULL PRIMARY KEY,
+			payment_reference text NOT NULL,
+			reserved_until timestamp NOT NULL
+		);
+
+		ALTER TABLE solana_unfulfilled_payment
+			ADD COLUMN sender_account varchar(64) NULL,
+			ADD COLUMN match_note text NULL;
+	`),
+	// Caller operation IDs retain one exact customer transfer challenge request.
+	// Append after the complete published asynchronous-debit/Solana prefix.
+	newSqlMigration(circleTransferRequestSchemaSql),
+	// Unmarked contracts retain reservations until one bounded worker settles them.
+	newSqlMigration(legacySettlementIntentSchemaSql),
+	// One durable receipt per logical close report, scoped to its contract.
+	newSqlMigration(contractCloseReportSchemaSql),
+	// App Store offer-code bindings (model/apple_offer_code_binding_model.go):
+	// an offer-code redemption carries no appAccountToken, so the verify
+	// endpoint binds its subscription to the network that was issued the
+	// welcome offer code, once. Renewals resolve through the same row.
+	newSqlMigration(`
+		CREATE TABLE apple_offer_code_binding (
+			original_transaction_id varchar(128) NOT NULL,
+			network_id uuid NOT NULL,
+			transaction_id varchar(128) NOT NULL,
+			offer_identifier varchar(128) NOT NULL,
+			bound_at timestamp NOT NULL,
+
+			PRIMARY KEY (original_transaction_id)
+		)
+	`),
+	// Google Play purchase bindings (model/play_purchase_binding_model.go): a
+	// purchase made outside the app's billing flow (a Play Store promo code
+	// redemption) carries no obfuscated account id, so the verify endpoint
+	// binds its token to the network that was issued the welcome offer, once.
+	// Linked tokens of the same subscription resolve through the same root.
+	newSqlMigration(`
+		CREATE TABLE play_purchase_binding (
+			purchase_token text NOT NULL,
+			root_purchase_token text NOT NULL,
+			network_id uuid NOT NULL,
+			offer varchar(256) NOT NULL,
+			bound_at timestamp NOT NULL,
+
+			PRIMARY KEY (purchase_token)
+		)
+	`),
+	// Optional original evidence is appended after the complete published prefix.
+	// Existing v764 receipts keep their schema, custody and rolling-writer role.
+	newSqlMigration(contractCloseReportEvidenceSchemaSql),
+	newSqlMigration(contractCloseOriginalSchemaSql),
+	newSqlMigration(contractCloseInventorySchemaSql),
+	newSqlMigration(verifyOriginalSchemaSql),
+	newSqlMigration(providerWorkOriginalSchemaSql),
+	newSqlMigration(walletMappingConsentSchemaSql),
+	newSqlMigration(verifyOriginalRequestSchemaSql),
+	newSqlMigration(providerWorkOwnerSchemaSql),
+	newSqlMigration(verifyRequestClosureSchemaSql),
+	newSqlMigration(providerWorkSessionSchemaSql),
+	newSqlMigration(stOperatorGasSchemaSql),
+	newSqlMigration(providerWorkOpenSchemaSql),
+	newSqlMigration(verifyOriginalRequestJsonRepairSql),
+	newSqlMigration(stNativeFeeSettlementSchemaSql),
+	// The recurring grant that wrote a balance (model.GrantKind: free, pro,
+	// referral), so the balance summary can leave out a grant in its grace once the
+	// next grant of its kind has started. Nullable without a default, so adding it
+	// rewrites no rows, and nothing is backfilled: older rows, and rows from
+	// binaries that predate it during a rollout, stay NULL and the summary
+	// recognizes those grants by their exact window. The lock timeout keeps the
+	// ALTER from waiting behind a long lock holder (the nightly pg_dump holds its
+	// share lock for hours) with every balance query queued behind it; a migrate
+	// that times out is re-run.
+	newSqlMigration(`
+		SET LOCAL lock_timeout = '5s';
+		ALTER TABLE transfer_balance ADD COLUMN grant_kind varchar(32) NULL;
+	`),
+	newSqlMigration(providerWorkSessionContentionRepairSql),
 }

@@ -31,16 +31,17 @@ const (
 	PaymentReconcileActionSkippedStore           = "skipped_store"
 	PaymentReconcileActionHeartbeat              = "heartbeat"
 	PaymentReconcileActionError                  = "error"
-	// Stripe listed a paid invoice whose destination was deleted before the
-	// ledger-gated credit. This is a durable operator-disposition event, not a
-	// provider/listing error and not a successful credit.
+	// Stripe listed a paid invoice whose destination is deleted or unresolved
+	// after complete authority reads. This is a durable operator-disposition
+	// event, not a provider/listing error and not a successful credit.
 	PaymentReconcileActionCreditUnfulfillable = "credit_unfulfillable"
 )
 
 // Webhook-written operator events (UPGRADE.md §2 S7/S11) that join the
 // reconciler's audit stream. Their run_id is a fresh provenance id, not a
-// reconcile run: the store's REAL-TIME refund/revocation handlers and the
-// stripe email fallback write these as they happen.
+// reconcile run: the store's REAL-TIME refund/revocation handlers write these
+// as they happen. (The stripe invoice.paid webhook also writes
+// credit_unfulfillable, above, for a paid invoice that names no network.)
 const (
 	// a store refund clawed back (or tried to claw back) what it granted
 	PaymentReconcileActionRefunded = "refunded"
@@ -52,9 +53,15 @@ const (
 	// a refund/dispute whose charge could not be mapped to anything we
 	// granted: recorded for the operator instead of guessing what to claw
 	PaymentReconcileActionRefundUnmatched = "refund_unmatched"
-	// stripeHandleInvoicePaid resolved the network by the LEGACY customer
-	// email fallback (S11) -- every use is surfaced until it can be retired
-	PaymentReconcileActionEmailFallback = "email_fallback"
+	// X402Purchase settled the payment (the money moved) and the grant failed
+	// (S9). Evidence is the settle transaction; details carry what was bought.
+	// The reconciler retries the idempotent grant until a resolving event
+	// (credited, already_credited or credit_unfulfillable) with the same
+	// evidence exists.
+	PaymentReconcileActionSettledNotGranted = "settled_not_granted"
+	// the reconciler found a settled_not_granted transaction already granted
+	// (an agent retry got there first): resolved without a new credit
+	PaymentReconcileActionAlreadyCredited = "already_credited"
 )
 
 // PaymentReconcileStoreAll is the store label for run-level rows (heartbeat).
@@ -135,15 +142,51 @@ func AddPaymentReconciliationEventInTx(
 	return
 }
 
-// GetPaymentReconciliationEventsByAction reads one store's audit rows for one
-// action since a time, oldest first, bounded by limit and excluding dry runs.
-// This is how the stripe reconciler leg and the CLI summary surface
-// webhook-written events (email_fallback) since the last watermark.
-func GetPaymentReconciliationEventsByAction(
+// AddPaymentReconciliationEventOnce appends the event unless a non-dry-run row
+// with the same store, action and evidence already exists. added is false when
+// one does. Webhook redeliveries use this so one store object is one support
+// row; two concurrent first deliveries can still both append, which is
+// harmless (readers count distinct evidence).
+func AddPaymentReconciliationEventOnce(
+	ctx context.Context,
+	event *PaymentReconciliationEvent,
+) (added bool, err error) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		result, queryErr := tx.Query(
+			ctx,
+			`
+			SELECT 1 FROM payment_reconciliation_event
+			WHERE store = $1
+			  AND action = $2
+			  AND evidence = $3
+			  AND NOT dry_run
+			LIMIT 1
+			`,
+			event.Store,
+			event.Action,
+			event.Evidence,
+		)
+		exists := false
+		server.WithPgResult(result, queryErr, func() {
+			exists = result.Next()
+		})
+		if exists {
+			return
+		}
+		err = AddPaymentReconciliationEventInTx(tx, ctx, event)
+		added = err == nil
+	})
+	return
+}
+
+// GetUnresolvedSettledNotGrantedEvents reads the store's settled_not_granted
+// events that no real (non-dry-run) credited, already_credited or
+// credit_unfulfillable event with the same evidence resolves yet, one per
+// evidence (its first record), oldest first, bounded by limit. Events without
+// evidence (no settle transaction to key a retry on) are left to the operator.
+func GetUnresolvedSettledNotGrantedEvents(
 	ctx context.Context,
 	store string,
-	action string,
-	since time.Time,
 	limit int,
 ) []*PaymentReconciliationEvent {
 	events := []*PaymentReconciliationEvent{}
@@ -151,26 +194,40 @@ func GetPaymentReconciliationEventsByAction(
 		result, err := conn.Query(
 			ctx,
 			`
-			SELECT event_id, run_id, network_id,
-			       COALESCE(evidence, ''), details, event_time
-			FROM payment_reconciliation_event
-			WHERE store = $1
-			  AND action = $2
-			  AND event_time >= $3
-			  AND NOT dry_run
+			SELECT event_id, run_id, network_id, evidence, details, event_time
+			FROM (
+				SELECT DISTINCT ON (e.evidence)
+					e.event_id, e.run_id, e.network_id, e.evidence, e.details, e.event_time
+				FROM payment_reconciliation_event e
+				WHERE e.store = $1
+				  AND e.action = $2
+				  AND e.evidence IS NOT NULL
+				  AND NOT e.dry_run
+				  AND NOT EXISTS (
+					SELECT 1
+					FROM payment_reconciliation_event r
+					WHERE r.store = e.store
+					  AND r.evidence = e.evidence
+					  AND r.action IN ($3, $4, $5)
+					  AND NOT r.dry_run
+				  )
+				ORDER BY e.evidence, e.event_time ASC, e.event_id ASC
+			) unresolved
 			ORDER BY event_time ASC, event_id ASC
-			LIMIT $4
+			LIMIT $6
 			`,
 			store,
-			action,
-			since,
+			PaymentReconcileActionSettledNotGranted,
+			PaymentReconcileActionCredited,
+			PaymentReconcileActionAlreadyCredited,
+			PaymentReconcileActionCreditUnfulfillable,
 			limit,
 		)
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
 				event := &PaymentReconciliationEvent{
 					Store:  store,
-					Action: action,
+					Action: PaymentReconcileActionSettledNotGranted,
 				}
 				var detailsJson *string
 				server.Raise(result.Scan(
@@ -268,8 +325,11 @@ func SetPaymentReconcileWatermark(
 	store string,
 	watermarkTime time.Time,
 ) (err error) {
+	// a failed statement raises, which ends the transaction at once; the error
+	// result is always nil. Its error used to be assigned to the result while
+	// the transaction went on to a commit that server.Tx retried for a minute.
 	server.Tx(ctx, func(tx server.PgTx) {
-		_, err = tx.Exec(
+		server.RaisePgResult(tx.Exec(
 			ctx,
 			`
 			INSERT INTO payment_reconciliation_watermark (store, watermark_time, update_time)
@@ -280,7 +340,7 @@ func SetPaymentReconcileWatermark(
 			store,
 			watermarkTime,
 			server.NowUtc(),
-		)
+		))
 	})
 	return
 }

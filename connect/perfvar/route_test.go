@@ -254,10 +254,11 @@ type routeClient struct {
 	routeStateTrace *p2pRouteStateTrace
 }
 
-// One lifecycle bundle lets environment teardown join concrete clients while
-// pure tests hold exact transport and client completion barriers.
+// Forced-route transitions and teardown share concrete lifecycle operations;
+// pure tests can hold exact transport and client completion barriers.
 type routeClientLifecycle struct {
 	flush                 func()
+	closeTransport        func()
 	closeTransportAndWait func(context.Context) error
 	closeClientAndWait    func(context.Context) error
 }
@@ -270,6 +271,11 @@ func routeClientLifecycles(clients []*routeClient) []routeClientLifecycle {
 		client := client
 		lifecycles = append(lifecycles, routeClientLifecycle{
 			flush: client.client.Flush,
+			closeTransport: func() {
+				if client.transport != nil {
+					client.transport.Close()
+				}
+			},
 			closeTransportAndWait: func(ctx context.Context) error {
 				if client.transport == nil {
 					return nil
@@ -280,6 +286,27 @@ func routeClientLifecycles(clients []*routeClient) []routeClientLifecycle {
 		})
 	}
 	return lifecycles
+}
+
+// Forced P2P measurement closes every fallback before joining its owners.
+// One selector's withdrawal does not finish other selectors or carrier workers.
+func closeRouteClientTransportsAndWait(
+	ctx context.Context,
+	lifecycles []routeClientLifecycle,
+) error {
+	for _, lifecycle := range lifecycles {
+		lifecycle.closeTransport()
+	}
+	var closeErr error
+	for clientIndex, lifecycle := range lifecycles {
+		if err := lifecycle.closeTransportAndWait(ctx); err != nil {
+			closeErr = errors.Join(
+				closeErr,
+				fmt.Errorf("join route client %d platform transport: %w", clientIndex, err),
+			)
+		}
+	}
+	return closeErr
 }
 
 // Teardown flushes every source before stopping carriers, then joins each
@@ -356,6 +383,14 @@ type routeEnvironment struct {
 
 	poolOutstandingBefore        int64
 	poolOutstandingClassesBefore map[int]int64
+
+	// Opt-in connection-creation diagnostics retain handles, never packets.
+	// Atomic publication also permits installation after a TUN is constructed.
+	clientDialObserverForTest atomic.Pointer[routeClientDialObserver]
+}
+
+type routeClientDialObserver struct {
+	observe func(string, *clientconnect.Tun, net.Conn)
 }
 
 // The fixture uses gVisor TCP and UDP for client-edge traffic and real TLS.
@@ -695,6 +730,11 @@ func (self *routeEnvironment) newClientNodeWithProfileAt(
 	strategySettings.ConnectSettings.DialContextSettings = &clientconnect.DialContextSettings{
 		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
 			connection, dialErr := clientTun.DialContext(ctx, network, address)
+			if dialErr == nil {
+				if observer := self.clientDialObserverForTest.Load(); observer != nil {
+					observer.observe(name, clientTun, connection)
+				}
+			}
 			if useExtender {
 				self.t.Logf("[perfvar] extender client dial network=%s address=%s err=%v", network, address, dialErr)
 			}
@@ -1029,38 +1069,45 @@ func waitForP2pRoute(
 	}
 }
 
-// Route count distinguishes completed P2P promotion from exchange delivery.
-// The observer records every publication, so readiness does not depend on a
-// scheduler tick happening while the desired state remains visible.
+// Current-state readiness and historical transition proofs share the exact
+// production observer; tests may interpose a publication at the wait boundary.
+type routeStateObserver interface {
+	Snapshot() clientconnect.TestingMultiRouteWriterRouteState
+	WaitAfter(context.Context, uint64) (clientconnect.TestingMultiRouteWriterRouteState, error)
+	WaitForActiveRouteCountAfter(context.Context, uint64, int) (clientconnect.TestingMultiRouteWriterRouteState, error)
+}
+
+// Readiness requires the current route count. Exact publications wake this
+// waiter, but a historical promotion already withdrawn cannot admit traffic.
 func waitForRouteCount(
 	ctx context.Context,
-	observer *clientconnect.TestingMultiRouteWriterRouteStateObserver,
+	observer routeStateObserver,
 	routeCount int,
 ) error {
 	waitCtx, waitCancel := context.WithTimeout(ctx, 90*time.Second)
 	defer waitCancel()
-	state := observer.Snapshot()
-	if state.ActiveRouteCount == routeCount {
-		return nil
+	for {
+		state := observer.Snapshot()
+		if state.ActiveRouteCount == routeCount {
+			return nil
+		}
+		if _, err := observer.WaitAfter(waitCtx, state.Generation); err != nil {
+			return fmt.Errorf(
+				"route count=%d generation=%d, expected=%d: %w",
+				state.ActiveRouteCount,
+				state.Generation,
+				routeCount,
+				err,
+			)
+		}
 	}
-	state, err := observer.WaitForActiveRouteCountAfter(waitCtx, state.Generation, routeCount)
-	if err != nil {
-		return fmt.Errorf(
-			"route count=%d generation=%d, expected=%d: %w",
-			observer.Snapshot().ActiveRouteCount,
-			observer.Snapshot().Generation,
-			routeCount,
-			err,
-		)
-	}
-	return nil
 }
 
 // A caller-captured generation makes a post-action route assertion immune to
 // both a stale pre-action match and a fast transition that has since moved on.
 func waitForRouteCountAfter(
 	ctx context.Context,
-	observer *clientconnect.TestingMultiRouteWriterRouteStateObserver,
+	observer routeStateObserver,
 	barrier clientconnect.TestingMultiRouteWriterRouteState,
 	routeCount int,
 ) (clientconnect.TestingMultiRouteWriterRouteState, error) {
@@ -1279,8 +1326,12 @@ func measureP2pRoute(
 	if forcedRouteBarrier.ActiveRouteCount != 2 {
 		t.Fatalf("forced P2P transition started from route state=%+v", forcedRouteBarrier)
 	}
-	source.transport.Close()
-	destination.transport.Close()
+	if err := closeRouteClientTransportsAndWait(
+		environment.ctx,
+		routeClientLifecycles([]*routeClient{source, destination}),
+	); err != nil {
+		t.Fatalf("join platform transports before forced P2P route: %v", err)
+	}
 	if _, err := waitForRouteCountAfter(
 		environment.ctx,
 		routeStateObserver,

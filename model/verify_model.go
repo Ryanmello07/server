@@ -1,10 +1,10 @@
 package model
 
 // verify_model.go — state model for the `/verify` routing-verification
-// protocol (sn/VALIDATOR.md §§5-8). Redis holds all hot per-trail and
-// per-provider state so the trail path puts no pressure on Postgres; Postgres
-// gets only completed/expired proofs (`verify_trail`, VALIDATOR.md §6.2) and
-// periodic per-provider stat rollups (`verify_provider_stats`).
+// protocol (sn/VALIDATOR.md §§5-8). Redis holds hot per-trail/provider state.
+// PostgreSQL retains each signed transition before publication, terminal proofs
+// and the derived provider-stat projection. Missing historical originals remain
+// unknown rather than being reconstructed from that mutable projection.
 //
 // Redis key map (cluster rule: keys touched in one pipeline share a `{...}`
 // hash tag):
@@ -16,6 +16,8 @@ package model
 //	verify_reap             zset trailId -> step deadline unix ms (reaper index)
 //	verify_egress_v2_<ip>   exact-address index: ip -> clientId, or `!` if ambiguous (§8.1)
 //	{vce2_<clientId>}       reverse exact-address hash: ip -> entry expiry unix ms (§8.2)
+//	{vce2_<clientId>}leases_<ip>  reverse connection/proxy owner -> expiry
+//	{verify_egress_v2_<ip>}leases forward client/owner -> expiry
 //	verify_eligible_v2      set of currently eligible provider clientIds (§5.1)
 //	{velig_<clientId>}      eligibility token spend counter (INCR+EXPIRE, §5.3)
 //	{vstat_<clientId>}p<t>  per-period stats hash: assignments, confirmations,
@@ -26,7 +28,7 @@ package model
 //	verify_trails_<vpk>     active trail count per vpk (concurrent-trail cap, §9)
 //
 // The egress index is fed by exactly one bijection-gated feeder
-// (`FeedVerifyEgress`) with two sources: observed connection source ips
+// (`feedVerifyEgressLease`) with two independently owned sources: observed connection source ips
 // (connect/transport_announce.go) and proxy-allocated egresses (the API
 // controller's post-allocation feed + periodic `RefreshVerifyProxyEgress`). The §8.2
 // invariant — one provider ⇄ one egress ip — is enforced at write time (an ip
@@ -188,12 +190,14 @@ func (self *VerifySettings) TrailTtl(m int) time.Duration {
 // confirmation from the confirming request's source ip (zero while pending)
 // and carried verbatim into the published FINAL proof.
 type VerifyTrailHop struct {
-	ClientId     server.Id `json:"client_id"`
-	AssignedMs   uint64    `json:"assigned_ms"`
-	ConfirmedMs  uint64    `json:"confirmed_ms"`
-	AssignN      int       `json:"assign_n"`
-	Seed         bool      `json:"seed,omitempty"`
-	EgressIpHash [32]byte  `json:"egress_ip_hash"`
+	ClientId     server.Id  `json:"client_id"`
+	NetworkId    *server.Id `json:"network_id,omitempty"`
+	NetworkIssue string     `json:"network_issue,omitempty"`
+	AssignedMs   uint64     `json:"assigned_ms"`
+	ConfirmedMs  uint64     `json:"confirmed_ms"`
+	AssignN      int        `json:"assign_n"`
+	Seed         bool       `json:"seed,omitempty"`
+	EgressIpHash [32]byte   `json:"egress_ip_hash"`
 }
 
 // VerifyTrail is the full redis state of one trail (§6.1). `Hops` are the
@@ -350,89 +354,15 @@ func VerifyEgressIndexHashWithSettings(ip netip.Addr, settings *VerifySettings) 
 	return [32]byte(h.Sum(nil))
 }
 
-// FeedVerifyEgress is the single bijection-gated egress-index feeder (§8.1,
-// §8.2). Both feeders (observed connection source ips and proxy-allocated
-// egresses) call this. It:
-//  1. claims/refreshes the forward `verify_egress_v2_<ip>` entry, atomically
-//     downgrading the ip to ambiguous if another client already backs it,
-//  2. records the ip in the client's reverse hash with an entry expiry, and
-//  3. recomputes the client's eligible-set membership: eligible iff the
-//     client has exactly one live egress ip, the forward entry for that ip
-//     resolves back to the client, and the client has an active provide mode.
-//
-// Entries live `settings.EgressTtl` and must be re-fed while the egress holds
-// (connected clients refresh every `EgressRefreshInterval`; proxy egresses are
-// re-fed by `RefreshVerifyProxyEgress`), so a released or reassigned ip ages
-// out and is never miscredited.
-func FeedVerifyEgress(
-	ctx context.Context,
-	clientId server.Id,
-	ip netip.Addr,
-	settings *VerifySettings,
-) {
-	if !ip.IsValid() {
-		return
-	}
-	ip = ip.Unmap()
-	egressHash := VerifyEgressIndexHashWithSettings(ip, settings)
-	egressHashHex := hex.EncodeToString(egressHash[:])
-	nowMs := uint64(server.NowUtc().UnixMilli())
-	ttlSeconds := int64(settings.EgressTtl / time.Second)
-
-	server.Redis(ctx, func(r server.RedisClient) {
-		// atomically claim or refresh the forward entry; downgrade to the
-		// ambiguous marker if another client currently backs this ip. the
-		// ambiguous marker keeps its ttl (not extended by feeds) so a
-		// no-longer-contended ip heals after one ttl.
-		claimScript := `local cur = redis.call('GET', KEYS[1])
-if cur == false then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) return 1
-elseif cur == ARGV[1] then redis.call('EXPIRE', KEYS[1], ARGV[2]) return 1
-elseif cur == ARGV[3] then return 0
-else redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[2]) return 0 end`
-		r.Eval(
-			ctx,
-			claimScript,
-			[]string{verifyEgressKey(egressHash)},
-			clientId.String(),
-			ttlSeconds,
-			verifyEgressAmbiguous,
-		)
-
-		// record the egress hash in the client's reverse hash with a
-		// per-entry expiry (field name = the same hex the forward key uses)
-		expireMs := nowMs + uint64(settings.EgressTtl/time.Millisecond)
-		clientEgressKey := verifyClientEgressKey(clientId)
-		_, err := r.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HSet(ctx, clientEgressKey, egressHashHex, expireMs)
-			pipe.Expire(ctx, clientEgressKey, settings.EgressTtl)
-			return nil
-		})
-		server.Raise(err)
-	})
-
-	updateVerifyEligibleMembership(ctx, clientId)
+// Feeds the durable proxy allocation lease. Connection announcements use their
+// distinct connection ids so one transport cannot withdraw another's lease.
+func FeedVerifyEgress(ctx context.Context, clientId server.Id, ip netip.Addr, settings *VerifySettings) {
+	feedVerifyEgressLease(ctx, clientId, ip, verifyProxyEgressLeaseOwner, settings)
 }
 
-// ClearVerifyEgress drops one (client, ip) egress entry — the disconnect-side
-// of the observed-ip feeder. The forward entry is removed only if it still
-// resolves to this client (never clobber another claimant or the ambiguous
-// marker), then the client's eligible-set membership is recomputed.
-func ClearVerifyEgress(
-	ctx context.Context,
-	clientId server.Id,
-	ip netip.Addr,
-	settings *VerifySettings,
-) {
-	if !ip.IsValid() {
-		return
-	}
-	ip = ip.Unmap()
-	egressHash := VerifyEgressIndexHashWithSettings(ip, settings)
-	server.Redis(ctx, func(r server.RedisClient) {
-		r.HDel(ctx, verifyClientEgressKey(clientId), hex.EncodeToString(egressHash[:]))
-		server.RedisRemoveIfEqual(r, ctx, verifyEgressKey(egressHash), []byte(clientId.String()))
-	})
-	updateVerifyEligibleMembership(ctx, clientId)
+// Withdraws the proxy allocation lease without clearing live transport leases.
+func ClearVerifyEgress(ctx context.Context, clientId server.Id, ip netip.Addr, settings *VerifySettings) {
+	clearVerifyEgressLease(ctx, clientId, ip, verifyProxyEgressLeaseOwner, settings)
 }
 
 // RemoveVerifyEgressForClient drops all egress entries for a client — called
@@ -448,7 +378,8 @@ func RemoveVerifyEgressForClient(
 			server.Raise(err)
 		}
 		for egressHashHex := range entries {
-			server.RedisRemoveIfEqual(r, ctx, verifyEgressKeyFromHex(egressHashHex), []byte(clientId.String()))
+			server.Raise(removeVerifyEgressAddressForClient(ctx, r, clientId, egressHashHex).Err())
+			server.Raise(r.Del(ctx, verifyClientEgressLeaseKey(clientId, egressHashHex)).Err())
 		}
 		r.Del(ctx, verifyClientEgressKey(clientId))
 		r.SRem(ctx, verifyEligibleKey, clientId.String())
@@ -469,18 +400,18 @@ func verifyLiveEgressHashes(
 		server.Raise(err)
 	}
 	liveHashes := []string{}
-	expiredHashes := []string{}
+	expiredHashes := map[string]string{}
 	for egressHashHex, expireMsStr := range entries {
 		var expireMs uint64
 		fmt.Sscanf(expireMsStr, "%d", &expireMs)
 		if nowMs < expireMs {
 			liveHashes = append(liveHashes, egressHashHex)
 		} else {
-			expiredHashes = append(expiredHashes, egressHashHex)
+			expiredHashes[egressHashHex] = expireMsStr
 		}
 	}
 	if 0 < len(expiredHashes) {
-		r.HDel(ctx, verifyClientEgressKey(clientId), expiredHashes...)
+		pruneVerifyExpiredEgressHashes(ctx, r, clientId, expiredHashes)
 	}
 	return liveHashes
 }
@@ -497,14 +428,7 @@ func updateVerifyEligibleMembership(
 
 	eligible := false
 	server.Redis(ctx, func(r server.RedisClient) {
-		liveHashes := verifyLiveEgressHashes(ctx, r, clientId, nowMs)
-		if len(liveHashes) == 1 {
-			forward, err := r.Get(ctx, verifyEgressKeyFromHex(liveHashes[0])).Result()
-			if err != nil && !errors.Is(err, redis.Nil) {
-				server.Raise(err)
-			}
-			eligible = forward == clientId.String()
-		}
+		eligible = verifyClientHasLiveEgress(ctx, r, clientId, nowMs)
 	})
 
 	if eligible {
@@ -528,6 +452,20 @@ func updateVerifyEligibleMembership(
 			r.SRem(ctx, verifyEligibleKey, clientId.String())
 		}
 	})
+}
+
+// An eligible-set entry is only a candidate index. Expiry and connection
+// changes must pass the same exact-address bijection again before assignment.
+func verifyClientHasLiveEgress(ctx context.Context, r server.RedisClient, clientId server.Id, nowMs uint64) bool {
+	liveHashes := verifyLiveEgressHashes(ctx, r, clientId, nowMs)
+	if len(liveHashes) != 1 {
+		return false
+	}
+	forward, err := r.Get(ctx, verifyEgressKeyFromHex(liveHashes[0])).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		server.Raise(err)
+	}
+	return forward == clientId.String()
 }
 
 // ResolveVerifyEgress maps a request source ip to the provider currently
@@ -676,6 +614,13 @@ func SampleVerifyNextHop(
 			candidateId, err := server.ParseId(candidate)
 			if err != nil {
 				r.SRem(ctx, verifyEligibleKey, candidate)
+				continue
+			}
+			if !verifyClientHasLiveEgress(ctx, r, candidateId, uint64(server.NowUtc().UnixMilli())) {
+				// The set may outlive an address lease or race a disconnect.
+				// Never spend a token or assign an unattributable source.
+				server.Raise(r.SRem(ctx, verifyEligibleKey, candidate).Err())
+				excluded[candidate] = true
 				continue
 			}
 			provideModes, err := GetProvideModes(ctx, candidateId)
@@ -1239,7 +1184,7 @@ func ExpireVerifyTrail(
 	trailId server.Id,
 ) {
 	server.Redis(ctx, func(r server.RedisClient) {
-		r.HSet(ctx, verifyTrailHeaderKey(trailId), "status", VerifyTrailStatusExpired)
+		server.Raise(r.HSet(ctx, verifyTrailHeaderKey(trailId), "status", VerifyTrailStatusExpired).Err())
 		err := r.ZRem(ctx, verifyReapKey, trailId.String()).Err()
 		server.Raise(err)
 	})
@@ -1362,17 +1307,18 @@ func VerifyLatencyPercentiles(bucketCounts map[int]int64) (p50 *int, p90 *int, p
 
 // VerifyTrailRow is one durable `verify_trail` record (VALIDATOR.md §6.2).
 type VerifyTrailRow struct {
-	TrailId      server.Id
-	Vpk          []byte
-	ServerKeyId  byte
-	ServerNonce  []byte
-	Depth        int
-	Status       int
-	HopsJson     string
-	FinalSig     []byte
-	VerifierSig  []byte
-	CreateTime   time.Time
-	CompleteTime *time.Time
+	TrailId       server.Id
+	Vpk           []byte
+	ServerKeyId   byte
+	ServerNonce   []byte
+	Depth         int
+	Status        int
+	HopsJson      string
+	FinalSig      []byte
+	VerifierSig   []byte
+	CreateTime    time.Time
+	CompleteTime  *time.Time
+	OriginalState []byte
 }
 
 // InsertVerifyTrail durably persists a completed or expired trail (never a
@@ -1397,9 +1343,10 @@ func InsertVerifyTrail(
 				final_sig,
 				verifier_sig,
 				create_time,
-				complete_time
+				complete_time,
+				original_state
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (trail_id) DO NOTHING
 			`,
 			row.TrailId,
@@ -1413,7 +1360,9 @@ func InsertVerifyTrail(
 			row.VerifierSig,
 			row.CreateTime.UTC(),
 			row.CompleteTime,
+			row.OriginalState,
 		))
+		server.RaisePgResult(tx.Exec(ctx, `DELETE FROM verify_original_pending WHERE trail_id=$1`, row.TrailId))
 	})
 }
 
@@ -1436,7 +1385,8 @@ func GetVerifyTrailRow(
 				final_sig,
 				verifier_sig,
 				create_time,
-				complete_time
+				complete_time,
+				original_state
 			FROM verify_trail
 			WHERE trail_id = $1
 			`,
@@ -1459,6 +1409,7 @@ func GetVerifyTrailRow(
 					&r.VerifierSig,
 					&r.CreateTime,
 					&r.CompleteTime,
+					&r.OriginalState,
 				))
 				r.ServerKeyId = byte(serverKeyId)
 				row = r
@@ -1478,7 +1429,7 @@ func ListVerifyTrailRows(ctx context.Context, minTime, maxTime time.Time, limit 
 	server.Db(ctx, func(conn server.PgConn) {
 		result, err := conn.Query(ctx, `
 			SELECT trail_id, vpk, server_key_id, server_nonce, depth, status,
-				hops_json, final_sig, verifier_sig, create_time, complete_time
+				hops_json, final_sig, verifier_sig, create_time, complete_time, original_state
 			FROM verify_trail
 			WHERE create_time >= $1 AND create_time < $2
 			ORDER BY create_time, trail_id
@@ -1490,7 +1441,7 @@ func ListVerifyTrailRows(ctx context.Context, minTime, maxTime time.Time, limit 
 				var serverKeyId int16
 				server.Raise(result.Scan(&row.TrailId, &row.Vpk, &serverKeyId,
 					&row.ServerNonce, &row.Depth, &row.Status, &row.HopsJson,
-					&row.FinalSig, &row.VerifierSig, &row.CreateTime, &row.CompleteTime))
+					&row.FinalSig, &row.VerifierSig, &row.CreateTime, &row.CompleteTime, &row.OriginalState))
 				row.ServerKeyId = byte(serverKeyId)
 				rows = append(rows, row)
 			}
@@ -1526,6 +1477,16 @@ func SweepExpiredVerifyTrails(
 		}
 	})
 
+	seenTrailIds := map[string]bool{}
+	for _, trailId := range trailIdStrs {
+		seenTrailIds[trailId] = true
+	}
+	for _, trailId := range dueVerifyOriginalTrails(ctx, now, settings.SweepLimit) {
+		if !seenTrailIds[trailId] {
+			trailIdStrs = append(trailIdStrs, trailId)
+			seenTrailIds[trailId] = true
+		}
+	}
 	for _, trailIdStr := range trailIdStrs {
 		trailId, err := server.ParseId(trailIdStr)
 		if err != nil {
@@ -1536,7 +1497,16 @@ func SweepExpiredVerifyTrails(
 		}
 
 		trail := GetVerifyTrail(ctx, trailId)
-		if trail == nil || trail.Status != VerifyTrailStatusActive {
+		originalRecovery := false
+		if trail == nil {
+			if original := GetLatestVerifyOriginal(ctx, trailId); original != nil {
+				body, err := DecodeVerifyOriginal(original)
+				server.Raise(err)
+				trail = body.Trail
+				originalRecovery = true
+			}
+		}
+		if trail == nil || (trail.Status != VerifyTrailStatusActive && !originalRecovery) {
 			// ttl-expired or already terminal: drop the registry entry
 			server.Redis(ctx, func(r server.RedisClient) {
 				r.ZRem(ctx, verifyReapKey, trailIdStr)
@@ -1558,6 +1528,20 @@ func SweepExpiredVerifyTrails(
 			// The pre-lock snapshot may have changed while waiting. All expiry
 			// decisions and durable evidence below use the fenced reload.
 			trail = GetVerifyTrail(ctx, trailId)
+			var originalDeadlineMs uint64
+			if original := GetLatestVerifyOriginal(ctx, trailId); original != nil {
+				body, err := DecodeVerifyOriginal(original)
+				server.Raise(err)
+				if trail != nil {
+					server.Raise(VerifyOriginalMatchesTrail(body, trail))
+				}
+				if trail == nil || len(trail.Hops) < len(body.Trail.Hops) {
+					trail = PublishVerifyOriginal(ctx, original, settings).Trail
+				}
+				if trail.Pending != nil && body.Trail.Pending != nil && trail.Pending.ClientId == body.Trail.Pending.ClientId && len(trail.Hops) == len(body.Trail.Hops) {
+					originalDeadlineMs = body.RecoveryMs
+				}
+			}
 			if trail == nil || trail.Status != VerifyTrailStatusActive {
 				server.Redis(ctx, func(r server.RedisClient) {
 					r.ZRem(ctx, verifyReapKey, trailIdStr)
@@ -1567,6 +1551,9 @@ func SweepExpiredVerifyTrails(
 
 			if trail.Pending != nil {
 				deadlineMs := trail.Pending.AssignedMs + uint64((settings.StepTimeout+settings.StepTimeoutGrace)/time.Millisecond)
+				if originalDeadlineMs != 0 {
+					deadlineMs = originalDeadlineMs
+				}
 				if nowMs < deadlineMs {
 					// activity since the registry score was written: re-score
 					server.Redis(ctx, func(r server.RedisClient) {
@@ -1579,11 +1566,11 @@ func SweepExpiredVerifyTrails(
 				}
 			}
 
-			ExpireVerifyTrail(ctx, trailId)
-			DecrVerifyActiveTrails(ctx, trail.Vpk)
 			if !trail.Poison {
 				InsertVerifyTrail(ctx, NewExpiredVerifyTrailRow(trail))
 			}
+			ExpireVerifyTrail(ctx, trailId)
+			DecrVerifyActiveTrails(ctx, trail.Vpk)
 			sweptCount += 1
 			if glog.V(1) {
 				glog.Infof("[verify]reaped expired trail %s (depth %d, poison=%t)\n", trailId, len(trail.Hops), trail.Poison)
@@ -1609,15 +1596,18 @@ func NewExpiredVerifyTrailRow(trail *VerifyTrail) *VerifyTrailRow {
 	}
 	hopsJsonBytes, err := json.Marshal(hops)
 	server.Raise(err)
+	originalState, err := json.Marshal(trail)
+	server.Raise(err)
 	return &VerifyTrailRow{
-		TrailId:     trail.TrailId,
-		Vpk:         trail.Vpk,
-		ServerKeyId: trail.ServerKeyId,
-		ServerNonce: trail.ServerNonce,
-		Depth:       len(trail.Hops),
-		Status:      VerifyTrailRowStatusExpired,
-		HopsJson:    string(hopsJsonBytes),
-		CreateTime:  time.UnixMilli(int64(trail.CreateMs)).UTC(),
+		TrailId:       trail.TrailId,
+		Vpk:           trail.Vpk,
+		ServerKeyId:   trail.ServerKeyId,
+		ServerNonce:   trail.ServerNonce,
+		Depth:         len(trail.Hops),
+		Status:        VerifyTrailRowStatusExpired,
+		HopsJson:      string(hopsJsonBytes),
+		CreateTime:    time.UnixMilli(int64(trail.CreateMs)).UTC(),
+		OriginalState: originalState,
 	}
 }
 

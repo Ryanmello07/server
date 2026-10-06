@@ -4,12 +4,28 @@ import (
 	// "time"
 	"fmt"
 
-	"github.com/urnetwork/glog"
-	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/jwt"
 	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/session"
 )
+
+// A coded network create refusal for a client that asked for `result_errors`.
+// It keeps the refusal's HTTP status, because the signup liveness monitor counts
+// every 2xx network create as a created network, and the router answers it
+// with the result as the JSON body, where the client reads `error.code`.
+type networkCreateCodedRefusal struct {
+	result *model.NetworkCreateResult
+}
+
+// The refusal's "<status> <message>" transport text.
+func (self *networkCreateCodedRefusal) Error() string {
+	return self.result.Error.Error()
+}
+
+// The body the router writes with the refusal's status.
+func (self *networkCreateCodedRefusal) HttpErrorResultBody() any {
+	return self.result
+}
 
 func NetworkCreate(
 	networkCreate model.NetworkCreateArgs,
@@ -20,7 +36,15 @@ func NetworkCreate(
 		return nil, err
 	}
 	if result.Error != nil {
-		return nil, fmt.Errorf("%s", result.Error.Message)
+		if result.Error.Code != "" && networkCreate.ResultErrors {
+			// a coded refusal, for a client that reads the code: still the
+			// refusal's status, with the result as the body
+			return nil, &networkCreateCodedRefusal{result: result}
+		}
+		// Preserve the model's explicit client-refusal classification. Turning
+		// every result message into a plain error reported ordinary form and
+		// duplicate-account refusals as unhandled HTTP 500 failures.
+		return nil, result.Error
 	}
 	enrollNetworkCreateOnboardingPostPrimary(result, session)
 
@@ -71,11 +95,13 @@ func NetworkCreate(
 
 	// if verification required, send it
 	if result.VerificationRequired != nil {
-		verifySend := AuthVerifySendArgs{
-			UserAuth:   result.VerificationRequired.UserAuth,
-			UseNumeric: verifyUseNumeric,
-		}
-		AuthVerifySend(verifySend, session)
+		// why no code was sent goes back to the client; it used to be dropped
+		result.VerificationRequired.SendError = sendVerification(
+			result.VerificationRequired.UserAuth,
+			verifyUseNumeric,
+			session,
+			authVerifySendResult,
+		)
 	} else {
 
 		if result.UserAuth != nil && !result.SuppressAccountMessages {
@@ -183,32 +209,7 @@ func NetworkRemove(session *session.ClientSession) (*NetworkRemoveResult, error)
 	// local owner. Each confirmed cancellation closes only its own renewal, so
 	// partial progress is retryable and any remaining failure leaves the
 	// network and its authentication context intact.
-	if err := UnsubscribeStripe(session); err != nil {
-		glog.Errorf("Failed to unsubscribe Stripe: %v", err)
-		return &NetworkRemoveResult{
-			Error: &NetworkRemoveResultError{
-				Message: "Failed to unsubscribe Stripe",
-			},
-		}, nil
-	}
-
-	success, userAuths := model.RemoveNetwork(
-		session.Ctx,
-		session.ByJwt.NetworkId,
-		&session.ByJwt.UserId,
-	)
-
-	if success {
-		server.Tx(session.Ctx, func(tx server.PgTx) {
-			for userAuth, _ := range userAuths {
-				ScheduleRemoveProductUpdates(session, userAuth, tx)
-			}
-		})
-
-		return &NetworkRemoveResult{}, nil
-	}
-
-	return nil, fmt.Errorf("Could not remove network")
+	return networkRemoveWithSteps(session, &defaultNetworkRemoveSteps)
 }
 
 type GetNetworkReliabilityResult struct {

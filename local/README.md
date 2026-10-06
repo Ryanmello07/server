@@ -39,9 +39,14 @@ Press `Ctrl-C` in the `run-local.sh` terminal to stop the containers, restore
   ```
 - After both containers are healthy and both published ports are reachable from
   the host, atomically publishes `/tmp/urnetwork-server-run-local.lock/ready`.
-  That attestation binds the lock's opaque owner token to the selected IP,
-  hostnames, and ports. `test-env.sh` requires the complete record and the two
-  unique launcher-managed mappings before it probes either service.
+  That attestation binds the lock's owner token to the selected IP, hostnames,
+  and ports. The launcher re-execs before acquiring resources, preserving its
+  PID and flags while adding a random 128-bit nonce to its arguments. Its `v2`
+  owner token binds that nonce to the PID. `test-env.sh` requires a live,
+  non-zombie process with that exact nonce field in `ps`'s rendered command,
+  the complete record, and the two unique launcher-managed mappings before it
+  probes either service. Matching files or a reused PID alone cannot establish
+  readiness.
 
 ## Why not 127.0.0.1
 
@@ -85,6 +90,28 @@ withdraws the readiness attestation before changing hosts, listeners, or the
 loopback alias. It removes readiness only when both the lock and attestation
 still contain its owner token; ambiguous state is retained for inspection and
 future preflights fail closed.
+
+The launcher defers `HUP`, `INT`, and `TERM` during lock acquisition and ignores
+further signals once cleanup starts, so an ordinary interruption cannot strand
+the lock between directory creation and owner publication, or between owner
+removal and directory removal. `SIGKILL`, host failure, and filesystem errors
+can still leave incomplete state.
+
+Readiness validation rejects an absent owner or an old `v1` token even when
+the containers are healthy. This rejection does not authorize stale-lock
+reclamation: retain the residual state and follow the ownership checks below.
+
+An empty `/tmp/urnetwork-server-run-local.lock` is not proof that the services
+are unowned. For recovery, first prevent concurrent launcher starts and test
+runs, confirm that the original launcher and its cleanup have ended, and retain
+the lock metadata plus the current hosts, interface, and exact Compose-service
+identities. Recover only the residual mappings, alias, and containers whose
+ownership is established; preserve any ambiguous or unrelated state. Once the
+lock is confirmed abandoned and still empty, use
+`rmdir /tmp/urnetwork-server-run-local.lock`, which refuses unexpected contents.
+Do not recursively delete it or infer abandonment from a missing owner record
+or a PID alone. Start a fresh foreground launcher and wait for `Local
+environment is up` before resuming tests.
 
 An isolated portable environment may provision its own disposable PostgreSQL
 and Redis services instead of using this launcher. That workflow must select
@@ -137,15 +164,21 @@ then its `local` directory, then its `all` directory. The exact local full-suite
 boundary is:
 
 - vault: `auth.yml`, `brevo.yml`, `circle.yml`, `client.yml`, `coinbase.yml`,
-  `helius.yml`, `ipinfo.yml`, `jwt.yml`, `jwt-local-evaluator.pem`,
+  `helius.yml`, `jwt.yml`, `jwt-local-evaluator.pem`,
   `password.yml`, `pg.yml`, `proxy.yml`, `redis.yml`, `services.yml`, `st.yml`,
   `stripe.yml`, `wireguard.yml`, and `x402.yml`, plus `tls` certificate/key
   pairs for `ur.network`, `bringyour.com`, `main-connect.ur.network`, and
   `main-connect.bringyour.com`; each pair must be colocated at one direct or
   recursively versioned resolver location;
-- config: `apple_roots.pem`, `brevo.yml`, `city-list.yml`, `db.yml`,
-  `email.yml`, `iso-country-list.yml`, `pro.yml`, `redis.yml`, `settings.yml`,
-  `subsidy.yml`, and `tls.yml`.
+- config: `apple_roots.pem`, `brevo.yml`, `db.yml`, `email.yml`,
+  `mmdb/places.yml`, `pro.yml`, `redis.yml`, `settings.yml`, `subsidy.yml`,
+  and `tls.yml`.
+
+`mmdb/places.yml` is the location seeder's place list, which ships in the dated
+directory of the GeoLite2 database it is exported from
+(`all/mmdb/<date>/places.yml`). A config entry may therefore be a relative
+path, and it resolves through semantic-version directories at every level, as
+the Go resolver does; no path element may begin with a dot.
 
 An incomplete explicit resource checkout is rejected fail closed.
 The underlying resolver orders certificate and key paths independently,
@@ -202,6 +235,13 @@ from zsh; do not source `run-local-state.sh` directly into stock zsh.
   sibling vault checkout also exists. Set it consistently for both the launcher
   and the test shell; forcing it only for tests selects a different password
   from a stack initialized with `vault/local/pg.yml`.
+- The portable fixture also provides a public test password pepper, a
+  throwaway P-256 JWT signing key (`jwt-local-evaluator.pem`), and a
+  synthetic subsidy configuration for model tests. The subsidy keeps nonzero
+  accrual, points, referral and wallet thresholds; tests that exercise only
+  ledger settlement select an explicit zero-subsidy copy. These files stay
+  under `testdata/*/local` and are selected by the existing local-resource
+  rules; they neither load Main resources nor change application policy.
 - Startup authenticates with the selected application password and checks
   `CREATEDB`. Container health and an open port alone do not prove that the
   selected profile matches an existing PostgreSQL volume.
@@ -218,10 +258,17 @@ from zsh; do not source `run-local-state.sh` directly into stock zsh.
   `local-redis.bringyour.com` aliases, flush the resolver cache, and remove a
   stale lock only after that ownership check. Preserve unrelated aliases on a
   shared hosts line.
-- A launcher started from an older checkout has no readiness attestation. Stop
-  it normally and restart the current `run-local.sh`; do not synthesize `ready`
-  by hand.
+- A launcher started from an older checkout can lack readiness or use an old
+  owner token without a live process challenge. Stop it normally and restart
+  the current `run-local.sh`; do not synthesize `ready` by hand.
 - The postgres data volume (`pgdata`) persists across runs; the init script only
   runs on a fresh volume.
 - The postgres image must be the glibc (debian) build, not alpine: the test
   harness creates databases `WITH ... LOCALE='en_US.UTF-8'`, which alpine lacks.
+
+The local readiness regressions are Go tests (`local_run_local_*_test.go` and
+the launcher cases in `test_harness_test.go`). They use temporary metadata and
+Go-managed child processes. Bash remains necessary at the integration boundary
+because the existing platform launcher owns shell traps, sudo, host mappings,
+and Compose; these tests invoke its real helpers without provisioning services.
+This is the existing-platform exception to the runner's Go automation rule.

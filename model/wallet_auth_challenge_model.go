@@ -201,8 +201,30 @@ type UseWalletAuthChallengeArgs struct {
 
 type UseWalletAuthChallengeResult struct {
 	Valid bool
-	Error *WalletAuthChallengeResultError
+	// a signature that decoded cleanly but does not verify for PublicKey over
+	// Message (`401 invalid signature`), as distinct from malformed input and a
+	// wrong, used or expired challenge. An sr25519 signature cannot be
+	// recovered to the key that made it, so this cannot say which key (or
+	// which text) was signed, only that it was not this address over this
+	// message.
+	SignatureMismatch bool
+	Error             *WalletAuthChallengeResultError
 }
+
+// The stable `error.code` of a wallet sign-in, network create or add-auth
+// refusal for a signature that decoded cleanly but does not verify for the
+// address over the challenge (`SignatureMismatch`). With manual entry
+// (TAO.com) it means the wallet signed with another account than the address
+// entered. Every other wallet refusal has no code.
+const WalletAuthErrorCodeSignatureMismatch = "signature_mismatch"
+
+// the refusal's message, which clients that do not know the code show
+const walletAuthSignatureMismatchMessage = "The signature does not match this wallet address. Sign the challenge with this address."
+
+// validateWalletAuth's answer to a signature that decoded but does not verify.
+// The text is the one this refusal has always had; AddAuth tells it apart with
+// errors.Is to answer with the code.
+var errWalletSignatureMismatch = errors.New("401 invalid signature")
 
 func UseWalletAuthChallenge(
 	args *UseWalletAuthChallengeArgs,
@@ -293,8 +315,9 @@ func UseWalletAuthChallenge(
 	}
 	if !isValid {
 		return &UseWalletAuthChallengeResult{
-			Valid: false,
-			Error: &WalletAuthChallengeResultError{Message: "401 invalid signature"},
+			Valid:             false,
+			SignatureMismatch: true,
+			Error:             &WalletAuthChallengeResultError{Message: "401 invalid signature"},
 		}, nil
 	}
 

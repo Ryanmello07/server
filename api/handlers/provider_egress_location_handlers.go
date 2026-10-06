@@ -51,13 +51,12 @@ func readOperatorIngestSecret() string {
 	return values[0]
 }
 
-// ProviderEgressLocationSubmit ingests a probed provider egress location from
-// the operator's prober. The prober routes geolocation lookups through a
-// provider's own egress -- rather than relying on a lookup against the
-// provider's control-connection ip -- and submits the result here so the
-// server can prefer it over the built-in mmdb lookup. The route is
-// operator-to-server, authenticated by the shared secret above rather than a
-// network jwt.
+// ProviderEgressLocationSubmit ingests where a provider's traffic exits: the
+// address the operator's own /ip echo saw through the provider's tunnel, which
+// the server places with its own GeoLite2 (connect/GEOMAP.md §11.3) and
+// prefers over the lookup on the provider's control-connection ip. The route
+// is operator-to-server, authenticated by the shared secret above rather than
+// a network jwt.
 func ProviderEgressLocationSubmit(w http.ResponseWriter, r *http.Request) {
 	secret := operatorIngestSecret()
 	provided := r.Header.Get(operatorSecretHeader)
@@ -94,19 +93,11 @@ func ProviderEgressLocationSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ProviderEgressLocationAttempt records that the operator's prober tried to
-// probe a provider, whether or not the try produced a location.
-//
-// The prober reports a *failure* here; a success is reported by
-// ProviderEgressLocationSubmit above, whose provider_egress_location row
-// already defers the provider for the full staleness window. Reporting a
-// success here as well is harmless -- the attempt backoff is far shorter than
-// that window -- but redundant.
-//
-// This exists because ProviderEgressLocationDue would otherwise be starved by
-// providers that can never be probed successfully: they never get an egress
-// row, so they sort to the head of the queue on every poll forever. See
-// model.GetProviderEgressLocationDue.
+// ProviderEgressLocationAttempt retains attempt diagnostics and reports local
+// setup/publication failures. The model releases an incomplete URL claim into
+// its bounded failure retry without inventing a measured URL error or success.
+// A stored location or legacy aggregate result does not satisfy the URL quota;
+// the due route uses its durable deadline and rolling selected-policy history.
 //
 // Same auth as the two endpoints around it: operator-to-server, the shared
 // secret header rather than a network jwt, fail-closed when the vault resource
@@ -173,7 +164,11 @@ const (
 // OPTIONAL, exactly like provider_bandwidth.yml and pro.yml: a deployment
 // without the file must not fail to boot, it falls back to the conservative
 // default.
-var maxProviderEgressDueLimit = sync.OnceValue(func() int {
+var maxProviderEgressDueLimit = sync.OnceValue(readMaxProviderEgressDueLimit)
+
+// The uncached reader gives synthetic configuration tests the same parsing
+// path that each API process memoizes at startup.
+func readMaxProviderEgressDueLimit() int {
 	resource, err := server.Config.SimpleResource("provider_egress_due.yml")
 	if err != nil {
 		glog.Infof(
@@ -196,44 +191,53 @@ var maxProviderEgressDueLimit = sync.OnceValue(func() int {
 	}
 	glog.Infof("[pegl]max due limit: %d from provider_egress_due.yml\n", y.MaxDueLimit)
 	return y.MaxDueLimit
-})
-
-// providerEgressDueAge is how stale a stored probe must be before its provider
-// is offered up for re-probing. It is deliberately shorter than
-// model.ProviderEgressLocationMaxAge -- the age past which a stored location
-// stops being trusted at all. If the two were equal, every location would lapse
-// to the mmdb fallback at the exact moment it became due and stay lapsed until
-// the prober worked its way around to it; at half the max age the prober has a
-// full max-age/2 window to refresh a location before it expires.
-const providerEgressDueAge = model.ProviderEgressLocationMaxAge / 2
-
-// ProviderEgressLocationDueResult is the response body of
-// ProviderEgressLocationDue.
-type ProviderEgressLocationDueResult struct {
-	ClientIds []server.Id `json:"client_ids"`
 }
 
-// ProviderEgressLocationDue tells the operator's prober which providers to
-// probe next: those whose egress location has gone stale, and those that have
-// never been probed at all, oldest first.
-//
-// This moves the probe schedule from the prober's memory into the database.
-// The prober used to decide what to probe from an in-memory ttl cache, so a
-// restart re-probed the whole population and nothing durable recorded what was
-// actually due; observed_at already carries that information server-side, and
-// this exposes it.
-//
-// A provider is skipped if it has a fresh success *or* a recent attempt. The
-// second cutoff, ProviderEgressProbeAttemptBackoff, is much shorter than the
-// first: a provider that failed to probe should be retried within hours, but
-// must not be handed back on every poll, which is what would starve the rest of
-// the queue (see ProviderEgressLocationAttempt above).
-//
-// A current explicit blackhole failure is also deferred because its cheaper
-// check has already proved that the fixed tunnel cannot carry a destination.
-// The independent blackhole queue retries without this endpoint's attempt
-// backoff; a passing check restores eligibility immediately, while a stale or
-// missing check fails open after ProviderBlackholeCheckMaxAge.
+// providerEgressDueAge remains the legacy location-refresh cutoff for retained
+// diagnostic callers. ProviderEgressLocationDue does not use location age: its
+// URL quota and pacing are independent of the location's trust lifetime.
+const providerEgressDueAge = model.ProviderEgressLocationMaxAge / 2
+
+// One provider of a due list, with the place it is published under: the prober
+// draws a provider's sample only from the destinations compatible with that
+// place, so a site blocked in a country never counts against that country's
+// exits (connect/GEOMAP.md §11.3). Both place fields are empty for a provider
+// the reliability rollup has not placed, which excludes nothing.
+type ProviderEgressDueProvider struct {
+	ClientId server.Id `json:"client_id"`
+	// CountryCode is lowercase alpha-2.
+	CountryCode string `json:"country_code,omitempty"`
+	Region      string `json:"region,omitempty"`
+}
+
+// ProviderEgressLocationDueResult is the retained diagnostic due-list shape.
+// The URL due route additionally returns the token, quota deficit and ordinal
+// through model.ProviderUrlProbeDue; this shape can read only its place subset.
+type ProviderEgressLocationDueResult struct {
+	Providers []ProviderEgressDueProvider `json:"providers"`
+}
+
+// Joins a due list, in its order, to the places its providers are published
+// under.
+func providerEgressDueProviders(r *http.Request, clientIds []server.Id) []ProviderEgressDueProvider {
+	places := model.GetProviderEgressPlaces(r.Context(), clientIds)
+	providers := make([]ProviderEgressDueProvider, 0, len(clientIds))
+	for _, clientId := range clientIds {
+		place := places[clientId]
+		providers = append(providers, ProviderEgressDueProvider{
+			ClientId:    clientId,
+			CountryCode: place.CountryCode,
+			Region:      place.Region,
+		})
+	}
+	return providers
+}
+
+// ProviderEgressLocationDue retains its operator route while atomically
+// claiming paced URL turns. It returns the durable cycle token, remaining
+// success target and accepted outcome ordinal along with each provider place.
+// Reliability and ARIN risk determine eligibility; no independent cheap probe
+// gates admission. Unacknowledged claims expire without changing evidence.
 //
 // Same auth as ProviderEgressLocationSubmit above: operator-to-server, the
 // shared secret header rather than a network jwt, fail-closed when the vault
@@ -259,19 +263,16 @@ func ProviderEgressLocationDue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// shard_index / shard_count partition the queue across independent workers.
-	// Absent (or shard_count=1) is the single-prober case and behaves exactly as
-	// before, so an existing prober needs no change.
+	// Absent (or shard_count=1) selects the single-shard URL queue. Retaining
+	// the route name does not make legacy aggregate results satisfy its quota.
 	//
-	// Without this, every worker polling inside the attempt backoff gets the
-	// same rows -- the queue hands work out but never claims it -- so N workers
-	// repeat one shard's work instead of dividing it. Main assigns these slices
-	// to durable task rows rather than to hosts, so any taskworker can execute
-	// any slice.
+	// Durable task rows own these slices rather than particular hosts. Atomic
+	// row claims also exclude duplicate work while an earlier turn is active.
 	shardCount := 1
 	shardIndex := 0
 	if raw := r.URL.Query().Get("shard_count"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 {
+		if err != nil || parsed < 1 || model.ProviderUrlProbeSlotCount < parsed {
 			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
 		}
@@ -288,26 +289,6 @@ func ProviderEgressLocationDue(w http.ResponseWriter, r *http.Request) {
 		shardIndex = parsed
 	}
 
-	// both cutoffs are computed here and passed as arguments; observed_at and
-	// attempt_at are naive timestamps holding utc, so comparing them to sql
-	// now() in the query would cast through the session timezone
-	now := server.NowUtc()
-	minObservedAt := now.Add(-providerEgressDueAge)
-	minAttemptAt := now.Add(-model.ProviderEgressProbeAttemptBackoff)
-
-	result := &ProviderEgressLocationDueResult{
-		ClientIds: model.GetProviderEgressLocationDueSharded(
-			r.Context(),
-			minObservedAt,
-			minAttemptAt,
-			limit,
-			shardIndex,
-			shardCount,
-		),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(result); err != nil {
-		glog.Infof("[pegl]could not write response. err = %s\n", err)
-	}
+	respondProviderUrlProbeDue(w, r, limit, shardIndex, shardCount,
+		model.ClaimProviderUrlProbeDueWithObservation, providerUrlProbeDueTiming)
 }

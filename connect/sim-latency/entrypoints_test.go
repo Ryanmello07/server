@@ -18,13 +18,20 @@ import (
 type launchPlaybook struct {
 	Schema int `yaml:"schema"`
 	Season struct {
-		EpochCount               int    `yaml:"epoch_count"`
-		SubmissionWindowSeconds  int    `yaml:"submission_window_seconds"`
-		PreparationWindowSeconds int    `yaml:"preparation_window_seconds"`
-		SubmissionFeeUsd         int    `yaml:"submission_fee_usd"`
-		QueueLimit               int    `yaml:"queue_limit"`
-		ScoreTimeoutSeconds      int    `yaml:"score_timeout_seconds"`
-		BaselineSourcePolicy     string `yaml:"baseline_source_policy"`
+		EpochCount                  int    `yaml:"epoch_count"`
+		SubmissionWindowSeconds     int    `yaml:"submission_window_seconds"`
+		PreparationWindowSeconds    int    `yaml:"preparation_window_seconds"`
+		SubmissionFeeUsd            int    `yaml:"submission_fee_usd"`
+		QueueLimit                  int    `yaml:"queue_limit"`
+		ScoreTimeoutSeconds         int    `yaml:"score_timeout_seconds"`
+		BaselineSourcePolicy        string `yaml:"baseline_source_policy"`
+		ScoreBaselineScope          string `yaml:"score_baseline_scope"`
+		ScoreBaselineReplicateCount int    `yaml:"score_baseline_replicates"`
+		CandidateReplicateCount     int    `yaml:"candidate_replicates_per_submission"`
+		FirstAttemptOrder           string `yaml:"first_attempt_order"`
+		LaterAttemptOrder           string `yaml:"later_attempt_order"`
+		BaselineFailurePolicy       string `yaml:"baseline_failure_policy"`
+		HostDriftPolicy             string `yaml:"host_drift_policy"`
 	} `yaml:"season"`
 	Significance struct {
 		Authority                 string  `yaml:"authority"`
@@ -32,8 +39,17 @@ type launchPlaybook struct {
 		Alpha                     float64 `yaml:"alpha"`
 		InitialImprovementPercent float64 `yaml:"initial_improvement_percent"`
 		ThresholdScope            string  `yaml:"threshold_scope"`
+		ControlSampleScope        string  `yaml:"control_sample_scope"`
+		ControlIdentity           string  `yaml:"control_identity"`
 		NoWinnerPolicy            string  `yaml:"no_winner_policy"`
 	} `yaml:"significance"`
+	HonestyReview struct {
+		Ordering            string `yaml:"ordering"`
+		NormalizedScoreRole string `yaml:"normalized_score_role"`
+	} `yaml:"honesty_review"`
+	EvaluationSource struct {
+		Repositories []string `yaml:"repositories"`
+	} `yaml:"evaluation_source"`
 	Checklist []struct {
 		Id     string `yaml:"id"`
 		Status string `yaml:"status"`
@@ -128,18 +144,46 @@ func TestHostBuildAndRunEntrypoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Model-role contracts survive prose line wrapping but must keep the exact
+	// model, reasoning level, and ownership required by the current handoff.
+	runbook := strings.Join(strings.Fields(string(seasonRunbook)), " ")
 	for _, required := range []string{
 		"Mandatory candidate review",
-		"Terra with max reasoning",
-		"Sol with max reasoning",
+		"Use Terra (`gpt-5.6-terra`) with medium reasoning for all test execution",
+		"failure or suspected flake must be handed to Astra (`gpt-6-astra`) with max reasoning to diagnose the root cause, implement the correction, and add a deterministic regression test",
+		"Terra medium then reruns the affected test and required suite",
+		"do not accept an Astra-run test as the independent completion result",
+		"Astra with max reasoning owns code evaluation, each winning-submission honesty and safety code review, the approve/reject decision",
+		"every winner promotion, and all source or config merge/push operations",
+		"Terra must not approve candidates, merge branches, or push source/config refs",
+		"Astra max owns the source pull/merge and release review; Terra medium owns independent regression and image validation",
+		"Before qualifying the repaired evaluator, Terra medium must independently exercise the deterministic regressions",
 		"fabricated measurements",
 		"status 20",
 		"mode-0700 temporary directory",
 		"After epoch 6",
 	} {
-		if !strings.Contains(string(seasonRunbook), required) {
+		if !strings.Contains(runbook, required) {
 			t.Errorf("RUN-MAIN.md is missing agent handoff contract %q", required)
 		}
+	}
+	for _, stale := range []string{
+		"Terra max",
+		"Use Terra (`gpt-5.6-terra`) with max reasoning",
+	} {
+		if strings.Contains(runbook, stale) {
+			t.Errorf("RUN-MAIN.md retains superseded agent handoff contract %q", stale)
+		}
+	}
+	incidentRunbook, err := os.ReadFile("launch/STAGING-4-G5-INCIDENT.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep current release instructions aligned without rewriting historical
+	// model identities in the incident's captured validation evidence.
+	incident := strings.Join(strings.Fields(string(incidentRunbook)), " ")
+	if !strings.Contains(incident, "Have Terra medium verify that the tests reproduce the pre-fix behavior and pass on the repaired source; Astra max reviews the repair and merges") {
+		t.Error("STAGING-4-G5-INCIDENT.md is missing the current release-review model roles")
 	}
 }
 
@@ -201,11 +245,19 @@ func TestRunMainAdvancesAndExplicitlyReplacesStagingRounds(t *testing.T) {
 			t.Fatal(err)
 		}
 		binaryPath := filepath.Join(t.TempDir(), "sim-latency")
+		sourceRecordBytes, err := json.Marshal(sourceRecord{
+			Schema:       1,
+			Epoch:        0,
+			Branch:       stagingEvaluationSourceBranch,
+			Repositories: sourceTestCommits(strings.Repeat("a", 40)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		binaryFixture := `#!/usr/bin/env bash
 set -euo pipefail
 [[ ${1:-} == staging-source-check ]]
-printf '%s\n' '{"schema":1,"epoch":0,"branch":"sim-latency-staging","repositories":{"server":"a","connect":"b","sdk":"c","proxy":"d","glog":"e","goidenticons":"f","userwireguard":"g","sn":"h"}}'
-`
+printf '%s\n' '` + string(sourceRecordBytes) + "'\n"
 		if err := os.WriteFile(binaryPath, []byte(binaryFixture), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -250,7 +302,13 @@ func TestLaunchPlaybookFreezesWeeklySixEpochContract(t *testing.T) {
 		playbook.Season.PreparationWindowSeconds != 16*60*60 ||
 		playbook.Season.SubmissionFeeUsd != 20 || playbook.Season.QueueLimit != 0 ||
 		playbook.Season.ScoreTimeoutSeconds != 10800 ||
-		playbook.Season.BaselineSourcePolicy != "promote_significant_winner_or_carry_forward_unchanged" {
+		playbook.Season.BaselineSourcePolicy != "promote_significant_winner_or_carry_forward_unchanged" ||
+		playbook.Season.ScoreBaselineScope != "one_append_only_control_per_epoch" ||
+		playbook.Season.ScoreBaselineReplicateCount != 9 || playbook.Season.CandidateReplicateCount != 9 ||
+		playbook.Season.FirstAttemptOrder != "trusted_baseline_before_untrusted_candidate_build" ||
+		playbook.Season.LaterAttemptOrder != "authenticate_frozen_baseline_then_build_and_run_candidate" ||
+		playbook.Season.BaselineFailurePolicy != "freeze_completed_control_even_when_candidate_build_is_terminal" ||
+		playbook.Season.HostDriftPolicy != "full_self_check_after_every_job_stop_without_rebaseline_on_mismatch" {
 		t.Fatalf("launch season is not frozen: %+v", playbook.Season)
 	}
 	if playbook.Significance.Authority != "config/main/sim-latency.yml" ||
@@ -258,8 +316,17 @@ func TestLaunchPlaybookFreezesWeeklySixEpochContract(t *testing.T) {
 		playbook.Significance.Alpha != scoreSignificanceAlpha ||
 		playbook.Significance.InitialImprovementPercent != 16.1 ||
 		playbook.Significance.ThresholdScope != "per_source_epoch" ||
+		playbook.Significance.ControlSampleScope != "immutable_round_baseline_shared_by_all_submissions" ||
+		playbook.Significance.ControlIdentity != "exact_baseline_json_sha256_in_every_score" ||
 		playbook.Significance.NoWinnerPolicy != "carry_commits_and_threshold_forward_when_none_significant_or_all_rejected" {
 		t.Fatalf("launch significance policy is not frozen: %+v", playbook.Significance)
+	}
+	if playbook.HonestyReview.Ordering != "raw_score_asc_submitted_at_job_id" ||
+		playbook.HonestyReview.NormalizedScoreRole != "display_only" {
+		t.Fatalf("launch ranking policy is not frozen: %+v", playbook.HonestyReview)
+	}
+	if strings.Join(playbook.EvaluationSource.Repositories, " ") != strings.Join(sourceRepositoryNames(), " ") {
+		t.Fatalf("playbook source repositories = %v, want %v", playbook.EvaluationSource.Repositories, sourceRepositoryNames())
 	}
 	statuses := map[string]string{}
 	for _, item := range playbook.Checklist {

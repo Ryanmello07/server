@@ -89,8 +89,8 @@ install -m 0555 "$SCRIPT_DIR/entrypoint.sh" "$build_context/evaluator/entrypoint
 install -m 0555 "$SERVER_ROOT/connect/sim-latency/official-run.sh" "$build_context/evaluator/official-run.sh"
 install -m 0444 "$source_config" "$build_context/sim-latency.yml"
 
-readonly REPOSITORIES=(server connect sdk proxy glog goidenticons userwireguard sn)
-declare -A revisions
+readonly REPOSITORIES=(server connect sdk proxy glog goidenticons userwireguard sn operator-proxy warp)
+revision_args=()
 
 source_record=""
 if [ "$include_worktree" = false ]; then
@@ -112,7 +112,7 @@ if [ "$include_worktree" = false ]; then
     fi
     jq -e \
         --argjson epoch "$source_epoch" \
-        --argjson repositories '["server","connect","sdk","proxy","glog","goidenticons","userwireguard","sn"]' \
+        --argjson repositories '["server","connect","sdk","proxy","glog","goidenticons","userwireguard","sn","operator-proxy","warp"]' \
         '.schema == 1 and .epoch == $epoch and .branch == "sim-latency" and
          (.significant_improvement_percent | type == "number" and . > 0 and . <= 50) and
          (($record.repositories | keys) == ($repositories | sort)) and
@@ -126,18 +126,35 @@ if [ "$include_worktree" = false ]; then
 fi
 
 overlay_worktree() {
-    local source_root="$1" clone_root="$2" relative
-    if ! git -C "$source_root" diff --quiet HEAD; then
+    local source_root="$1" clone_root="$2" relative diff_status overlay_status
+    local untracked_path="$build_context/untracked-files"
+    if git -C "$source_root" diff --quiet HEAD; then
+        :
+    else
+        diff_status=$?
+        [ "$diff_status" -eq 1 ] || {
+            printf 'could not inspect development source changes: %s\n' "$source_root" >&2
+            exit 1
+        }
         git -C "$source_root" diff --binary HEAD | git -C "$clone_root" apply --whitespace=nowarn
     fi
+    # Process-substitution failures are not propagated by the read loop.
+    git -C "$source_root" ls-files --others --exclude-standard -z > "$untracked_path" || {
+        printf 'could not enumerate development source files: %s\n' "$source_root" >&2
+        exit 1
+    }
     while IFS= read -r -d '' relative; do
         [ -f "$source_root/$relative" ] && [ ! -L "$source_root/$relative" ] || {
             printf 'development snapshot only accepts regular untracked files: %s/%s\n' "$source_root" "$relative" >&2
             exit 1
         }
         install -D -m "$(stat -c '%a' "$source_root/$relative")" "$source_root/$relative" "$clone_root/$relative"
-    done < <(git -C "$source_root" ls-files --others --exclude-standard -z)
-    if [ -n "$(git -C "$clone_root" status --porcelain --untracked-files=all)" ]; then
+    done < "$untracked_path"
+    overlay_status="$(git -C "$clone_root" status --porcelain --untracked-files=all)" || {
+        printf 'could not inspect development clone: %s\n' "$clone_root" >&2
+        exit 1
+    }
+    if [ -n "$overlay_status" ]; then
         git -C "$clone_root" add --all
         GIT_AUTHOR_NAME='URnetwork Evaluator' \
         GIT_AUTHOR_EMAIL='evaluator@invalid' \
@@ -167,30 +184,26 @@ for repository in "${REPOSITORIES[@]}"; do
     if [ "$include_worktree" = true ]; then
         overlay_worktree "$source_root" "$clone_root"
     fi
-    [ -z "$(git -C "$clone_root" status --porcelain --untracked-files=all)" ] || {
+    clone_status="$(git -C "$clone_root" status --porcelain --untracked-files=all)" || {
+        printf 'could not inspect temporary clone: %s\n' "$repository" >&2
+        exit 1
+    }
+    [ -z "$clone_status" ] || {
         printf 'temporary clone is not clean: %s\n' "$repository" >&2
         exit 1
     }
-    revisions[$repository]="$(git -C "$clone_root" rev-parse HEAD)"
+    clone_revision="$(git -C "$clone_root" rev-parse HEAD)"
+    revision_args+=(--arg "$repository" "$clone_revision")
 done
 
 jq -n \
-    --arg server "${revisions[server]}" \
-    --arg connect "${revisions[connect]}" \
-    --arg proxy "${revisions[proxy]}" \
-    --arg sdk "${revisions[sdk]}" \
-    --arg glog "${revisions[glog]}" \
-    --arg goidenticons "${revisions[goidenticons]}" \
-    --arg userwireguard "${revisions[userwireguard]}" \
-    --arg sn "${revisions[sn]}" \
+    --argjson repositories "$(jq -n "${revision_args[@]}" '$ARGS.named')" \
     --argjson development_snapshot "$include_worktree" \
     '{schema: 1, development_snapshot: $development_snapshot,
-      repositories: {server: $server, connect: $connect, proxy: $proxy,
-      sdk: $sdk, glog: $glog, goidenticons: $goidenticons,
-      userwireguard: $userwireguard, sn: $sn}}' \
+      repositories: $repositories}' \
     > "$build_context/source-lock.json"
 
-base_sha="${revisions[server]}"
+base_sha="$(jq -er '.repositories.server' "$build_context/source-lock.json")"
 source_lock_sha256="$(sha256sum "$build_context/source-lock.json" | awk '{print $1}')"
 source_config_sha256="$(sha256sum "$build_context/sim-latency.yml" | awk '{print $1}')"
 if [ -z "$image_tag" ]; then
@@ -199,6 +212,7 @@ fi
 
 DOCKER_BUILDKIT=1 sudo -n docker build \
     --platform linux/amd64 \
+    --no-cache \
     --network default \
     --file "$SCRIPT_DIR/Dockerfile.base" \
     --build-arg "BASE_SHA=$base_sha" \

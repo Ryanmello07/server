@@ -29,6 +29,169 @@ func canceledCircleRetryRestoreMigrationIndex(t testing.TB) int {
 	return sqlMigrationIndex(t, "restore_canceled_circle_retries")
 }
 
+// The raw-only review function is published history. Compatibility must append
+// after it, so databases that already applied 677 still install the correction.
+func TestCompetitionRankingCompatibilityMigrationAppendsAfterSharedBaseline(t *testing.T) {
+	baselineIndex := sqlMigrationIndex(t, "CREATE TABLE competition_round_baseline")
+	compatibilityIndex := sqlMigrationIndex(t, "competition round baseline cannot replace legacy ranking policy")
+	if baselineIndex != 675 || compatibilityIndex != 677 {
+		t.Fatalf("baseline/compatibility migration indices = %d/%d, want 675/677", baselineIndex, compatibilityIndex)
+	}
+	rawMigration, ok := migrations[676].(*SqlMigration)
+	if !ok || !strings.Contains(rawMigration.sql, "ORDER BY (score_json->>'raw_score')::numeric ASC") ||
+		strings.Contains(rawMigration.sql, "normalized_score") {
+		t.Fatal("published migration 677 was changed instead of superseded")
+	}
+	compatibility, ok := migrations[compatibilityIndex].(*SqlMigration)
+	if !ok {
+		t.Fatalf("ranking compatibility migration is %T, want *SqlMigration", migrations[compatibilityIndex])
+	}
+	normalized := strings.Join(strings.Fields(compatibility.sql), " ")
+	for _, marker := range []string{
+		"CREATE OR REPLACE FUNCTION competition_candidate_review_insert_guard()",
+		"ORDER BY CASE WHEN NOT EXISTS ( SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id ) THEN (score_json->>'normalized_score')::numeric END DESC, (score_json->>'raw_score')::numeric ASC, submitted_at, job_id",
+		"CREATE OR REPLACE FUNCTION competition_round_baseline_insert_guard()",
+		"canceled OR finalized_at IS NOT NULL",
+		"IF NOT EXISTS ( SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id ) AND EXISTS ( SELECT 1 FROM competition_job WHERE round_id = NEW.round_id AND state = 'succeeded' )",
+		"state = 'running' AND attempt_count >= NEW.source_attempt",
+	} {
+		if !strings.Contains(normalized, marker) {
+			t.Errorf("ranking compatibility migration lost %q", marker)
+		}
+	}
+}
+
+// Automatic staging winner selection supersedes the forced-null rule without
+// moving applied migrations or changing production's ordered review policy.
+func TestCompetitionStagingWinnerMigrationAppendsWithoutChangingReviewPolicy(t *testing.T) {
+	index := sqlMigrationIndex(t, "expected_staging_winner uuid")
+	if index != 683 {
+		t.Fatalf("automatic staging winner migration index = %d, want 683", index)
+	}
+	migration := migrations[index].(*SqlMigration)
+	normalized := strings.Join(strings.Fields(migration.sql), " ")
+	for _, marker := range []string{
+		"CREATE OR REPLACE FUNCTION competition_round_honesty_review_guard()",
+		"NEW.finalized_at IS NOT NULL AND OLD.finalized_at IS NULL",
+		"state IN ('queued', 'running')",
+		"IF NEW.staging = true THEN SELECT job_id INTO expected_staging_winner",
+		"round_id = NEW.round_id AND state = 'succeeded'",
+		`score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb`,
+		`score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb`,
+		"score_json->'gates' <> '{}'::jsonb",
+		"WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)",
+		"ORDER BY CASE WHEN NOT EXISTS ( SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id ) THEN (score_json->>'normalized_score')::numeric END DESC, (score_json->>'raw_score')::numeric ASC, submitted_at, job_id LIMIT 1",
+		"NEW.winner_job_id IS DISTINCT FROM expected_staging_winner",
+	} {
+		if !strings.Contains(normalized, marker) {
+			t.Errorf("staging winner migration lost %q", marker)
+		}
+	}
+	for _, forbidden := range []string{"DROP TRIGGER", "DROP FUNCTION", "UPDATE competition_round", "CREATE OR REPLACE FUNCTION competition_candidate_review_insert_guard"} {
+		if strings.Contains(migration.sql, forbidden) {
+			t.Errorf("staging winner migration unexpectedly contains %q", forbidden)
+		}
+	}
+	old := migrations[651].(*SqlMigration)
+	if !strings.Contains(old.sql, "competition staging round cannot select a winner") {
+		t.Fatal("applied migration 652's forced-null rule was edited instead of superseded")
+	}
+	productionGate := func(sql string) string {
+		_, body, found := strings.Cut(sql, "IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (")
+		if !found {
+			t.Fatal("production honesty gate is missing")
+		}
+		body, _, _ = strings.Cut(body, "$competition_round_honesty_review_gate$;")
+		return strings.Join(strings.Fields(body), " ")
+	}
+	if productionGate(old.sql) != productionGate(migration.sql) {
+		t.Fatal("automatic staging winner migration changed production's approval/unresolved-candidate gate")
+	}
+}
+
+// Staging's best-safe-winner policy must supersede, not rewrite, the applied
+// significant-winner migration and must leave production review unchanged.
+func TestCompetitionStagingBestWinnerMigrationPreservesProductionGate(t *testing.T) {
+	oldIndex := sqlMigrationIndex(t, "expected_staging_winner uuid")
+	newIndex := sqlMigrationIndex(t, "staging_best_safe_winner_v691")
+	if oldIndex != 683 || newIndex != 690 {
+		t.Fatalf("staging winner migration indices = %d/%d, want 683/690", oldIndex, newIndex)
+	}
+	oldMigration := migrations[oldIndex].(*SqlMigration)
+	newMigration := migrations[newIndex].(*SqlMigration)
+	oldSql := strings.Join(strings.Fields(oldMigration.sql), " ")
+	newSql := strings.Join(strings.Fields(newMigration.sql), " ")
+	if !strings.Contains(oldSql, `score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb`) ||
+		!strings.Contains(oldSql, `score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb`) {
+		t.Fatal("applied staging winner migration was changed")
+	}
+	stagingSection, productionSection, found := strings.Cut(newSql, "IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (")
+	if !found || !strings.Contains(stagingSection, `score_json @> '{"placeable":true}'::jsonb`) ||
+		strings.Contains(stagingSection, "statistically_significant") ||
+		strings.Contains(stagingSection, "takeover_eligible") {
+		t.Fatal("staging best-winner migration retains a statistical or takeover gate")
+	}
+	_, oldProduction, found := strings.Cut(oldSql, "IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (")
+	if !found || productionSection != oldProduction {
+		t.Fatal("staging best-winner migration changed production review")
+	}
+}
+
+func TestCompetitionStagingApprovalMigrationIsAppendOnlyAndWinnerBound(t *testing.T) {
+	index := sqlMigrationIndex(t, "CREATE TABLE competition_staging_winner_approval")
+	if index != 720 {
+		t.Fatalf("staging approval migration index = %d, want published index 720", index)
+	}
+	sql := migrations[index].(*SqlMigration).sql
+	for _, marker := range []string{
+		"PRIMARY KEY REFERENCES competition_round(round_id)",
+		"competition_staging_winner_approval_append_only",
+		"competition_append_only_guard()",
+		"round.staging = true",
+		"round.finalized_at IS NOT NULL",
+		"round.winner_job_id = NEW.job_id",
+		"job.state = 'succeeded'",
+	} {
+		if !strings.Contains(sql, marker) {
+			t.Errorf("staging approval migration lost %q", marker)
+		}
+	}
+	if strings.Contains(sql, "competition_candidate_review_insert_guard") ||
+		strings.Contains(sql, "UPDATE competition_round") {
+		t.Fatal("staging approval migration changed production review or finalized round")
+	}
+}
+
+// The best-safe winner query and honesty guard are insufficient if the
+// independent immutable-round trigger still requires takeover eligibility.
+// Migration 720 must relax only staging while preserving all production and
+// immutable-field checks from the published admission-close migration.
+func TestCompetitionStagingWinnerLifecycleGuardMigration(t *testing.T) {
+	oldIndex := sqlMigrationIndex(t, "ADD COLUMN admission_closed_at")
+	newIndex := sqlMigrationIndex(t, "staging_best_safe_winner_immutable_guard_v720")
+	if oldIndex != 652 || newIndex != 719 {
+		t.Fatalf("lifecycle guard migration indices = %d/%d, want 652/719", oldIndex, newIndex)
+	}
+	oldSql := migrations[oldIndex].(*SqlMigration).sql
+	newSql := migrations[newIndex].(*SqlMigration).sql
+	const marker = "CREATE OR REPLACE FUNCTION competition_round_immutable_guard()"
+	_, oldFunction, oldFound := strings.Cut(oldSql, marker)
+	_, newFunction, newFound := strings.Cut(newSql, marker)
+	if !oldFound || !newFound {
+		t.Fatal("staging lifecycle migration does not replace the published guard")
+	}
+	const oldPredicate = "(job.score_json->>'takeover_eligible')::boolean"
+	const newPredicate = "(NEW.staging OR (job.score_json->>'takeover_eligible')::boolean)"
+	if !strings.Contains(oldFunction, oldPredicate) || !strings.Contains(newFunction, newPredicate) {
+		t.Fatal("staging lifecycle migration did not relax takeover eligibility")
+	}
+	normalizedOld := strings.Join(strings.Fields(oldFunction), " ")
+	normalizedNew := strings.Join(strings.Fields(strings.Replace(newFunction, newPredicate, oldPredicate, 1)), " ")
+	if normalizedOld != normalizedNew {
+		t.Fatal("staging lifecycle migration changed another immutable-field or production rule")
+	}
+}
+
 func accountPaymentContractRetentionMigrationIndex(t testing.TB) int {
 	return sqlMigrationIndex(t, "account_payment_contract_retention_queue")
 }

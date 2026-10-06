@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -91,6 +92,10 @@ type NetworkCreateArgs struct {
 	// Absent = on (the line ships ticked); false turns the preference off from
 	// the first moment, before any campaign mail can go out.
 	ProductUpdates *bool `json:"product_updates,omitempty"`
+	// answer a coded refusal (`NetworkCreateResultError.Code`) with the result
+	// as the body of its HTTP status (401), instead of the plain text message
+	// older clients expect; the status stays a refusal either way
+	ResultErrors bool `json:"result_errors,omitempty"`
 }
 
 type NetworkCreateResult struct {
@@ -115,10 +120,32 @@ type NetworkCreateResultNetwork struct {
 
 type NetworkCreateResultVerification struct {
 	UserAuth string `json:"user_auth"`
+	// set when no code was sent for this verification (rate limited or the
+	// send failed). Clients that predate the field ignore it.
+	SendError *AuthVerifySendError `json:"send_error,omitempty"`
 }
 
 type NetworkCreateResultError struct {
+	// `WalletAuthErrorCodeSignatureMismatch` for a wallet signature that does
+	// not verify for its address, "" for every other refusal. Only a coded
+	// refusal reaches a client that asked for `result_errors` as a result, in
+	// the body of its refusal status.
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
+	// Only an explicit input/duplicate refusal may become a client status.
+	// Internal and ambiguous creation failures retain the existing 500 path.
+	// This marker is server-internal; the model's JSON/message contract stays
+	// unchanged, and client input cannot set the classification.
+	refusalStatus int
+}
+
+// Preserve the existing numeric-prefix HTTP error transport without changing JSON.
+func (self *NetworkCreateResultError) Error() string {
+	switch self.refusalStatus {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusConflict:
+		return fmt.Sprintf("%d %s", self.refusalStatus, self.Message)
+	}
+	return self.Message
 }
 
 func ValidateNetworkName(networkName string) (string, error) {
@@ -150,19 +177,67 @@ func ValidateNetworkName(networkName string) (string, error) {
 	return normalized, nil
 }
 
+// Reject only explicit request-shape errors here. A nonempty token for a
+// supported provider still goes through ParseAuthJwt below the limiter; a
+// verification, key-fetch, or provider failure is not classified by its text.
+func networkCreateAuthShapeError(networkCreate NetworkCreateArgs) *NetworkCreateResultError {
+	message := ""
+	switch {
+	case networkCreate.UserAuth != nil:
+		// Keep the existing email/phone branch precedence and password policy.
+		// A missing pointer would otherwise panic in networkCreateUserAuth.
+		if networkCreate.Password == nil {
+			message = "Password is required."
+		}
+	case networkCreate.AuthJwt != nil && (networkCreate.AuthJwtType != nil || networkCreate.WalletAuth == nil):
+		// A complete SSO pair precedes wallet auth. Preserve the existing
+		// wallet selection when only an incomplete, unused SSO field is set.
+		switch {
+		case networkCreate.AuthJwtType == nil:
+			message = "Authentication type is required."
+		case strings.TrimSpace(*networkCreate.AuthJwt) == "":
+			message = "Authentication token is required."
+		case AuthType(*networkCreate.AuthJwtType) != AuthTypeApple && AuthType(*networkCreate.AuthJwtType) != AuthTypeGoogle:
+			message = "Unsupported authentication type."
+		}
+	case networkCreate.WalletAuth != nil:
+		// Unused fields on an explicitly selected wallet method do not change
+		// its existing validation or challenge semantics.
+	case networkCreate.Password != nil:
+		message = "Email or phone number is required for password signup."
+	case networkCreate.AuthJwtType != nil:
+		message = "Authentication token is required."
+	}
+	if message == "" {
+		return nil
+	}
+	return &NetworkCreateResultError{Message: message, refusalStatus: http.StatusBadRequest}
+}
+
 func NetworkCreate(
 	networkCreate NetworkCreateArgs,
 	session *session.ClientSession,
 ) (*NetworkCreateResult, error) {
 	userAuth, _ := NormalUserAuthV1(networkCreate.UserAuth)
 
+	seedphraseSignup := networkCreate.UserAuth == nil && networkCreate.AuthJwt == nil && networkCreate.WalletAuth == nil
+	// Orphan credential fields are not a request for a seedphrase account.
+	// Keep terms refusal precedence and reject before selecting that path or
+	// spending its independent daily budget.
+	if seedphraseSignup && networkCreate.Terms {
+		if shapeError := networkCreateAuthShapeError(networkCreate); shapeError != nil {
+			return &NetworkCreateResult{Error: shapeError}, nil
+		}
+	}
+
 	// seedphrase path: no auth method provided
-	if networkCreate.UserAuth == nil && networkCreate.AuthJwt == nil && networkCreate.WalletAuth == nil {
+	if seedphraseSignup {
 
 		if !networkCreate.Terms {
 			result := &NetworkCreateResult{
 				Error: &NetworkCreateResultError{
-					Message: AgreeToTerms,
+					Message:       AgreeToTerms,
+					refusalStatus: http.StatusBadRequest,
 				},
 			}
 			return result, nil
@@ -255,7 +330,8 @@ func NetworkCreate(
 	if !networkCreate.Terms {
 		result := &NetworkCreateResult{
 			Error: &NetworkCreateResultError{
-				Message: AgreeToTerms,
+				Message:       AgreeToTerms,
+				refusalStatus: http.StatusBadRequest,
 			},
 		}
 		return result, nil
@@ -266,7 +342,8 @@ func NetworkCreate(
 	if error != nil {
 		result := &NetworkCreateResult{
 			Error: &NetworkCreateResultError{
-				Message: error.Error(),
+				Message:       error.Error(),
+				refusalStatus: http.StatusBadRequest,
 			},
 		}
 		return result, nil
@@ -277,7 +354,8 @@ func NetworkCreate(
 	if err != nil {
 		result := &NetworkCreateResult{
 			Error: &NetworkCreateResultError{
-				Message: err.Error(),
+				Message:       err.Error(),
+				refusalStatus: http.StatusConflict,
 			},
 		}
 		return result, nil
@@ -288,10 +366,15 @@ func NetworkCreate(
 	if networkCreate.UserAuth != nil && userAuth == nil {
 		result := &NetworkCreateResult{
 			Error: &NetworkCreateResultError{
-				Message: "Invalid email or phone number.",
+				Message:       "Invalid email or phone number.",
+				refusalStatus: http.StatusBadRequest,
 			},
 		}
 		return result, nil
+	}
+
+	if shapeError := networkCreateAuthShapeError(networkCreate); shapeError != nil {
+		return &NetworkCreateResult{Error: shapeError}, nil
 	}
 
 	containsProfanity := goaway.IsProfane(validatedNetworkName)
@@ -360,7 +443,8 @@ func NetworkCreate(
 		} else {
 			result := &NetworkCreateResult{
 				Error: &NetworkCreateResultError{
-					Message: "Account might already exist. Please start over.",
+					Message:       "Account might already exist. Please start over.",
+					refusalStatus: resultNetworkCreate.refusalStatus,
 				},
 			}
 			return result, nil
@@ -368,7 +452,7 @@ func NetworkCreate(
 	} else if networkCreate.AuthJwt != nil && networkCreate.AuthJwtType != nil {
 		// user is creating a network via social login
 
-		authJwt, _ := ParseAuthJwt(*networkCreate.AuthJwt, AuthType(*networkCreate.AuthJwtType))
+		authJwt := parseSsoAuthJwt("network create", *networkCreate.AuthJwt, AuthType(*networkCreate.AuthJwtType))
 
 		if authJwt != nil {
 
@@ -414,7 +498,8 @@ func NetworkCreate(
 			} else {
 				result := &NetworkCreateResult{
 					Error: &NetworkCreateResultError{
-						Message: "Account might already exist. Please log in again.",
+						Message:       "Account might already exist. Please log in again.",
+						refusalStatus: resultNetworkCreate.refusalStatus,
 					},
 				}
 				return result, nil
@@ -464,6 +549,17 @@ func NetworkCreate(
 		}, session.Ctx)
 		if err != nil {
 			return nil, err
+		}
+		if useResult.SignatureMismatch {
+			// coded, so the apps can say the wallet signed with another
+			// account; a client without `result_errors` gets the 401
+			return &NetworkCreateResult{
+				Error: &NetworkCreateResultError{
+					Code:          WalletAuthErrorCodeSignatureMismatch,
+					Message:       walletAuthSignatureMismatchMessage,
+					refusalStatus: http.StatusUnauthorized,
+				},
+			}, nil
 		}
 		if !useResult.Valid {
 			msg := "400 invalid wallet challenge"
@@ -555,9 +651,14 @@ func NetworkCreate(
 			}
 			return result, nil
 		} else {
+			message := "Account might already exist. Please log in again."
+			if networkCreateResult.refusalMessage != "" {
+				message = networkCreateResult.refusalMessage
+			}
 			result := &NetworkCreateResult{
 				Error: &NetworkCreateResultError{
-					Message: "Account might already exist. Please log in again.",
+					Message:       message,
+					refusalStatus: networkCreateResult.refusalStatus,
 				},
 			}
 			return result, nil
@@ -575,6 +676,10 @@ type networkCreateResult struct {
 	UserId      server.Id
 	Seedphrase  string
 	IsPro       bool
+	// Created=false alone also covers internal helper failures; only a
+	// completed existing-account/name check establishes a client refusal.
+	refusalStatus  int
+	refusalMessage string
 }
 
 /**
@@ -591,15 +696,16 @@ func networkCreateWalletAuth(
 	}
 
 	created := false
+	refusalStatus := 0
+	refusalMessage := ""
 	var createdNetworkId server.Id
 	var createdUserId server.Id
 	isPro := false
-	var walletConflictErr error
 
 	server.Tx(ctx, func(tx server.PgTx) {
+		refusalStatus = 0
+		refusalMessage = ""
 		var userId *server.Id
-		// cleared per attempt so a transient retry cannot inherit it
-		walletConflictErr = nil
 
 		result, err := tx.Query(
 			ctx,
@@ -616,25 +722,15 @@ func networkCreateWalletAuth(
 
 		if userId != nil {
 			glog.Infof("Network user already exists with this wallet address")
+			refusalStatus = http.StatusConflict
 			return
 		}
 
-		// Detect a wallet already bound in network_user_auth_wallet here,
-		// before any INSERT. Left to addWalletAuthInTx below it raises a
-		// plain error, which server.Tx cannot classify as transient, so the
-		// panic escaped the transaction and the router's recover answered
-		// the generic "Error. Please email support@ur.io for help." 500 --
-		// instead of the structured NetworkCreateResult.Error every other
-		// failure in this function returns. Moving the check up rather than
-		// capturing that error is what keeps it safe: the network_user
-		// INSERT below has already run by then, and the raise is what aborts
-		// the transaction and prevents an orphan user row.
-		//
-		// Today's writers keep the two tables in step (addWalletAuthInTx
-		// mirrors onto network_user.wallet_address and RemoveAuth clears
-		// both), so the pre-check above catches the ordinary cases and this
-		// one covers the divergence -- the legacy shape addWalletAuthInTx's
-		// own comment describes.
+		// The current writers mirror wallet ownership in network_user and
+		// network_user_auth_wallet, but legacy or partially repaired rows may
+		// exist only in the child table. Detect that shape before inserting a
+		// new user so the transaction returns the same explicit client conflict
+		// instead of raising an unclassified uniqueness error after the insert.
 		var conflictUserId *server.Id
 		result, err = tx.Query(
 			ctx,
@@ -649,7 +745,8 @@ func networkCreateWalletAuth(
 			}
 		})
 		if conflictUserId != nil {
-			walletConflictErr = errors.New("This wallet is already linked to another account.")
+			refusalStatus = http.StatusConflict
+			refusalMessage = "This wallet is already linked to another account."
 			return
 		}
 
@@ -716,16 +813,14 @@ func networkCreateWalletAuth(
 		created = true
 	})
 
-	if walletConflictErr != nil {
-		return networkCreateResult{}, walletConflictErr
-	}
-
 	return networkCreateResult{
-		Created:     created,
-		NetworkId:   createdNetworkId,
-		NetworkName: networkCreate.NetworkName,
-		UserId:      createdUserId,
-		IsPro:       isPro,
+		Created:        created,
+		NetworkId:      createdNetworkId,
+		NetworkName:    networkCreate.NetworkName,
+		UserId:         createdUserId,
+		IsPro:          isPro,
+		refusalStatus:  refusalStatus,
+		refusalMessage: refusalMessage,
 	}, nil
 
 }
@@ -744,11 +839,13 @@ func networkCreateAuthJwt(
 ) networkCreateResult {
 
 	created := false
+	refusalStatus := 0
 	var createdNetworkId server.Id
 	var createdUserId server.Id
 	isPro := false
 
 	server.Tx(ctx, func(tx server.PgTx) {
+		refusalStatus = 0
 		var userId *server.Id
 
 		result, err := tx.Query(
@@ -766,6 +863,7 @@ func networkCreateAuthJwt(
 
 		if userId != nil {
 			// server.Logger().Printf("User already exists\n")
+			refusalStatus = http.StatusConflict
 			return
 		}
 
@@ -837,11 +935,12 @@ func networkCreateAuthJwt(
 	})
 
 	return networkCreateResult{
-		Created:     created,
-		NetworkId:   createdNetworkId,
-		NetworkName: networkCreate.NetworkName,
-		UserId:      createdUserId,
-		IsPro:       isPro,
+		Created:       created,
+		NetworkId:     createdNetworkId,
+		NetworkName:   networkCreate.NetworkName,
+		UserId:        createdUserId,
+		IsPro:         isPro,
+		refusalStatus: refusalStatus,
 	}
 
 }
@@ -860,11 +959,13 @@ func networkCreateUserAuth(
 ) networkCreateResult {
 
 	created := false
+	refusalStatus := 0
 	var createdNetworkId server.Id
 	var createdUserId server.Id
 	isPro := false
 
 	server.Tx(ctx, func(tx server.PgTx) {
+		refusalStatus = 0
 		var result server.PgResult
 		var err error
 
@@ -884,6 +985,7 @@ func networkCreateUserAuth(
 		})
 
 		if userId != nil {
+			refusalStatus = http.StatusConflict
 			return
 		}
 
@@ -903,6 +1005,7 @@ func networkCreateUserAuth(
 		})
 
 		if existingNetworkId != nil {
+			refusalStatus = http.StatusConflict
 			return
 		}
 
@@ -969,11 +1072,12 @@ func networkCreateUserAuth(
 	})
 
 	return networkCreateResult{
-		Created:     created,
-		NetworkId:   createdNetworkId,
-		NetworkName: networkCreate.NetworkName,
-		UserId:      createdUserId,
-		IsPro:       isPro,
+		Created:       created,
+		NetworkId:     createdNetworkId,
+		NetworkName:   networkCreate.NetworkName,
+		UserId:        createdUserId,
+		IsPro:         isPro,
+		refusalStatus: refusalStatus,
 	}
 
 }
@@ -1321,6 +1425,26 @@ func Testing_CreateNetwork(
 	})
 
 	return
+}
+
+// Inserts a network_user/network pair shaped exactly like the pre-removal
+// networkCreateGuest function used to create: auth_type='guest', no user_auth,
+// no password, no rows in any auth table. Guest signup is retired, but rows
+// shaped like this still exist in production and this fork's code must not
+// mistreat them.
+func Testing_CreateLegacyGuestNetwork(ctx context.Context, networkId server.Id, userId server.Id) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`INSERT INTO network_user (user_id, user_name, auth_type) VALUES ($1, $2, $3)`,
+			userId, "guest", "guest",
+		))
+		server.RaisePgResult(tx.Exec(
+			ctx,
+			`INSERT INTO network (network_id, network_name, admin_user_id) VALUES ($1, $2, $3)`,
+			networkId, "g"+networkId.String(), userId,
+		))
+	})
 }
 
 func Testing_CreateNetworkByWallet(

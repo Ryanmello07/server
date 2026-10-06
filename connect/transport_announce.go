@@ -176,7 +176,10 @@ type ConnectionAnnounce struct {
 	// ipFamilyIntent is the family the transport declared it intends to
 	// prove: 0 (legacy), 4 or 6. Recorded with the connection; the observed
 	// family is derived from clientAddress at the model.
-	ipFamilyIntent  int
+	ipFamilyIntent int
+	// the client's app version from its auth, for the provider rollout gauge
+	// (providerVersionConnection); "" when it sent none
+	appVersion      string
 	handlerId       server.Id
 	announceTimeout time.Duration
 
@@ -186,6 +189,7 @@ type ConnectionAnnounce struct {
 
 	stateLock           sync.Mutex
 	connectionId        *server.Id
+	shadowCaptureLease  *arinShadowOwnerLease
 	receiveMessageCount uint64
 	receiveByteCount    ByteCount
 	sendMessageCount    uint64
@@ -266,6 +270,7 @@ func NewConnectionAnnounce(
 		clientId,
 		clientAddress,
 		0,
+		"",
 		handlerId,
 		announceTimeout,
 		testConfig,
@@ -274,7 +279,8 @@ func NewConnectionAnnounce(
 }
 
 // NewConnectionAnnounceWithIpFamily is NewConnectionAnnounce with the address
-// family the transport declared it intends to prove (0, 4 or 6).
+// family the transport declared it intends to prove (0, 4 or 6) and the
+// client's app version from its auth.
 func NewConnectionAnnounceWithIpFamily(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -282,6 +288,7 @@ func NewConnectionAnnounceWithIpFamily(
 	clientId server.Id,
 	clientAddress string,
 	ipFamilyIntent int,
+	appVersion string,
 	handlerId server.Id,
 	announceTimeout time.Duration,
 	testConfig *TestConfig,
@@ -294,6 +301,7 @@ func NewConnectionAnnounceWithIpFamily(
 		clientId:               clientId,
 		clientAddress:          clientAddress,
 		ipFamilyIntent:         ipFamilyIntent,
+		appVersion:             appVersion,
 		handlerId:              handlerId,
 		announceTimeout:        announceTimeout,
 		settings:               settings,
@@ -314,6 +322,7 @@ func NewConnectionAnnounceWithIpFamily(
 		if lifecycleDone != nil {
 			defer lifecycleDone()
 		}
+		defer announce.releaseArinShadowOwner()
 		server.HandleError(announce.run, cancel)
 	}()
 	return announce
@@ -411,6 +420,7 @@ func (self *ConnectionAnnounce) run() {
 		self.handlerId,
 		self.settings.LocationRetryTimeout,
 		self.ipFamilyIntent,
+		self.networkId,
 	)
 	if err != nil {
 		glog.Infof("[t][%s]could not connect client. err = %s\n", hex.EncodeToString(clientAddressHash[:]), err)
@@ -420,27 +430,14 @@ func (self *ConnectionAnnounce) run() {
 	// verify egress feeder (observed source ip, sn/VALIDATOR.md §8): while
 	// connected, this client's observed address is a candidate provider
 	// egress for `/verify` source-ip attribution. Feed on connect,
-	// ttl-refresh while connected, clear on disconnect. The bijection gate in
+	// ttl-refresh while connected, release only this connection on disconnect.
+	// Overlapping H1/H3 connections retain independent leases. The bijection gate in
 	// the model excludes shared or ambiguous ips (§8.2).
 	verifySettings, verifyEnabled := connectionVerifySettings()
 	verifyEgressIp, verifyEgressOk := netip.Addr{}, false
 	if verifyEnabled {
 		verifyEgressIp, verifyEgressOk = model.ParseVerifyEgressIp(self.clientAddress)
 	}
-	if verifyEgressOk {
-		model.FeedVerifyEgress(self.ctx, self.clientId, verifyEgressIp, verifySettings)
-		self.startWorker(func() {
-			for {
-				select {
-				case <-self.ctx.Done():
-					return
-				case <-time.After(verifySettings.EgressRefreshInterval):
-				}
-				model.FeedVerifyEgress(self.ctx, self.clientId, verifyEgressIp, verifySettings)
-			}
-		})
-	}
-
 	cleanup = func() {
 		server.HandleError(func() {
 			// The transport is normally canceled before cleanup begins. Preserve
@@ -450,10 +447,24 @@ func (self *ConnectionAnnounce) run() {
 			defer cleanupCancel()
 			model.DisconnectNetworkClient(cleanupCtx, connectionId)
 			if verifyEgressOk {
-				model.ClearVerifyEgress(cleanupCtx, self.clientId, verifyEgressIp, verifySettings)
+				model.ClearVerifyConnectionEgress(cleanupCtx, self.clientId, connectionId, verifyEgressIp, verifySettings)
 			}
 			if glog.V(1) {
 				glog.Infof("[t][%s]disconnect client\n", hex.EncodeToString(clientAddressHash[:]))
+			}
+		})
+	}
+
+	if verifyEgressOk {
+		model.FeedVerifyConnectionEgress(self.ctx, self.clientId, connectionId, verifyEgressIp, verifySettings)
+		self.startWorker(func() {
+			for {
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-time.After(verifySettings.EgressRefreshInterval):
+				}
+				model.FeedVerifyConnectionEgress(self.ctx, self.clientId, connectionId, verifyEgressIp, verifySettings)
 			}
 		})
 	}
@@ -465,6 +476,11 @@ func (self *ConnectionAnnounce) run() {
 		self.setLatencyWithLock()
 		self.setSpeedWithLock()
 	}()
+
+	// the provider rollout gauge, kept current from the provide modes each
+	// sync below reads anyway
+	providerVersion := newProviderVersionConnection(defaultProviderVersionConnections, self.appVersion)
+	defer providerVersion.release()
 
 	// register this client in the network peer registry, now that the
 	// connection has survived the announce window. 2026-07-15 outage:
@@ -584,6 +600,7 @@ func (self *ConnectionAnnounce) run() {
 
 			changedCount, currentProvideModes := model.GetProvideKeyChanges(self.ctx, self.clientId, startTime)
 			provideEnabled := currentProvideModes[model.ProvideModePublic]
+			providerVersion.update(provideEnabled, nextStartTime)
 			// stats only matter for providers
 			// avoid populating stats for non-providers
 			if provideEnabled || 0 < changedCount {
@@ -690,6 +707,8 @@ func (self *ConnectionAnnounce) setConnectionId(connectionId server.Id) {
 	defer self.stateLock.Unlock()
 
 	self.connectionId = &connectionId
+	self.shadowCaptureLease.close()
+	self.shadowCaptureLease = currentArinShadowOwners.add(connectionId, self)
 }
 
 func (self *ConnectionAnnounce) ConnectionId() *server.Id {

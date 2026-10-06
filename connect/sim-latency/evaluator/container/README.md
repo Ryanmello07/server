@@ -26,14 +26,35 @@ trusted baseline and scorer continue to execute from the pristine base image.
 
 For every evaluation attempt, `prepare-evaluation-source.sh` copies fresh
 `server`, `connect`, `sdk`, `proxy`, `glog`, `goidenticons`, `userwireguard`,
-and `sn` repositories out of that authenticated base image into a bounded
-temporary directory. It checks out a local
+`sn`, `operator-proxy`, and `warp` repositories out of that authenticated base
+image into a bounded temporary directory. It checks out a local
 `sim-latency` branch at each epoch source-lock commit without reading or
 changing any host repository checkout. Baseline and candidate have distinct
 trees; the builder applies the canonical patch only to the candidate tree.
 The selected tree is mounted read-only at `/workspace` in each runner and is
 removed before evidence is retained. This keeps continuously updated control
 code on `main` separate from the measured source.
+
+Sealing transfers host ownership to the container uid before the baseline runs.
+The later host-side protected-tree comparison trusts each exact authenticated
+repository only for that Git command; it never adds global or wildcard trust.
+Git inspection failures are infrastructure failures, not evidence of a changed
+protected tree. The builder returns exit 2 for these failures so a healthy
+Docker daemon cannot turn a Git error into a terminal submission rejection.
+The base builder, image build stages, and isolation checks also require a
+successful Git inspection before accepting an empty status as a clean tree.
+The isolation check only passes a protected-source probe after the specific
+submission rejection, not an unrelated build or infrastructure failure.
+
+New rounds use policy schema 2, which freezes the host evaluator command path
+and SHA-256 as well as the evaluator image. Moving to a different release
+directory or changing the script requires a new round; a worker configuration
+change cannot silently change an existing schema-2 round. Schema-1 rounds
+remain readable and evaluable during the upgrade, but have no historical host
+script pin to compare. Keep their configured release unchanged until they
+drain; this upgrade does not rewrite an open round's policy or evidence. Upgrade
+both the API and worker before creating a schema-2 round; old workers cannot
+evaluate that new policy version.
 
 This replaces custom per-job cgroup filesystem code. Docker creates the
 container cgroups; Compose puts runner, PostgreSQL, and Redis below one
@@ -46,15 +67,17 @@ runs later with `network_mode: none`.
 The frozen host split gives untrusted builds and evaluations 10 physical cores
 and reserves 2 physical cores for the worker, Docker control plane, and cleanup.
 The active stack is capped at 96 GiB total (runner 72 GiB, PostgreSQL 16 GiB,
-Redis 8 GiB), leaving at least 24 GiB outside its declared ceilings on a
-qualified host. Submission builds use the same 10-core set in a separate
+Redis 8 GiB). The 4 GiB host evidence tmpfs is budgeted separately, including
+retained pages from previous stages and host-side copies. Qualification requires
+at least 24 GiB after both ceilings, not merely after the active containers.
+Submission builds use the same 10-core set in a separate
 cgroup parent, with a 12 GiB no-swap limit, a 600-second TERM/KILL deadline,
 and bounded, fully drained build logs. `resource-boundary.sh` derives the exact
 logical CPU ids from topology and rejects overlapping sets or insufficient
 memory capacity.
 
 The evaluator mounts its complete untrusted work/evidence tree as a root-owned
-32 GiB `tmpfs` with `nosuid,nodev,noexec`. Candidate output, repeated run
+4 GiB `tmpfs` with `nosuid,nodev,noexec`. Candidate output, repeated run
 copies, and scorer inputs therefore share one hard aggregate ENOSPC ceiling.
 Compose binds the frozen host `config/local` and `vault/local` directories
 directly, independently, and read-only. Their sorted-file manifest digests are
@@ -68,6 +91,20 @@ bounded evidence to durable storage, authenticates it, and seals it read-only.
 A compile/vet failure returns the terminal typed
 `candidate_build_failed` result with build-boundary evidence; it does not forge
 runtime reset or accounting claims for a measurement that never started.
+
+Post-run checks validate PostgreSQL and Redis state as well as the runner:
+backing services must remain healthy, running, unrestarted, and free of OOM
+or nonzero-exit evidence. Resource flags come from the observed container
+states, not unconditional success constants. A candidate process exit is a
+terminal `run_process_failed` only after its containment and backing services
+authenticate. Candidate-only memory-limit exits are terminal when complete
+cgroup counters prove the attribution; unknown or backing-service OOMs remain
+infrastructure failures, as do failed baselines. Terminal classification also
+requires complete container, network, and evidence-mount cleanup. A new attempt
+refuses to start if evaluator resources remain from earlier work, and separate
+per-attempt cgroup identities prevent stale counters from affecting retries.
+Failed attempts retain a restricted, authenticated diagnostic archive
+through `server/blob`, without inventing a successful score or full-run marker.
 
 Docker does not replace host qualification. The authoritative host still needs
 exactly 12 physical CPUs exposed (10 evaluation + 2 management), fixed

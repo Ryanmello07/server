@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -42,8 +43,8 @@ const MaxJsonRequestBytes int64 = 16 * 1024 * 1024
 
 type ImplFunction[R any] func(*session.ClientSession) (R, error)
 type ImplWithInputFunction[T any, R any] func(T, *session.ClientSession) (R, error)
-type BodyFormatFunction func(*http.Request) (io.Reader, error)
-type FormatFunction[R any] func(result R) (complete bool)
+type BodyFormatFunction func(*session.ClientSession, *http.Request) (io.Reader, error)
+type FormatFunction[R any] func(*session.ClientSession, R) (complete bool)
 
 // writeJsonResponse marshals result as JSON and writes it. This is the default
 // response path; calling it directly avoids building a closure per response
@@ -66,7 +67,7 @@ func writeJsonResponse[R any](w http.ResponseWriter, result R) {
 // JsonFormatter returns a FormatFunction that writes result as JSON. The default
 // path uses writeJsonResponse directly; this remains for explicit formatter lists.
 func JsonFormatter[R any](w http.ResponseWriter) FormatFunction[R] {
-	return func(result R) bool {
+	return func(_ *session.ClientSession, result R) bool {
 		writeJsonResponse(w, result)
 		return true
 	}
@@ -99,7 +100,7 @@ func wrap[R any](
 	}
 
 	for _, formatter := range formatters {
-		if complete := formatter(result); complete {
+		if complete := formatter(session, result); complete {
 			return
 		}
 	}
@@ -131,6 +132,15 @@ func implName[R any](impl ImplFunction[R]) string {
 	return name
 }
 
+// Dependency failure is not a credential rejection. Keep the sentinel through
+// the wrapper so RaiseHttpError can emit a fixed JSON response without causes.
+func authenticationHttpError(err error) error {
+	if errors.Is(err, session.ErrAuthUnavailable) {
+		return err
+	}
+	return fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+}
+
 // allow guest mode, or authenticated requests
 func WrapRequireAuth[R any](
 	impl ImplFunction[R],
@@ -142,7 +152,7 @@ func WrapRequireAuth[R any](
 		func(session *session.ClientSession) (R, error) {
 			if err := session.Auth(req); err != nil {
 				var empty R
-				return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+				return empty, authenticationHttpError(err)
 			}
 			r, err := impl(session)
 			return r, tagImplError(impl, err)
@@ -164,7 +174,7 @@ func WrapRequireClient[R any](
 		func(session *session.ClientSession) (R, error) {
 			if err := session.Auth(req); err != nil || session.ByJwt.ClientId == nil {
 				var empty R
-				return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+				return empty, authenticationHttpError(err)
 			}
 			r, err := impl(session)
 			return r, tagImplError(impl, err)
@@ -219,7 +229,7 @@ func wrapWithInput[T any, R any](
 		req.Body = http.MaxBytesReader(w, req.Body, MaxJsonRequestBytes)
 	}
 
-	body, err := bodyFormatter(req)
+	body, err := bodyFormatter(session, req)
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
@@ -264,6 +274,16 @@ func wrapWithInput[T any, R any](
 		return
 	}
 
+	// json.Unmarshal accepts the JSON literal null for pointer, map, slice, and
+	// interface inputs. Passing that typed nil to an implementation makes an
+	// otherwise client-controlled malformed request look like an application
+	// nil-pointer panic. No input wrapper has a meaningful null-body contract:
+	// require a concrete JSON value before dispatching any implementation.
+	if bytes.Equal(bytes.TrimSpace(bodyBytes), []byte("null")) {
+		http.Error(w, "request body must not be null", http.StatusBadRequest)
+		return
+	}
+
 	// server.Logger().Printf("Handling %s\n", impl)
 	result, err := impl(input, session)
 	if err != nil {
@@ -276,8 +296,9 @@ func wrapWithInput[T any, R any](
 		return
 	}
 
+	advanceControlHttpPhase(req, controlHttpResponse)
 	for _, formatter := range formatters {
-		if complete := formatter(result); complete {
+		if complete := formatter(session, result); complete {
 			return
 		}
 	}
@@ -313,7 +334,7 @@ func WrapWithInputBodyFormatterRequireAuth[T any, R any](
 		func(arg T, session *session.ClientSession) (R, error) {
 			if err := session.Auth(req); err != nil {
 				var empty R
-				return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+				return empty, authenticationHttpError(err)
 			}
 			return impl(arg, session)
 		},
@@ -350,10 +371,12 @@ func WrapWithInputBodyFormatterRequireClient[T any, R any](
 	wrapWithInput(
 		bodyFormatter,
 		func(arg T, session *session.ClientSession) (R, error) {
+			advanceControlHttpPhase(req, controlHttpAuthenticate)
 			if err := session.Auth(req); err != nil || session.ByJwt.ClientId == nil {
 				var empty R
-				return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+				return empty, authenticationHttpError(err)
 			}
+			advanceControlHttpPhase(req, controlHttpController)
 			return impl(arg, session)
 		},
 		w,
@@ -378,7 +401,7 @@ func WrapWithInputOptionalAuth[T any, R any](
 			if req.Header.Get("Authorization") != "" {
 				if err := session.Auth(req); err != nil {
 					var empty R
-					return empty, fmt.Errorf("%d Not authorized.", http.StatusUnauthorized)
+					return empty, authenticationHttpError(err)
 				}
 			}
 			return impl(arg, session)
@@ -423,6 +446,13 @@ func WrapWithInputBodyFormatterNoAuth[T any, R any](
 }
 
 func RaiseHttpError(err error, w http.ResponseWriter) (statusError bool) {
+	if errors.Is(err, session.ErrAuthUnavailable) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("{\"error\":\"Authentication temporarily unavailable.\"}\n"))
+		return true
+	}
+
 	statusCode := http.StatusInternalServerError
 	message := err.Error()
 
@@ -446,10 +476,27 @@ func RaiseHttpError(err error, w http.ResponseWriter) (statusError bool) {
 		}
 	}
 
+	// A refusal that carries its result (network create's coded refusal for a
+	// client that asked for `result_errors`) keeps its 4xx status, so route
+	// metrics still count it as refused, and answers with the result as its
+	// JSON body, where that client reads the code. Read through a one-method
+	// interface like the retry hint above; a body without a 4xx status adds
+	// nothing.
+	var resultBody interface{ HttpErrorResultBody() any }
+	if statusError && statusCode/100 == 4 && errors.As(err, &resultBody) {
+		if body, marshalErr := json.Marshal(resultBody.HttpErrorResultBody()); marshalErr == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.WriteHeader(statusCode)
+			_, _ = w.Write(append(body, '\n'))
+			return
+		}
+	}
+
 	http.Error(w, message, statusCode)
 	return
 }
 
-func RequestBodyFormatter(req *http.Request) (io.Reader, error) {
+func RequestBodyFormatter(_ *session.ClientSession, req *http.Request) (io.Reader, error) {
 	return req.Body, nil
 }

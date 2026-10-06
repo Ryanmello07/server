@@ -34,6 +34,8 @@ var wgPeersGauge = prometheus.NewGauge(
 	},
 )
 
+var defaultDeviceRpcH1PlusStats = &connect.H1PlusStats{}
+
 var wgInboundPeerQueueDropPacketsGauge = prometheus.NewGauge(
 	prometheus.GaugeOpts{
 		Namespace: "urnetwork",
@@ -76,6 +78,7 @@ var lifecycleJoinEnabledGauge = prometheus.NewGaugeFunc(
 )
 
 func init() {
+	prometheus.MustRegister(server.NewH1PlusCollector("proxy", connect.H1FramerXlProtocol, defaultDeviceRpcH1PlusStats))
 	prometheus.MustRegister(wgPeersGauge)
 	prometheus.MustRegister(wgInboundPeerQueueDropPacketsGauge)
 	prometheus.MustRegister(wgInboundDecryptionQueueDropPacketsGauge)
@@ -95,6 +98,8 @@ func DefaultProxySettings() *ProxySettings {
 	// dial failure can recover inside an ordinary client request deadline.
 	httpProxySettings := proxy.DefaultHttpProxySettings()
 	return &ProxySettings{
+		EnableDeviceRpcH1Plus:    true,
+		DeviceRpcH1PlusStats:     defaultDeviceRpcH1PlusStats,
 		SocksPort:                InternalSocksPort,
 		HttpPort:                 InternalHttpPort,
 		HttpsPort:                InternalHttpsPort,
@@ -131,10 +136,19 @@ func DefaultProxySettings() *ProxySettings {
 		WgHandoffInitiatePace:    5 * time.Second,
 		// must outlive WgHandoffPollTimeout with margin (see the field comment)
 		WgHandoffRequestTtl: 20 * time.Minute,
+
+		// the device's own key lifetime: a client with traffic re-handshakes
+		// every two minutes and a silent one lets its keys expire at three
+		WgSessionWindow:        3 * time.Minute,
+		WgSessionSampleTimeout: 15 * time.Second,
 	}
 }
 
 type ProxySettings struct {
+	// EnableDeviceRpcH1Plus accepts authenticated urnetwork-framerxl/1 in
+	// addition to WebSocket. On by default; false opts out.
+	EnableDeviceRpcH1Plus bool
+	DeviceRpcH1PlusStats  *connect.H1PlusStats
 	// Ingress ports are settings instead of constructor-local constants so
 	// independent instances (including tests and overlapping local
 	// environments) can bind disjoint sockets. Production defaults retain the
@@ -227,6 +241,13 @@ type ProxySettings struct {
 	// host drain — keep it > WgHandoffPollTimeout with margin; default
 	// 20min) and the drain-end export itself.
 	WgHandoffRequestTtl time.Duration
+
+	// WireGuard session metrics (wg_sessions.go, the proxy dashboard). A peer
+	// is in session while its newest completed handshake is inside
+	// WgSessionWindow; the peer table is sampled every WgSessionSampleTimeout.
+	// <= 0 on either disables the sampling.
+	WgSessionWindow        time.Duration
+	WgSessionSampleTimeout time.Duration
 }
 
 type socks5Server struct {
@@ -347,6 +368,7 @@ func (self *socks5Server) newSocksProxy() *proxy.SocksProxy {
 			recordProxyAdmissionFailure("socks", false)
 			return nil, err
 		}
+		pd.recordFlowTraceDial("socks", conn)
 		return instrumentProxyConnection("socks", conn), nil
 	}
 
@@ -501,6 +523,7 @@ func (self *httpServer) newHttpProxy() *proxy.HttpProxy {
 			recordProxyAdmissionFailure("http", false)
 			return nil, err
 		}
+		pd.recordFlowTraceDial("http", conn)
 		return instrumentProxyConnection("http", conn), nil
 	}
 
@@ -652,6 +675,7 @@ func NewWgServer(
 	}
 
 	go s.runRuntimeMetrics()
+	go server.HandleError(s.runSessionMetrics, cancel)
 	go server.HandleError(s.run, cancel)
 
 	return s

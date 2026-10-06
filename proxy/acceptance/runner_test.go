@@ -616,7 +616,7 @@ func TestHTTPSRequestTraceIdentifiesResponseHeaderStall(t *testing.T) {
 
 // An error before GotConn must not be mislabeled as an established data-plane
 // tunnel; this is the adjacent failure class needed to interpret a timeout.
-func TestHTTPSRequestTraceIdentifiesTunnelConnectFailure(t *testing.T) {
+func TestHTTPSRequestTraceIdentifiesTCPConnectFailure(t *testing.T) {
 	started := time.Date(2026, time.August, 29, 4, 3, 0, 0, time.UTC)
 	requestTrace := &httpsRequestTrace{started: started, phase: "starting_request"}
 	clientTrace := requestTrace.clientTrace()
@@ -624,7 +624,7 @@ func TestHTTPSRequestTraceIdentifiesTunnelConnectFailure(t *testing.T) {
 	clientTrace.ConnectDone("tcp", "example.test:443", errors.New("dial failed"))
 
 	detail := requestTrace.wrap(errors.New("dial failed"), started.Add(time.Second)).Error()
-	if !strings.Contains(detail, "phase connecting_tunnel_failed") {
+	if !strings.Contains(detail, "phase connecting_tcp_failed") {
 		t.Errorf("trace detail %q does not identify the connect failure", detail)
 	}
 	if !strings.Contains(detail, "connection not_established") {
@@ -635,9 +635,8 @@ func TestHTTPSRequestTraceIdentifiesTunnelConnectFailure(t *testing.T) {
 	}
 }
 
-// The live proxy failure supplied only "unknown authority" even though the
-// parsed peer chain was available. Preserve a bounded identity for every
-// certificate so an invalid origin chain and an intercepting exit diverge.
+// A supplied TLS connection state can retain the parsed peer chain. Preserve
+// its bounded identity so invalid origin and intercepting exit chains diverge.
 func TestHTTPSRequestTraceRetainsRejectedPeerCertificateChain(t *testing.T) {
 	started := time.Date(2026, time.September, 1, 6, 20, 12, 0, time.UTC)
 	requestTrace := &httpsRequestTrace{started: started, phase: "starting_request"}
@@ -672,9 +671,9 @@ func TestHTTPSRequestTraceRetainsRejectedPeerCertificateChain(t *testing.T) {
 }
 
 // On the live failure, TLSHandshakeDone carried an empty ConnectionState even
-// though x509 returned UnknownAuthorityError. The rejected leaf inside that
+// though x509 returned UnknownAuthorityError. The rejected certificate inside that
 // error is the last normal-verifier evidence available and must not be lost.
-func TestHTTPSRequestTraceFallsBackToRejectedUnknownAuthorityLeaf(t *testing.T) {
+func TestHTTPSRequestTraceFallsBackToRejectedUnknownAuthorityCertificate(t *testing.T) {
 	started := time.Date(2026, time.September, 1, 7, 46, 47, 0, time.UTC)
 	requestTrace := &httpsRequestTrace{started: started, phase: "starting_request"}
 	clientTrace := requestTrace.clientTrace()
@@ -691,7 +690,7 @@ func TestHTTPSRequestTraceFallsBackToRejectedUnknownAuthorityLeaf(t *testing.T) 
 		"phase tls_handshake_failed",
 		"peer_certs=unavailable",
 		"verified_chains=0",
-		"rejected_leaf=connectivitycheck.gstatic.com>unexpected_edge_issuer/",
+		"rejected_cert=connectivitycheck.gstatic.com>unexpected_edge_issuer/",
 		"certificate signed by unknown authority",
 	} {
 		if !strings.Contains(detail, evidence) {

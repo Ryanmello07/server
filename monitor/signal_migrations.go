@@ -1,3 +1,4 @@
+// Checks the published migration identities and the schema each live head requires.
 package monitor
 
 import (
@@ -44,7 +45,207 @@ type migrationArtifact struct {
 // ordered, or otherwise look-alike index from arming the deadline scheduler.
 const providerEgressHealthDeadlineIndexDefinition = "CREATE INDEX provider_egress_health_measured_at_client_id ON public.provider_egress_health USING btree (measured_at, client_id)"
 
-var migrationArtifacts = []migrationArtifact{
+const walletAuthChallengeAttemptAddressTimeIndexDefinition = "CREATE INDEX wallet_auth_challenge_attempt_client_address_hash_attempt_time ON public.wallet_auth_challenge_attempt USING btree (client_address_hash, attempt_time)"
+
+// Pin the operative trigger events and complete normalized bodies. The first
+// policy remains required through head 690; its best-safe successor begins at 691.
+const competitionStagingWinnerArtifactQuery = `(
+	NOT EXISTS (
+		SELECT 1 FROM (VALUES
+			('competition_candidate_review', 'competition_staging_candidate_review_blocked', 'competition_staging_candidate_review_guard', 7, ARRAY[]::text[]),
+			('competition_round', 'competition_round_honesty_reviewed', 'competition_round_honesty_review_guard', 19, ARRAY['finalized_at', 'winner_job_id']::text[])
+		) AS expected(table_name, trigger_name, function_name, trigger_type, update_columns)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM competition_trigger_artifact AS actual
+			JOIN competition_function_artifact AS guard ON guard.function_oid = actual.function_oid
+			WHERE actual.table_name = expected.table_name
+			  AND actual.trigger_name = expected.trigger_name
+			  AND guard.function_name = expected.function_name
+			  AND actual.trigger_type = expected.trigger_type
+			  AND actual.update_columns = expected.update_columns
+			  AND actual.enabled AND actual.unconditional
+		)
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM (VALUES
+			('competition_staging_candidate_review_guard', $staging_review_body$
+				BEGIN
+					IF EXISTS (
+						SELECT 1 FROM competition_round
+						WHERE round_id = NEW.round_id AND staging = true
+					) THEN
+						RAISE EXCEPTION 'competition staging round cannot enter candidate review';
+					END IF;
+					RETURN NEW;
+				END
+			$staging_review_body$),
+			('competition_round_honesty_review_guard', $staging_winner_body$
+				DECLARE
+					expected_staging_winner uuid;
+				BEGIN
+					IF NEW.finalized_at IS NOT NULL AND OLD.finalized_at IS NULL THEN
+						IF EXISTS (
+							SELECT 1 FROM competition_job
+							WHERE round_id = NEW.round_id AND state IN ('queued', 'running')
+						) THEN
+							RAISE EXCEPTION 'competition epoch still has active evaluations';
+						END IF;
+						IF NEW.staging = true THEN
+							SELECT job_id INTO expected_staging_winner
+							FROM competition_job
+							WHERE round_id = NEW.round_id AND state = 'succeeded'
+							  AND score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+							  AND score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+							  AND jsonb_typeof(score_json->'gates') = 'object'
+							  AND score_json->'gates' <> '{}'::jsonb
+							  AND NOT EXISTS (
+							      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+							      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+							  )
+							ORDER BY CASE WHEN NOT EXISTS (
+							             SELECT 1 FROM competition_round_baseline WHERE round_id = NEW.round_id
+							         ) THEN (score_json->>'normalized_score')::numeric END DESC,
+							         (score_json->>'raw_score')::numeric ASC, submitted_at, job_id
+							LIMIT 1;
+							IF NEW.winner_job_id IS DISTINCT FROM expected_staging_winner THEN
+								RAISE EXCEPTION 'competition staging winner is not the highest-ranked eligible job';
+							END IF;
+							RETURN NEW;
+						END IF;
+						IF NEW.winner_job_id IS NOT NULL AND NOT EXISTS (
+							SELECT 1 FROM competition_candidate_review
+							WHERE round_id = NEW.round_id AND job_id = NEW.winner_job_id
+							  AND decision = 'approved'
+						) THEN
+							RAISE EXCEPTION 'competition winner has not passed honesty review';
+						END IF;
+						IF NEW.winner_job_id IS NULL AND EXISTS (
+							SELECT 1
+							FROM competition_job AS candidate
+							WHERE candidate.round_id = NEW.round_id AND candidate.state = 'succeeded'
+							  AND candidate.score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+							  AND candidate.score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb
+							  AND jsonb_typeof(candidate.score_json->'gates') = 'object'
+							  AND candidate.score_json->'gates' <> '{}'::jsonb
+							  AND NOT EXISTS (
+							      SELECT 1 FROM jsonb_each(candidate.score_json->'gates') AS gate
+							      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+							  )
+							  AND NOT EXISTS (
+							      SELECT 1 FROM competition_candidate_review AS review
+							      WHERE review.round_id = NEW.round_id
+							        AND review.job_id = candidate.job_id
+							        AND review.decision = 'rejected'
+							  )
+						) THEN
+							RAISE EXCEPTION 'competition epoch has an unresolved significant candidate';
+						END IF;
+					END IF;
+					RETURN NEW;
+				END
+			$staging_winner_body$)
+		) AS expected(function_name, definition)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM competition_function_artifact AS actual
+			WHERE actual.function_name = expected.function_name
+			  AND actual.definition = btrim(regexp_replace(expected.definition, '[[:space:]]+', ' ', 'g'))
+		)
+	)
+)`
+
+var competitionStagingBestWinnerArtifactQuery = func() string {
+	oldEligibility := `AND score_json @> '{"placeable":true,"takeover_eligible":true}'::jsonb
+							  AND score_json @> '{"significance":{"statistically_significant":true,"recommended_next_epoch_takeover_margin_supported":true}}'::jsonb`
+	newEligibility := `AND score_json @> '{"placeable":true}'::jsonb`
+	if strings.Count(competitionStagingWinnerArtifactQuery, oldEligibility) != 1 {
+		panic("staging winner monitor cannot locate its historical eligibility gate")
+	}
+	return strings.Replace(competitionStagingWinnerArtifactQuery, oldEligibility, newEligibility, 1)
+}()
+
+// These guards survive the policy namespace transition. The successor owns
+// them once the historical key shape is no longer required.
+const clientKeyHistoryGuardsArtifactQuery = `(
+	NOT EXISTS (
+		SELECT 1 FROM (VALUES
+			('st_client_key_history', 'st_client_key_history_immutable', 'st_client_key_history_immutable_guard'),
+			('st_client_key_head', 'st_client_key_head_identity', 'st_client_key_head_identity_guard'),
+			('network_client', 'st_client_key_retire_on_client_delete', 'st_client_key_retire_deleted_client')
+		) expected(table_name, trigger_name, function_name)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM pg_trigger trigger_record
+			JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
+			JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+			WHERE namespace.nspname = 'public' AND relation.relname = expected.table_name
+				AND trigger_record.tgname = expected.trigger_name
+				AND trigger_record.tgenabled = 'O'
+				AND trigger_record.tgfoid = to_regprocedure('public.' || expected.function_name || '()')
+				AND NOT trigger_record.tgisinternal
+		)
+	)
+)`
+
+// The policy namespace append changes identity keys but leaves signed rows
+// immutable; the active-head index admits exactly one live projection.
+const clientKeyPolicyNamespaceArtifactQuery = `(
+	EXISTS (
+		SELECT 1 FROM constraint_artifact
+		WHERE table_name = 'st_client_key_history' AND constraint_type = 'p'
+		  AND definition = 'PRIMARY KEY (client_id, domain_hash, generation)' AND validated
+	)
+	AND EXISTS (
+		SELECT 1 FROM constraint_artifact
+		WHERE table_name = 'st_client_key_head' AND constraint_type = 'p'
+		  AND definition = 'PRIMARY KEY (client_id, domain_hash)' AND validated
+	)
+	AND EXISTS (
+		SELECT 1 FROM constraint_artifact
+		WHERE table_name = 'st_client_key_head' AND constraint_type = 'f'
+		  AND definition LIKE '%(client_id, domain_hash, generation)%st_client_key_history(client_id, domain_hash, generation)%'
+		  AND validated
+	)
+	AND EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'st_client_key_head'
+		  AND column_name = 'is_current' AND data_type = 'boolean' AND is_nullable = 'NO'
+	)
+	AND EXISTS (
+		SELECT 1 FROM index_artifact
+		WHERE table_name = 'st_client_key_head' AND index_name = 'st_client_key_head_current'
+		  AND definition = 'CREATE UNIQUE INDEX st_client_key_head_current ON public.st_client_key_head USING btree (client_id) WHERE is_current'
+		  AND predicate_definition = 'is_current' AND indisvalid AND indisready
+	)
+	AND to_regprocedure('public.st_client_key_head_identity_guard()') IS NOT NULL
+	AND regexp_replace(
+		pg_get_functiondef(to_regprocedure('public.st_client_key_head_identity_guard()')),
+		'[[:space:]]+', ' ', 'g'
+	) LIKE '%NOT OLD.is_current AND (NEW.is_current OR NEW.generation <> OLD.generation)%'
+	AND ` + clientKeyHistoryGuardsArtifactQuery + `
+)`
+
+// Admission pins the complete installed function, its relation and its enabled
+// insert/update trigger; a numeric head cannot hide a disabled custody guard.
+var contractUsageGuardArtifactQuery = `(
+    EXISTS (
+        SELECT 1 FROM pg_proc AS function_record
+        WHERE function_record.oid = to_regprocedure('public.transfer_contract_usage_guard()')
+          AND function_record.prorettype = 'trigger'::regtype
+          AND function_record.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+          AND function_record.prosrc = '` + strings.ReplaceAll(server.ContractUsageGuardFunctionBodySql, "'", "''") + `'
+    )
+    AND EXISTS (
+        SELECT 1 FROM pg_trigger AS trigger_record
+        WHERE trigger_record.tgrelid = to_regclass('public.transfer_contract')
+          AND trigger_record.tgname = 'transfer_contract_usage_guard'
+          AND trigger_record.tgfoid = to_regprocedure('public.transfer_contract_usage_guard()')
+          AND trigger_record.tgtype = 23 AND trigger_record.tgenabled = 'O'
+          AND trigger_record.tgnargs = 0 AND trigger_record.tgqual IS NULL
+          AND trigger_record.tgattr = ''::int2vector
+          AND NOT trigger_record.tgisinternal
+    )
+)`
+
+var migrationArtifacts = append([]migrationArtifact{
 	{name: "competition_round", requiredVersion: 588, rowColumn: 1},
 	{name: "competition_job_immutable_guard", requiredVersion: 589, rowColumn: 2},
 	{name: "competition_round.providers_sha256", requiredVersion: 590, rowColumn: 3},
@@ -106,7 +307,7 @@ var migrationArtifacts = []migrationArtifact{
 	{name: "onboarding_results_daily", requiredVersion: 648, rowColumn: 59},
 	{name: "network_onboarding_experiment_state", requiredVersion: 649, rowColumn: 60},
 	{name: "network_onboarding_created_at", requiredVersion: 650, rowColumn: 61},
-	{name: "signed client-key history tables and guards", requiredVersion: 651, rowColumn: 62},
+	{name: "signed client-key history tables and guards", requiredVersion: 651, removedVersion: 744, rowColumn: 62},
 	{name: "repeatable competition staging lifecycle", requiredVersion: 652, rowColumn: 63},
 	{name: "competition_round.admission_closed_at and guard", requiredVersion: 653, rowColumn: 64},
 	{name: "network_points_leaderboard_snapshot.epoch_metrics_available", requiredVersion: 654, rowColumn: 65},
@@ -130,15 +331,113 @@ var migrationArtifacts = []migrationArtifact{
 	{name: "network_extender.country_location_id", requiredVersion: 672, rowColumn: 83},
 	{name: "contract_extender.create_time", requiredVersion: 673, rowColumn: 84},
 	{name: "contract_extender_create_time_contract_id", requiredVersion: 674, rowColumn: 85},
-}
+	{name: "wallet_auth_challenge_attempt_client_address_hash_attempt_time", requiredVersion: 675, rowColumn: 86},
+	{name: "competition_round_baseline and append-only guards", requiredVersion: 676, rowColumn: 87},
+	{name: "competition candidate absolute raw-score ordering", requiredVersion: 677, removedVersion: 678, rowColumn: 88},
+	{name: "competition legacy/shared-control ranking policy", requiredVersion: 678, rowColumn: 89},
+	{name: "network_extender_latency attestation table and identity key", requiredVersion: 679, rowColumn: 90},
+	{name: "network_extender_latency_create_time retention index", requiredVersion: 680, rowColumn: 91},
+	{name: "network_extender_latency_extender_id_create_time lookup index", requiredVersion: 681, rowColumn: 92},
+	{name: "network_extender_activation history table and identity key", requiredVersion: 682, rowColumn: 93},
+	{name: "network_extender_activation_extender_id_activate_time lookup index", requiredVersion: 683, rowColumn: 94},
+	{name: "competition staging automatic winner and review isolation", requiredVersion: 684, removedVersion: 691, rowColumn: 95},
+	{name: "account_payment_block paid-traffic week table", requiredVersion: 685, rowColumn: 96},
+	{name: "account_payment.block_rollup_complete", requiredVersion: 686, rowColumn: 97},
+	{name: "account_payment.block_rollup_cursor", requiredVersion: 687, rowColumn: 98},
+	{name: "account_payment_block_number_payment", requiredVersion: 688, rowColumn: 99},
+	{name: "account_payment_block_rollup_pending", requiredVersion: 689, rowColumn: 100},
+	{name: "account_point_payment_rollup", requiredVersion: 690, rowColumn: 101},
+	{name: "competition staging best-safe winner and review isolation", requiredVersion: 691, rowColumn: 102},
+	{name: "location.geoname_id", requiredVersion: 692, rowColumn: 103},
+	{name: "location_geoname_id", requiredVersion: 693, rowColumn: 104},
+	{name: "network_ping table and primary key", requiredVersion: 694, removedVersion: 714, rowColumn: 105},
+	{name: "network_ping_target_pinger_nonce replay index", requiredVersion: 695, removedVersion: 714, rowColumn: 106},
+	{name: "network_ping_create_time retention index", requiredVersion: 696, removedVersion: 714, rowColumn: 107},
+	{name: "network_ping_target_extender_id_create_time target lookup index", requiredVersion: 697, removedVersion: 714, rowColumn: 108},
+	{name: "network_ping_pinger_kind_pinger_id_create_time pinger lookup index", requiredVersion: 698, removedVersion: 714, rowColumn: 109},
+	{name: "network_client_location.accuracy_km", requiredVersion: 699, rowColumn: 110},
+	{name: "network_extender_activation.accuracy_km", requiredVersion: 700, rowColumn: 111},
+	{name: "network_ping.hop_count", requiredVersion: 701, rowColumn: 112},
+	{name: "derived_location table and node primary key", requiredVersion: 702, rowColumn: 113},
+	{name: "network_client_location.genesis_location_id", requiredVersion: 703, rowColumn: 114},
+	{name: "network_client_location_reliability.egress_index", requiredVersion: 704, rowColumn: 115},
+	{name: "network_client_location_reliability.egress_quality", requiredVersion: 705, rowColumn: 116},
+	{name: "network_client_location_reliability.egress_evidence_time", requiredVersion: 706, rowColumn: 117},
+	{name: "provider_blackhole_check.consecutive_failures", requiredVersion: 707, rowColumn: 118},
+	{name: "provider_blackhole_check.first_failed_at", requiredVersion: 708, rowColumn: 119},
+	{name: "provider_blackhole_check.next_due_at", requiredVersion: 709, rowColumn: 120},
+	{name: "provider_egress_health unscored-load columns", requiredVersion: 710, rowColumn: 121},
+	{name: "provider_egress_destination table and name primary key", requiredVersion: 711, rowColumn: 122},
+	{name: "provider_egress_site_tally table and day/site/place primary key", requiredVersion: 712, rowColumn: 123},
+	{name: "provider_egress_place_tally table and day/place primary key", requiredVersion: 713, rowColumn: 124},
+	{name: "network_ping day partitions, replay key and read indexes", requiredVersion: 714, rowColumn: 125},
+	{name: "network_ping_legacy removed", requiredVersion: 715, rowColumn: 126},
+	{name: "network_ping_hour_tally table and hour tally key", requiredVersion: 716, rowColumn: 127},
+	{name: "network_ping_pinger_day day partitions and pinger key", requiredVersion: 717, rowColumn: 128},
+	{name: "network_ping_target_day day partitions and target key", requiredVersion: 718, rowColumn: 129},
+	{name: "network_ping_target_hour_tally day partitions and target hour key", requiredVersion: 719, rowColumn: 130},
+	{name: "competition staging lifecycle winner eligibility", requiredVersion: 720, rowColumn: 131},
+	{name: "competition staging winner approval and append-only guards", requiredVersion: 721, rowColumn: 132},
+	{name: "connection and rollup ARIN exception facts", requiredVersion: 722, rowColumn: 133},
+	{name: "URL receipt history and durable probe queue", requiredVersion: 723, rowColumn: 134},
+	{name: "provider_egress_health.security_measured_at", requiredVersion: 724, rowColumn: 135},
+	{name: "probe queue eligibility and partial due index", requiredVersion: 725, rowColumn: 136},
+	{name: "URL receipt marker and pre-version success index", requiredVersion: 726, removedVersion: 729, rowColumn: 137},
+	{name: "per-URL security identity and retained legacy quarantine", requiredVersion: 727, rowColumn: 138},
+	{name: "probe queue generated slot and partial slot index", requiredVersion: 728, rowColumn: 139},
+	{name: "URL policy version and exact selected-success index", requiredVersion: 729, rowColumn: 140},
+	{name: "connection ARIN lookup provenance", requiredVersion: 730, rowColumn: 141},
+	{name: "network_client_location_reliability_arin_exceptions", requiredVersion: 731, rowColumn: 142},
+	{name: "URL completion receipts and exact readiness invalidation", requiredVersion: 732, rowColumn: 143},
+	{name: "provider_probe_cycle_completed_ready", requiredVersion: 733, rowColumn: 144},
+	{name: "provider_probe_cycle_slot_completed_ready", requiredVersion: 734, rowColumn: 145},
+	{name: "provider_probe_cycle_completed_waiting", requiredVersion: 735, rowColumn: 146},
+	{name: "provider_probe_cycle_slot_completed_waiting", requiredVersion: 736, rowColumn: 147},
+	{name: "provider_probe_cycle_completed_expiry", requiredVersion: 737, rowColumn: 148},
+	{name: "provider_probe_cycle_slot_completed_expiry", requiredVersion: 738, rowColumn: 149},
+	{name: "transfer_balance_active_network_end_start_id", requiredVersion: 739, rowColumn: 150},
+	{name: "observed reliability counts and exact checkpoint invalidation", requiredVersion: 740, rowColumn: 151},
+	{name: "selected-policy measured URL run quota index", requiredVersion: 741, rowColumn: 152},
+	{name: "transfer_contract subnet usage columns and shape", requiredVersion: 742, rowColumn: 153},
+	{name: "transfer_contract_closed_usage lookup index", requiredVersion: 743, rowColumn: 154},
+	{name: "signed client-key policy namespaces and active head", requiredVersion: 744, rowColumn: 155},
+	{name: "transfer_contract immutable usage and terminal attribution guard", requiredVersion: 745, rowColumn: 156},
+	{name: "st_provider_usage_archive exact atomic copy and append-only custody", requiredVersion: 746, rowColumn: 157},
+	{name: "net escrow durable snapshot revision and retention fences", requiredVersion: 747, rowColumn: 158},
+	{name: "terminal usage missing timestamp index", requiredVersion: 748, rowColumn: 159},
+	{name: "resumable client registration identity and retention", requiredVersion: 749, rowColumn: 160},
+	{name: "network_client_location.arin_quality_verified", requiredVersion: 750, rowColumn: 161},
+	{name: "subscriber quality write token and exact invalidation guard", requiredVersion: 751, rowColumn: 162},
+	{name: "private prober shard ownership and cleanup fences", requiredVersion: 752, rowColumn: 163},
+	{name: "net escrow contract revision point lookup", requiredVersion: 753, rowColumn: 164},
+	{name: "durable net escrow reservation snapshot", requiredVersion: 754, rowColumn: 165},
+	{name: "Redis contract admission compatibility and policy", requiredVersion: 755, rowColumn: 166},
+	{name: "provider payment bonus provenance and submission guards", requiredVersion: 756, rowColumn: 167},
+	{name: "provider earning boundary immutable guards", requiredVersion: 757, rowColumn: 168},
+	{name: "asynchronous transfer debit journal and retention guard", requiredVersion: 758, rowColumn: 169},
+	{name: "acceptance-test balance drain audit", requiredVersion: 759, rowColumn: 170},
+	{name: "active acceptance-test balance drain lookup", requiredVersion: 760, rowColumn: 171},
+	{name: "Solana payment amount reservations", requiredVersion: 761, rowColumn: 172},
+	{name: "Circle customer transfer custody and append-only observations", requiredVersion: 762, rowColumn: 173},
+	{name: "legacy settlement intent and ownership guards", requiredVersion: 763, rowColumn: 174},
+	{name: "logical contract close report receipts", requiredVersion: 764, rowColumn: 175},
+	{name: "Apple offer-code transaction bindings", requiredVersion: 765, rowColumn: 176},
+	{name: "Google Play purchase-token bindings", requiredVersion: 766, rowColumn: 177},
+	{name: "original contract close evidence custody", requiredVersion: 767, rowColumn: 178},
+	{name: "original client close signature companions", requiredVersion: 768, rowColumn: 179},
+	{name: "original client report inventory", requiredVersion: 769, rowColumn: 180},
+}, snMainnetMigrationArtifacts()...)
 
 func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, error) {
+	// Every artifact is queried before its version is checked. Nullable catalog
+	// lookups keep future or missing functions from aborting schema inspection;
+	// an existence conjunct cannot protect a strict regprocedure cast.
 	rows, err := env.runner.pg(ctx, `
 		WITH version AS (
 			SELECT coalesce(max(end_version_number), 0)::int AS value
 			FROM migration_audit
 			WHERE status = 'success'
-		), index_artifact AS (
+		), `+competitionStagingApprovalCatalogQuery+`, `+migrationFp2CatalogQuery+`, index_artifact AS (
 			SELECT table_relation.relname::text AS table_name,
 			       index_relation.relname::text AS index_name,
 			       regexp_replace(pg_get_indexdef(index_relation.oid), '[[:space:]]+', ' ', 'g') AS definition,
@@ -166,6 +465,43 @@ func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, err
 			JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
 			JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
 			WHERE namespace.nspname = 'public'
+		), competition_function_artifact AS (
+			SELECT expected.function_name,
+			       function_record.oid AS function_oid,
+			       btrim(regexp_replace(
+			           function_record.prosrc,
+			           '[[:space:]]+', ' ', 'g'
+			       )) AS definition
+			FROM (VALUES
+			    ('competition_staging_candidate_review_guard'),
+			    ('competition_round_honesty_review_guard'),
+			    ('competition_append_only_guard'),
+			    ('competition_staging_winner_approval_guard')
+			) AS expected(function_name)
+			JOIN pg_proc AS function_record
+			  ON function_record.oid = to_regprocedure('public.' || expected.function_name || '()')
+			WHERE function_record.prokind = 'f'
+			  AND function_record.prorettype = 'pg_catalog.trigger'::regtype
+		), competition_trigger_artifact AS (
+			SELECT relation.relname::text AS table_name,
+			       trigger_record.tgname::text AS trigger_name,
+			       trigger_record.tgfoid AS function_oid,
+			       trigger_record.tgtype::int AS trigger_type,
+			       trigger_record.tgenabled = 'O' AS enabled,
+			       trigger_record.tgqual IS NULL AS unconditional,
+			       ARRAY(
+			           SELECT attribute_record.attname::text
+			           FROM pg_attribute AS attribute_record
+			           WHERE attribute_record.attrelid = relation.oid
+			             AND attribute_record.attnum = ANY(trigger_record.tgattr)
+			           ORDER BY attribute_record.attname
+			       ) AS update_columns
+			FROM pg_trigger AS trigger_record
+			JOIN pg_class AS relation ON relation.oid = trigger_record.tgrelid
+			JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+			WHERE namespace.nspname = 'public'
+			  AND relation.relname IN ('competition_candidate_review', 'competition_round', 'competition_staging_winner_approval')
+			  AND NOT trigger_record.tgisinternal
 		)
 		SELECT version.value,
 		       to_regclass('public.competition_round') IS NOT NULL,
@@ -656,23 +992,7 @@ func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, err
 		                 AND definition LIKE '%(client_id, generation)%st_client_key_history(client_id, generation)%'
 		                 AND validated
 		           )
-		           AND NOT EXISTS (
-		               SELECT 1 FROM (VALUES
-		                   ('st_client_key_history', 'st_client_key_history_immutable', 'st_client_key_history_immutable_guard'),
-		                   ('st_client_key_head', 'st_client_key_head_identity', 'st_client_key_head_identity_guard'),
-		                   ('network_client', 'st_client_key_retire_on_client_delete', 'st_client_key_retire_deleted_client')
-		               ) expected(table_name, trigger_name, function_name)
-		               WHERE NOT EXISTS (
-		                   SELECT 1 FROM pg_trigger trigger_record
-		                   JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
-		                   JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-		                   WHERE namespace.nspname = 'public' AND relation.relname = expected.table_name
-		                     AND trigger_record.tgname = expected.trigger_name
-		                     AND trigger_record.tgenabled = 'O'
-		                     AND trigger_record.tgfoid = to_regprocedure('public.' || expected.function_name || '()')
-		                     AND NOT trigger_record.tgisinternal
-		               )
-		           )
+		           AND `+clientKeyHistoryGuardsArtifactQuery+`
 		       ),
 		       (
 		           EXISTS (
@@ -1013,7 +1333,857 @@ func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, err
 		             AND definition = 'CREATE INDEX contract_extender_create_time_contract_id ON public.contract_extender USING btree (create_time, contract_id)'
 		             AND predicate_definition IS NULL
 		             AND indisvalid AND indisready
-		       )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'wallet_auth_challenge_attempt'
+		             AND index_name = 'wallet_auth_challenge_attempt_client_address_hash_attempt_time'
+		             AND definition = 'CREATE INDEX wallet_auth_challenge_attempt_client_address_hash_attempt_time ON public.wallet_auth_challenge_attempt USING btree (client_address_hash, attempt_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       (
+		           to_regclass('public.competition_round_baseline') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 13
+		               FROM (VALUES
+		                   ('round_id', 'uuid', 'NO'),
+		                   ('baseline_json', 'bytea', 'NO'),
+		                   ('baseline_sha256', 'character', 'NO'),
+		                   ('source_job_id', 'uuid', 'NO'),
+		                   ('source_attempt', 'integer', 'NO'),
+		                   ('source_artifact_manifest_sha256', 'character', 'NO'),
+		                   ('base_sha', 'character', 'NO'),
+		                   ('providers_sha256', 'character', 'NO'),
+		                   ('evaluator_image_digest', 'character varying', 'NO'),
+		                   ('scorer_version', 'character varying', 'NO'),
+		                   ('hardware_id', 'character varying', 'NO'),
+		                   ('host_qualification_sha256', 'character', 'NO'),
+		                   ('created_at', 'timestamp without time zone', 'NO')
+		               ) AS expected(column_name, data_type, is_nullable)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'competition_round_baseline'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		               )
+		           )
+		           AND (
+		               SELECT count(*) = 13
+		               FROM information_schema.columns
+		               WHERE table_schema = 'public'
+		                 AND table_name = 'competition_round_baseline'
+		           )
+		           AND (
+		               SELECT count(*) = 3
+		               FROM (VALUES
+		                   ('p', 'PRIMARY KEY (round_id)'),
+		                   ('f', 'FOREIGN KEY (round_id) REFERENCES competition_round(round_id)'),
+		                   ('f', 'FOREIGN KEY (source_job_id) REFERENCES competition_job(job_id)')
+		               ) AS expected(constraint_type, definition)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM constraint_artifact AS actual
+		                   WHERE actual.table_name = 'competition_round_baseline'
+		                     AND actual.constraint_type = expected.constraint_type
+		                     AND actual.definition = expected.definition
+		                     AND actual.validated
+		               )
+		           )
+		           AND to_regprocedure('public.competition_round_baseline_insert_guard()') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 2
+		               FROM (VALUES
+		                   ('competition_round_baseline_source_guard', 'public.competition_round_baseline_insert_guard()'),
+		                   ('competition_round_baseline_append_only', 'public.competition_append_only_guard()')
+		               ) AS expected(trigger_name, function_name)
+		               WHERE EXISTS (
+		                   SELECT 1
+		                   FROM pg_trigger AS actual
+		                   JOIN pg_class AS relation ON relation.oid = actual.tgrelid
+		                   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		                   WHERE namespace.nspname = 'public'
+		                     AND relation.relname = 'competition_round_baseline'
+		                     AND actual.tgname = expected.trigger_name
+		                     AND actual.tgfoid = to_regprocedure(expected.function_name)
+		                     AND actual.tgenabled <> 'D'
+		                     AND NOT actual.tgisinternal
+		               )
+		           )
+		       ),
+		       (
+		           to_regprocedure('public.competition_candidate_review_insert_guard()') IS NOT NULL
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%ORDER BY (score_json->>''raw_score'')::numeric ASC%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%submitted_at, job_id%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) NOT LIKE '%normalized_score%'
+		       ),
+		       (
+		           to_regprocedure('public.competition_candidate_review_insert_guard()') IS NOT NULL
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%ORDER BY CASE WHEN NOT EXISTS (%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%FROM competition_round_baseline WHERE round_id = NEW.round_id%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%THEN (score_json->>''normalized_score'')::numeric END DESC%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%(score_json->>''raw_score'')::numeric ASC%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_candidate_review_insert_guard()')
+		           ) LIKE '%submitted_at, job_id%'
+		           AND to_regprocedure('public.competition_round_baseline_insert_guard()') IS NOT NULL
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_round_baseline_insert_guard()')
+		           ) LIKE '%competition round baseline cannot be attached after finalization or cancellation%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_round_baseline_insert_guard()')
+		           ) LIKE '%competition round baseline cannot replace legacy ranking policy%'
+		           AND pg_get_functiondef(
+		               to_regprocedure('public.competition_round_baseline_insert_guard()')
+		           ) LIKE '%state = ''running'' AND attempt_count >= NEW.source_attempt%'
+		       ),
+		       (
+		           to_regclass('public.network_extender_latency') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 7
+		               FROM (VALUES
+		                   ('latency_id', 'uuid', 'NO'),
+		                   ('extender_id', 'uuid', 'NO'),
+		                   ('client_id', 'uuid', 'NO'),
+		                   ('probe_nonce', 'bytea', 'NO'),
+		                   ('rtt_ms', 'integer', 'NO'),
+		                   ('probe_time', 'timestamp without time zone', 'NO'),
+		                   ('create_time', 'timestamp without time zone', 'NO')
+		               ) AS expected(column_name, data_type, is_nullable)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_extender_latency'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		               )
+		           )
+		           AND (
+		               SELECT count(*) = 2
+		               FROM (VALUES
+		                   ('p', 'PRIMARY KEY (latency_id)'),
+		                   ('u', 'UNIQUE (extender_id, client_id, probe_nonce)')
+		               ) AS expected(constraint_type, definition)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM constraint_artifact AS actual
+		                   WHERE actual.table_name = 'network_extender_latency'
+		                     AND actual.constraint_type = expected.constraint_type
+		                     AND actual.definition = expected.definition
+		                     AND actual.validated
+		               )
+		           )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_extender_latency'
+		             AND index_name = 'network_extender_latency_create_time'
+		             AND definition = 'CREATE INDEX network_extender_latency_create_time ON public.network_extender_latency USING btree (create_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_extender_latency'
+		             AND index_name = 'network_extender_latency_extender_id_create_time'
+		             AND definition = 'CREATE INDEX network_extender_latency_extender_id_create_time ON public.network_extender_latency USING btree (extender_id, create_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       (
+		           to_regclass('public.network_extender_activation') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 10
+		               FROM (VALUES
+		                   ('activation_id', 'uuid', 'NO', NULL),
+		                   ('extender_id', 'uuid', 'NO', NULL),
+		                   ('activate_time', 'timestamp without time zone', 'NO', NULL),
+		                   ('ip_version', 'integer', 'NO', NULL),
+		                   ('client_address_hash', 'bytea', 'YES', NULL),
+		                   ('country_code', 'character varying', 'NO', quote_literal('') || '::character varying'),
+		                   ('location_id', 'uuid', 'YES', NULL),
+		                   ('city_location_id', 'uuid', 'YES', NULL),
+		                   ('region_location_id', 'uuid', 'YES', NULL),
+		                   ('country_location_id', 'uuid', 'YES', NULL)
+		               ) AS expected(column_name, data_type, is_nullable, column_default)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_extender_activation'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		                     AND actual.column_default IS NOT DISTINCT FROM expected.column_default
+		                     AND actual.character_maximum_length IS NULL
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'network_extender_activation'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (activation_id)'
+		                 AND validated
+		           )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_extender_activation'
+		             AND index_name = 'network_extender_activation_extender_id_activate_time'
+		             AND definition = 'CREATE INDEX network_extender_activation_extender_id_activate_time ON public.network_extender_activation USING btree (extender_id, activate_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       `+competitionStagingWinnerArtifactQuery+`,
+		       (
+		           to_regclass('public.account_payment_block') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 2
+		               FROM (VALUES
+		                   ('payment_id', 'uuid', 'NO'),
+		                   ('block_number', 'bigint', 'NO')
+		               ) AS expected(column_name, data_type, is_nullable)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'account_payment_block'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'account_payment_block'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (payment_id, block_number)'
+		                 AND validated
+		           )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'account_payment'
+		             AND column_name = 'block_rollup_complete'
+		             AND data_type = 'boolean' AND is_nullable = 'NO'
+		             AND column_default IN ('false', 'false::boolean')
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'account_payment'
+		             AND column_name = 'block_rollup_cursor'
+		             AND data_type = 'uuid' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'account_payment_block'
+		             AND index_name = 'account_payment_block_number_payment'
+		             AND definition = 'CREATE INDEX account_payment_block_number_payment ON public.account_payment_block USING btree (block_number, payment_id)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'account_payment'
+		             AND index_name = 'account_payment_block_rollup_pending'
+		             AND definition = 'CREATE INDEX account_payment_block_rollup_pending ON public.account_payment USING btree (create_time, payment_id) WHERE (NOT block_rollup_complete)'
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'account_point'
+		             AND index_name = 'account_point_payment_rollup'
+		             AND definition = 'CREATE INDEX account_point_payment_rollup ON public.account_point USING btree (account_payment_id) WHERE ((account_payment_id IS NOT NULL) AND (point_value > 0))'
+		             AND indisvalid AND indisready
+		       ),
+		       `+competitionStagingBestWinnerArtifactQuery+`,
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'location'
+		             AND column_name = 'geoname_id'
+		             AND data_type = 'bigint' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'location'
+		             AND index_name = 'location_geoname_id'
+		             AND definition = 'CREATE UNIQUE INDEX location_geoname_id ON public.location USING btree (geoname_id) WHERE (geoname_id IS NOT NULL)'
+		             AND predicate_definition = '(geoname_id IS NOT NULL)'
+		             AND indisvalid AND indisready
+		       ),
+		       (
+		           to_regclass('public.network_ping') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 12
+		               FROM (VALUES
+		                   ('ping_id', 'uuid', 'NO', NULL::text[]),
+		                   ('pinger_kind', 'smallint', 'NO', NULL),
+		                   ('pinger_id', 'uuid', 'NO', NULL),
+		                   ('target_extender_id', 'uuid', 'NO', NULL),
+		                   ('probe_nonce', 'bytea', 'NO', NULL),
+		                   ('rtt_ms', 'integer', 'NO', NULL),
+		                   ('probe_time', 'timestamp without time zone', 'NO', NULL),
+		                   ('cosign', 'smallint', 'NO', NULL),
+		                   ('cosign_reason', 'smallint', 'NO', ARRAY['0', '0::smallint', '''0''::smallint']),
+		                   ('pinger_signature', 'bytea', 'NO', NULL),
+		                   ('cosignature', 'bytea', 'YES', NULL),
+		                   ('create_time', 'timestamp without time zone', 'NO', ARRAY['now()'])
+		               ) AS expected(column_name, data_type, is_nullable, column_defaults)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_ping'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		                     AND (
+		                         (expected.column_defaults IS NULL AND actual.column_default IS NULL)
+		                         OR actual.column_default = ANY(expected.column_defaults)
+		                     )
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'network_ping'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (ping_id)'
+		                 AND validated
+		           )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_ping'
+		             AND index_name = 'network_ping_target_pinger_nonce'
+		             AND definition = 'CREATE UNIQUE INDEX network_ping_target_pinger_nonce ON public.network_ping USING btree (target_extender_id, pinger_kind, pinger_id, probe_nonce)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_ping'
+		             AND index_name = 'network_ping_create_time'
+		             AND definition = 'CREATE INDEX network_ping_create_time ON public.network_ping USING btree (create_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_ping'
+		             AND index_name = 'network_ping_target_extender_id_create_time'
+		             AND definition = 'CREATE INDEX network_ping_target_extender_id_create_time ON public.network_ping USING btree (target_extender_id, create_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_ping'
+		             AND index_name = 'network_ping_pinger_kind_pinger_id_create_time'
+		             AND definition = 'CREATE INDEX network_ping_pinger_kind_pinger_id_create_time ON public.network_ping USING btree (pinger_kind, pinger_id, create_time)'
+		             AND predicate_definition IS NULL
+		             AND indisvalid AND indisready
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_client_location'
+		             AND column_name = 'accuracy_km'
+		             AND data_type = 'real' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_extender_activation'
+		             AND column_name = 'accuracy_km'
+		             AND data_type = 'real' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_ping'
+		             AND column_name = 'hop_count'
+		             AND data_type = 'smallint' AND is_nullable = 'NO'
+		             AND column_default IN ('0', '0::smallint', '''0''::smallint')
+		       ),
+		       (
+		           to_regclass('public.derived_location') IS NOT NULL
+		           AND (
+		               SELECT count(*) = 20
+		               FROM (VALUES
+		                   ('node_kind', 'smallint'),
+		                   ('node_id', 'uuid'),
+		                   ('genesis_latitude', 'double precision'),
+		                   ('genesis_longitude', 'double precision'),
+		                   ('genesis_accuracy_km', 'real'),
+		                   ('delta_latitude', 'double precision'),
+		                   ('delta_longitude', 'double precision'),
+		                   ('latitude', 'double precision'),
+		                   ('longitude', 'double precision'),
+		                   ('ping_count', 'integer'),
+		                   ('peer_count', 'integer'),
+		                   ('residual_km', 'real'),
+		                   ('reputation', 'real'),
+		                   ('crossed_region', 'boolean'),
+		                   ('crossed_country', 'boolean'),
+		                   ('location_id', 'uuid'),
+		                   ('city_location_id', 'uuid'),
+		                   ('region_location_id', 'uuid'),
+		                   ('country_location_id', 'uuid'),
+		                   ('update_time', 'timestamp without time zone')
+		               ) AS expected(column_name, data_type)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'derived_location'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = 'NO'
+		                     AND actual.column_default IS NULL
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'derived_location'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (node_kind, node_id)'
+		                 AND validated
+		           )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_client_location'
+		             AND column_name = 'genesis_location_id'
+		             AND data_type = 'uuid' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_client_location_reliability'
+		             AND column_name = 'egress_index'
+		             AND data_type = 'smallint' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_client_location_reliability'
+		             AND column_name = 'egress_quality'
+		             AND data_type = 'boolean' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'network_client_location_reliability'
+		             AND column_name = 'egress_evidence_time'
+		             AND data_type = 'timestamp without time zone' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'provider_blackhole_check'
+		             AND column_name = 'consecutive_failures'
+		             AND data_type = 'integer' AND is_nullable = 'NO'
+		             AND column_default IN ('0', '0::integer', '''0''::integer')
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'provider_blackhole_check'
+		             AND column_name = 'first_failed_at'
+		             AND data_type = 'timestamp without time zone' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM information_schema.columns
+		           WHERE table_schema = 'public' AND table_name = 'provider_blackhole_check'
+		             AND column_name = 'next_due_at'
+		             AND data_type = 'timestamp without time zone' AND is_nullable = 'YES'
+		             AND column_default IS NULL
+		       ),
+		       (
+		           SELECT count(*) = 6
+		           FROM (VALUES
+		               ('not_measured_count', 'integer'),
+		               ('not_measured_names', 'text'),
+		               ('canary_passed_names', 'text'),
+		               ('canary_failed_names', 'text'),
+		               ('short_classes', 'text'),
+		               ('unscored_failed_names', 'text')
+		           ) AS expected(column_name, data_type)
+		           WHERE EXISTS (
+		               SELECT 1 FROM information_schema.columns AS actual
+		               WHERE actual.table_schema = 'public'
+		                 AND actual.table_name = 'provider_egress_health'
+		                 AND actual.column_name = expected.column_name
+		                 AND actual.data_type = expected.data_type
+		                 AND actual.is_nullable = 'NO'
+		                 AND actual.column_default IN ('0', '0::integer', '''''::text')
+		           )
+		       ),
+		       (
+		           (
+		               SELECT count(*) = 25
+		               FROM information_schema.columns
+		               WHERE table_schema = 'public' AND table_name = 'provider_egress_destination'
+		           )
+		           AND (
+		               SELECT count(*) = 9
+		               FROM (VALUES
+		                   ('name', 'character varying', 'NO'),
+		                   ('class', 'character varying', 'NO'),
+		                   ('url', 'character varying', 'NO'),
+		                   ('incompatible', 'jsonb', 'NO'),
+		                   ('verify', 'jsonb', 'NO'),
+		                   ('active', 'boolean', 'NO'),
+		                   ('probation', 'boolean', 'NO'),
+		                   ('retired_time', 'timestamp without time zone', 'YES'),
+		                   ('above_retire_since', 'timestamp without time zone', 'YES')
+		               ) AS expected(column_name, data_type, is_nullable)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'provider_egress_destination'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'provider_egress_destination'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (name)'
+		                 AND validated
+		           )
+		       ),
+		       (
+		           (
+		               SELECT count(*) = 11
+		               FROM information_schema.columns
+		               WHERE table_schema = 'public' AND table_name = 'provider_egress_site_tally'
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'provider_egress_site_tally'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (tally_day, name, country_code, region)'
+		                 AND validated
+		           )
+		       ),
+		       (
+		           (
+		               SELECT count(*) = 7
+		               FROM information_schema.columns
+		               WHERE table_schema = 'public' AND table_name = 'provider_egress_place_tally'
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'provider_egress_place_tally'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (tally_day, country_code, region)'
+		                 AND validated
+		           )
+		       ),
+		       (
+		           EXISTS (
+		               SELECT 1
+		               FROM pg_class AS relation
+		               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		               WHERE namespace.nspname = 'public'
+		                 AND relation.relname = 'network_ping'
+		                 AND relation.relkind = 'p'
+		                 AND pg_get_partkeydef(relation.oid) = 'RANGE (create_time)'
+		           )
+		           AND (
+		               SELECT count(*) = 13
+		               FROM (VALUES
+		                   ('ping_id', 'uuid', 'NO', NULL::text[]),
+		                   ('pinger_kind', 'smallint', 'NO', NULL),
+		                   ('pinger_id', 'uuid', 'NO', NULL),
+		                   ('target_extender_id', 'uuid', 'NO', NULL),
+		                   ('probe_nonce', 'bytea', 'NO', NULL),
+		                   ('rtt_ms', 'integer', 'NO', NULL),
+		                   ('probe_time', 'timestamp without time zone', 'NO', NULL),
+		                   ('cosign', 'smallint', 'NO', NULL),
+		                   ('cosign_reason', 'smallint', 'NO', ARRAY['0', '0::smallint', '''0''::smallint']),
+		                   ('pinger_signature', 'bytea', 'NO', NULL),
+		                   ('cosignature', 'bytea', 'YES', NULL),
+		                   ('create_time', 'timestamp without time zone', 'NO', ARRAY['now()']),
+		                   ('hop_count', 'smallint', 'NO', ARRAY['0', '0::smallint', '''0''::smallint'])
+		               ) AS expected(column_name, data_type, is_nullable, column_defaults)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_ping'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = expected.is_nullable
+		                     AND (
+		                         (expected.column_defaults IS NULL AND actual.column_default IS NULL)
+		                         OR actual.column_default = ANY(expected.column_defaults)
+		                     )
+		               )
+		           )
+		           AND (
+		               SELECT count(*) = 3
+		               FROM (VALUES
+		                   ('network_ping_target_pinger_nonce', 'CREATE UNIQUE INDEX network_ping_target_pinger_nonce ON ONLY public.network_ping USING btree (target_extender_id, pinger_kind, pinger_id, probe_nonce, create_time)'),
+		                   ('network_ping_target_extender_id_create_time', 'CREATE INDEX network_ping_target_extender_id_create_time ON ONLY public.network_ping USING btree (target_extender_id, create_time)'),
+		                   ('network_ping_pinger_kind_pinger_id_create_time', 'CREATE INDEX network_ping_pinger_kind_pinger_id_create_time ON ONLY public.network_ping USING btree (pinger_kind, pinger_id, create_time)')
+		               ) AS expected(index_name, definition)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM index_artifact AS actual
+		                   WHERE actual.table_name = 'network_ping'
+		                     AND actual.index_name = expected.index_name
+		                     AND actual.definition = expected.definition
+		                     AND actual.predicate_definition IS NULL
+		                     AND actual.indisvalid AND actual.indisready
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM pg_inherits AS inheritance
+		               WHERE inheritance.inhparent = to_regclass('public.network_ping')
+		           )
+		           AND NOT EXISTS (
+		               SELECT 1
+		               FROM pg_inherits AS inheritance
+		               JOIN pg_class AS partition_relation ON partition_relation.oid = inheritance.inhrelid
+		               LEFT JOIN LATERAL (
+		                   SELECT (matched.value)[1]::timestamp AS lower_bound,
+		                          (matched.value)[2]::timestamp AS upper_bound
+		                   FROM regexp_match(
+		                       pg_get_expr(partition_relation.relpartbound, partition_relation.oid),
+		                       '^FOR VALUES FROM \(''([^'']*)''\) TO \(''([^'']*)''\)$'
+		                   ) AS matched(value)
+		               ) AS bound ON true
+		               WHERE inheritance.inhparent = to_regclass('public.network_ping')
+		                 AND NOT coalesce(
+		                     partition_relation.relkind = 'r'
+		                     AND bound.lower_bound = date_trunc('day', bound.lower_bound)
+		                     AND bound.upper_bound = bound.lower_bound + interval '1 day'
+		                     AND partition_relation.relname = 'network_ping_p' || to_char(bound.lower_bound, 'YYYYMMDD'),
+		                     false
+		                 )
+		           )
+		       ),
+		       to_regclass('public.network_ping_legacy') IS NULL,
+		       (
+		           COALESCE((
+		               SELECT relkind = 'r'
+		               FROM pg_class WHERE oid = to_regclass('public.network_ping_hour_tally')
+		           ), false)
+		           AND (
+		               SELECT count(*) = 9
+		               FROM (VALUES
+				   ('hour', 'timestamp without time zone'),
+				   ('shard', 'smallint'),
+				   ('pinger_kind', 'smallint'),
+				   ('relayed', 'boolean'),
+				   ('cosign', 'smallint'),
+				   ('cosign_reason', 'smallint'),
+				   ('ping_count', 'bigint'),
+				   ('zero_rtt_count', 'bigint'),
+				   ('beyond_half_planet_count', 'bigint')
+		               ) AS expected(column_name, data_type)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_ping_hour_tally'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = 'NO'
+		                     AND actual.column_default IS NULL
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'network_ping_hour_tally'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (hour, shard, pinger_kind, relayed, cosign, cosign_reason)'
+		                 AND validated
+		           )
+		       ),
+		       (
+		           COALESCE((
+		               SELECT relkind = 'p' AND pg_get_partkeydef(oid) = 'RANGE (day)'
+		               FROM pg_class WHERE oid = to_regclass('public.network_ping_pinger_day')
+		           ), false)
+		           AND (
+		               SELECT count(*) = 3
+		               FROM (VALUES
+				   ('day', 'date'),
+				   ('pinger_kind', 'smallint'),
+				   ('pinger_id', 'uuid')
+		               ) AS expected(column_name, data_type)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_ping_pinger_day'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = 'NO'
+		                     AND actual.column_default IS NULL
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'network_ping_pinger_day'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (day, pinger_kind, pinger_id)'
+		                 AND validated
+		           )
+		           AND `+migrationDayPartitionsArtifactQuery("network_ping_pinger_day")+`
+		       ),
+		       (
+		           COALESCE((
+		               SELECT relkind = 'p' AND pg_get_partkeydef(oid) = 'RANGE (day)'
+		               FROM pg_class WHERE oid = to_regclass('public.network_ping_target_day')
+		           ), false)
+		           AND (
+		               SELECT count(*) = 2
+		               FROM (VALUES
+				   ('day', 'date'),
+				   ('target_extender_id', 'uuid')
+		               ) AS expected(column_name, data_type)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_ping_target_day'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = 'NO'
+		                     AND actual.column_default IS NULL
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'network_ping_target_day'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (day, target_extender_id)'
+		                 AND validated
+		           )
+		           AND `+migrationDayPartitionsArtifactQuery("network_ping_target_day")+`
+		       ),
+		       (
+		           COALESCE((
+		               SELECT relkind = 'p' AND pg_get_partkeydef(oid) = 'RANGE (hour)'
+		               FROM pg_class WHERE oid = to_regclass('public.network_ping_target_hour_tally')
+		           ), false)
+		           AND (
+		               SELECT count(*) = 5
+		               FROM (VALUES
+				   ('hour', 'timestamp without time zone'),
+				   ('target_extender_id', 'uuid'),
+				   ('pinger_kind', 'smallint'),
+				   ('ping_count', 'bigint'),
+				   ('rejection_count', 'bigint')
+		               ) AS expected(column_name, data_type)
+		               WHERE EXISTS (
+		                   SELECT 1 FROM information_schema.columns AS actual
+		                   WHERE actual.table_schema = 'public'
+		                     AND actual.table_name = 'network_ping_target_hour_tally'
+		                     AND actual.column_name = expected.column_name
+		                     AND actual.data_type = expected.data_type
+		                     AND actual.is_nullable = 'NO'
+		                     AND actual.column_default IS NULL
+		               )
+		           )
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'network_ping_target_hour_tally'
+		                 AND constraint_type = 'p'
+		                 AND definition = 'PRIMARY KEY (hour, target_extender_id, pinger_kind)'
+		                 AND validated
+		           )
+			   AND `+migrationDayPartitionsArtifactQuery("network_ping_target_hour_tally")+`
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM pg_proc AS function_record
+		           JOIN pg_namespace AS namespace ON namespace.oid = function_record.pronamespace
+		           WHERE namespace.nspname = 'public'
+		             AND function_record.proname = 'competition_round_immutable_guard'
+		             AND position('NEW.staging OR (job.score_json->>''takeover_eligible'')::boolean'
+		                          in pg_get_functiondef(function_record.oid)) > 0
+		       ),
+		       `+competitionStagingApprovalArtifactQuery+`,
+		       `+strings.Join(migrationFp2ArtifactQueries, ",\n")+`,
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'network_client_location_reliability'
+		             AND index_name = 'network_client_location_reliability_arin_exceptions'
+		             AND definition = 'CREATE INDEX network_client_location_reliability_arin_exceptions ON public.network_client_location_reliability USING btree (client_id) INCLUDE (arin_risk, arin_non_quality) WHERE (arin_risk OR arin_non_quality)'
+		             AND predicate_definition = '(arin_risk OR arin_non_quality)'
+		             AND indisvalid AND indisready
+		       ),
+		       `+strings.Join(migrationUrlCompletionArtifactQueries, ",\n")+`,
+		       `+migrationReliabilityObservationArtifactQuery+`,
+		       `+migrationUrlProbeMeasuredQuotaArtifactQuery+`,
+		       (
+		           (SELECT count(*) = 3 FROM (VALUES
+		               ('usage_origin_is_source', 'boolean', 'YES'),
+		               ('usage_unverified', 'boolean', 'NO'),
+		               ('provider_usage', 'jsonb', 'YES')
+		           ) AS expected(column_name, data_type, is_nullable)
+		           WHERE EXISTS (
+		               SELECT 1 FROM information_schema.columns AS actual
+		               WHERE actual.table_schema = 'public' AND actual.table_name = 'transfer_contract'
+		                 AND actual.column_name = expected.column_name
+		                 AND actual.data_type = expected.data_type
+		                 AND actual.is_nullable = expected.is_nullable
+		           ))
+		           AND EXISTS (
+		               SELECT 1 FROM constraint_artifact
+		               WHERE table_name = 'transfer_contract'
+		                 AND constraint_name = 'transfer_contract_provider_usage_shape'
+		                 AND constraint_type = 'c'
+		                 AND definition LIKE '%jsonb_typeof(provider_usage)%'
+		           )
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM index_artifact
+		           WHERE table_name = 'transfer_contract'
+		             AND index_name = 'transfer_contract_closed_usage'
+		             AND definition = 'CREATE INDEX transfer_contract_closed_usage ON public.transfer_contract USING btree (close_time, contract_id) WHERE (outcome IS NOT NULL)'
+		             AND predicate_definition = '(outcome IS NOT NULL)'
+		             AND indisvalid AND indisready
+		       ),
+		       `+clientKeyPolicyNamespaceArtifactQuery+`,
+		       `+contractUsageGuardArtifactQuery+`,
+		       `+providerUsageArchiveArtifactQuery+`,
+		       `+netEscrowRevisionArtifactQuery+`,
+		       `+providerUsageTimeIndexArtifactQuery+`,
+		       `+clientRegistrationArtifactQuery+`,
+		       `+subscriberQualityVerifiedArtifactQuery+`,
+		       `+subscriberQualityWriteGuardArtifactQuery+`,
+		       `+proberShardOwnershipArtifactQuery+`,
+		       `+netEscrowContractPointRevisionArtifactQuery+`,
+		       `+netEscrowSnapshotArtifactQuery+`,
+		       `+redisAdmissionArtifactQuery+`,
+		       `+providerPaymentBonusArtifactQuery+`,
+		       `+providerPayoutBoundaryArtifactQuery+`,
+		       `+transferDebitArtifactQuery+`,
+		       `+testBalanceDrainArtifactQuery+`,
+		       `+testBalanceDrainIndexArtifactQuery+`,
+		       `+solanaPaymentAmountArtifactQuery+`,
+		       `+circleTransferRequestArtifactQuery+`,
+		       `+legacySettlementIntentArtifactQuery+`,
+		       `+contractCloseReportArtifactQuery+`,
+		       `+appleOfferCodeBindingArtifactQuery+`,
+		       `+playPurchaseBindingArtifactQuery+`,
+		       `+contractCloseEvidenceArtifactQuery+`,
+		       `+contractCloseOriginalArtifactQuery+`,
+		       `+contractCloseInventoryArtifactQuery+snMainnetMigrationArtifactQueries()+`
 		FROM version;
 	`)
 	if err != nil {
@@ -1066,11 +2236,11 @@ func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, err
 			} else {
 				compareCount := min(dbVersion, requiredHead)
 				for index := 0; index < compareCount; index++ {
-					expectedIdentity, identityErr := server.MigrationIdentity(index)
+					matches, identityErr := server.MigrationIdentityMatches(index, strings.TrimSpace(catalogIdentities[index]))
 					if identityErr != nil {
 						return nil, identityErr
 					}
-					if strings.TrimSpace(catalogIdentities[index]) != expectedIdentity {
+					if !matches {
 						missing = append(missing, fmt.Sprintf("migration_catalog identity[%d]@v600", index))
 						break
 					}
@@ -1113,6 +2283,40 @@ func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, err
 	}
 
 	return findings, nil
+}
+
+// The day-partition contract of network_ping's tallies kept by day (GEOMAP
+// §5.7): at least one partition, and every partition of `table` a plain table
+// named for the day it covers and covering exactly that day
+// (network_ping_pinger_day_p20260924 holds 2026-09-24). A bound is read back
+// from pg_get_expr's text and cast in the same session, so the check holds
+// under any date style.
+func migrationDayPartitionsArtifactQuery(table string) string {
+	return fmt.Sprintf(`EXISTS (
+		               SELECT 1 FROM pg_inherits AS inheritance
+		               WHERE inheritance.inhparent = to_regclass('public.%[1]s')
+		           )
+		           AND NOT EXISTS (
+		               SELECT 1
+		               FROM pg_inherits AS inheritance
+		               JOIN pg_class AS partition_relation ON partition_relation.oid = inheritance.inhrelid
+		               LEFT JOIN LATERAL (
+		                   SELECT (matched.value)[1]::timestamp AS lower_bound,
+		                          (matched.value)[2]::timestamp AS upper_bound
+		                   FROM regexp_match(
+		                       pg_get_expr(partition_relation.relpartbound, partition_relation.oid),
+		                       '^FOR VALUES FROM \(''([^'']*)''\) TO \(''([^'']*)''\)$'
+		                   ) AS matched(value)
+		               ) AS bound ON true
+		               WHERE inheritance.inhparent = to_regclass('public.%[1]s')
+		                 AND NOT coalesce(
+		                     partition_relation.relkind = 'r'
+		                     AND bound.lower_bound = date_trunc('day', bound.lower_bound)
+		                     AND bound.upper_bound = bound.lower_bound + interval '1 day'
+		                     AND partition_relation.relname = '%[1]s_p' || to_char(bound.lower_bound, 'YYYYMMDD'),
+		                     false
+		                 )
+		           )`, table)
 }
 
 func migrationBool(value string) bool {

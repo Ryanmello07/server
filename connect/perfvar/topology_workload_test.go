@@ -335,7 +335,14 @@ func measureFullTunUDPDirection(
 	}
 	defer connection.Close()
 	var providerAddress net.Addr
+	var providerReturnOwner clientconnect.Id
 	if !upload {
+		registrationOwner, err := newFullTunUDPRegistrationOwner(connection.LocalAddr(), listener.LocalAddr())
+		if err != nil {
+			return workloadResult{}, fmt.Errorf("identify UDP registration flow: %w", err)
+		}
+		removeRegistrationOwner := path.providerClient.AddReceiveCallback(registrationOwner.observe)
+		defer removeRegistrationOwner()
 		if _, err := connection.Write([]byte{1}); err != nil {
 			return workloadResult{}, fmt.Errorf("open UDP provider NAT: %w", err)
 		}
@@ -361,11 +368,21 @@ func measureFullTunUDPDirection(
 		if err := path.waitForSetupBoundary(ctx); err != nil {
 			return workloadResult{}, fmt.Errorf("join UDP provider registration: %w", err)
 		}
+		providerReturnOwner, err = registrationOwner.wait(ctx)
+		if err != nil {
+			return workloadResult{}, fmt.Errorf("resolve UDP registration owner: %w", err)
+		}
+		removeRegistrationOwner()
 		carrierMeasurementStart, err := beginPerfvarCarrierMeasurement(path)
 		if err != nil {
 			return workloadResult{}, err
 		}
 		path.setCarrierMeasurementStart(carrierMeasurementStart)
+		if path.afterUdpRegistrationForTest != nil {
+			if err := path.afterUdpRegistrationForTest(ctx, connection); err != nil {
+				return workloadResult{}, fmt.Errorf("after UDP registration: %w", err)
+			}
+		}
 	}
 	packetInterval := time.Duration(float64(time.Second) * float64(payloadByteCount*8) / float64(offeredBitsPerSecond))
 	if packetInterval <= 0 {
@@ -477,12 +494,8 @@ func measureFullTunUDPDirection(
 			return workloadResult{}, fmt.Errorf("begin measured bridge flow window for %+v", bridgeFlowKey)
 		}
 	} else {
-		deviceClient := path.deviceClient.Load()
-		if deviceClient == nil || deviceClient.ClientId() == (clientconnect.Id{}) {
-			return workloadResult{}, fmt.Errorf("derive measured provider-return flow before the generated device client is ready")
-		}
 		providerReturnFlowKey, err = fullTunProviderReturnUdpFlowKey(
-			deviceClient.ClientId(),
+			providerReturnOwner,
 			listener.LocalAddr(),
 			connection.LocalAddr(),
 		)
@@ -521,6 +534,13 @@ func measureFullTunUDPDirection(
 		}
 	}
 	sendDuration := time.Since(startTime)
+	bridgeFailure := func(targetPackets int64, targetBytes clientconnect.ByteCount, boundaryOK bool) error {
+		stateLock.Lock()
+		delivered, duplicate, corrupt := deliveredPacketCount, duplicatePacketCount, corruptPacketCount
+		stateLock.Unlock()
+		return path.bridgeSends.flowFailure(ctx, measuredBridgeWindow, targetPackets, targetBytes,
+			boundaryOK, delivered, duplicate, corrupt, path.multiClient.TcpCollapseDropCount())
+	}
 	// First prove that every measured application datagram reached its source
 	// SendPack. No terminal marker has entered the path yet.
 	if upload {
@@ -533,14 +553,8 @@ func measureFullTunUDPDirection(
 			targetBridgeByteCount,
 		)
 		if !bridgeBoundaryOk || !path.bridgeSends.waitThrough(ctx, bridgeBoundary) {
-			return workloadResult{}, fmt.Errorf(
-				"application bridge did not complete measured flow %+v at %d packets and %d bytes: %w; failures=%d",
-				measuredBridgeWindow.flowKey,
-				targetPacketCount,
-				targetBridgeByteCount,
-				ctx.Err(),
-				path.bridgeSends.failureCount.Load(),
-			)
+			return workloadResult{}, fmt.Errorf("application bridge did not complete measured flow: %w",
+				bridgeFailure(targetPacketCount, targetBridgeByteCount, bridgeBoundaryOk))
 		}
 	} else {
 		targetProviderReturnByteCount := clientconnect.ByteCount(targetPacketCount) *
@@ -552,22 +566,13 @@ func measureFullTunUDPDirection(
 			targetProviderReturnByteCount,
 		)
 		if !boundaryOk || !path.providerReturns.waitThrough(ctx, providerReturnBoundary) {
-			return workloadResult{}, fmt.Errorf(
-				"provider return source did not complete flow %+v at %d packets and %d bytes: %w; observed_packets=%d observed_bytes=%d failures=%d congestion=%+v",
-				providerReturnFlowKey,
-				targetPacketCount,
-				targetProviderReturnByteCount,
-				ctx.Err(),
-				path.providerReturns.startedPacketCount.Load(),
-				path.providerReturns.startedByteCount.Load(),
-				path.providerReturns.failures.Load()-providerReturnFailureCountBefore,
-				path.providerRemoteNat.CongestionDropStats(),
-			)
+			return workloadResult{}, path.providerReturnSourceFailure(ctx, providerReturnBoundary,
+				boundaryOk, targetPacketCount, targetProviderReturnByteCount, providerReturnFailureCountBefore)
 		}
 	}
 	sourceSerializationBoundary, boundaryOk := sourceTracker.boundary(ctx)
 	if !boundaryOk {
-		return workloadResult{}, fmt.Errorf("snapshot UDP source serialization boundary: %w", ctx.Err())
+		return workloadResult{}, fmt.Errorf("snapshot UDP source serialization boundary: %w", sourceTracker.boundaryError(ctx))
 	}
 	if !sourceTracker.waitThrough(ctx, sourceSerializationBoundary) {
 		return workloadResult{}, fmt.Errorf(
@@ -613,15 +618,8 @@ func measureFullTunUDPDirection(
 				targetBridgeByteCount,
 			)
 			if !bridgeBoundaryOk || !path.bridgeSends.waitThrough(ctx, bridgeBoundary) {
-				return workloadResult{}, fmt.Errorf(
-					"marker %d bridge source did not complete flow %+v at %d packets and %d bytes: %w; failures=%d",
-					markerAttemptCount,
-					measuredBridgeWindow.flowKey,
-					targetBridgePacketCount,
-					targetBridgeByteCount,
-					ctx.Err(),
-					path.bridgeSends.failureCount.Load(),
-				)
+				return workloadResult{}, fmt.Errorf("marker %d bridge source did not complete flow: %w",
+					markerAttemptCount, bridgeFailure(targetBridgePacketCount, targetBridgeByteCount, bridgeBoundaryOk))
 			}
 		} else {
 			targetProviderReturnPacketCount := targetPacketCount + int64(markerAttemptCount)
@@ -1646,6 +1644,22 @@ func hasTransferEncoding(encodings []string, want string) bool {
 	return false
 }
 
+type fullTunLatencyProbeTestObserver struct {
+	observe latencyProbeObserver
+	phase   func(string)
+	finish  func()
+}
+
+// Only an explicitly selected diagnostic installs this factory. It is called
+// before any echo worker starts and its finish runs after every worker joins.
+var newFullTunLatencyProbeObserverForTest func(*fullTunPath) *fullTunLatencyProbeTestObserver
+
+func (self *fullTunLatencyProbeTestObserver) observePhase(phase string) {
+	if self != nil && self.phase != nil {
+		self.phase(phase)
+	}
+}
+
 // A host UDP echo probe observes interactive RTT before, during, and after a
 // full-TUN bulk transfer over the same selected route. The compatibility entry
 // point retains the original upload direction.
@@ -1701,6 +1715,17 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 	upload bool,
 	startHook func() error,
 ) (workloadResult, error) {
+	var probeTrace *fullTunLatencyProbeTestObserver
+	var probeObserver latencyProbeObserver
+	if newFullTunLatencyProbeObserverForTest != nil {
+		probeTrace = newFullTunLatencyProbeObserverForTest(path)
+		if probeTrace != nil {
+			probeObserver = probeTrace.observe
+			if probeTrace.finish != nil {
+				defer probeTrace.finish()
+			}
+		}
+	}
 	probeListener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		return workloadResult{}, err
@@ -1723,7 +1748,12 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 			if readErr != nil {
 				return
 			}
-			_, _ = probeListener.WriteTo(packetBytes[:readByteCount], sourceAddress)
+			observeLatencyProbePacket(probeObserver, "echo-read", packetBytes[:readByteCount], time.Time{}, nil)
+			writeByteCount, writeErr := probeListener.WriteTo(packetBytes[:readByteCount], sourceAddress)
+			if writeErr == nil && writeByteCount != readByteCount {
+				writeErr = io.ErrShortWrite
+			}
+			observeLatencyProbePacket(probeObserver, "echo-write", packetBytes[:readByteCount], time.Time{}, writeErr)
 		}
 	}()
 	var probeServerJoinOnce sync.Once
@@ -1749,11 +1779,12 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 			if ctx.Err() != nil {
 				break
 			}
-			latency, probeErr := runLatencyProbe(
+			latency, probeErr := runLatencyProbeObserved(
 				ctx,
 				probeConnection,
 				startSequence+uint64(probeIndex),
 				probeTimeout,
+				probeObserver,
 			)
 			samples.add(latency, probeErr)
 			if err := waitForWorkloadDelay(ctx, 5*time.Millisecond); err != nil {
@@ -1762,7 +1793,9 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 		}
 		return samples
 	}
+	probeTrace.observePhase("idle-start")
 	idleSamples := probeMany(latencyProbeIdleStartSequence, 8)
+	probeTrace.observePhase("idle-end")
 	if err := idleSamples.validate("idle"); err != nil {
 		result := workloadResult{}
 		applyLatencyProbeSamples(&result, idleSamples, latencyProbeSamples{}, latencyProbeSamples{})
@@ -1844,6 +1877,11 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 			return workloadResult{}, err
 		}
 	}
+	var loadedProbeSettings *loadedLatencyProbeTestSettings
+	if probeObserver != nil {
+		loadedProbeSettings = &loadedLatencyProbeTestSettings{observer: probeObserver}
+	}
+	probeTrace.observePhase("loaded-start")
 	loadedSamples := runLoadedLatencyProbes(
 		ctx,
 		probeConnection,
@@ -1854,8 +1892,9 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 			fullTunEffectiveRateBitsPerSecond(path, upload),
 		),
 		bulkFinished,
-		nil,
+		loadedProbeSettings,
 	)
+	probeTrace.observePhase("loaded-end")
 	var bulkResult workloadResult
 	select {
 	case err := <-bulkErrors:
@@ -1871,7 +1910,9 @@ func measureFullTunLatencyUnderLoadDirectionWithStartHook(
 		return workloadResult{}, ctx.Err()
 	}
 	joinBulkUpload()
+	probeTrace.observePhase("post-load-start")
 	postLoadSamples := probeMany(latencyProbePostLoadStartSequence, 8)
+	probeTrace.observePhase("post-load-end")
 	joinProbeServer()
 	applyLatencyProbeSamples(&bulkResult, idleSamples, loadedSamples, postLoadSamples)
 	if err := validateLatencyProbeSamples(idleSamples, loadedSamples, postLoadSamples); err != nil {

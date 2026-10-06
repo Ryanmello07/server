@@ -1,13 +1,38 @@
 # Sim-latency competition live-deployment playbook
 
-Status date: 2026-09-15
+Status date: 2026-09-25
 
-Evaluator/baseline qualification: **measured-product qualification complete;
-corrected epoch-0 scorer image installed and smoke-tested; live API/config
-verified and staging epoch 4 open with its worker running; accepted live score
-pending**
+Evaluator/baseline qualification: **historical measured-product qualification
+preserved; staging epoch 8 finalized with a named comment-only winner; staging
+epoch 9 is evaluating three accepted jobs in FIFO order**
 
-Launch-control validation: **complete locally; release deployment and external actions pending**
+Launch-control validation: **staging API/evaluator active; explicit staging
+winner approval and zero-margin future staging policy require the next
+migration/API/evaluator-image rollout; production qualification and external
+launch actions remain pending**
+
+After close and FIFO drain, staging selects the highest-ranked placeable
+candidate passing every gate, regardless of significance or takeover margin,
+or no winner when none is placeable. Naming a winner alone leaves
+`honesty_review: not_reviewed`. A separate, append-only manual approval of the
+exact finalized staging winner changes that entry to `approved` for Apex
+adapter-path testing; it never promotes source or changes a finalized ranking.
+Production retains mandatory review. Historical finalized results stay intact.
+
+After a staging round finalizes with a winner, inspect the authenticated
+candidate in a private temporary directory with
+`./run-local-main.sh staging-review --epoch N next`. If the patch and score
+are honest and safe, record a reviewed evidence JSON object with
+`./run-local-main.sh staging-review --epoch N approve --job-id ID --reviewer ID --reason TEXT --evidence PATH`.
+This marks only that winner's leaderboard entry `approved`; it does not merge
+the patch. An unreviewed or dishonest staging winner remains `not_reviewed`.
+
+For the next staging epoch, deploy the new migration and API before using
+`staging-review`; rebuild the evaluator image with the zero-margin scorer and
+pin its digest in main competition config before opening that epoch. Do not
+change epoch 9's frozen image, source, or 0.161 policy mid-round. Once epoch 9
+drains, close/finalize it, deploy the new release, and open the next staging
+epoch. The production policy remains at its configured positive margin.
 
 Deployment model: one authoritative 12-physical-core host; 10 evaluation cores,
 2 management cores; one content-addressed image per canonical submission patch.
@@ -31,23 +56,25 @@ Read these first:
 - [Apex open-question checklist](launch/APEX-OPEN-QUESTIONS.md)
 - [Submitter onboarding](launch/ONBOARDING.md)
 - [Incident response](launch/INCIDENT-RESPONSE.md)
+- [Staging epoch 4 G5 investigation](launch/STAGING-4-G5-INCIDENT.md)
+- [Staging epoch 5 release and deployment order](launch/STAGING-5-RELEASE.md)
 - [Agent season harness](RUN-MAIN.md)
 - [Machine-readable launch status](playbook.yml)
 
 ## 1. Go-live position
 
-### What is already frozen and qualified
+### Current policy, release, and qualification evidence
 
 | Item | Frozen value / state |
 |---|---|
 | Public patch-authoring tag | `apex-season-1` at `eb697281cbe0a19a27d7771fe69fb24c2c3dab8c` |
 | Evaluator source | Epoch ledger `config/main/sim-latency.yml` is the sole authority for branch, epoch commits, and the significant-improvement percentage |
 | Control plane | API and worker follow `main`; their commits are not scoring inputs. Every job persists the exact API and worker runtime image digests. |
-| Evaluator image | Source commit `759b7462ef4dbe849d7bfbcc7a73e8b5c573c340`; locally installed image `sha256:4b7e46e2243d26b915e83a85d3c2b4b7679d5038bc0c53197ce274cec137209b`. Full Docker smoke passed on 2026-09-14. Live API and staging epoch 4's immutable policy pin this release, verified on 2026-09-15. An accepted live score remains pending. |
-| Host qualification | `acf226db6b8e50d67f8957cddb3903d5d4e9e82566935d61d270ccb5b03463a3` |
-| Simulator / scorer | `fcadc7f736e26e23f5c6eb4867713f528728fdf9193a40616c80d5ccb1963a7f`; includes the required significance record. Measured product code is unchanged by the scorer repair. |
+| Evaluator image | Epoch-5 source `807b473c927d1ae09a03276bb9758afb715fac9e`; image `sha256:b0c07cf45c30adb483ee5c215b7426b2e098c0b35c7cf4c4abcb0166cb43a87e`, installed; clean-source build, Go validation, and full Docker smoke passed. Repeated live API checks match this tuple on 2026-09-19. [Release record](launch/STAGING-5-RELEASE.md). |
+| Host qualification | Prior authenticated containment record `acf226db6b8e50d67f8957cddb3903d5d4e9e82566935d61d270ccb5b03463a3` is retained for staging only; the new image needs separate exact-image production qualification. |
+| Simulator / scorer | `e27929e9f2ef45f9f23c2120b651fafe048f38d82f3ca308b1b200b48ea05cbf`; shared-baseline scoring and restored database recovery. New epoch measurements must use the new checkpoint, not historical baseline samples. |
 | Workload | 1,800 providers; 200 clients; 80 arrivals/min; quality window 2; 4 exchange hosts; 4 shards |
-| Measurement | 180 seconds; impairment on; median of `R=9` |
+| Measurement | 180 seconds; impairment on; one immutable epoch control at `R=9`, then `R=9` fresh candidate runs per submission |
 | Takeover rule | Epoch 1 starts at `candidate <= same-round baseline * 0.839`; every epoch also requires G1–G6 and one-sided Welch `p <= 0.05`. The source ledger supplies later percentages. |
 | Epoch lifecycle | six epochs; exactly seven days of admission; immediate FIFO evaluation; accepted backlog drains past close; worker seals and exits; ranked significant candidates remain embargoed until the honesty-review harness approves the first honest candidate or rejects the list; only then do results reveal and the external loop promote/create the next epoch |
 | Winner promotion | Round N evaluates source epoch N-1. The first honesty-approved significant winner's score variance sets source epoch N's threshold. With no significant candidate or after all are rejected, `--no-winner` carries commits and threshold forward unchanged. Promotion is bound to the approved database job, patch digest, and entire score document; the config ledger is always pushed last. |
@@ -57,32 +84,62 @@ Read these first:
 | Evaluation leaf hashes | config `f2fd41f07258389a5b8cbfd12af69c7e71124755432e48e115933a66f835962d`; vault `f84b7bdd1976c5e404c196584025287ab346f4bcfd60196da9ca46191a39f3fa` |
 | Artifact retention | versioned MinIO object storage with compliance retention and post-upload SHA-256 authentication; score commit fails closed |
 | Monitoring | main Grafana dashboard plus provisioned page/warn rules in `warp/grafana/alerting/competition.yml` |
-| Local evaluator audit | 10 passed, 0 pending, 0 failed |
-| Final Go validation | sim-latency and competition/API race suites, migration application/order, PostgreSQL/Redis lifecycle integration, vet, OpenAPI conformance, dashboards, and alerts pass on 2026-08-28 |
-| Fresh hostile cleanup | CPU bomb covered all ten evaluation CPUs; memory bomb exited 137 with `OOMKilled=true`; management cleanup took 655 ms and left zero containers/networks |
+| Historical evaluator audit | 10 passed, 0 pending, 0 failed; preserved qualification evidence, not a new-image production audit |
+| Latest Go validation | CSV/scorer precision regressions, simulator lifecycle database tests, full sim-latency race suite, `tests.sh`, offline candidate-surface vet, shared-control/historical-ranking migration and controller tests, and competition API/OpenAPI conformance passed on 2026-09-18. Historical dashboard/alert and qualification evidence retains its original dates. |
+| Historical hostile cleanup | CPU bomb covered all ten evaluation CPUs; memory bomb exited 137 with `OOMKilled=true`; management cleanup took 655 ms and left zero containers/networks |
 
-The host controls, hardened Docker boundary, trusted commands, `/etc` host
-manifest, production-pressure CPU/memory-bomb cleanup, API/worker release
-artifacts, API staging, FIFO/cache/failover, and reveal path have all passed.
-The second image-identical host is not a launch requirement.
+Historical qualification covers host controls, the hardened Docker boundary,
+trusted commands, the `/etc` host manifest, production-pressure CPU/memory-bomb
+cleanup, API staging, FIFO/cache/failover, and reveal. It does not automatically
+qualify a changed evaluator image or source graph. The second image-identical
+host is not a launch requirement.
 
 ### Current staging deployment
 
-Verified on 2026-09-15 at 14:56 UTC: staging epoch 4 is open as round
-`01a0a58b-9a3e-2e43-f612-0034ff7296ff`, from `2026-09-15T14:56:00Z` through
-`2026-09-17T14:56:00Z` (end exclusive). The singleton worker passed preflight
-and is running on sille. The public API exposes the corrected evaluator pin,
-the new polling status fields, and finalized staging epochs through
-`/competition/leaderboard?include_staging=true`. Epoch 3's failed results and
-frozen policy remain unchanged. No production round has been created.
+Verified on 2026-09-19: API version `2026.9.18+1049819730` advertises the
+epoch-5 source/image above. Read-only database checks found migration audit
+maximum 683, the shared round-baseline table, and both historical/shared-ranking
+guards. No earlier staging jobs were queued or running before creation.
 
-This is staging submission readiness, not proof of a successful live score or
-production launch readiness. Staging uses authenticated prior containment
-qualification; the new image still needs the exact production rebaseline.
-Redis's alternate cluster ports currently refuse connections from sille, so
-the worker uses the existing authoritative PostgreSQL FIFO fallback. The
-database host heartbeat is fresh. At 15:06 UTC, a temporary loopback-only
-forwarder restored authenticated Grafana pushes through crisp
+At `2026-09-19T09:57:30Z`, staging epoch 5 is open as round
+`01a0b913-c344-27f3-cb64-338dbddc8b07`, opened at
+`2026-09-19T09:57:00Z`. Admission closes at `2026-09-21T09:57:00Z`;
+reveal waits for admission close and backlog drain; an explicit early staging
+close can precede the scheduled reveal. This is a 48-hour staging window,
+not the seven-day production cadence. The singleton service
+`urnetwork-sim-latency-staging-epoch-5.service` started at
+`2026-09-19T09:53:30Z` after independent staging preflight passed. Its
+digest-pinned worker comes from server main `07b210bc76f15c714d2de8484153e407bbf65808`;
+the worker image and binary identities are in the [release record](launch/STAGING-5-RELEASE.md).
+The service remained active with the same PID/invocation and zero restarts;
+authenticated staging host refreshes continued through `2026-09-19T09:57:19Z`.
+Three further API checks at `2026-09-19T09:59:31Z` agreed on the open round,
+schedule, and source/image. No production round has been created. The shared
+baseline count is zero while the worker awaits the first submission; successful
+shared-control scoring remains unproven. The worker installed at this opening
+still enforced null staging winners. The automatic named-winner follow-up above
+has not been deployed and does not change the frozen evaluator or baseline.
+
+Staging epoch 4 remains finalized as round
+`01a0a58b-9a3e-2e43-f612-0034ff7296ff`, from `2026-09-15T14:56:00Z` through
+`2026-09-17T14:56:00Z` (end exclusive), finalized at
+`2026-09-17T14:56:00.946063Z`. Its staging-inclusive leaderboard contains four
+entries, and Macrocosmos reported that its downstream path worked end to end.
+Its immutable policy, scores, and original ranking are unchanged.
+
+Epoch 4's accepted scores do not qualify the new shared-baseline release or
+prove production launch readiness. Staging uses authenticated prior
+containment qualification; the new image still needs exact-image production
+qualification. Redis's remote cluster ports again refused connections from
+sille on September 19; the worker used the supported authoritative PostgreSQL
+FIFO fallback. This is a degraded dispatch path, not a staging admission
+blocker. A public-TLS authenticated Grafana/Prometheus query at
+`2026-09-19T09:58:17Z` returned the exact worker image/revision and epoch-5
+staging metrics for `host=sille`, `env=main`, `service=sim`: queue/backlog zero
+and heartbeat age 25.955 seconds, below the 30-second stale threshold. A
+read-only database check independently confirmed a fresh host heartbeat.
+The active loopback-only metrics forwarder remains transient. On September 15
+at 15:06 UTC, it restored authenticated pushes through crisp
 (`172.28.208.58:3100`); the worker logged `push ok` without restarting.
 Fireside (`172.28.208.3:3100`) also accepts connections and requires
 authentication. The forwarder is a transient systemd service and does not
@@ -90,12 +147,27 @@ survive reboot. Persistent host routing, multi-endpoint failover, and complete
 monitoring/deployment verification remain pending; the publisher currently
 supports only its local endpoint.
 
-The config rollover also exposed a historical seed-reveal bug: decryption used
+On September 16, investigation of a comment-only submission's G5 rejection
+proved that epoch 4's frozen source omitted database fix `46515d82`, which is
+present on `main` and in the qualified August baseline. A wrapped pgx write
+timeout therefore escaped the database recovery path during startup. All 18
+replicates completed, but the lifecycle-wide G5 gate correctly rejected the
+unexpected recovery. [The incident record](launch/STAGING-4-G5-INCIDENT.md)
+contains the source lineage and authenticated evidence hashes. The runtime
+repair and build guard passed independent regression, race, and vet checks,
+plus three consecutive sim-latency suite runs. The repaired image is now built
+from the operator-approved new source checkpoint; its release validation is
+recorded [here](launch/STAGING-5-RELEASE.md). Epoch 4's source/image and results
+remain unchanged. API/config rollout is complete; the new live scoring proof
+and exact-image production qualification remain launch blockers.
+
+An earlier config rollover also exposed a historical seed-reveal bug: decryption used
 the current base commit instead of the round's immutable policy base. The
 fix is committed at server `45215c8f1cd3c3ef5855734042c513706a179b53` and
-passed deterministic unit and PostgreSQL lifecycle tests; its API rollout is
-pending. New epoch 4 matches the current base and does not depend on that
-rollout to evaluate or finalize. No historical seed or ciphertext was changed.
+passed deterministic unit and PostgreSQL lifecycle tests. The live epoch-4
+`providers.yml` reveal succeeded under the September 19 deployment and matched
+SHA-256 `3f3829a588e4c024459e2c4c653be8244e2e515c56da645e3c6447b9c1d99fae`.
+No historical seed or ciphertext was changed.
 
 ### Production services supplied by the main environment
 
@@ -144,11 +216,11 @@ has an owner and a recorded value.
 | Control-plane data services | **Complete by operator confirmation.** PostgreSQL is authoritative for admission, exact FIFO order, leases, results, and finalization. A main-Redis list is the rebuildable FIFO dispatch index; a flush or interrupted push recovers from PostgreSQL. | Run the normal migration verification for the final commit; no new durable data service is needed. |
 | Service supervision | **Complete by operator confirmation.** Main API plus one competition worker per epoch use the reviewed main-environment migration and boot ordering. The worker exits zero after close and FIFO drain, leaving significant candidates embargoed for the separate honesty-review command. | Verify the final deployed versions, singleton worker heartbeat, clean one-shot exit handling, and review-harness handoff in the agentic controller. |
 | Public ingress | **Complete by operator confirmation.** DNS/TLS/reverse proxy/firewall/rate limits are provided by main. | Smoke the final `/competition/*` routes, including the 262,144-byte request ceiling and ordinary ingress rate limiting. There is no epoch job-count rejection. |
-| Release distribution | **Corrected eight-repository evaluator installed; live pin verified.** Epoch 4 freezes the new image and base; the matching main worker is running. The public info response exposes the evaluator image, and each job response exposes its frozen evaluator plus exact API/worker runtime images. Main API/worker releases continue normally and are not scoring inputs. | Verify an accepted live staging score and finalized leaderboard entry, then complete the exact production host/round rebaseline. |
+| Release distribution | **Epoch 4 finalized with four entries; epoch 5 open with matching API/config and singleton worker.** Public info matches the new ten-repository checkpoint and evaluator image. Job responses expose frozen evaluator plus exact API/worker runtime images; main API/worker releases are not scoring inputs. | Verify successful shared-baseline scores and the finalized leaderboard, then complete exact-image production qualification. |
 | Artifact retention | Implemented through `server/blob`: every workload and authenticated attempt artifact is uploaded to exact MinIO versions under compliance retention and read back/hash-verified before score commit. `/readyz` now fails unless object lock, versioning, and an enabled server-validated replication destination all pass. `support@ur.xyz` is the owner authorized to delete evidence after `retain_until`. | Run and retain the live protection/capacity preflight. Grafana warns at 75% used and pages at 90%. |
 | Monitoring and on-call | Competition metrics, dashboard, MinIO capacity views, 15-second runner heartbeat, 30-second stale warning, service-labeled alert rules, and the `support@ur.xyz` contact-policy reconciler are implemented for main Mimir/Grafana. | Deploy the final server and warp commits and retain the live Grafana routing proof. |
 | Submission integration | Main API implements authenticated generate/submit/poll plus public info, reveal, and leaderboard routes from `sn/api/competition.yml`. The Go-only onboarding and atomic token rotation/revocation flows are documented in `launch/ONBOARDING.md`. | Deliver the token through the private channel and exercise live revocation once. No separate API is required. |
-| Leaderboard and winner | Implemented at public `GET /competition/leaderboard`; its default view contains finalized production epochs, while `include_staging=true` adds clearly marked null-winner staging epochs for adapter conformance. Production rows expose approved/rejected/not-reviewed disposition. Ranked significant candidates require append-only operator honesty review, and promotion is database-bound to the exact approved patch and score. The admission fee is fixed at $20 USD. | Publish rewards, eligibility, legal terms, and abuse/appeal handling. Exercise staging reconciliation, reject/advance, approve, exhausted-no-winner, and one dry-run promotion before opening epoch 1. |
+| Leaderboard and winner | Public `GET /competition/leaderboard` defaults to finalized production epochs. Staging publishes its best placeable candidate passing every gate, or null when none qualifies, through `include_staging=true`; its winner starts `not_reviewed` and can become `approved` only by the explicit append-only `staging-review` command, without source promotion. Production rows retain approved/rejected/not-reviewed disposition; ranked significant production candidates require append-only honesty review, and promotion binds the exact approved patch and score. The admission fee is fixed at $20 USD. | Publish rewards, eligibility, legal terms, and abuse/appeal handling. Exercise staging approval reconciliation, then production reject/advance, approve, exhausted-no-winner, and one dry-run promotion before opening epoch 1. |
 | Apex | Adapter mapping and handoff fields are documented in `launch/APEX-HANDOFF.md`. | Macrocosmos must accept the asynchronous external-evaluator contract, stage it, record signed image identities, and activate the private registry entry. |
 
 The installed provisioner authenticates an existing bundle and intentionally
@@ -158,18 +230,23 @@ season bundle. Either generate/promote a replacement bundle atomically or add
 an explicit approval record for the staging-generated bundle. This remains a
 human authorization gate, not missing evaluator code.
 
-## 3. Preflight the authoritative host
+## 3. Preflight the authoritative production host
 
 Run preflight from the frozen local commits and evidence. Do not rebuild from a
 moving `origin/main` during launch.
+This section requires a separately qualified production release. The retained
+staging checker does not satisfy it; staging epoch 5 follows the
+[scheduled-round-first release sequence](launch/STAGING-5-RELEASE.md).
 
 ```bash
+: "${COMPETITION_QUALIFIED_RELEASE:?Set the independently qualified digest-named release directory}"
+
 sudo systemctl is-active \
   urnetwork-authoritative-host-controls.service \
   urnetwork-authoritative-host-irqs.service \
   docker.service
 
-sudo /usr/local/libexec/urnetwork/competition-2abcf145/competition-host-self-check \
+sudo "$COMPETITION_QUALIFIED_RELEASE/competition-host-self-check" \
   --json | jq -e '
     .logical_cpu_count == 12 and
     .smt_disabled and .governor_pinned and .turbo_pinned and
@@ -178,9 +255,9 @@ sudo /usr/local/libexec/urnetwork/competition-2abcf145/competition-host-self-che
     .resource_bomb_cleanup_verified and
     ([.checks[]] | all)'
 
-sudo /usr/local/libexec/urnetwork/competition-2abcf145/container/hash-local-mount.sh \
+sudo "$COMPETITION_QUALIFIED_RELEASE/container/hash-local-mount.sh" \
   /home/by/urnetwork/config/local
-sudo /usr/local/libexec/urnetwork/competition-2abcf145/container/hash-local-mount.sh \
+sudo "$COMPETITION_QUALIFIED_RELEASE/container/hash-local-mount.sh" \
   /home/by/urnetwork/vault/local
 
 sudo docker ps -aq --filter label=com.urnetwork.competition.job-id
@@ -200,17 +277,20 @@ manifest and candidate resource manifest are intentionally different.
 
 ## 4. Deploy the final main-API release
 
-The sealed calibration tree remains authoritative for the evaluator image,
-host controls, baseline, and containment evidence. Its older API/worker
-binaries predate the six-epoch lifecycle, MinIO archive, leaderboard, and
-competition signals; do not deploy those two historical binaries as the live
+The sealed calibration tree preserves historical measurements and containment
+evidence. It does not select the current evaluator image or qualify a changed
+source graph. The current source ledger and digest-verified release record
+select that image. Do not deploy historical API/worker binaries as the live
 control plane.
 
 After the control-plane changes are pushed:
 
 1. build and deploy the main API through the normal main-environment release;
 2. build and deploy `cli/competitionworker` from `main`;
-3. build the host simulator with `cd connect/sim-latency && make`;
+3. extract the host simulator from the exact evaluator image, verify its
+   source/build identity and SHA-256, and install it in the root-owned,
+   read-only digest-named release directory; do not rebuild the measured
+   simulator from moving `main` (`make` remains the development/CLI build);
 4. run `(cd connect/sim-latency && ./tests.sh)` and the Go control-plane gates;
 5. verify the deploy system injects `WARP_IMAGE_DIGEST=sha256:...` into both
    processes and that new jobs persist those two exact runtime identities; and
@@ -290,14 +370,17 @@ curl -fsS "$COMPETITION_API_BASE/healthz" | \
   jq -e '.status == "alive"'
 curl -fsS "$COMPETITION_API_BASE/info" | \
   jq -e '.enabled == true and
-         .base_sha == "759b7462ef4dbe849d7bfbcc7a73e8b5c573c340" and
-         .evaluator_image_digest == "sha256:4b7e46e2243d26b915e83a85d3c2b4b7679d5038bc0c53197ce274cec137209b" and
+         .base_sha == "807b473c927d1ae09a03276bb9758afb715fac9e" and
+         .evaluator_image_digest == "sha256:b0c07cf45c30adb483ee5c215b7426b2e098c0b35c7cf4c4abcb0166cb43a87e" and
          .evaluation_policy.provider_count == 1800 and
          .evaluation_policy.replicates == 9 and
-         .evaluation_policy.takeover_margin == 0.161'
+         (.evaluation_policy.takeover_margin == 0.161 or
+          .evaluation_policy.takeover_margin == 0)'
 ```
 
-The literal source/image and 0.161 checks above apply to source epoch 0.
+The literal source/image checks above apply to the current staging source.
+`/info` reports the frozen current round policy: historical staging rounds
+retain 0.161, while rounds opened after the zero-margin rollout report 0.
 For every later round, derive the source and margin from its selected source
 epoch in `config/main/sim-latency.yml` and the image from the corresponding
 verified release; do not copy epoch 0 values forward.
@@ -308,7 +391,12 @@ scorer omitted significance and triggered a retry that exhausted the total
 budget. The repaired image and strict contract validation are mandatory;
 finalized historical jobs must not be rewritten as scores from the new image.
 
-On first boot, the worker must heartbeat before round generation. An
+The rest of sections 5–6 describe **production round generation and
+qualification**, not the staging exception. For staging epoch 5, create the
+scheduled round after API/config rollout, then preflight/start its worker
+before admission; follow [the release sequence](launch/STAGING-5-RELEASE.md).
+
+On production first boot, the worker must heartbeat before round generation. An
 authenticated `/readyz` remains 503 until the host has an authenticated
 rebaseline matching the current round and its selected source epoch. That is
 expected during preparation; do not open submissions until it passes.
@@ -350,7 +438,7 @@ COMPETITION_ROUND_ID="$(jq -er '.round_id' round-created.json)"
 Store `round-created.json` in the immutable operator record. A round cannot be
 edited or overlapped after creation.
 
-## 6. Run and promote the mandatory same-round rebaseline
+## 6. Run and promote the mandatory production same-round rebaseline
 
 Stop the ordinary worker before rebaseline and confirm there is no running job.
 Use the exact no-op patch:
@@ -382,15 +470,14 @@ evidence read-only.
 The promotion invocation is:
 
 ```bash
-COMPETITION_SELF_CHECK=/usr/local/libexec/urnetwork/competition-2abcf145/\
-competition-host-self-check
-COMPETITION_SELF_CHECK_SHA=d3c904313ebdd24edfaa6615e2b54e7c95367162661b4e873505a99fa016c8f7
+: "${COMPETITION_QUALIFIED_RELEASE:?Set the independently qualified digest-named release directory}"
+: "${COMPETITION_SELF_CHECK_SHA:?Set the SHA-256 from that qualification record}"
+COMPETITION_SELF_CHECK="$COMPETITION_QUALIFIED_RELEASE/competition-host-self-check"
 COMPETITION_RESOURCE_BOMB_REPORT=/home/by/urnetwork/server/connect/sim-latency/\
 eval-12c/final-calibration-p1800-cf0fd3a9/host-qualification/\
 resource-bomb-cleanup-production.json
 
-sudo /usr/local/libexec/urnetwork/competition-2abcf145/\
-promote-round-rebaseline.sh \
+sudo "$COMPETITION_QUALIFIED_RELEASE/promote-round-rebaseline.sh" \
   --result "/var/lib/urnetwork/competition/rebaseline/$COMPETITION_ROUND_ID/result.json" \
   --host-config /etc/urnetwork/competition-host.json \
   --resource-bomb-report "$COMPETITION_RESOURCE_BOMB_REPORT" \
@@ -447,18 +534,26 @@ Operate with these expectations:
 - `closes_at` rejects only new admissions. Every queued/running job continues
   to a terminal result, so the grading interval can extend arbitrarily past
   the seven-day window as paid submissions require;
-- one job may legitimately remain active for about 2.5 hours and is terminated
-  as failed at the three-hour submission-wide execution deadline;
-- a continuously available host therefore has 56 full three-hour evaluation
-  slots in a seven-day admission window. The first complete 18-replicate
-  staging pass reached scoring in about 2 hours 33 minutes, a theoretical
-  ceiling near 65 slots before scoring, transition, and recovery overhead;
-  admission remains unbounded, so excess work extends the private grading
-  interval after close rather than being dropped;
+- the first full job may legitimately remain active for about 2.5 hours because
+  it establishes the epoch's nine-run control before its nine candidate runs.
+  Later jobs skip the control and are expected to consume roughly half that
+  measurement time. Every job is still terminated as failed at the three-hour
+  submission-wide execution deadline;
+- the first complete 18-replicate staging pass reached scoring in about 2 hours
+  33 minutes. Reusing its control makes later nine-replicate jobs approximately
+  1 hour 16 minutes at the same observed rate, for a rough theoretical ceiling
+  near 130 candidates per uninterrupted week before build, scoring,
+  transition, and recovery overhead. The three-hour deadline still gives a
+  conservative lower bound of 56 worst-case slots. Admission remains
+  unbounded, so excess work extends the private grading interval after close
+  rather than being dropped;
 - infrastructure failures retry under the same job/cache identity, up to
   three attempts within that same three-hour deadline;
 - structural/build/submission errors are terminal and do not get noise redraws;
-- baseline and candidate each run nine repetitions with distinct fresh stores;
+- the first complete attempt measures nine control repetitions before any
+  submitted build; PostgreSQL freezes its exact `baseline.json` bytes and
+  SHA-256. Every candidate runs nine repetitions with distinct fresh stores
+  against that same control, and later attempts never rerun it;
 - every candidate build and run is offline/default-deny;
 - accounting, resources, score, completion, and failure artifacts are retained
   and sealed; and
@@ -467,10 +562,12 @@ Operate with these expectations:
   supported next-epoch threshold, and therefore `takeover_eligible: true`;
 - statistical eligibility creates a ranked review candidate, not a winner. The
   first candidate that receives an append-only `approved` honesty review is the
-  winner; `rejected` candidates are discarded and the next rank is presented;
+  winner; `rejected` candidates are discarded and the next rank is presented.
+  Ranking is absolute candidate median latency ascending; normalized score is
+  display-only;
 - every successful result preserves baseline and candidate means and sample
-  variances, the observed and required improvement percentages, p-value, and
-  recommended next-epoch margin.
+  variances, the epoch-baseline SHA-256, observed and required improvement
+  percentages, p-value, and recommended next-epoch margin.
 
 When the final accepted job becomes terminal after admission closes, the worker
 seals the ranked significant-candidate set and exits successfully. It does not
@@ -506,6 +603,12 @@ Monitor at least:
 - `/var/lib/urnetwork/competition` bytes, inodes, immutable modes, and retention;
 - Docker objects with `com.urnetwork.competition.job-id` labels; and
 - drift in host, command, image, local-leaf, workload, and scorer hashes.
+
+The worker performs the complete host self-check again after every completed
+job and before the next claim. Any identity or policy drift stops the queue; it
+does not redraw the round control. The separate promoted `rebaseline_passed`
+host marker remains a production readiness gate and must not be confused with
+the append-only score baseline.
 
 Install `server/grafana/dashboards/competition.json` through the normal Grafana
 dashboard sync and `warp/grafana/alerting/competition.yml` through Grafana file
@@ -632,7 +735,8 @@ and prior percentage unchanged, and is rejected unless the round finalized
 without a winner.
 
 The command creates one additional temporary root and freshly clones `server`,
-`connect`, `sdk`, `proxy`, `glog`, `goidenticons`, `userwireguard`, and `sn`.
+`connect`, `sdk`, `proxy`, `glog`, `goidenticons`, `userwireguard`, `sn`,
+`operator-proxy`, and `warp`.
 It checks out every `sim-latency` branch at the prior epoch commit, applies the
 winner only to the evaluated server-tree surface, and verifies all dependency
 commits remain unchanged. The long-lived local checkouts are discovery-only
@@ -736,16 +840,19 @@ Still to add or approve before a public competition starts:
   six-epoch weekly cadence and post-review finalization reveal are already frozen);
 - [ ] atomic live credential/seed-key rotation or explicit approval to promote
   the staging-generated bundle;
-- [ ] verify an accepted live staging score and finalized leaderboard entry,
-  then complete the exact production rebaseline. The corrected epoch-0 pin
-  and polling contract are live, and staging epoch 4 is open with its worker
-  running. The complete eight-repository image at server
-  commit `759b7462ef4dbe849d7bfbcc7a73e8b5c573c340` is installed locally and
-  its full Docker smoke passed on 2026-09-14;
-  main API/worker releases remain on `main`, and every job API response persists
-  and exposes its frozen evaluator plus exact API/worker runtime image digests;
-- [ ] deploy server `45215c8f1cd3c3ef5855734042c513706a179b53` or a descendant
-  containing the historical round seed-reveal fix before further base rollovers;
+- [x] deploy the epoch-5 API/migrations and matching evaluator configuration,
+  explicitly create staging epoch 5, and start its preflighted singleton
+  worker in the [recorded release order](launch/STAGING-5-RELEASE.md). Epoch 4's
+  immutable policy, four published scores, and historical ranking are preserved;
+- [x] verify epoch-5 opening and continued authenticated worker host refreshes;
+- [ ] verify successful jobs sharing one authenticated epoch baseline and a
+  finalized leaderboard under the new absolute-latency ranking, then complete
+  exact-image production qualification and rebaseline. Epoch 4's successful
+  downstream proof does not qualify the new shared-control path. Main
+  API/worker releases remain on `main`, and every job response exposes its
+  frozen evaluator plus exact API/worker runtime image digests;
+- [x] verify epoch-4 round reveal under the deployed API, preserving the
+  immutable-policy fix `45215c8f1cd3c3ef5855734042c513706a179b53`;
 - [ ] live MinIO `/readyz` proof, backup-replication record, and capacity check;
   `support@ur.xyz` is recorded as the owner authorized to delete evidence after
   `retain_until`;

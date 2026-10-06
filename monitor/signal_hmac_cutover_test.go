@@ -2,13 +2,19 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/server/model"
 )
 
 func syntheticHMACCutoverSource(row Row) *syntheticSource {
 	return &syntheticSource{postgresFn: func(query string) ([]Row, error) {
+		if strings.Contains(query, "monitor-schema-readiness") {
+			return []Row{{"true"}}, nil
+		}
 		if !strings.Contains(query, "monitor-signal-2.24-hmac-cutover") {
 			return nil, nil
 		}
@@ -40,8 +46,8 @@ func TestHMACCutoverSignalSyntheticIncompatibleCohort(t *testing.T) {
 		"legacy_networks=20",
 		"legacy_dark=90",
 		"compatible_ok=50",
-		"reject each newly created contract before forwarding traffic",
-		"compatible-version cohort remains a healthy control",
+		"actual legacy-only receiver rejects standard-signed contracts before payload forwarding",
+		"Passing claimed-compatible checks exclude only a universal shared-path failure",
 		"Raw descriptions plus provider and network identifiers never leave",
 		"explicit security/availability decision",
 		"expires and fails open",
@@ -51,7 +57,7 @@ func TestHMACCutoverSignalSyntheticIncompatibleCohort(t *testing.T) {
 		"rebuild and safely promote the monitor from that same policy source",
 		"bounded period with a named sunset",
 		"not final protocol closure",
-		"whole refresh inside the three-hour verdict lifetime",
+		"whole refresh inside the 8h0m0s verdict lifetime",
 		"passing its availability gate is not final closure",
 		"not a Proxy RAM or active-client hardware ceiling",
 	} {
@@ -74,7 +80,7 @@ func TestHMACCutoverCatalogPreservesDecisionAndClosureBoundaries(t *testing.T) {
 	}
 	section := strings.Join(strings.Fields(catalog[start:end]), " ")
 	for _, want := range []string{
-		"three-hour lifetime expires",
+		"eight-hour lifetime expires",
 		"deliberately fails open",
 		"not a durable quarantine",
 		"Never permanently exclude a provider from its self-reported description alone",
@@ -119,6 +125,41 @@ func TestHMACCutoverSignalSyntheticNeedsBehavioralControl(t *testing.T) {
 	}
 	if strings.Contains(markdown, "reject each newly created contract") {
 		t.Fatalf("insufficient cohort was given the causal diagnosis:\n%s", markdown)
+	}
+}
+
+func TestHMACCutoverSignalSyntheticControlDegradationDoesNotClaimRecovery(t *testing.T) {
+	// The legacy cohort independently meets its dark threshold, but the
+	// compatible control is one observation below 50%. Current causal
+	// attribution must fail closed without implying that an earlier causal
+	// sample recovered.
+	row := Row{"t", "86400", "1000", "300", "20", "200", "500", "100", "100", "0", "100", "51", "49"}
+	alerts, err := NewHMACCutoverSignal().Run(
+		context.Background(), syntheticSettings(syntheticHMACCutoverSource(row)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("alerts = %d, want one readiness warning: %+v", len(alerts), alerts)
+	}
+	alert := requireAlertClass(t, alerts, "contract-hmac-readiness")
+	if alert.Severity != SeverityWarn {
+		t.Fatalf("severity = %s, want warn", alert.Severity)
+	}
+	markdown := alert.Markdown()
+	for _, want := range []string{
+		"compatible_ok=49",
+		"fails closed to readiness",
+		"cannot retroactively negate an earlier behaviorally confirmed incompatibility",
+		"PAGE-to-WARN class reassignment is not recovery",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("control-degradation alert missing %q:\n%s", want, markdown)
+		}
+	}
+	if strings.Contains(markdown, "reject each newly created contract") {
+		t.Fatalf("insufficient current control was given the causal diagnosis:\n%s", markdown)
 	}
 }
 
@@ -184,7 +225,7 @@ func TestHMACCutoverQueryIsBoundedAndPrivate(t *testing.T) {
 		"regexp_count",
 		"ROW(2026, 5, 14)",
 		"provider_blackhole_check",
-		"interval '10800 seconds'",
+		"interval '28800 seconds'",
 		"timestamp '2026-09-01 00:00:00'",
 		"count(DISTINCT network_id)",
 	} {
@@ -197,5 +238,28 @@ func TestHMACCutoverQueryIsBoundedAndPrivate(t *testing.T) {
 		if strings.Contains(finalSelect, forbidden) {
 			t.Fatalf("final aggregate exports %q:\n%s", forbidden, finalSelect)
 		}
+	}
+}
+
+// A verdict is what the dark rule of connect/GEOMAP.md §11.3 says it is: a
+// current pass, or a provider dark over consecutive failures (or a TLS
+// failure); a single failed check and a check that measured nothing are no
+// verdict and join neither cohort's checked count, so a legacy cohort cannot
+// look dark on failures the rule does not call dark.
+func TestHMACCutoverQueryCountsOnlyCurrentVerdicts(t *testing.T) {
+	query := hmacCutoverQuery()
+	rules := model.DefaultProviderEgressRules()
+	for _, want := range []string{
+		"COALESCE(pbc.ok, false) AS ok",
+		"AND (pbc.ok OR " + model.ProviderBlackholeDarkSql("pbc", "clock.utc_now - interval '28800 seconds'", rules) + ")",
+		fmt.Sprintf("%d <= pbc.consecutive_failures", rules.DarkConsecutiveFailures),
+		"pbc.failure = '" + model.ProviderBlackholeTlsAuthenticationFailure + "'",
+	} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("query missing %q:\n%s", want, query)
+		}
+	}
+	if strings.Contains(query, "           pbc.ok,\n") {
+		t.Fatal("the query still reads a single failed check as dark")
 	}
 }

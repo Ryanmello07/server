@@ -132,11 +132,16 @@ func TestSolanaIntentRefusedPlansCreateNothing(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
 
+		// a network with a login method: a guest network is refused before the
+		// plan is read (subscription_guest_purchase_test.go)
 		networkId := server.NewId()
 		clientId := server.NewId()
+		userId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "solanarefused", userId)
 		userSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: networkId,
 			ClientId:  &clientId,
+			UserId:    userId,
 		})
 
 		assertRefusedAndNothingStored := func(reference string, plan string) {
@@ -146,6 +151,8 @@ func TestSolanaIntentRefusedPlansCreateNothing(t *testing.T) {
 			}, userSession)
 			connect.AssertEqual(t, err, nil)
 			connect.AssertNotEqual(t, result.Error, nil)
+			// the plan refusal, not the guest refusal
+			connect.AssertEqual(t, result.Error.Code, "")
 			// an errored result must not carry a price the client could act on
 			connect.AssertEqual(t, result.AmountUsd, float64(0))
 
@@ -170,6 +177,21 @@ func TestSolanaIntentRefusedPlansCreateNothing(t *testing.T) {
 	})
 }
 
+// solanaTestAmountSuffixes makes the quote suffixes deterministic for one test:
+// the picker proposes them in order, repeating the last one.
+func solanaTestAmountSuffixes(t testing.TB, suffixMicros ...int64) {
+	prevPick := solanaPickAmountSuffixMicro
+	i := 0
+	solanaPickAmountSuffixMicro = func() int64 {
+		suffixMicro := suffixMicros[min(i, len(suffixMicros)-1)]
+		i += 1
+		return suffixMicro
+	}
+	t.Cleanup(func() {
+		solanaPickAmountSuffixMicro = prevPick
+	})
+}
+
 // TestSolanaIntentQuoteIsTheServersAndDuplicatesAreLoud pins the two halves of intent
 // creation that each shipped broken once:
 //
@@ -185,14 +207,23 @@ func TestSolanaIntentQuoteIsTheServersAndDuplicatesAreLoud(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
 
+		// a network with a login method: a guest network is refused before the
+		// quote (subscription_guest_purchase_test.go)
 		networkId := server.NewId()
 		clientId := server.NewId()
+		userId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "solanaquote", userId)
 		userSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
 			NetworkId: networkId,
 			ClientId:  &clientId,
+			UserId:    userId,
 		})
 
 		reference := "intent-quote-1"
+		solanaTestAmountSuffixes(t, 101)
+		// the quote is the price plus the reserved sub-cent suffix
+		quotedMonthlyUsd := model.SolanaMicroToUsd(model.SolanaUsdToMicro(model.Pro().PriceMonthlyUsd()) + 101)
+		quotedYearlyUsd := model.SolanaMicroToUsd(model.SolanaUsdToMicro(model.Pro().PriceYearlyUsd()) + 101)
 
 		result, err := CreateSolanaPaymentIntent(&SolanaPaymentIntentArgs{
 			Reference: reference,
@@ -200,14 +231,14 @@ func TestSolanaIntentQuoteIsTheServersAndDuplicatesAreLoud(t *testing.T) {
 		}, userSession)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, result.Error, nil)
-		connect.AssertEqual(t, result.AmountUsd, model.Pro().PriceMonthlyUsd())
+		connect.AssertEqual(t, result.AmountUsd, quotedMonthlyUsd)
 
 		// the STORED quote is the same price and plan -- this is what the webhook will
 		// hold the arriving payment to
 		search, err := model.SearchPaymentIntents([]string{reference}, userSession)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertNotEqual(t, search, nil)
-		connect.AssertEqual(t, search.ExpectedAmountUsd, model.Pro().PriceMonthlyUsd())
+		connect.AssertEqual(t, search.ExpectedAmountUsd, quotedMonthlyUsd)
 		connect.AssertEqual(t, search.SubscriptionPlan, model.SolanaPlanMonthly)
 		connect.AssertEqual(t, *search.NetworkId, networkId)
 
@@ -224,7 +255,7 @@ func TestSolanaIntentQuoteIsTheServersAndDuplicatesAreLoud(t *testing.T) {
 		search, err = model.SearchPaymentIntents([]string{reference}, userSession)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertNotEqual(t, search, nil)
-		connect.AssertEqual(t, search.ExpectedAmountUsd, model.Pro().PriceMonthlyUsd())
+		connect.AssertEqual(t, search.ExpectedAmountUsd, quotedMonthlyUsd)
 		connect.AssertEqual(t, search.SubscriptionPlan, model.SolanaPlanMonthly)
 
 		// yearly quotes the yearly price
@@ -234,7 +265,7 @@ func TestSolanaIntentQuoteIsTheServersAndDuplicatesAreLoud(t *testing.T) {
 		}, userSession)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, result.Error, nil)
-		connect.AssertEqual(t, result.AmountUsd, model.Pro().PriceYearlyUsd())
+		connect.AssertEqual(t, result.AmountUsd, quotedYearlyUsd)
 	})
 }
 
@@ -311,7 +342,7 @@ func TestSolanaWebhookGrantsExactlyThePlanQuoted(t *testing.T) {
 		connect.AssertEqual(t, balances[0].Pro, true)
 		connect.AssertEqual(t, balances[0].BalanceByteCount, RefreshSupporterTransferBalance)
 		// a MONTH plus the grace period. The year-for-everything webhook fails here.
-		connect.AssertEqual(t, balances[0].EndTime.Sub(balances[0].StartTime), 30*24*time.Hour+SubscriptionGracePeriod)
+		connect.AssertEqual(t, balances[0].EndTime.Sub(balances[0].StartTime), 30*24*time.Hour+manualPaymentGracePeriod)
 		// the entitlement is refreshed immediately, not after the pro cache ttl
 		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
 
@@ -367,7 +398,7 @@ func TestSolanaWebhookOverpaymentBuysThePlanQuotedNotAYear(t *testing.T) {
 		balances := model.GetActiveTransferBalances(ctx, networkId)
 		connect.AssertEqual(t, len(balances), 1)
 		// the plan QUOTED: a month, not the year the old webhook assumed
-		connect.AssertEqual(t, balances[0].EndTime.Sub(balances[0].StartTime), 30*24*time.Hour+SubscriptionGracePeriod)
+		connect.AssertEqual(t, balances[0].EndTime.Sub(balances[0].StartTime), 30*24*time.Hour+manualPaymentGracePeriod)
 	})
 }
 
@@ -429,7 +460,7 @@ func TestSolanaWebhookUnderpaymentTakesNothingAndKeepsTheQuote(t *testing.T) {
 		balances := model.GetActiveTransferBalances(ctx, networkId)
 		connect.AssertEqual(t, len(balances), 1)
 		connect.AssertEqual(t, balances[0].Pro, true)
-		connect.AssertEqual(t, balances[0].EndTime.Sub(balances[0].StartTime), SubscriptionYearDuration+SubscriptionGracePeriod)
+		connect.AssertEqual(t, balances[0].EndTime.Sub(balances[0].StartTime), SubscriptionYearDuration+manualPaymentGracePeriod)
 	})
 }
 
@@ -631,5 +662,68 @@ func TestSolanaWebhookRecordsUnmatchedAndUnderpaid(t *testing.T) {
 		connect.AssertEqual(t, err, nil)
 		_, err = model.GetUnfulfilledSolanaPayment(ctx, "sig-under-recorded-2")
 		connect.AssertNotEqual(t, err, nil)
+	})
+}
+
+// TestSolanaWebhookCreditsMemolessExactAmount walks a payment sent WITHOUT the
+// reference through the real webhook: the quote's unique amount, sent from a
+// wallet that cannot add a memo, credits the one intent quoted it. A second
+// payment of the same amount is recorded for support with the sender and the
+// reason, and a redelivery credits nothing twice.
+func TestSolanaWebhookCreditsMemolessExactAmount(t *testing.T) {
+	skipWithoutProYml(t)
+
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+
+		networkId := server.NewId()
+		clientId := server.NewId()
+		userId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "solanamemoless", userId)
+
+		userSession := session.Testing_CreateClientSession(ctx, &jwt.ByJwt{
+			NetworkId: networkId,
+			ClientId:  &clientId,
+			UserId:    userId,
+		})
+		webhookSession := session.Testing_CreateClientSession(ctx, nil)
+
+		solanaTestAmountSuffixes(t, 4317)
+		intentResult, err := CreateSolanaPaymentIntent(&SolanaPaymentIntentArgs{
+			Reference: "memoless-webhook-1",
+			Plan:      model.SolanaPlanMonthly,
+		}, userSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, intentResult.Error, nil)
+		connect.AssertEqual(t, model.SolanaUsdToMicro(intentResult.AmountUsd), model.SolanaUsdToMicro(model.Pro().PriceMonthlyUsd())+4317)
+
+		sentAt := server.NowUtc().Add(time.Minute)
+		payment := solanaMemolessPayment("sig-memoless-webhook-1", solanaReceiverAddresses[0], intentResult.AmountUsd, sentAt)
+		result, err := HeliusWebhook([]*SolanaTransaction{payment}, webhookSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Message, "Processed 1 matching payments")
+		connect.AssertEqual(t, len(model.GetActiveTransferBalances(ctx, networkId)), 1)
+		connect.AssertEqual(t, model.IsProNetwork(ctx, networkId), true)
+
+		// the redelivery credits nothing
+		result, err = HeliusWebhook([]*SolanaTransaction{payment}, webhookSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Message, "No payment intent found for this network ID")
+		connect.AssertEqual(t, len(model.GetActiveTransferBalances(ctx, networkId)), 1)
+
+		// a second payment of the same amount: the intent is paid, so it is
+		// recorded for support, not credited
+		second := solanaMemolessPayment("sig-memoless-webhook-2", solanaReceiverAddresses[0], intentResult.AmountUsd, sentAt)
+		result, err = HeliusWebhook([]*SolanaTransaction{second}, webhookSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, result.Message, "No payment intent found for this network ID")
+		connect.AssertEqual(t, len(model.GetActiveTransferBalances(ctx, networkId)), 1)
+
+		recorded, err := model.GetUnfulfilledSolanaPayment(ctx, "sig-memoless-webhook-2")
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, recorded.Reason, model.SolanaUnfulfilledReasonNoIntent)
+		connect.AssertEqual(t, recorded.TokenAmountUsd, intentResult.AmountUsd)
+		connect.AssertEqual(t, *recorded.SenderAccount, solanaMemolessSender)
+		connect.AssertNotEqual(t, recorded.MatchNote, nil)
 	})
 }

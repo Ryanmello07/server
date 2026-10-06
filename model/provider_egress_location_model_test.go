@@ -29,10 +29,11 @@ func TestProviderEgressLocationUpsertAndGet(t *testing.T) {
 			ClientId:    clientId,
 			LocationId:  country.LocationId,
 			CountryCode: "us",
-			ASN:         401486,
-			Org:         "RAVNIX LLC",
-			Hosting:     true,
-			ObservedAt:  now,
+			// a documentation asn (rfc 5398) and a synthetic organization
+			ASN:        64500,
+			Org:        "Example Transit",
+			Hosting:    true,
+			ObservedAt: now,
 		})
 
 		got := GetProviderEgressLocation(ctx, clientId)
@@ -41,8 +42,11 @@ func TestProviderEgressLocationUpsertAndGet(t *testing.T) {
 		}
 		connect.AssertEqual(t, got.LocationId, country.LocationId)
 		connect.AssertEqual(t, got.CountryCode, "us")
-		connect.AssertEqual(t, got.ASN, 401486)
-		connect.AssertEqual(t, got.Hosting, true)
+		connect.AssertEqual(t, got.ASN, 64500)
+		// a probe carries no hosting, proxy or mobile verdict any more
+		// (connect/GEOMAP.md §11.3): the deprecated flags are neither stored nor
+		// read, whatever a caller sets
+		connect.AssertEqual(t, got.Hosting, false)
 		connect.AssertEqual(t, got.Proxy, false)
 
 		// upsert replaces, given a strictly newer observed_at: the upsert is
@@ -52,15 +56,14 @@ func TestProviderEgressLocationUpsertAndGet(t *testing.T) {
 			ClientId:    clientId,
 			LocationId:  country.LocationId,
 			CountryCode: "us",
-			ASN:         999,
-			Hosting:     false,
+			ASN:         64501,
 			Proxy:       true,
 			ObservedAt:  now.Add(time.Minute),
 		})
 		got = GetProviderEgressLocation(ctx, clientId)
-		connect.AssertEqual(t, got.ASN, 999)
+		connect.AssertEqual(t, got.ASN, 64501)
 		connect.AssertEqual(t, got.Hosting, false)
-		connect.AssertEqual(t, got.Proxy, true)
+		connect.AssertEqual(t, got.Proxy, false)
 	})
 }
 
@@ -291,8 +294,12 @@ func TestGetProviderEgressLocationDue(t *testing.T) {
 			CountryCode: "us", ObservedAt: now.Add(-72 * time.Hour),
 		})
 		for _, clientId := range []server.Id{fresh, stale} {
+			measuredAt := now
+			if clientId == stale {
+				measuredAt = now.Add(-3 * ProviderEgressHealthMaxAge / 4)
+			}
 			SetProviderEgressHealth(ctx, &ProviderEgressHealth{
-				ClientId: clientId, MeasuredAt: now,
+				ClientId: clientId, MeasuredAt: measuredAt,
 				OKCount: 1, Total: 1,
 			})
 		}
@@ -302,8 +309,8 @@ func TestGetProviderEgressLocationDue(t *testing.T) {
 		// excludes anything; freshness is the only variable
 		due := GetProviderEgressLocationDue(ctx, now.Add(-24*time.Hour), now, 100)
 
-		// a provider probed an hour ago must not be re-probed; one probed three
-		// days ago must be; one never probed must be
+		// A provider with fresh health must not be re-probed; one whose
+		// health is stale must be, as must one never measured.
 		if slices.Contains(due, fresh) {
 			t.Fatalf("due = %v, must not contain the provider probed an hour ago (%s)", due, fresh)
 		}
@@ -337,13 +344,9 @@ func TestGetProviderEgressLocationDue(t *testing.T) {
 	})
 }
 
-// A current blackhole failure already proves that a fixed provider tunnel
-// cannot carry any destination. Offering the same provider to the expensive
-// full queue spends its location and health stages without producing evidence.
-// Only that current explicit failure is deferred: a passing, stale, or absent
-// verdict remains fail-open, and the independent cheap queue must still offer
-// deferred failures so recovery can restore full probing.
-func TestGetProviderEgressLocationDueDefersOnlyCurrentBlackholes(t *testing.T) {
+// Cheap reachability telemetry cannot suppress full quality evidence. Every
+// otherwise eligible provider stays due across cheap-check states and lanes.
+func TestGetProviderEgressLocationDueIgnoresCheapBlackholeFailures(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
 		now := server.NowUtc()
@@ -362,15 +365,23 @@ func TestGetProviderEgressLocationDueDefersOnlyCurrentBlackholes(t *testing.T) {
 			checkedAt time.Time
 			ok        bool
 			present   bool
+			// dark is a failure repeated to the dark rule's threshold over its
+			// span; a failure without it is one failed check
+			dark bool
 		}
 		verdictStates := []verdictState{
 			{
 				name: "current failure", checkedAt: now.Add(-ProviderBlackholeCheckDueAge - time.Minute),
+				present: true, dark: true,
+			},
+			{
+				// one failed check is a failure, not a verdict (GEOMAP §11.3)
+				name: "current single failure", checkedAt: now.Add(-ProviderBlackholeCheckDueAge - time.Minute),
 				present: true,
 			},
 			{
 				name: "stale failure", checkedAt: now.Add(-ProviderBlackholeCheckMaxAge - time.Minute),
-				present: true,
+				present: true, dark: true,
 			},
 			{
 				name: "current pass", checkedAt: now.Add(-time.Minute),
@@ -393,22 +404,28 @@ func TestGetProviderEgressLocationDueDefersOnlyCurrentBlackholes(t *testing.T) {
 				addressOctet++
 
 				if verdict.present {
-					failure := ""
-					if !verdict.ok {
-						failure = "synthetic_dark"
-					}
-					SetProviderBlackholeCheck(ctx, &ProviderBlackholeCheck{
+					check := &ProviderBlackholeCheck{
 						ClientId: clientId, CheckedAt: verdict.checkedAt,
-						OK: verdict.ok, Failure: failure,
-					})
+						OK: verdict.ok,
+					}
+					if !verdict.ok {
+						check.Failure = "synthetic_dark"
+						check.ConsecutiveFailures = 1
+						firstFailedAt := verdict.checkedAt
+						if verdict.dark {
+							check.ConsecutiveFailures = DefaultProviderEgressRules().DarkConsecutiveFailures
+							firstFailedAt = verdict.checkedAt.Add(-40 * time.Minute)
+						}
+						check.FirstFailedAt = &firstFailedAt
+					}
+					SetProviderBlackholeCheck(ctx, check)
 				}
 
 				label := fmt.Sprintf("%s/%s", lane, verdict.name)
 				if verdict.name == "current failure" {
 					currentFailures[clientId] = label
-				} else {
-					wantFullDue[clientId] = label
 				}
+				wantFullDue[clientId] = label
 
 				switch lane {
 				case "stale location":
@@ -417,7 +434,7 @@ func TestGetProviderEgressLocationDueDefersOnlyCurrentBlackholes(t *testing.T) {
 						CountryCode: "zz", ObservedAt: now.Add(-ProviderEgressLocationMaxAge/2 - time.Hour),
 					})
 					SetProviderEgressHealth(ctx, &ProviderEgressHealth{
-						ClientId: clientId, MeasuredAt: now.Add(-time.Minute),
+						ClientId: clientId, MeasuredAt: now.Add(-3 * ProviderEgressHealthMaxAge / 4),
 						OKCount: 1, Total: 1,
 					})
 				case "stale health":
@@ -447,24 +464,46 @@ func TestGetProviderEgressLocationDueDefersOnlyCurrentBlackholes(t *testing.T) {
 		if len(fullDue) != len(wantFullDue) {
 			t.Fatalf("len(full due) = %d, want %d", len(fullDue), len(wantFullDue))
 		}
-		for clientId, label := range currentFailures {
-			if slices.Contains(fullDue, clientId) {
-				t.Errorf("full due contains current blackhole failure %s", label)
-			}
-		}
 		for clientId, label := range wantFullDue {
 			if !slices.Contains(fullDue, clientId) {
 				t.Errorf("full due is missing fail-open provider %s", label)
 			}
 		}
 
-		blackholeDue := GetProviderBlackholeCheckDue(
-			ctx, now.Add(-ProviderBlackholeCheckDueAge), 100, 0, 1,
-		)
+		blackholeDue := GetProviderBlackholeCheckDue(ctx, now, 100, 0, 1)
 		for clientId, label := range currentFailures {
 			if !slices.Contains(blackholeDue, clientId) {
 				t.Errorf("cheap blackhole due is missing deferred provider %s", label)
 			}
+		}
+	})
+}
+
+// The refresh target leaves four hours of headroom before the eight-hour
+// evidence deadline, even when the last location remains current for days.
+func TestGetProviderEgressLocationDueRefreshesWithinFourHours(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		now := server.NowUtc()
+		country := &Location{LocationType: LocationTypeCountry, Country: "Synthetic Country", CountryCode: "zz"}
+		CreateLocation(ctx, country)
+		fresh, due := server.NewId(), server.NewId()
+		for i, clientId := range []server.Id{fresh, due} {
+			testing_connectProbeableProvider(t, ctx, clientId, country.LocationId, fmt.Sprintf("192.0.2.%d:0", i+1), ProvideModePublic)
+			SetProviderEgressLocation(ctx, &ProviderEgressLocation{ClientId: clientId, LocationId: country.LocationId, ObservedAt: now})
+			age := 2 * time.Hour
+			if clientId == due {
+				age = 4*time.Hour + time.Second
+			}
+			SetProviderEgressHealth(ctx, &ProviderEgressHealth{ClientId: clientId, MeasuredAt: now.Add(-age), OKCount: 1, Total: 1})
+		}
+		UpdateClientLocationReliabilities(ctx, now.Add(-time.Hour), now)
+		got := GetProviderEgressLocationDue(ctx, now.Add(-ProviderEgressLocationMaxAge/2), now, 10)
+		if !slices.Equal(got, []server.Id{due}) {
+			t.Fatalf("four-hour refresh candidates = %v, want %s", got, due)
+		}
+		if ProviderEgressProbeAttemptBackoff >= 4*time.Hour {
+			t.Fatalf("attempt retry %s can consume the entire refresh cycle", ProviderEgressProbeAttemptBackoff)
 		}
 	})
 }
@@ -872,9 +911,8 @@ func TestGetProviderEgressLocationDueOrderingIsStableAcrossLimits(t *testing.T) 
 		UpdateClientLocationReliabilities(ctx, now.Add(-time.Hour), now)
 
 		// Location cleanup deliberately does not delete the independently useful
-		// health history. Such a provider belongs to the no-location lane, not
-		// stale health, even when its retained health row is the oldest evidence
-		// in the database.
+		// health history. Once that health is stale, it takes the health deadline
+		// lane even though the exit location has been removed.
 		SetProviderEgressLocation(ctx, &ProviderEgressLocation{
 			ClientId: healthWithoutLocation, LocationId: city.LocationId,
 			CountryCode: "us", ObservedAt: now.Add(-30 * 24 * time.Hour),
@@ -890,12 +928,10 @@ func TestGetProviderEgressLocationDueOrderingIsStableAcrossLimits(t *testing.T) 
 		if GetProviderEgressHealth(ctx, healthWithoutLocation) == nil {
 			t.Fatal("location cleanup must retain independent health evidence")
 		}
-		unlocated = append(unlocated, healthWithoutLocation)
-
 		// Hard deadlines, in order:
-		// crossed health (-1h), overlap health (+5m), healthFirst (+10m), missing health (+15m),
-		// locationSecond (+20m), then locationTie/healthTie (+30m,
-		// client_id tie-break).
+		// healthWithoutLocation (expired for days), crossed health (-1h),
+		// overlap health (+5m), healthFirst (+10m), missing health (+15m),
+		// healthTie (+30m). Fresh health suppresses the stale-location-only rows.
 		locationTimes := map[server.Id]time.Time{
 			crossedDeadlines: now.Add(-90 * time.Hour),
 			overlap:          now.Add(-ProviderEgressLocationMaxAge + 40*time.Minute),
@@ -903,16 +939,24 @@ func TestGetProviderEgressLocationDueOrderingIsStableAcrossLimits(t *testing.T) 
 			locationTie:      now.Add(-ProviderEgressLocationMaxAge + 30*time.Minute),
 		}
 		for clientId, observedAt := range locationTimes {
-			SetProviderEgressLocation(ctx, &ProviderEgressLocation{
+			testingSetHistoricalProviderEgressLocation(t, ctx, &ProviderEgressLocation{
 				ClientId: clientId, LocationId: city.LocationId,
 				CountryCode: "us", ObservedAt: observedAt,
 			})
+			// This is a historical observation, not a verdict-triggered
+			// backdate written after the new health below. The ordinary writer
+			// stamps real insertion time, so arrange the historical write clock
+			// explicitly rather than accidentally simulating a later quorum.
+			server.Tx(ctx, func(tx server.PgTx) {
+				server.RaisePgResult(tx.Exec(ctx, `UPDATE provider_egress_location
+					SET update_time=observed_at WHERE client_id=$1`, clientId))
+			})
 		}
 		healthTimes := map[server.Id]time.Time{
-			// Both crossedDeadlines lanes are due, but its 25-hour-old
+			// Both crossedDeadlines lanes are due, but its expired
 			// health expires before its 90-hour-old location. The merge and
 			// monitor category must follow that earlier absolute deadline.
-			crossedDeadlines: now.Add(-25 * time.Hour),
+			crossedDeadlines: now.Add(-ProviderEgressHealthMaxAge - time.Hour),
 			overlap:          now.Add(-ProviderEgressHealthMaxAge + 5*time.Minute),
 			healthFirst:      now.Add(-ProviderEgressHealthMaxAge + 10*time.Minute),
 			healthTie:        now.Add(-ProviderEgressHealthMaxAge + 30*time.Minute),
@@ -961,10 +1005,7 @@ func TestGetProviderEgressLocationDueOrderingIsStableAcrossLimits(t *testing.T) 
 		minObservedAt := now.Add(-ProviderEgressLocationMaxAge / 2)
 		minAttemptAt := now.Add(-ProviderEgressProbeAttemptBackoff)
 
-		tied := []server.Id{locationTie, healthTie}
-		slices.SortFunc(tied, func(a server.Id, b server.Id) int { return a.Cmp(b) })
-		expected := []server.Id{crossedDeadlines, overlap, healthFirst, missingHealth, locationSecond}
-		expected = append(expected, tied...)
+		expected := []server.Id{healthWithoutLocation, crossedDeadlines, overlap, healthFirst, missingHealth, healthTie}
 		slices.SortFunc(unlocated, func(a server.Id, b server.Id) int { return a.Cmp(b) })
 		expected = append(expected, unlocated...)
 
@@ -985,26 +1026,104 @@ func TestGetProviderEgressLocationDueOrderingIsStableAcrossLimits(t *testing.T) 
 		// Every limit is the exact prefix of the same stable ordering. Limits 1
 		// through 4 are all smaller than the saturated unlocated backlog and
 		// therefore fail under the former fixed-pass precedence.
+		expectedLanes := map[server.Id]ProviderEgressDueLane{
+			healthWithoutLocation: ProviderEgressDueStaleHealth,
+			crossedDeadlines:      ProviderEgressDueStaleHealth, overlap: ProviderEgressDueStaleHealth,
+			healthFirst: ProviderEgressDueStaleHealth, missingHealth: ProviderEgressDueMissingHealth,
+			healthTie: ProviderEgressDueStaleHealth,
+		}
 		for limit := 0; limit <= len(expected)+2; limit += 1 {
 			want := expected[:min(limit, len(expected))]
-			got := GetProviderEgressLocationDue(ctx, minObservedAt, minAttemptAt, limit)
+			got, diagnostics := GetProviderEgressLocationDueShardedWithDiagnostics(ctx, minObservedAt, minAttemptAt, limit, 0, 1)
 			if !slices.Equal(got, want) {
 				t.Errorf("limit %d: due = %v, want %v", limit, got, want)
 			}
+			wantDiagnostics := ProviderEgressDueDiagnostics{}
+			for _, clientId := range want {
+				lane := expectedLanes[clientId]
+				if clientId == crossedDeadlines || clientId == healthWithoutLocation {
+					wantDiagnostics.Selected[lane].Expired++
+				} else {
+					wantDiagnostics.Selected[lane].Current++
+				}
+			}
+			if diagnostics != wantDiagnostics {
+				t.Errorf("limit %d: selected diagnostics = %+v, want %+v", limit, diagnostics, wantDiagnostics)
+			}
+		}
+
+		// The opposite chronology is a real recheck request: fresh health
+		// must not suppress a later client-verdict backdate. This also keeps
+		// the historical-clock correction from weakening that exception.
+		if !ReprioritiseProviderEgressProbe(ctx, fresh, now) {
+			t.Fatal("fresh historical control did not accept a later verdict backdate")
+		}
+		afterVerdict := GetProviderEgressLocationDue(ctx, minObservedAt, minAttemptAt, 100)
+		if len(afterVerdict) != len(expected)+1 || !slices.Contains(afterVerdict, fresh) ||
+			slices.Contains(afterVerdict, locationSecond) || slices.Contains(afterVerdict, locationTie) {
+			t.Fatal("later verdict backdate was lost or ordinary historical locations became forced rechecks")
 		}
 	})
 }
 
-func TestProviderEgressStaleHealthDueQueryRequiresLocation(t *testing.T) {
+func TestProviderEgressStaleHealthDueQueryAllowsMissingLocation(t *testing.T) {
 	normalized := strings.Join(strings.Fields(providerEgressStaleHealthDueQuery), " ")
 	for _, want := range []string{
-		"FROM provider_egress_health INNER JOIN provider_egress_location ON provider_egress_location.client_id = provider_egress_health.client_id",
+		"FROM provider_egress_health INNER JOIN network_client_location_reliability ON network_client_location_reliability.client_id = provider_egress_health.client_id",
 		"ORDER BY provider_egress_health.measured_at ASC, provider_egress_health.client_id ASC LIMIT $4",
 	} {
 		if !strings.Contains(normalized, want) {
 			t.Fatalf("stale-health query lacks %q: %s", want, normalized)
 		}
 	}
+}
+
+// The quality probe measures sampled websites, not a fixed exit-IP echo.
+// Health acknowledgement therefore controls the next Full run even when no
+// exit location was learned. Missing and aging health must still be offered.
+func TestProviderEgressDueUsesHealthWithoutExitLocation(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		now := server.NowUtc()
+		location := &Location{
+			LocationType: LocationTypeCountry,
+			Country:      "Synthetic Country",
+			CountryCode:  "zz",
+		}
+		CreateLocation(ctx, location)
+		freshUnlocated := server.NewId()
+		freshStaleLocation := server.NewId()
+		staleUnlocated := server.NewId()
+		missingUnlocated := server.NewId()
+		for index, clientId := range []server.Id{freshUnlocated, freshStaleLocation, staleUnlocated, missingUnlocated} {
+			testing_connectProbeableProvider(t, ctx, clientId, location.LocationId, fmt.Sprintf("192.0.2.%d:0", index+1), ProvideModePublic)
+		}
+		UpdateClientLocationReliabilities(ctx, now.Add(-time.Hour), now)
+		testingSetHistoricalProviderEgressLocation(t, ctx, &ProviderEgressLocation{
+			ClientId: freshStaleLocation, LocationId: location.LocationId,
+			CountryCode: "zz", ObservedAt: now.Add(-4 * 24 * time.Hour),
+		})
+		for _, clientId := range []server.Id{freshUnlocated, freshStaleLocation} {
+			SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+				ClientId: clientId, MeasuredAt: now, OKCount: 1, Total: 1,
+			})
+		}
+		SetProviderEgressHealth(ctx, &ProviderEgressHealth{
+			ClientId: staleUnlocated, MeasuredAt: now.Add(-3 * ProviderEgressHealthMaxAge / 4),
+			OKCount: 1, Total: 1,
+		})
+		due, diagnostics := GetProviderEgressLocationDueShardedWithDiagnostics(
+			ctx, now.Add(-ProviderEgressLocationMaxAge/2),
+			now.Add(-ProviderEgressProbeAttemptBackoff), 10, 0, 1,
+		)
+		if !slices.Equal(due, []server.Id{staleUnlocated, missingUnlocated}) {
+			t.Fatalf("due = %v, want stale-health then missing-health-only providers", due)
+		}
+		if diagnostics.Selected[ProviderEgressDueStaleHealth].Current != 1 ||
+			diagnostics.Selected[ProviderEgressDueNoLocation].Current != 1 {
+			t.Fatalf("due diagnostics = %+v, want one stale-health and one no-location", diagnostics)
+		}
+	})
 }
 
 func TestGetProviderEgressLocationDueAdvancesAfterAttempt(t *testing.T) {
@@ -1038,8 +1157,12 @@ func TestGetProviderEgressLocationDueAdvancesAfterAttempt(t *testing.T) {
 			CountryCode: "zz", ObservedAt: now.Add(-ProviderEgressLocationMaxAge + 2*time.Minute),
 		})
 		for _, clientId := range []server.Id{first, second} {
+			measuredAt := now.Add(-ProviderEgressHealthMaxAge + time.Minute)
+			if clientId == second {
+				measuredAt = now.Add(-ProviderEgressHealthMaxAge + 2*time.Minute)
+			}
 			SetProviderEgressHealth(ctx, &ProviderEgressHealth{
-				ClientId: clientId, MeasuredAt: now,
+				ClientId: clientId, MeasuredAt: measuredAt,
 				OKCount: 1, Total: 1,
 			})
 		}

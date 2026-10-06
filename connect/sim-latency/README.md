@@ -31,7 +31,7 @@ The initial calibrated values are:
 | Workload | 1,800 providers; 200 client identities; 80 arrivals/minute |
 | Selection | quality window 2; 4 exchange hosts; 4 fleet shards |
 | Measurement | 180 seconds with provider impairment enabled |
-| Aggregation | median of 9 independently reset runs |
+| Aggregation | one immutable 9-run control per epoch; median of 9 fresh runs per candidate |
 | Initial significant-improvement percentage | 16.1% |
 | Admission | six seven-day epochs; unbounded paid submissions at $20 each |
 | Dispatch | immediate single-job FIFO; Redis list backed by authoritative PostgreSQL |
@@ -77,10 +77,23 @@ programs are retained only under [`old/`](old/README.md).
 
 For each replicate, the raw score is p95 `total_ms` over requests that start in
 the measured window. Failures and incomplete bodies are charged at the frozen
-request-timeout ceiling. Lower is better. The candidate and same-round
-baseline each contribute nine independently reset replicate scores, aggregated
-by median. The displayed normalized score is
-`100 * baseline_median / candidate_median`, clamped to 1–200.
+request-timeout ceiling. Lower is better. Each epoch has exactly one control
+sample of nine independently reset runs. The evaluator measures that control
+before it builds or runs the first submission, freezes the exact
+`baseline.json` bytes and SHA-256 in the append-only
+`competition_round_baseline` row, and gives every later evaluation those same
+authenticated bytes. Each candidate contributes nine separately reset runs.
+
+The competition ranks candidates by their absolute median raw score ascending,
+then submission time and job id. The displayed normalized score remains
+`100 * baseline_median / candidate_median`, clamped to 1–200, but it is only a
+presentation of the shared control and is not a ranking input. After the first
+control is frozen, an ordinary submission runs only the nine candidate
+replicates rather than another nine control replicates.
+
+Historical epochs without an immutable shared control retain their original
+per-job baseline samples and normalized-score-first ranking. The new policy
+does not rewrite an already-published leaderboard.
 
 A score is placeable only when all G1–G6 correctness, volume, path-integrity,
 matchmaking, stability, and resource gates pass. A placeable submission is
@@ -91,15 +104,20 @@ takeover-eligible only when all of these are also true:
 2. a one-sided Welch test over the run-level raw scores has `p <= 0.05`; and
 3. the winning variance supports a next-epoch threshold in `(0%, 50%]`.
 
-Every successful score records the baseline and candidate means, sample
-variances, observed improvement, current margin, minimum statistically
-significant improvement, required improvement, Welch statistic/degrees of
-freedom/p-value, and the recommended next-epoch margin. This is part of the
-immutable evaluation result, not a post-hoc leaderboard calculation.
+Every successful score records the exact baseline SHA-256, baseline and
+candidate means, sample variances, observed improvement, current margin,
+minimum statistically significant improvement, required improvement, Welch
+statistic/degrees of freedom/p-value, and the recommended next-epoch margin.
+The one-sided Welch test is recalculated for each candidate using the shared
+nine-run control and that candidate's nine independent runs; reusing the
+control does not turn requests within a run into independent observations.
+This is part of the immutable evaluation result, not a post-hoc leaderboard
+calculation.
 
-Epoch 1 begins from source epoch 0's calibrated 16.1% requirement. Statistical
-eligibility places a submission into the ranked honesty-review queue; it does
-not by itself make the submission a winner. When an epoch has an approved
+Production epoch 1 begins from source epoch 0's calibrated 16.1% requirement.
+Production statistical eligibility places a submission into the ranked
+honesty-review queue; it does not by itself make the submission a winner.
+When an epoch has an approved
 winner, its authenticated `score.json` sets the next source epoch's
 percentage to the scorer's recommendation, which never weakens the incumbent
 margin. If no submission is statistically significant, or every significant
@@ -110,9 +128,9 @@ source commits and percentage carry forward unchanged.
 
 The complete local-module graph that can affect the measured product is frozen
 by source epoch: `server`, `connect`, `sdk`, `proxy`, `glog`, `goidenticons`,
-`userwireguard`, and `sn`, all on branch `sim-latency`. The first four are the
-product roots, the next three are their reachable UR dependencies, and `sn` is
-also a server dependency and evaluator build input. The trusted API and worker
+`userwireguard`, `sn`, `operator-proxy`, and `warp`, all on branch `sim-latency`.
+The first four are the product roots; the remaining six are required local
+dependencies and evaluator build inputs. The trusted API and worker
 continue on `main`; they record their runtime image digests per evaluation but
 their source commits are not scoring inputs.
 
@@ -127,8 +145,8 @@ prepared disposable repository root:
   source-check --epoch 0 --repos-root /tmp/evaluation-source --json
 ```
 
-After round N closes and every evaluation is terminal, the worker exits with
-any significant results still embargoed. The trusted agent harness enumerates
+After production round N closes and every evaluation is terminal, the worker
+exits with any significant results still embargoed. The trusted agent harness enumerates
 the exact ranked candidate into a fresh mode-0700 directory:
 
 ```bash
@@ -163,7 +181,7 @@ Only after review finalizes the epoch does the external control loop run one of:
 ./run-local-main.sh promote --epoch N --no-winner
 ```
 
-Promotion creates one temporary root and clones all eight locked repositories
+Promotion creates one temporary root and clones all ten locked repositories
 into it. It checks out each `sim-latency` branch at the prior epoch, applies and
 commits the winner to the evaluated server surface, verifies every dependency
 remains unchanged, pushes changed source branches first, and activates the new
@@ -180,18 +198,27 @@ number of sequential staging epochs numbered from zero. Each staging epoch
 uses the same authenticated submission, immutable MinIO retention, canonical
 patch cache, Redis FIFO, isolated evaluator, scoring, embargo, and poll-result
 publication paths as production. It is fee-free, always evaluates against the
-frozen source epoch 0, and finalizes automatically with no winner after its
-window closes and all accepted work drains. The default production leaderboard
+frozen source epoch 0, and finalizes automatically after admission closes and
+all accepted work drains. The highest-ranked placeable candidate passing every
+gate becomes the named staging winner, regardless of statistical significance
+or takeover margin. If none qualifies, `winner_job_id` is null. The default
+production leaderboard
 excludes staging; `GET /competition/leaderboard?include_staging=true` exposes
-finalized staging rows with `staging: true` and `winner_job_id: null` so the
-Apex adapter can exercise its production reconciliation path. Staging never
-creates honesty-review candidates, source promotion, or a production winner.
+the same winner identity in the finalized staging round and its winning entry.
+Staging has no review pause before finalization: its winner starts
+`honesty_review: not_reviewed`. After explicit manual review, the append-only
+`staging-review` command can mark that exact finalized winner `approved` so
+Apex can exercise its approved-winner path. Staging never promotes source or
+creates a production winner. Newly opened staging rounds freeze a zero
+takeover margin; historical rounds retain their original policy. The
+[epoch-5 release record](launch/STAGING-5-RELEASE.md) describes its historical
+opening policy.
 
 With the operator-token environment configured as described in `RUN-MAIN.md`,
 `./run-main.sh staging` creates or returns the current staging epoch and
 `./run-main.sh advance-staging` closes admission, evaluates every accepted FIFO
 submission through finalization and reveal, then creates the next open epoch.
-Its source preflight requires all eight remote `sim-latency-staging` branches
+Its source preflight requires all ten remote `sim-latency-staging` branches
 to exactly alias the frozen epoch-zero commits. `staging-worker` remains the
 natural-window variant. `staging --replace-current` is an explicit reset that
 refuses to run while an evaluation is active. Committing production epoch 1
@@ -273,9 +300,10 @@ Local `compare` reports rich TTFB, throughput, failure, and goodput diagnostics;
 it is not the official winner decision. Requests within one run are correlated,
 so comparisons use independently reset runs as the statistical unit.
 
-The trusted evaluator builds a same-round manifest from the exact nine baseline
-artifact sets, then supplies that signed manifest and nine candidate artifact
-sets to `score`:
+The trusted evaluator builds the round manifest once from the exact nine
+control artifact sets. The worker stores its exact bytes and digest before it
+can distribute that same manifest with each set of nine candidate artifacts to
+`score`:
 
 ```bash
 sim-latency score-baseline \
@@ -302,6 +330,10 @@ Re-scoring the same authenticated bundle is byte-deterministic.
   a fresh encrypted CSPRNG epoch seed and revealed only after finalization.
 - Every replicate starts from fresh PostgreSQL and Redis state. Reusing
   reliability history makes runs dependent and invalidates the variance model.
+- The worker reruns the complete host self-check after every job. Any change to
+  the qualified hardware, kernel/microcode, CPU policy, evaluator image, local
+  leaves, workload, or scorer identity stops the queue; it never silently
+  redraws the epoch control to accommodate drift.
 - `FindProviders2` stats must cover at least the frozen fraction of the measured
   window and join to the exact workload identities.
 - Candidate networking is internal-only; scoring runs with no network.

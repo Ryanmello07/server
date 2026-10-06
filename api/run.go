@@ -16,6 +16,7 @@ import (
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/controller"
+	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/oauth"
 	"github.com/urnetwork/server/router"
 	"github.com/urnetwork/server/stats"
@@ -34,6 +35,23 @@ func init() {
 
 type RunOptions struct {
 	Port int
+	// Optional owners for a process composing multiple service runners.
+	WarpStatus       *router.WarpStatusState
+	StartStatsPusher func(context.Context) func()
+}
+
+// The lb streams the request body of a `streamable_paths` route through at
+// the client's pace and marks it (router.RequestBufferingHeader); this
+// replaces the ReadTimeout and WriteTimeout below for that request. The
+// idle window outlasts the lb's client_body_timeout (15s) so the lb, not
+// the service, is what cuts a stalled client; the response timeout is the
+// WriteTimeout, restarted once the body is in hand instead of at the
+// headers. Every other route keeps the server timeouts: the lb hands it a
+// whole body at lan speed.
+var apiStreamingBody = router.StreamingBody{
+	IdleTimeout:     30 * time.Second,
+	ResponseTimeout: 30 * time.Second,
+	DrainTimeout:    5 * time.Second,
 }
 
 func apiWarmupTargets() []server.WarmupTarget {
@@ -75,7 +93,11 @@ func (self RunOptions) Validate() error {
 // commands and integration harnesses share this runner so route construction,
 // readiness, warmup, metrics, and drain behavior cannot diverge.
 func Run(ctx context.Context, options RunOptions) error {
-	return runWithDependencies(ctx, options, ReadinessCheck, server.StartStatsPusher, server.HttpListenAndServeWithReusePort)
+	startStatsPusher := options.StartStatsPusher
+	if startStatsPusher == nil {
+		startStatsPusher = server.StartStatsPusher
+	}
+	return runWithDependencies(ctx, options, ReadinessCheck, startStatsPusher, server.HttpListenAndServeWithReusePort)
 }
 
 // The command and tests exercise the same startup and drain wiring. Only the
@@ -103,7 +125,7 @@ func runWithDependencies(
 	go func() {
 		select {
 		case <-ctx.Done():
-			router.SetWarpStatusDrainingIfReady()
+			options.WarpStatus.SetDrainingIfReady()
 			readyGauge.Set(0)
 			serveCancel()
 		case <-draining:
@@ -137,21 +159,21 @@ func runWithDependencies(
 		oauth.NewReaperWithDefaults(processCtx)
 	}); err != nil {
 		glog.Infof("[api]not ready (%s)\n", err)
-		router.SetWarpStatusNotReady(err)
+		options.WarpStatus.SetNotReady(err)
 		readyGauge.Set(0)
 	} else if ctx.Err() == nil {
 		admitted = true
-		router.SetWarpStatusReady()
+		options.WarpStatus.SetReady()
 		readyGauge.Set(1)
 		// Rejected candidates keep /status and logs, but must not allocate a
 		// fresh process cohort in the remote metrics store on every retry.
 		flushStats = startStatsPusher(processCtx)
 		if ctx.Err() != nil {
-			router.SetWarpStatusDrainingIfReady()
+			options.WarpStatus.SetDrainingIfReady()
 			readyGauge.Set(0)
 		}
 	} else {
-		router.SetWarpStatusDrainingIfReady()
+		options.WarpStatus.SetDrainingIfReady()
 		readyGauge.Set(0)
 	}
 	if statsHandle != nil {
@@ -169,9 +191,20 @@ func runWithDependencies(
 			return err
 		}
 	} else {
-		apiRouter = router.NewRouter(processCtx, routesWithReservedAttemptUpload(nil))
+		apiRouter = router.NewRouter(processCtx, routesWithReservedAttemptUpload(nil, routeOwners{}))
 	}
 	defer closeApiRouter()
+	apiRouter.SetStreamingBody(apiStreamingBody)
+	var handler http.Handler = apiRouter
+	if options.WarpStatus != nil {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/status" {
+				options.WarpStatus.Handler(w, r)
+				return
+			}
+			apiRouter.ServeHTTP(w, r)
+		})
+	}
 
 	glog.Infof("[api]serving %s %s on *:%d\n", server.RequireEnv(), server.RequireVersion(), options.Port)
 	listenIPv4, _, listenPort := server.RequireListenIpPort(options.Port)
@@ -179,7 +212,7 @@ func runWithDependencies(
 		serveCtx,
 		net.JoinHostPort(listenIPv4, strconv.Itoa(listenPort)),
 		// beta-only: see api/cors_beta.go
-		withCors(apiRouter),
+		withCors(handler),
 		false,
 		server.HttpServerOptions{
 			ReadTimeout:           15 * time.Second,
@@ -212,7 +245,11 @@ func NewRouter(routeCtx context.Context, uploadCtx context.Context) (*router.Rou
 	if err != nil {
 		return nil, nil, fmt.Errorf("reserved validator staging startup: %w", err)
 	}
-	return router.NewRouter(routeCtx, routesWithReservedAttemptUpload(reservedUpload)),
-		reservedUpload.Close,
+	notifications := model.NewContractOriginNotifications(routeCtx, model.DefaultContractOriginNotificationSettings())
+	// FindProviders2 answers served here count toward each provider's
+	// appearance histogram; the close writes what the drain left
+	appearances := model.NewProviderAppearances(routeCtx, model.DefaultProviderAppearanceSettings())
+	return router.NewRouter(routeCtx, routesWithReservedAttemptUpload(reservedUpload, routeOwners{notifications: notifications, appearances: appearances})),
+		func() { notifications.Close(); appearances.Close(); reservedUpload.Close() },
 		nil
 }

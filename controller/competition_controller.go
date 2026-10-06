@@ -239,19 +239,48 @@ func (self *blobArtifactArchive) ArchiveAttempt(
 		return nil, errors.New("attempt archive identity is invalid")
 	}
 	artifacts := append([]evaluationArtifact(nil), manifest.Artifacts...)
-	for _, item := range []struct {
+	workerArtifacts := []struct {
 		path   string
 		digest string
 	}{
 		{path: "canonical.patch", digest: manifest.PatchSha256},
-		{path: "worker-result.json", digest: manifest.ResultSha256},
 		{path: "worker.stderr.log", digest: manifest.StderrSha256},
-	} {
-		_, size, err := hashRegularFile(filepath.Join(attemptDirectory, item.path))
-		if err != nil {
-			return nil, fmt.Errorf("authenticate retained %s: %w", item.path, err)
+	}
+	if manifest.Failure == nil || manifest.ResultSha256 != "" {
+		workerArtifacts = append(workerArtifacts, struct {
+			path   string
+			digest string
+		}{path: "worker-result.json", digest: manifest.ResultSha256})
+	}
+	for _, item := range workerArtifacts {
+		var size int64
+		if manifest.Failure != nil {
+			file, err := openFailureArtifactPath(attemptDirectory, item.path, false)
+			if err != nil {
+				return nil, fmt.Errorf("authenticate retained %s: %w", item.path, err)
+			}
+			info, statErr := file.Stat()
+			closeErr := file.Close()
+			if err := errors.Join(statErr, closeErr); err != nil {
+				return nil, err
+			}
+			size = info.Size()
+		} else {
+			var err error
+			_, size, err = hashRegularFile(filepath.Join(attemptDirectory, item.path))
+			if err != nil {
+				return nil, fmt.Errorf("authenticate retained %s: %w", item.path, err)
+			}
 		}
 		artifacts = append(artifacts, evaluationArtifact{Path: item.path, Sha256: item.digest, Bytes: size})
+	}
+	if manifest.Failure != nil {
+		if validateEvaluationError(manifest.Failure) != nil || manifest.PatchSha256 != job.PatchSha256 {
+			return nil, errors.New("attempt failure archive identity is invalid")
+		}
+		if err := authenticateFailureArchiveArtifacts(attemptDirectory, artifacts); err != nil {
+			return nil, fmt.Errorf("authenticate failure archive: %w", err)
+		}
 	}
 	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
 
@@ -959,6 +988,7 @@ func validateRuntimeImageDigest(value string) (string, error) {
 const (
 	maxSelfCheckBytes       = 1 * 1024 * 1024
 	maxEvaluatorResultBytes = 8 * 1024 * 1024
+	maxRoundBaselineBytes   = 1 * 1024 * 1024
 	processTermGrace        = 10 * time.Second
 )
 
@@ -984,6 +1014,8 @@ type evaluatorRequest struct {
 	RoundSeedHex         string           `json:"round_seed_hex"`
 	ProvidersPath        string           `json:"providers_path"`
 	ProvidersSha256      string           `json:"providers_sha256"`
+	RoundBaselinePath    string           `json:"round_baseline_path"`
+	RoundBaselineSha256  string           `json:"round_baseline_sha256"`
 	PatchPath            string           `json:"patch_path"`
 	PatchSha256          string           `json:"patch_sha256"`
 	ArtifactDirectory    string           `json:"artifact_directory"`
@@ -991,6 +1023,40 @@ type evaluatorRequest struct {
 	VaultLocalDirectory  string           `json:"vault_local_directory"`
 	PatchPolicy          PatchPolicy      `json:"patch_policy"`
 	EvaluationPolicy     EvaluationPolicy `json:"evaluation_policy"`
+}
+
+// This is the strict subset of baseline.json independently authenticated by
+// the worker before it freezes or redistributes the scorer-owned document.
+type roundBaselineManifest struct {
+	ScoreSchema      int                      `json:"score_schema"`
+	Kind             string                   `json:"kind"`
+	ScorerVersion    string                   `json:"scorer_version"`
+	RoundId          string                   `json:"round_id"`
+	ConfigSha256     string                   `json:"config_sha256"`
+	RequestTimeoutMs int64                    `json:"request_timeout_ms"`
+	RunFlags         map[string]string        `json:"run_flags"`
+	TakeoverMargin   float64                  `json:"takeover_margin"`
+	Replicates       []roundBaselineReplicate `json:"replicates"`
+}
+
+// Carries the recomputed score inputs and public live telemetry for one
+// trusted control run.
+type roundBaselineReplicate struct {
+	RawScore                        float64                               `json:"raw_score"`
+	SuccessRate                     float64                               `json:"success_rate"`
+	RequestCount                    int64                                 `json:"request_count"`
+	ReceivedBytes                   int64                                 `json:"received_bytes"`
+	FindProvidersLoadP95Ms          float64                               `json:"findproviders_load_p95_ms"`
+	FindProvidersPoolP05            float64                               `json:"findproviders_pool_p05"`
+	FindProvidersSampleSpanFraction float64                               `json:"findproviders_sample_span_fraction"`
+	LiveMetrics                     map[string]roundBaselineMetricSummary `json:"live_metrics"`
+}
+
+// Carries one public metric and its within-run uncertainty.
+type roundBaselineMetricSummary struct {
+	Value   float64 `json:"value"`
+	N       int     `json:"n"`
+	BlockSe float64 `json:"block_se,omitempty"`
 }
 
 type evaluatorResult struct {
@@ -1060,6 +1126,7 @@ type artifactManifest struct {
 	ResultSha256           string               `json:"result_sha256"`
 	Security               evaluationSecurity   `json:"security"`
 	Artifacts              []evaluationArtifact `json:"artifacts"`
+	Failure                *CompetitionError    `json:"failure,omitempty"`
 	Retention              *artifactRetention   `json:"retention,omitempty"`
 }
 
@@ -1095,9 +1162,11 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	if err := verifyPinnedExecutable(settings.EvaluatorCommand, settings.EvaluatorCommandSha256); err != nil {
 		return infrastructureFailure("evaluator_identity_mismatch", "pinned evaluator identity check failed")
 	}
-	if !storedPolicyMatches(settings, job.Round.PolicyJson) {
+	roundSettings, err := settingsForFrozenRound(settings, &job.Round)
+	if err != nil {
 		return infrastructureFailure("round_policy_mismatch", "round policy does not match the frozen evaluator policy")
 	}
+	settings = roundSettings
 	if job.Round.Staging && job.Round.Epoch < 0 ||
 		!job.Round.Staging && (job.Round.Epoch < 1 || settings.SeasonPolicy.EpochCount < job.Round.Epoch) {
 		return infrastructureFailure("source_epoch_invalid", "round does not map to a configured measured-source epoch")
@@ -1144,6 +1213,18 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	if err != nil {
 		return infrastructureFailure("artifact_create_failed", "round workload artifact could not be written")
 	}
+	if job.RoundBaseline != nil {
+		if err := validateRoundBaselineRecord(settings, &job.Round, job.RoundBaseline); err != nil {
+			return infrastructureFailure("round_baseline_mismatch", "frozen round baseline failed authentication")
+		}
+		if err := writeExclusiveFile(
+			filepath.Join(attemptDir, "round-baseline.json"),
+			job.RoundBaseline.Json,
+			0400,
+		); err != nil {
+			return infrastructureFailure("artifact_create_failed", "frozen round baseline could not be materialized")
+		}
+	}
 	if err := writeExclusiveFile(patchPath, job.Patch, 0400); err != nil {
 		return infrastructureFailure("artifact_create_failed", "canonical patch artifact could not be written")
 	}
@@ -1155,6 +1236,7 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 		clear(requestBytes)
 		return infrastructureFailure("artifact_create_failed", "evaluator request artifact could not be written")
 	}
+	requestDigest := sha256.Sum256(append(requestBytes, '\n'))
 	clear(requestBytes)
 	stderrFile, err := os.OpenFile(stderrPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
 	if err != nil {
@@ -1164,8 +1246,18 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	stdout := &boundedBuffer{limit: maxSelfCheckBytes}
 	exitCode, runErr := runContainedCommand(evalCtx, attemptDir, settings.EvaluatorCommand,
 		[]string{"--request", requestPath, "--result", resultPath}, stdout, stderrFile)
+	evaluationCanceled := evalCtx.Err() != nil
 	cancel()
 	closeErr := stderrFile.Close()
+	archiveFailure := true
+	defer func() {
+		if archiveFailure && outcome.Error != nil {
+			outcome = archiveFailedEvaluation(
+				ctx, settings, job, attemptDir, hex.EncodeToString(requestDigest[:]), outcome.Error,
+				candidateStageFailureEligible(evaluationCanceled, exitCode, runErr, closeErr),
+			)
+		}
+	}()
 	if runErr != nil || closeErr != nil {
 		return infrastructureFailure("evaluator_process_failed", "evaluator process could not be completed and reaped")
 	}
@@ -1182,6 +1274,9 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	if err := decoder.Decode(&result); err != nil || result.Schema != 1 || result.JobId != job.JobId.String() {
 		return infrastructureFailure("evaluator_result_invalid", "evaluator result identity or schema is invalid")
 	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return infrastructureFailure("evaluator_result_invalid", "evaluator result contains trailing data")
+	}
 	if (result.Score == nil) == (result.EvalError == nil) {
 		return infrastructureFailure("evaluator_result_invalid", "evaluator must return exactly one of score or eval_error")
 	}
@@ -1193,6 +1288,11 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 					"pinned scorer returned an invalid result",
 				),
 			}
+		}
+		if !scoreMatchesFrozenMargin(result.Score, settings.EvaluationPolicy.TakeoverMargin) {
+			return EvaluationOutcome{Error: terminalInfrastructureError(
+				"score_result_invalid", "pinned scorer used a margin different from the frozen round",
+			)}
 		}
 	}
 	if result.EvalError != nil {
@@ -1206,6 +1306,29 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	artifacts, err := authenticateResultArtifacts(attemptDir, result.Artifacts, result.EvalError)
 	if err != nil {
 		return infrastructureFailure("artifact_authentication_failed", "retained evaluator artifacts failed authentication")
+	}
+	var roundBaselineJson []byte
+	var roundBaselineSha256 string
+	roundBaselineJson, err = readRegularFile(filepath.Join(attemptDir, "baseline.json"), maxRoundBaselineBytes)
+	if err != nil {
+		return infrastructureFailure("round_baseline_missing", "evaluator did not return its authenticated round baseline")
+	}
+	roundBaselineSha256, err = validateRoundBaselineJson(settings, &job.Round, roundBaselineJson)
+	if err != nil {
+		clear(roundBaselineJson)
+		return infrastructureFailure("round_baseline_invalid", "evaluator returned an invalid round baseline")
+	}
+	if job.RoundBaseline != nil &&
+		(job.RoundBaseline.Sha256 != roundBaselineSha256 || !bytes.Equal(job.RoundBaseline.Json, roundBaselineJson)) {
+		clear(roundBaselineJson)
+		return infrastructureFailure("round_baseline_changed", "evaluator changed the frozen round baseline")
+	}
+	if result.Score != nil {
+		baselineSha256, ok := result.Score.Diagnostics["baseline_sha256"].(string)
+		if !ok || baselineSha256 != roundBaselineSha256 {
+			clear(roundBaselineJson)
+			return infrastructureFailure("score_baseline_mismatch", "score does not identify the frozen round baseline")
+		}
 	}
 	resultHash := sha256.Sum256(resultBytes)
 	requestHash, _, requestHashErr := hashRegularFile(requestPath)
@@ -1230,6 +1353,7 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	if err := sealArtifactDirectory(attemptDir); err != nil {
 		return infrastructureFailure("artifact_seal_failed", "artifact directory could not be sealed read-only")
 	}
+	archiveFailure = false
 	if settings.artifactArchive == nil {
 		return infrastructureFailure("artifact_archive_unavailable", "durable artifact retention is unavailable")
 	}
@@ -1245,12 +1369,19 @@ func (self CommandEvaluator) Evaluate(ctx context.Context, settings *Settings, j
 	}
 	return EvaluationOutcome{
 		Score: result.Score, Error: result.EvalError,
-		ArtifactManifest: archivedManifest,
+		ArtifactManifest: archivedManifest, RoundBaselineJson: roundBaselineJson,
+		RoundBaselineSha256: roundBaselineSha256,
 	}
 }
 
 // Build the complete immutable handoff from the claimed queue row.
 func evaluatorRequestForJob(settings *Settings, job *queuedJob, seed, attemptDir, patchPath, providersPath string) evaluatorRequest {
+	roundBaselinePath := ""
+	roundBaselineSha256 := ""
+	if job.RoundBaseline != nil {
+		roundBaselinePath = filepath.Join(attemptDir, "round-baseline.json")
+		roundBaselineSha256 = job.RoundBaseline.Sha256
+	}
 	return evaluatorRequest{
 		Schema: 1, JobId: job.JobId.String(), RoundId: job.RoundId.String(),
 		SourceEpoch: evaluationSourceEpoch(&job.Round),
@@ -1260,12 +1391,101 @@ func evaluatorRequestForJob(settings *Settings, job *queuedJob, seed, attemptDir
 		ScorerVersion: ScorerVersion, RoundSeedHex: seed, PatchPath: patchPath,
 		PatchSha256:   job.PatchSha256,
 		ProvidersPath: providersPath, ProvidersSha256: job.Round.ProvidersSha256,
+		RoundBaselinePath: roundBaselinePath, RoundBaselineSha256: roundBaselineSha256,
 		ArtifactDirectory:    attemptDir,
 		ConfigLocalDirectory: settings.ConfigLocalDirectory,
 		VaultLocalDirectory:  settings.VaultLocalDirectory,
 		PatchPolicy:          settings.PatchPolicy,
 		EvaluationPolicy:     settings.EvaluationPolicy,
 	}
+}
+
+// This fixed allowlist prevents a scorer document from smuggling an expanded
+// telemetry surface through the control-plane database.
+var roundBaselineLiveMetrics = map[string]bool{
+	"ttfb_p50_ms":                true,
+	"ttfb_p95_ms":                true,
+	"throughput_p50_bytes_per_s": true,
+	"throughput_p95_bytes_per_s": true,
+}
+
+// Verifies the exact scorer document and returns the digest that becomes the
+// immutable round control identity.
+func validateRoundBaselineJson(settings *Settings, round *roundRecord, content []byte) (string, error) {
+	if settings == nil || round == nil || len(content) == 0 || maxRoundBaselineBytes < len(content) {
+		return "", errors.New("round baseline is empty, oversized, or unbound")
+	}
+	manifest := &roundBaselineManifest{}
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(manifest); err != nil {
+		return "", err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return "", errors.New("round baseline contains trailing data")
+	}
+	policy, err := decodeRoundPolicySnapshot(round.PolicyJson)
+	if err != nil {
+		return "", err
+	}
+	if manifest.ScoreSchema != ScoreSchema || manifest.Kind != "sim-latency-score-baseline" ||
+		manifest.ScorerVersion != ScorerVersion || manifest.RoundId != round.RoundId.String() ||
+		manifest.ConfigSha256 != round.ProvidersSha256 ||
+		manifest.RequestTimeoutMs != settings.EvaluationPolicy.RequestTimeoutMs ||
+		manifest.TakeoverMargin != settings.EvaluationPolicy.TakeoverMargin ||
+		len(manifest.RunFlags) == 0 || len(manifest.Replicates) != settings.EvaluationPolicy.Replicates ||
+		policy.EvaluationPolicy.RequestTimeoutMs != manifest.RequestTimeoutMs ||
+		policy.EvaluationPolicy.TakeoverMargin != manifest.TakeoverMargin {
+		return "", errors.New("round baseline identity does not match the frozen round")
+	}
+	finite := func(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
+	finitePositive := func(value float64) bool { return finite(value) && 0 < value }
+	finiteNonnegative := func(value float64) bool { return finite(value) && 0 <= value }
+	for _, replicate := range manifest.Replicates {
+		if !finitePositive(replicate.RawScore) ||
+			float64(manifest.RequestTimeoutMs) < replicate.RawScore ||
+			!finite(replicate.SuccessRate) || replicate.SuccessRate < 0.97 || 1 < replicate.SuccessRate ||
+			replicate.RequestCount <= 0 || replicate.ReceivedBytes <= 0 ||
+			!finiteNonnegative(replicate.FindProvidersLoadP95Ms) ||
+			!finitePositive(replicate.FindProvidersPoolP05) ||
+			!finite(replicate.FindProvidersSampleSpanFraction) ||
+			replicate.FindProvidersSampleSpanFraction < 0.90 || 1 < replicate.FindProvidersSampleSpanFraction ||
+			len(replicate.LiveMetrics) != len(roundBaselineLiveMetrics) {
+			return "", errors.New("round baseline replicate is invalid")
+		}
+		for name, metric := range replicate.LiveMetrics {
+			if !roundBaselineLiveMetrics[name] || !finiteNonnegative(metric.Value) ||
+				metric.N <= 0 || !finiteNonnegative(metric.BlockSe) {
+				return "", errors.New("round baseline live metric is invalid")
+			}
+		}
+	}
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+// Binds stored bytes to the exact source, workload, evaluator, and qualified
+// hardware identities required by the current worker.
+func validateRoundBaselineRecord(settings *Settings, round *roundRecord, baseline *roundBaselineRecord) error {
+	if baseline == nil || baseline.RoundId != round.RoundId ||
+		!sha256Pattern.MatchString(baseline.Sha256) ||
+		baseline.BaseSha != settings.BaseSha || baseline.ProvidersSha256 != round.ProvidersSha256 ||
+		baseline.EvaluatorImageDigest != settings.EvaluatorImageDigest ||
+		baseline.ScorerVersion != ScorerVersion ||
+		baseline.HardwareId != settings.EvaluationPolicy.HardwareId ||
+		baseline.HostQualificationSha256 != settings.EvaluationPolicy.HostQualificationSha256 ||
+		baseline.SourceJobId == (server.Id{}) || baseline.SourceAttempt <= 0 ||
+		!sha256Pattern.MatchString(baseline.SourceArtifactManifestSha256) || baseline.CreatedAt.IsZero() {
+		return errors.New("round baseline record identity is invalid")
+	}
+	digest, err := validateRoundBaselineJson(settings, round, baseline.Json)
+	if err != nil {
+		return err
+	}
+	if digest != baseline.Sha256 {
+		return errors.New("round baseline record digest does not match its bytes")
+	}
+	return nil
 }
 
 // Staging rounds always exercise the frozen season baseline, regardless of
@@ -1333,17 +1553,55 @@ func hashLocalMountDirectory(root string) (string, error) {
 	return hex.EncodeToString(manifest.Sum(nil)), nil
 }
 
+// New rounds freeze the complete host command identity. Legacy rounds retain
+// their schema-one policy during the rolling upgrade; they never had that pin.
 func storedPolicyMatches(settings *Settings, stored json.RawMessage) bool {
-	var actual roundPolicySnapshot
-	if len(stored) == 0 || json.Unmarshal(stored, &actual) != nil {
+	actual, err := decodeRoundPolicySnapshot(stored)
+	if err != nil {
 		return false
 	}
 	expectedBytes, err := policySnapshot(settings)
 	if err != nil {
 		return false
 	}
+	if actual.Schema == 1 {
+		var expected roundPolicySnapshot
+		if err := json.Unmarshal(expectedBytes, &expected); err != nil {
+			return false
+		}
+		expected.Schema = 1
+		expected.EvaluatorCommand = ""
+		expected.EvaluatorCommandSha256 = ""
+		expectedBytes, err = json.Marshal(expected)
+		if err != nil {
+			return false
+		}
+	}
 	actualBytes, err := json.Marshal(actual)
 	return err == nil && bytes.Equal(actualBytes, expectedBytes)
+}
+
+// Staging rounds created after the no-margin change freeze zero in their own
+// policy snapshot. Historical staging rounds retain their original margin;
+// neither case changes the production policy in process configuration.
+func settingsForFrozenRound(settings *Settings, round *roundRecord) (*Settings, error) {
+	if settings == nil || round == nil {
+		return nil, errors.New("round policy is missing")
+	}
+	copy := *settings
+	if round.Staging {
+		policy, err := decodeRoundPolicySnapshot(round.PolicyJson)
+		if err != nil {
+			return nil, err
+		}
+		if policy.EvaluationPolicy.TakeoverMargin == 0 {
+			copy.EvaluationPolicy.TakeoverMargin = 0
+		}
+	}
+	if !storedPolicyMatches(&copy, round.PolicyJson) {
+		return nil, errors.New("round policy does not match the frozen evaluator policy")
+	}
+	return &copy, nil
 }
 
 func validateEvaluationError(evalError *CompetitionError) error {
@@ -1454,7 +1712,7 @@ func authenticateArtifacts(root string, declared []evaluationArtifact) ([]evalua
 func authenticateResultArtifacts(root string, declared []evaluationArtifact, evalError *CompetitionError) ([]evaluationArtifact, error) {
 	if evalError != nil && evalError.Kind == "submission" && evalError.Code == "candidate_build_failed" {
 		return authenticateArtifactsRequired(root, declared, map[string]bool{
-			"submission-error.json": false, "evaluation.complete.json": false,
+			"baseline.json": false, "submission-error.json": false, "evaluation.complete.json": false,
 		})
 	}
 	return authenticateArtifacts(root, declared)
@@ -1554,13 +1812,19 @@ func sealArtifactDirectory(root string) error {
 	return nil
 }
 
+// Own the process group through termination, including descendants that outlive
+// its leader. Bound inherited output pipes and ignore already-dead zombies.
 func runContainedCommand(ctx context.Context, directory, command string, args []string, stdout, stderr io.Writer) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	cmd := exec.Command(command, args...)
 	cmd.Dir = directory
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "TZ=UTC"}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = processTermGrace
 	if err := cmd.Start(); err != nil {
 		return -1, err
 	}
@@ -1572,21 +1836,24 @@ func runContainedCommand(ctx context.Context, directory, command string, args []
 	case <-ctx.Done():
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		timer := time.NewTimer(processTermGrace)
+		leaderWaited := false
 		select {
 		case waitErr = <-done:
-			if !timer.Stop() {
-				<-timer.C
-			}
+			leaderWaited = true
 		case <-timer.C:
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		timer.Stop()
+		// A cooperative leader is not proof that its whole group stopped.
+		terminateErr := terminateContainedProcessGroup(cmd.Process.Pid)
+		if !leaderWaited {
 			waitErr = <-done
 		}
-		return exitStatus(waitErr), ctx.Err()
+		return cmd.ProcessState.ExitCode(), errors.Join(ctx.Err(), terminateErr)
 	}
 
-	if err := syscall.Kill(-cmd.Process.Pid, 0); err == nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		return exitStatus(waitErr), errors.New("evaluator left a descendant process running")
+	if running, err := containedProcessGroupRunning(cmd.Process.Pid); err != nil || running {
+		terminateErr := terminateContainedProcessGroup(cmd.Process.Pid)
+		return cmd.ProcessState.ExitCode(), errors.Join(errors.New("evaluator left a descendant process running"), err, terminateErr)
 	}
 	if waitErr != nil {
 		var exitError *exec.ExitError
@@ -1596,6 +1863,53 @@ func runContainedCommand(ctx context.Context, directory, command string, args []
 		return -1, waitErr
 	}
 	return 0, nil
+}
+
+// Reap responsibility can outlive termination; only live members keep the wait active.
+func terminateContainedProcessGroup(processGroupId int) error {
+	control := containedProcessGroupControl{
+		signal:  syscall.Kill,
+		running: containedProcessGroupRunning,
+	}
+	return control.terminate(processGroupId)
+}
+
+// Native signaling and inspection are separate observations of a changing
+// group. Keeping these operations paired permits exact exit-ordering tests
+// without altering the production clock, deadline, or polling interval.
+type containedProcessGroupControl struct {
+	signal  func(int, syscall.Signal) error
+	running func(int) (bool, error)
+}
+
+// The caller owns this group; every signal and inspection keeps that identity.
+// Darwin can refuse signals while an exiting member is not yet a zombie.
+// Keep joining that state within the original deadline, never treating a
+// signal result alone as proof that descriptors and descendants are gone.
+func (self containedProcessGroupControl) terminate(processGroupId int) error {
+	deadline := time.Now().Add(processTermGrace)
+	for {
+		var signalErr error
+		if err := self.signal(-processGroupId, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			signalErr = fmt.Errorf("kill evaluator process group: %w", err)
+			if !errors.Is(err, syscall.EPERM) {
+				return signalErr
+			}
+		}
+		running, inspectErr := self.running(processGroupId)
+		if inspectErr != nil {
+			return errors.Join(signalErr, inspectErr)
+		}
+		if !running {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return errors.Join(signalErr, errors.New("evaluator process group did not terminate"))
+		}
+		// An orphaned zombie may await the host reaper indefinitely. Only
+		// live group members, not kill(pid, 0) alone, keep this wait active.
+		<-time.After(10 * time.Millisecond)
+	}
 }
 
 func exitStatus(err error) int {
@@ -3063,6 +3377,9 @@ func (self *Service) Info(ctx context.Context) (*InfoResult, *CompetitionError) 
 			return nil, revealErr
 		}
 		result.ActiveRound = view
+		if err := applyFrozenRoundPublicPolicy(&result, round); err != nil {
+			return nil, infrastructureError("round_policy_mismatch", "active round policy could not be authenticated")
+		}
 	}
 	stagingRound, err := self.store.CurrentStagingRound(ctx, settings)
 	if err != nil {
@@ -3074,8 +3391,25 @@ func (self *Service) Info(ctx context.Context) (*InfoResult, *CompetitionError) 
 			return nil, revealErr
 		}
 		result.StagingRound = view
+		if round == nil {
+			if err := applyFrozenRoundPublicPolicy(&result, stagingRound); err != nil {
+				return nil, infrastructureError("round_policy_mismatch", "staging round policy could not be authenticated")
+			}
+		}
 	}
 	return &result, nil
+}
+
+func applyFrozenRoundPublicPolicy(result *InfoResult, round *roundRecord) error {
+	policy, err := decodeRoundPolicySnapshot(round.PolicyJson)
+	if err != nil || policy.CompetitionId != result.CompetitionId {
+		return errors.New("round policy identity is invalid")
+	}
+	result.BaseSha = policy.BaseSha
+	result.EvaluatorImageDigest = policy.EvaluatorImageDigest
+	result.PatchPolicy = policy.PatchPolicy
+	result.EvaluationPolicy = policy.EvaluationPolicy
+	return nil
 }
 
 // Creates the next fee-free evaluated round before production begins. A
@@ -3500,6 +3834,11 @@ func validateScore(score *ScoreResult) error {
 	return model.ValidateCompetitionScore(score)
 }
 
+func scoreMatchesFrozenMargin(score *ScoreResult, margin float64) bool {
+	return score != nil && score.Significance != nil &&
+		math.Abs(score.Significance.TakeoverMarginPercent-margin*100) <= 1e-9
+}
+
 func infrastructureError(code, message string) *CompetitionError {
 	return &CompetitionError{Kind: "infrastructure", Code: code, Message: message, Retriable: true}
 }
@@ -3565,19 +3904,21 @@ func (self PostgresStore) dequeueSignal(ctx context.Context, settings *Settings)
 }
 
 type roundPolicySnapshot struct {
-	Schema               int              `json:"schema"`
-	CompetitionId        string           `json:"competition_id"`
-	BaseSha              string           `json:"base_sha"`
-	EvaluatorImageDigest string           `json:"evaluator_image_digest"`
-	ScoreSchema          int              `json:"score_schema"`
-	ScorerVersion        string           `json:"scorer_version"`
-	PatchPolicy          PatchPolicy      `json:"patch_policy"`
-	EvaluationPolicy     EvaluationPolicy `json:"evaluation_policy"`
-	SeasonPolicy         SeasonPolicy     `json:"season_policy"`
+	Schema                 int              `json:"schema"`
+	CompetitionId          string           `json:"competition_id"`
+	BaseSha                string           `json:"base_sha"`
+	EvaluatorImageDigest   string           `json:"evaluator_image_digest"`
+	EvaluatorCommand       string           `json:"evaluator_command,omitempty"`
+	EvaluatorCommandSha256 string           `json:"evaluator_command_sha256,omitempty"`
+	ScoreSchema            int              `json:"score_schema"`
+	ScorerVersion          string           `json:"scorer_version"`
+	PatchPolicy            PatchPolicy      `json:"patch_policy"`
+	EvaluationPolicy       EvaluationPolicy `json:"evaluation_policy"`
+	SeasonPolicy           SeasonPolicy     `json:"season_policy"`
 }
 
-// Decodes the complete schema-one snapshot before any of its identity fields
-// are trusted for authenticated encryption or evaluator provenance.
+// Both policy versions remain readable for seed reveal and historical evidence.
+// Schema two also authenticates the host script; schema one never carried it.
 func decodeRoundPolicySnapshot(stored json.RawMessage) (*roundPolicySnapshot, error) {
 	if len(stored) == 0 {
 		return nil, errors.New("round policy is empty")
@@ -3591,26 +3932,37 @@ func decodeRoundPolicySnapshot(stored json.RawMessage) (*roundPolicySnapshot, er
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, errors.New("round policy has trailing content")
 	}
-	if policy.Schema != 1 || policy.CompetitionId == "" || 128 < len(policy.CompetitionId) ||
+	if (policy.Schema != 1 && policy.Schema != 2) || policy.CompetitionId == "" || 128 < len(policy.CompetitionId) ||
 		!gitShaPattern.MatchString(policy.BaseSha) ||
 		!imageDigestPattern.MatchString(policy.EvaluatorImageDigest) ||
 		policy.ScoreSchema != ScoreSchema || policy.ScorerVersion != ScorerVersion {
 		return nil, errors.New("round policy identity is invalid")
 	}
+	if policy.Schema == 1 {
+		if policy.EvaluatorCommand != "" || policy.EvaluatorCommandSha256 != "" {
+			return nil, errors.New("legacy round policy cannot carry an evaluator command pin")
+		}
+	} else if err := validatePinnedCommand(policy.EvaluatorCommand, policy.EvaluatorCommandSha256, "round evaluator"); err != nil {
+		return nil, err
+	}
 	return policy, nil
 }
 
+// Freeze the command path as well as its bytes because it resolves sibling
+// helpers from its immutable release directory.
 func policySnapshot(settings *Settings) ([]byte, error) {
 	return json.Marshal(roundPolicySnapshot{
-		Schema:               1,
-		CompetitionId:        settings.CompetitionId,
-		BaseSha:              settings.BaseSha,
-		EvaluatorImageDigest: settings.EvaluatorImageDigest,
-		ScoreSchema:          ScoreSchema,
-		ScorerVersion:        ScorerVersion,
-		PatchPolicy:          settings.PatchPolicy,
-		EvaluationPolicy:     settings.EvaluationPolicy,
-		SeasonPolicy:         settings.SeasonPolicy,
+		Schema:                 2,
+		CompetitionId:          settings.CompetitionId,
+		BaseSha:                settings.BaseSha,
+		EvaluatorImageDigest:   settings.EvaluatorImageDigest,
+		EvaluatorCommand:       settings.EvaluatorCommand,
+		EvaluatorCommandSha256: settings.EvaluatorCommandSha256,
+		ScoreSchema:            ScoreSchema,
+		ScorerVersion:          ScorerVersion,
+		PatchPolicy:            settings.PatchPolicy,
+		EvaluationPolicy:       settings.EvaluationPolicy,
+		SeasonPolicy:           settings.SeasonPolicy,
 	})
 }
 
@@ -3834,7 +4186,9 @@ func (self PostgresStore) CreateStagingRound(
 	if !now.Before(settings.SeasonEndsAt) {
 		return nil, ErrSeasonComplete
 	}
-	round, err := self.prepareRound(ctx, settings, args, true)
+	stagingSettings := *settings
+	stagingSettings.EvaluationPolicy.TakeoverMargin = 0
+	round, err := self.prepareRound(ctx, &stagingSettings, args, true)
 	if err != nil {
 		return nil, err
 	}
@@ -4076,9 +4430,9 @@ func (self PostgresStore) CloseStagingRound(
 	return round, err
 }
 
-// Publishes a drained staging epoch without winner selection or source
-// promotion. An unfinished round is returned unchanged so the worker can keep
-// polling without treating ordinary admission time as an error.
+// Publishes a drained staging epoch with its highest-ranked placeable job
+// passing every gate, without honesty review or source promotion. An unfinished
+// round is returned unchanged while admission or queued evaluation continues.
 func (self PostgresStore) FinalizeStagingRound(
 	ctx context.Context,
 	settings *Settings,
@@ -4106,8 +4460,11 @@ func (self PostgresStore) FinalizeStagingRound(
 				return
 			}
 			server.Raise(scanErr)
-			if round.FinalizedAt != nil ||
-				(round.AdmissionClosedAt == nil && now.Before(round.ClosesAt)) {
+			closedAt := round.ClosesAt
+			if round.AdmissionClosedAt != nil {
+				closedAt = *round.AdmissionClosedAt
+			}
+			if round.FinalizedAt != nil || now.Before(closedAt) {
 				return
 			}
 			var active int
@@ -4118,17 +4475,20 @@ func (self PostgresStore) FinalizeStagingRound(
 			if active != 0 {
 				return
 			}
+			var winnerJobId *server.Id
+			server.Raise(tx.QueryRow(ctx, stagingWinnerSql, round.RoundId).Scan(&winnerJobId))
 			server.RaisePgResult(tx.Exec(ctx, `
 				UPDATE competition_round
 				SET admission_closed_at = COALESCE(admission_closed_at, closes_at),
-					finalized_at = $2, winner_job_id = NULL
+					finalized_at = $2, winner_job_id = $3
 				WHERE round_id = $1
-			`, round.RoundId, now))
+			`, round.RoundId, now, winnerJobId))
 			if round.AdmissionClosedAt == nil {
 				admissionClosedAt := round.ClosesAt
 				round.AdmissionClosedAt = &admissionClosedAt
 			}
 			round.FinalizedAt = &now
+			round.WinnerJobId = winnerJobId
 			finalized = true
 		})
 	})
@@ -4172,11 +4532,37 @@ func (self PostgresStore) GetRound(ctx context.Context, settings *Settings, roun
 	return round, err
 }
 
+// Staging names the best placeable job without creating review
+// records. Shared controls use absolute latency; legacy rounds retain their
+// normalized ranking. The scalar subquery returns NULL when none is eligible.
+const stagingWinnerSql = `
+	SELECT (
+		SELECT job_id FROM competition_job
+		WHERE round_id = $1 AND state = 'succeeded'
+		  AND score_json @> '{"placeable":true}'::jsonb
+		  AND jsonb_typeof(score_json->'gates') = 'object'
+		  AND score_json->'gates' <> '{}'::jsonb
+		  AND NOT EXISTS (
+		      SELECT 1 FROM jsonb_each(score_json->'gates') AS gate
+		      WHERE NOT COALESCE((gate.value->>'passed')::boolean, false)
+		  )
+		ORDER BY CASE WHEN NOT EXISTS (
+		             SELECT 1 FROM competition_round_baseline WHERE round_id = $1
+		         ) THEN (score_json->>'normalized_score')::numeric END DESC,
+		         (score_json->>'raw_score')::numeric ASC, submitted_at, job_id
+		LIMIT 1
+	)
+`
+
+// A persisted shared control makes raw latency comparable across submissions.
+// Legacy rounds without that control retain their original normalized order.
 const nextCandidateReviewSql = `
 	WITH eligible AS (
 		SELECT job_id, patch_sha256, patch_bytes, submitted_at, score_json,
 		       CAST(row_number() OVER (
-		           ORDER BY (score_json->>'normalized_score')::numeric DESC,
+		           ORDER BY CASE WHEN NOT EXISTS (
+		                        SELECT 1 FROM competition_round_baseline WHERE round_id = $1
+		                    ) THEN (score_json->>'normalized_score')::numeric END DESC,
 		                    (score_json->>'raw_score')::numeric ASC,
 		                    submitted_at, job_id
 		       ) AS integer) AS candidate_rank
@@ -4472,6 +4858,116 @@ func (self PostgresStore) RecordCandidateReview(
 	return state, err
 }
 
+func stagingWinnerForReview(ctx context.Context, tx server.PgTx, settings *Settings, epoch int) (*roundRecord, *CandidateReviewCandidate, error) {
+	round, err := scanRound(tx.QueryRow(ctx, `
+		SELECT round_id, competition_id, epoch_number, staging, workload_commitment, seed_nonce,
+		       seed_ciphertext, providers_sha256, providers_path, policy_json, opens_at, closes_at,
+		       reveal_at, created_at, canceled, finalized_at, winner_job_id, admission_closed_at
+		FROM competition_round
+		WHERE competition_id = $1 AND epoch_number = $2 AND staging = true AND canceled = false
+		FOR UPDATE
+	`, settings.CompetitionId, epoch))
+	if err != nil {
+		return nil, nil, err
+	}
+	if round.FinalizedAt == nil || round.WinnerJobId == nil {
+		return round, nil, ErrReviewNotReady
+	}
+	candidate, err := scanNextCandidate(tx.QueryRow(ctx, `
+		SELECT 1, job_id, patch_sha256, patch_bytes, submitted_at, score_json
+		FROM competition_job
+		WHERE round_id = $1 AND job_id = $2 AND state = 'succeeded'
+	`, round.RoundId, *round.WinnerJobId))
+	return round, candidate, err
+}
+
+// Staging approval is retrospective: automatic winner selection remains
+// immutable, but its leaderboard entry can be marked approved after a real
+// manual review. This does not authorize source promotion.
+func (self PostgresStore) PrepareStagingWinnerReview(
+	ctx context.Context, settings *Settings, epoch int,
+) (state *CandidateReviewState, err error) {
+	var stateErr error
+	err = captureDatabaseError(func() {
+		server.Tx(ctx, func(tx server.PgTx) {
+			round, candidate, loadErr := stagingWinnerForReview(ctx, tx, settings, epoch)
+			if errors.Is(loadErr, pgx.ErrNoRows) {
+				stateErr = ErrNotFound
+				return
+			}
+			if errors.Is(loadErr, ErrReviewNotReady) {
+				stateErr = loadErr
+				return
+			}
+			server.Raise(loadErr)
+			var approved bool
+			server.Raise(tx.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM competition_staging_winner_approval WHERE round_id = $1)
+			`, round.RoundId).Scan(&approved))
+			if approved {
+				state = candidateReviewState(round, "finalized", 0)
+			} else {
+				state = candidateReviewState(round, "pending_review", 0)
+				state.Candidate = candidate
+			}
+		})
+	})
+	if err == nil && stateErr != nil {
+		return nil, stateErr
+	}
+	return state, err
+}
+
+func (self PostgresStore) ApproveStagingWinner(
+	ctx context.Context, settings *Settings, epoch int, decision CandidateReviewDecision,
+) (state *CandidateReviewState, err error) {
+	decision.Reason = strings.TrimSpace(decision.Reason)
+	if decision.Decision != "approved" {
+		return nil, errors.New("staging winner approval requires an approved decision")
+	}
+	if err := validateCandidateReviewDecision(decision); err != nil {
+		return nil, err
+	}
+	var stateErr error
+	err = captureDatabaseError(func() {
+		server.Tx(ctx, func(tx server.PgTx) {
+			round, candidate, loadErr := stagingWinnerForReview(ctx, tx, settings, epoch)
+			if errors.Is(loadErr, pgx.ErrNoRows) {
+				stateErr = ErrNotFound
+				return
+			}
+			if errors.Is(loadErr, ErrReviewNotReady) {
+				stateErr = loadErr
+				return
+			}
+			server.Raise(loadErr)
+			if candidate.JobId != decision.JobId {
+				stateErr = ErrReviewOutOfOrder
+				return
+			}
+			var prior bool
+			server.Raise(tx.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM competition_staging_winner_approval WHERE round_id = $1)
+			`, round.RoundId).Scan(&prior))
+			if prior {
+				stateErr = ErrConflict
+				return
+			}
+			server.RaisePgResult(tx.Exec(ctx, `
+				INSERT INTO competition_staging_winner_approval (
+					round_id, job_id, reviewer_id, reason, evidence_json, evidence_sha256, reviewed_at
+				) VALUES ($1, $2, $3, $4, $5::json, $6, $7)
+			`, round.RoundId, candidate.JobId, decision.ReviewerId, decision.Reason,
+				string(decision.Evidence), decision.EvidenceSha256, self.nowUtc()))
+			state = candidateReviewState(round, "finalized", 0)
+		})
+	})
+	if err == nil && stateErr != nil {
+		return nil, stateErr
+	}
+	return state, err
+}
+
 // RequirePromotionDecision is the final source-promotion interlock. The
 // promotion CLI may only carry forward a finalized no-winner epoch or apply the
 // exact job that has an append-only approved honesty review.
@@ -4563,9 +5059,6 @@ func (self PostgresStore) Leaderboards(
 					))
 					board.CompetitionId = settings.CompetitionId
 					board.Status = "finalized"
-					if board.Staging {
-						board.WinnerJobId = nil
-					}
 					board.Entries = []LeaderboardEntry{}
 					result.Epochs = append(result.Epochs, board)
 				}
@@ -4575,14 +5068,19 @@ func (self PostgresStore) Leaderboards(
 				jobRows, jobsErr := conn.Query(ctx, `
 					SELECT job.job_id, job.patch_sha256, job.submitted_at,
 					       job.score_json, count(principal.principal_id),
-					       COALESCE(review.decision, 'not_reviewed')
+					       CASE WHEN staging_approval.job_id IS NOT NULL THEN 'approved'
+					            ELSE COALESCE(review.decision, 'not_reviewed') END
 					FROM competition_job AS job
 					JOIN competition_job_principal AS principal ON principal.job_id = job.job_id
 					LEFT JOIN competition_candidate_review AS review
 					  ON review.round_id = job.round_id AND review.job_id = job.job_id
+					LEFT JOIN competition_staging_winner_approval AS staging_approval
+					  ON staging_approval.round_id = job.round_id AND staging_approval.job_id = job.job_id
 					WHERE job.round_id = $1 AND job.state = 'succeeded'
-					GROUP BY job.job_id, review.decision
-					ORDER BY (job.score_json->>'normalized_score')::numeric DESC,
+					GROUP BY job.job_id, review.decision, staging_approval.job_id
+					ORDER BY CASE WHEN NOT EXISTS (
+					             SELECT 1 FROM competition_round_baseline WHERE round_id = $1
+					         ) THEN (job.score_json->>'normalized_score')::numeric END DESC,
 					         (job.score_json->>'raw_score')::numeric ASC,
 					         job.submitted_at, job.job_id
 				`, board.RoundId)
@@ -4782,6 +5280,27 @@ func scanJob(row pgx.Row, includePatch bool, now time.Time) (*queuedJob, error) 
 	return job, nil
 }
 
+// Reads the append-only round control without accepting partial identities.
+func scanRoundBaseline(row pgx.Row) (*roundBaselineRecord, error) {
+	baseline := &roundBaselineRecord{}
+	err := row.Scan(
+		&baseline.RoundId,
+		&baseline.Json,
+		&baseline.Sha256,
+		&baseline.SourceJobId,
+		&baseline.SourceAttempt,
+		&baseline.SourceArtifactManifestSha256,
+		&baseline.BaseSha,
+		&baseline.ProvidersSha256,
+		&baseline.EvaluatorImageDigest,
+		&baseline.ScorerVersion,
+		&baseline.HardwareId,
+		&baseline.HostQualificationSha256,
+		&baseline.CreatedAt,
+	)
+	return baseline, err
+}
+
 func (self PostgresStore) GetJob(ctx context.Context, settings *Settings, jobId server.Id, principal *Principal) (job *queuedJob, err error) {
 	var stateErr error
 	err = captureDatabaseError(func() {
@@ -4973,6 +5492,19 @@ func (self PostgresStore) Claim(ctx context.Context, settings *Settings, workerI
 				return
 			}
 			server.Raise(scanErr)
+			baseline, baselineErr := scanRoundBaseline(tx.QueryRow(ctx, `
+				SELECT round_id, baseline_json, baseline_sha256, source_job_id,
+				       source_attempt, source_artifact_manifest_sha256, base_sha,
+				       providers_sha256, evaluator_image_digest, scorer_version,
+				       hardware_id, host_qualification_sha256, created_at
+				FROM competition_round_baseline WHERE round_id = $1
+			`, job.RoundId))
+			if baselineErr == nil {
+				server.Raise(validateRoundBaselineRecord(settings, &job.Round, baseline))
+				job.RoundBaseline = baseline
+			} else if !errors.Is(baselineErr, pgx.ErrNoRows) {
+				server.Raise(baselineErr)
+			}
 			server.RaisePgResult(tx.Exec(ctx, `
 				UPDATE competition_job SET state = 'running', started_at = COALESCE(started_at, $2),
 					lease_owner = $3, lease_expires_at = $4, attempt_count = attempt_count + 1,
@@ -5039,9 +5571,11 @@ func (self PostgresStore) Heartbeat(ctx context.Context, settings *Settings, wor
 }
 
 type EvaluationOutcome struct {
-	Score            *ScoreResult
-	Error            *CompetitionError
-	ArtifactManifest json.RawMessage
+	Score               *ScoreResult
+	Error               *CompetitionError
+	ArtifactManifest    json.RawMessage
+	RoundBaselineJson   []byte
+	RoundBaselineSha256 string
 }
 
 // Schedules an infrastructure retry only when it can begin before the one
@@ -5066,12 +5600,22 @@ func (self PostgresStore) Complete(ctx context.Context, settings *Settings, work
 			var state, owner string
 			var attempts int
 			var apiImageDigest, workerImageDigest string
+			var roundId server.Id
+			var staging bool
+			var providersSha256 string
+			var policyJson []byte
 			var startedAt time.Time
 			server.Raise(tx.QueryRow(ctx, `
 				SELECT state, COALESCE(lease_owner, ''), attempt_count,
-				       api_image_digest, COALESCE(worker_image_digest, ''), started_at
-				FROM competition_job WHERE job_id = $1 FOR UPDATE
-			`, jobId).Scan(&state, &owner, &attempts, &apiImageDigest, &workerImageDigest, &startedAt))
+				       api_image_digest, COALESCE(worker_image_digest, ''), started_at,
+			       job.round_id, round.staging, round.providers_sha256, round.policy_json
+				FROM competition_job AS job
+				JOIN competition_round AS round ON round.round_id = job.round_id
+				WHERE job.job_id = $1 FOR UPDATE OF job
+			`, jobId).Scan(
+				&state, &owner, &attempts, &apiImageDigest, &workerImageDigest, &startedAt,
+				&roundId, &staging, &providersSha256, &policyJson,
+			))
 			if state != "running" || owner != workerId {
 				leaseLost = true
 				return
@@ -5091,12 +5635,71 @@ func (self PostgresStore) Complete(ctx context.Context, settings *Settings, work
 			}
 			manifestJson := []byte(outcome.ArtifactManifest)
 			manifestHash := any(nil)
+			manifestSha256 := ""
 			if len(manifestJson) != 0 {
 				if !json.Valid(manifestJson) {
 					panic(errors.New("artifact manifest is invalid JSON"))
 				}
 				h := sha256.Sum256(manifestJson)
-				manifestHash = hex.EncodeToString(h[:])
+				manifestSha256 = hex.EncodeToString(h[:])
+				manifestHash = manifestSha256
+			}
+			// Every new scored result freezes its shared control atomically.
+			// Absence of that append-only row identifies legacy ranking policy.
+			if outcome.Score != nil && outcome.Error == nil &&
+				(len(outcome.RoundBaselineJson) == 0 || outcome.RoundBaselineSha256 == "") {
+				panic(errors.New("scored competition outcome requires its round baseline"))
+			}
+			if len(outcome.RoundBaselineJson) != 0 || outcome.RoundBaselineSha256 != "" {
+				if len(outcome.RoundBaselineJson) == 0 || !sha256Pattern.MatchString(outcome.RoundBaselineSha256) ||
+					manifestSha256 == "" {
+					panic(errors.New("round baseline outcome identity is incomplete"))
+				}
+				round := &roundRecord{
+					RoundResult: RoundResult{
+						RoundId: roundId, Staging: staging, ProvidersSha256: providersSha256,
+					},
+					PolicyJson: policyJson,
+				}
+				roundSettings, roundSettingsErr := settingsForFrozenRound(settings, round)
+				server.Raise(roundSettingsErr)
+				baselineSha256, baselineErr := validateRoundBaselineJson(roundSettings, round, outcome.RoundBaselineJson)
+				server.Raise(baselineErr)
+				if baselineSha256 != outcome.RoundBaselineSha256 {
+					panic(errors.New("round baseline outcome digest does not match its bytes"))
+				}
+				insertResult, insertErr := tx.Exec(ctx, `
+					INSERT INTO competition_round_baseline (
+						round_id, baseline_json, baseline_sha256, source_job_id,
+						source_attempt, source_artifact_manifest_sha256, base_sha,
+						providers_sha256, evaluator_image_digest, scorer_version,
+						hardware_id, host_qualification_sha256, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+					ON CONFLICT (round_id) DO NOTHING
+				`, roundId, outcome.RoundBaselineJson, baselineSha256, jobId, attempts,
+					manifestSha256, settings.BaseSha, providersSha256, settings.EvaluatorImageDigest,
+					ScorerVersion, settings.EvaluationPolicy.HardwareId,
+					settings.EvaluationPolicy.HostQualificationSha256, now)
+				server.Raise(insertErr)
+				if insertResult.RowsAffected() == 1 {
+					appendEvent(ctx, tx, jobId, now, "round_baseline_frozen", workerId, map[string]any{
+						"round_id": roundId.String(), "baseline_sha256": baselineSha256,
+						"source_attempt": attempts, "artifact_manifest_sha256": manifestSha256,
+					})
+				}
+				storedBaseline, storedErr := scanRoundBaseline(tx.QueryRow(ctx, `
+					SELECT round_id, baseline_json, baseline_sha256, source_job_id,
+					       source_attempt, source_artifact_manifest_sha256, base_sha,
+					       providers_sha256, evaluator_image_digest, scorer_version,
+					       hardware_id, host_qualification_sha256, created_at
+					FROM competition_round_baseline WHERE round_id = $1 FOR SHARE
+				`, roundId))
+				server.Raise(storedErr)
+				server.Raise(validateRoundBaselineRecord(roundSettings, round, storedBaseline))
+				if storedBaseline.Sha256 != baselineSha256 ||
+					!bytes.Equal(storedBaseline.Json, outcome.RoundBaselineJson) {
+					panic(errors.New("evaluator outcome conflicts with the immutable round baseline"))
+				}
 			}
 			if retryableInfrastructure && retryBudgetAvailable {
 				retry = true
@@ -5303,6 +5906,24 @@ type roundRecord struct {
 	Canceled       bool
 }
 
+// This append-only row binds the exact round control bytes to the source job,
+// retained attempt, frozen source, evaluator, and qualified host identities.
+type roundBaselineRecord struct {
+	RoundId                      server.Id
+	Json                         []byte
+	Sha256                       string
+	SourceJobId                  server.Id
+	SourceAttempt                int
+	SourceArtifactManifestSha256 string
+	BaseSha                      string
+	ProvidersSha256              string
+	EvaluatorImageDigest         string
+	ScorerVersion                string
+	HardwareId                   string
+	HostQualificationSha256      string
+	CreatedAt                    time.Time
+}
+
 type queuedJob struct {
 	ScoreJobResult
 	Patch          []byte
@@ -5311,6 +5932,7 @@ type queuedJob struct {
 	LeaseOwner     string
 	LeaseExpiresAt *time.Time
 	Round          roundRecord
+	RoundBaseline  *roundBaselineRecord
 }
 
 type HostSelfCheck struct {
@@ -5482,6 +6104,17 @@ func (self *Worker) Run(ctx context.Context) error {
 			if err := self.evaluateOne(ctx, job, hostCheck); err != nil {
 				return err
 			}
+			fresh, checkErr := self.selfCheck(ctx)
+			if checkErr != nil {
+				if fresh.HostId != "" {
+					_ = self.store.RegisterHost(context.WithoutCancel(ctx), self.settings, fresh)
+				}
+				return fmt.Errorf("competition evaluator lost self-check after job: %w", checkErr)
+			}
+			if err := self.store.RegisterHost(ctx, self.settings, fresh); err != nil {
+				return fmt.Errorf("refresh evaluator host after job: %w", err)
+			}
+			hostCheck = fresh
 			continue
 		}
 		select {
@@ -5528,7 +6161,8 @@ func (self *Worker) preflight(ctx context.Context) (HostSelfCheck, error) {
 
 // Keeps the production identity gate exact while allowing the staging era to
 // exercise a newly pinned evaluator from an authenticated prior containment
-// record. Staging scores never enter winner selection or source promotion.
+// record. Staging scores never enter production winner selection or source
+// promotion.
 func (self *Worker) selfCheck(ctx context.Context) (HostSelfCheck, error) {
 	hostCheck, checkErr := self.evaluator.SelfCheck(ctx, self.settings)
 	if checkErr == nil {
@@ -5559,8 +6193,8 @@ func (self *Worker) selfCheck(ctx context.Context) (HostSelfCheck, error) {
 
 // Seals the one round owned by this process after admission closes and the
 // immediate FIFO drains, including work that extends beyond closes_at.
-// Staging publishes without winner selection; production leaves a significant
-// candidate embargoed for the operator-controlled honesty review gate.
+// Staging names its best eligible job automatically; production leaves a
+// significant candidate embargoed for the operator-controlled honesty gate.
 func (self *Worker) finishEpoch(ctx context.Context) (bool, error) {
 	latest, err := self.store.CurrentRound(ctx, self.settings)
 	if err != nil {
@@ -5586,10 +6220,15 @@ func (self *Worker) finishEpoch(ctx context.Context) (bool, error) {
 		if latest.FinalizedAt == nil {
 			return false, nil
 		}
+		winner := "none"
+		if latest.WinnerJobId != nil {
+			winner = latest.WinnerJobId.String()
+		}
 		glog.Infof(
-			"[competition]staging epoch %d finalized round=%s winner=none\n",
+			"[competition]staging epoch %d finalized round=%s winner=%s\n",
 			latest.Epoch,
 			latest.RoundId,
+			winner,
 		)
 		return true, nil
 	}
@@ -6248,8 +6887,75 @@ func (self *ApexAdapterFileStore) RecordPoll(submissionId string, job ScoreJobRe
 	})
 }
 
-// ReconcileLeaderboard publishes results only from an atomically finalized
-// epoch and authenticates every returned job and patch identity.
+// Authenticates winner consistency without interpreting normalized versus raw
+// historical ranking. Entries already carry the server's frozen order. Old
+// no-winner staging boards remain valid even when they contain eligible scores.
+func validateApexLeaderboard(leaderboard LeaderboardResult) error {
+	if leaderboard.Status != "finalized" || leaderboard.RoundId == (server.Id{}) || leaderboard.FinalizedAt.IsZero() {
+		return errors.New("Apex reconciliation received a non-finalized leaderboard")
+	}
+	winnerCount := 0
+	var firstEligibleJobId *server.Id
+	for _, entry := range leaderboard.Entries {
+		if err := validateScore(&entry.Score); err != nil {
+			return fmt.Errorf("Apex reconciliation received an invalid leaderboard score: %w", err)
+		}
+		eligible := entry.Score.Placeable && len(entry.Score.Gates) != 0
+		if !leaderboard.Staging {
+			eligible = eligible && entry.Score.TakeoverEligible &&
+				entry.Score.Significance.StatisticallySignificant &&
+				entry.Score.Significance.RecommendedNextEpochTakeoverMarginSupported
+		}
+		for _, gate := range entry.Score.Gates {
+			eligible = eligible && gate.Passed
+		}
+		if eligible && firstEligibleJobId == nil {
+			jobId := entry.JobId
+			firstEligibleJobId = &jobId
+		}
+		matchesWinner := leaderboard.WinnerJobId != nil && *leaderboard.WinnerJobId == entry.JobId
+		if entry.Winner != matchesWinner {
+			return errors.New("Apex reconciliation received inconsistent leaderboard winner identities")
+		}
+		if leaderboard.Staging {
+			if entry.HonestyReview != "not_reviewed" &&
+				!(entry.Winner && entry.HonestyReview == "approved") {
+				return errors.New("Apex reconciliation received staging honesty-review state")
+			}
+		} else {
+			switch entry.HonestyReview {
+			case "approved":
+				if !entry.Winner {
+					return errors.New("Apex reconciliation received an approved non-winner")
+				}
+			case "not_reviewed", "rejected":
+			default:
+				return errors.New("Apex reconciliation received an invalid honesty-review state")
+			}
+			if entry.Winner && entry.HonestyReview != "approved" {
+				return errors.New("Apex reconciliation received an unapproved production winner")
+			}
+		}
+		if entry.Winner {
+			if !eligible {
+				return errors.New("Apex reconciliation received an ineligible winner")
+			}
+			winnerCount++
+		}
+	}
+	if leaderboard.WinnerJobId != nil {
+		if winnerCount != 1 {
+			return errors.New("Apex reconciliation received a winner missing its unique leaderboard entry")
+		}
+		if leaderboard.Staging && (firstEligibleJobId == nil || *firstEligibleJobId != *leaderboard.WinnerJobId) {
+			return errors.New("Apex reconciliation received a staging winner behind an eligible candidate")
+		}
+	}
+	return nil
+}
+
+// Publishes only internally consistent finalized results, then authenticates
+// every returned job, patch, and staging admission identity before persisting.
 func (self *ApexAdapterFileStore) ReconcileLeaderboard(leaderboards SeasonLeaderboardResult, now time.Time) error {
 	return self.update(func(state *apexAdapterState) error {
 		byJobId := map[server.Id]*ApexAdapterRecord{}
@@ -6261,11 +6967,8 @@ func (self *ApexAdapterFileStore) ReconcileLeaderboard(leaderboards SeasonLeader
 		}
 		seenJobIds := map[server.Id]bool{}
 		for _, leaderboard := range leaderboards.Epochs {
-			if leaderboard.Status != "finalized" || leaderboard.RoundId == (server.Id{}) || leaderboard.FinalizedAt.IsZero() {
-				return errors.New("Apex reconciliation received a non-finalized leaderboard")
-			}
-			if leaderboard.Staging && leaderboard.WinnerJobId != nil {
-				return errors.New("Apex reconciliation received a staging winner")
+			if err := validateApexLeaderboard(leaderboard); err != nil {
+				return err
 			}
 			for _, entry := range leaderboard.Entries {
 				if seenJobIds[entry.JobId] {
@@ -6281,12 +6984,6 @@ func (self *ApexAdapterFileStore) ReconcileLeaderboard(leaderboards SeasonLeader
 				}
 				if record.Staging != leaderboard.Staging {
 					return errors.New("leaderboard changed the staging admission identity")
-				}
-				if leaderboard.Staging && (entry.Winner || entry.HonestyReview != "not_reviewed") {
-					return errors.New("Apex reconciliation received staging winner-review state")
-				}
-				if entry.Score.ScoreSchema != ScoreSchema || entry.Score.Significance == nil {
-					return errors.New("leaderboard score is missing its statistical record")
 				}
 				if record.EvaluationStatus == "failed" || record.EvaluationStatus == "canceled" {
 					return errors.New("leaderboard score contradicts the terminal evaluation status")

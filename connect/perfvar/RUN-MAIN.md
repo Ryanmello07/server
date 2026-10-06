@@ -6,7 +6,8 @@ regressions, and promotes measured improvements. It covers the deterministic
 PERFVAR environment plus the two attached Android test devices. The research
 contracts remain
 [`connect/LOWBAR.md`](../../../connect/LOWBAR.md),
-[`connect/MEMSTEADY.md`](../../../connect/MEMSTEADY.md), and
+[`connect/MEMSTEADY.md`](../../../connect/MEMSTEADY.md),
+[`connect/NODELAY.md`](../../../connect/NODELAY.md), and
 [`PERFVAR.md`](./PERFVAR.md).
 
 `sim-latency` is deliberately outside this harness. Its separate continuous
@@ -88,22 +89,24 @@ external blocker is documented with the evidence needed to remove it.
   | `device-b` | `R5CX21FY6ND` | Galaxy S24 Ultra |
 
   Before each PERFVAR, LOWBAR, or MEMSTEADY block, require `adb devices -l` to
-  show both serials in `device` state and no other attached serial. Pass each
+  show both allowlisted serials in `device` state. Ignore every other entry,
+  including unauthorized and offline devices: it is not part of the performance
+  cohort and must never be selected as a substitute. Pass each allowlisted
   serial explicitly to its device process; a missing, unauthorized, or offline
-  serial makes the physical block `INVALID_ENVIRONMENT`. Public measurements
-  use only the opaque roles; serials are retained in the private manifest for
-  reproducibility.
+  allowlisted serial makes the physical block `INVALID_ENVIRONMENT`. Public
+  measurements use only the opaque roles; serials are retained in the private
+  manifest for reproducibility.
 
   A fail-closed preflight is:
 
   ```sh
-  actual=$(adb devices | awk 'NR > 1 && NF {print $1 ":" $2}' | sort)
-  expected=$(printf '%s\n' \
-    '3B161FDJG001KT:device' 'R5CX21FY6ND:device' | sort)
-  test "$(printf '%s\n' "$actual")" = "$(printf '%s\n' "$expected")" || {
-    echo 'authorized Android device set mismatch' >&2
-    exit 1
-  }
+  for serial in 3B161FDJG001KT R5CX21FY6ND; do
+    adb devices | awk -v serial="$serial" \
+      '$1 == serial && $2 == "device" { ok = 1 } END { exit !ok }' || {
+        echo 'allowlisted Android device unavailable' >&2
+        exit 1
+      }
+  done
   ```
 - Do not infer an HTTP status, origin policy, or bot challenge from encrypted
   payloads. Browser-only response metadata is diagnostic and may not be turned
@@ -111,8 +114,10 @@ external blocker is documented with the evidence needed to remove it.
 - Android `goRuntimeBytes` is the allocation surrogate for this campaign.
   Android whole-app PSS is diagnostic and does not prove the iOS Network
   Extension `phys_footprint` or jetsam boundary.
-- The Connect mobile ceiling is absolute: `goRuntimeBytes` must never exceed
-  25,165,824 bytes (24 MiB) in an acceptance sample. Statistical memory
+- The iOS-profile ceiling is absolute: `goRuntimeBytes` must never exceed
+  29,360,128 bytes (28 MiB) in an acceptance sample. Android MEMSTEADY must
+  select and attest `ios-memory-audit-v1`, retaining its 20-MiB admission target
+  and 32-MiB Go soft limit. Ordinary Android 28/40 is not this profile. Statistical memory
   improvement, a low p95, or later reclaim cannot override this gate.
 - Preserve unrelated working-tree changes. Build controls in temporary sibling
   worktrees; do not reset, switch, or clean an operator checkout. Do not pull,
@@ -184,8 +189,8 @@ do not rewrite the plan after observing data.
 
 ## Bootstrap and preflight
 
-1. Read this file, `PERFVAR.md`, the current active portions of `LOWBAR.md` and
-   `MEMSTEADY.md`, Android's
+1. Read this file, `PERFVAR.md`, the current active portions of `LOWBAR.md`,
+   `MEMSTEADY.md`, and `NODELAY.md`, Android's
    [`PHYSICAL_LOWBAR.md`](../../../android/app/scripts/PHYSICAL_LOWBAR.md), and
    the active entry in the tests measurement ledger.
 2. Inspect branch, HEAD, upstream, and `git status --short --branch` in tests,
@@ -232,6 +237,53 @@ Do not begin a candidate arm until the control source is reconstructible, both
 APKs are stamped with distinct immutable build IDs, and the full manifest is
 frozen.
 
+## Continuous packet-flow delay audit
+
+Run the `connect/NODELAY.md` audit at the start of every PERFVAR campaign and
+again at least daily while a campaign or standing harness continues. Also run
+it after any change to DNS, dial, carrier, Transfer, provider-window, TUN,
+proxy, or route lifecycle code. This is a source-and-evidence check alongside
+PERFVAR's measurements, not a substitute for them or a reason to run the
+separate sim-latency harness.
+
+For each changed or newly observed wait between DNS first usable answer,
+first dial attempt, carrier and contract readiness, cipher readiness,
+selectable-provider publication, first packet enqueue, and first response:
+
+1. Record the exact source path and event pair, whether the wait is a true
+   deadline, intentional privacy hedge/pacing, retry backoff, idle detection,
+   or timer-only readiness polling. A configured `250ms` does not prove a
+   packet waited that long; an event-driven maximum timeout is different from
+   a fixed delay. Equally, a successful probe at the end does not hide a
+   startup or packet-flow delay.
+2. Check both IPv4 and IPv6 first-answer behavior, TCP and UDP, initial and
+   resumed connections, Required encryption, zero-provider formation,
+   already-present failed candidates, cancellation, and time-expiring
+   selection filters. A usable A or AAAA answer or eligible offer must be
+   acted on promptly without waiting for the other family or a polling tick.
+   Preserve deliberate privacy boundaries and paced retries explicitly.
+3. When a readiness poll is found, add a deterministic actual-path test whose
+   causal case fails with the timer held and succeeds on publication, plus
+   controls for no publication, deadline, cancellation, failed-send pacing,
+   and stale/wrong-family state. Pair subscription with the state read under
+   the same owner lock so the fix cannot lose an edge; do not add an unbounded
+   goroutine, global budget, spin loop, or hot-path allocation to make the
+   test pass.
+4. Sol owns the causal analysis and smallest correction. Terra independently
+   runs source-frozen RED/GREEN, adjacent normal/race/vet, then the unchanged
+   PERFVAR control/candidate matrix and applicable Android cells. Record
+   stage timing and variance under the same compatibility key, with failed
+   attempts retained. A source-only improvement or one green focused test
+   is not a performance promotion or deployed-product verification.
+
+Append the audit date, inspected source revision/dirty hash, newly classified
+waits, test receipts, and any unresolved hypothesis to the campaign's private
+manifest, with a privacy-safe summary in `tests/PERFVAR-MEASUREMENTS.md`.
+Update `connect/NODELAY.md` when a verified mechanism, intentional policy, or
+adjacent-path result changes its explanation. An unchanged audit still records
+what was inspected and when; never silently carry an old NODELAY conclusion
+forward to a new binary.
+
 ## Statistical contract
 
 Predeclare metric direction. Convert paired continuous observations to an
@@ -263,7 +315,7 @@ default minimum practical effect is 5% for performance and 0.5 MiB for
 session-level Go-runtime memory unless the active baseline predeclares a more
 specific product threshold.
 
-The 24-MiB absolute ceiling is evaluated before statistics. Memory statistics
+The iOS-profile 28-MiB absolute ceiling is evaluated before statistics. Memory statistics
 can choose between two passing candidates; they can never make an over-ceiling
 candidate pass.
 
@@ -280,10 +332,13 @@ Correctness runs must explicitly clear measurement/failure-probe variables.
 
 ```sh
 cd "$URN_REG_WORKSPACE/server"
+# Attests the live run-local stack and exports its safe local DB/Redis aliases.
+# Do not replace this with WARP_ENV=local alone.
+source ./test-env.sh
 unset CONNECT_PERFVAR_MEASURE CONNECT_PERFVAR_FAILURE_PROBE
 unset CONNECT_PERFVAR_RESOURCE_HELPER CONNECT_PERFVAR_RESOURCE_HELPER_NAME
-go test -p=1 ./connect/perfvar -parallel=1 -count=1 -timeout=0
-go test -race -p=1 ./connect/perfvar -short -parallel=1 -count=1 -timeout=30m
+WARP_ENV=local go test -p=1 ./connect/perfvar -parallel=1 -count=1 -timeout=0
+WARP_ENV=local go test -race -p=1 ./connect/perfvar -short -parallel=1 -count=1 -timeout=30m
 ```
 
 For each control/candidate process block, alternate
@@ -293,9 +348,26 @@ the command status, stderr, and aggregate. Reject numeric throughput evidence
 from incorrect, queue-refused, or calibration-invalid runs, but retain those
 runs in completion/failure statistics.
 
+The user-authorized `shaped-link-v1` experiment is selected in the runner by
+`simulator_gate: "shaped-link-v1"` (or by
+`CONNECT_PERFVAR_GATE_PROTOCOL=shaped-link-v1` for a direct instrument run).
+It emits schema 15 plus independent, same-process pre/post capacity receipts.
+Follow the exact demand, fidelity, provenance, and per-metric rules in
+[`PERFVAR.md`](PERFVAR.md#optional-separated-shaped-link-gates-schema-15).
+The static 360/72, dynamic 240/48 and clean-LAN 80/16 run/aggregate counts,
+six fresh processes per arm, and five nested repetitions are unchanged.
+Keep the legacy 10% flag and its filtered aggregate. Only independently
+qualified cell-edge latency/stall/wire/memory metrics may survive a
+headroom-only failure; throughput remains unqualified. A partial metric
+comparison cannot satisfy full PERF or promote any historical invalid record.
+Before opting a campaign into this protocol, freeze and record a fresh A/A
+capacity study and compatible workload baseline. Keep raw failures and source
+hashes in the private bundle and add findings to the tests ledger.
+
 Run the canonical static low-bar matrix exactly as defined by `PERFVAR.md`:
 
 ```sh
+WARP_ENV=local \
 CONNECT_PERFVAR_MEASURE=1 \
 CONNECT_PERFVAR_SEED=20260810 \
 CONNECT_PERFVAR_ROUTE=exchange-h1,exchange-h3,p2p-fast,p2p-legacy \
@@ -345,6 +417,45 @@ CONNECT_PERFVAR_BYTE_COUNT=33554432 \
 go test ./connect/perfvar -run '^TestPerformanceVariations$' \
   -count=1 -timeout=0 -v
 ```
+
+### Rolling-upgrade compatibility: current app to an older provider
+
+New apps initially encounter providers which do not support delivery-window
+resizing or the paced-transfer policy built from that receiver feedback. Run
+the dedicated H1 comparison in addition to the three matrices. It preserves a
+current app in both arms. It has two cells: five modern/legacy alternating
+pairs in each direction on the mobile 5 Mbit/s down / 1 Mbit/s up profile,
+and three pairs per direction at 100 Mbit/s / one-second RTT. The latter is a
+high-BDP activation guard: a current/current arm must report a grown sender
+window rather than merely carrying a resize setting.
+
+```sh
+CONNECT_PERFVAR_LEGACY_PROVIDER_SWEEP=1 \
+go test ./connect/perfvar -run '^TestPerfvarLegacyProviderCompatibilitySweep$' \
+  -count=1 -timeout=0 -v
+```
+
+Collect every `[perfvar-legacy-provider]` record and the single
+`[perfvar-legacy-provider-aggregate]` separately by direction and provider
+generation. Require all thirty-two planned records, including any failed
+attempts; the aggregate must report thirty-two observed attempts. The
+current-provider arm
+is the compatibility control; the legacy arm is a hard H1 performance guard.
+Apply the normal paired
+five-percent practical-effect and statistical rule from this runbook. A
+correctness failure, an invalid carrier observation, or a regression in either
+direction blocks the app rollout; it may not be averaged into the regular
+current/current static matrix. The record identity distinguishes the synthetic
+4 MiB device pools and current-provider pools from the legacy provider's nil
+pools and fixed receive hold; none are parented under the Android iOS-profile
+budget or qualify device memory. This models the protocol facts an old provider can
+expose: a fixed transfer window plus no `receive_window_byte_count`,
+ACK-compression, or receiver-delay advertisement. The 1 MiB cell arm is a
+legacy-feedback/pacing compatibility guard; the high-BDP arm has an explicit
+sender-window-growth assertion. Each row retains the full carrier counters and
+is invalid when the normal PERFVAR carrier-drop/queue-refusal validity check
+fails. It does not pretend to measure a different
+server binary or a physical radio.
 
 H1 is the performance primary; H3, DNS-H3,
 and Auto remain compatibility/correctness observations until their planned
@@ -425,13 +536,13 @@ speed until their planned rework has its own compatible baseline.
 Evaluate memory per session and role, not per 15-second sample as independent
 data:
 
-- **25,165,824 bytes (24 MiB) is an absolute `goRuntimeBytes` ceiling. Every clean sample during
+- **29,360,128 bytes (28 MiB) is an absolute iOS-profile `goRuntimeBytes` ceiling. Every clean sample during
   startup, active traffic, burst recovery, and the quiet connected window must
-  be at or below 24 MiB; one sample above the ceiling fails the cell.**
-- Report p50, p95, maximum, time to return below 24 MiB, and counts above 24
+  be at or below 28 MiB; one sample above the ceiling fails the cell.**
+- Report p50, p95, maximum, time to return below 28 MiB, and counts above 24
   and 28 MiB, but no percentile or later reclaim can excuse an over-ceiling
-  sample. The old 28-MiB threshold remains a severity diagnostic, not the
-  acceptance barrier;
+  sample. The 24-MiB count is historical comparison telemetry, not today's
+  acceptance barrier. Preserve previous 24-MiB verdicts; do not requalify old runs;
 - client and provider roles must pass independently;
 - packet roots must stay within the active policy bound, returned-pool storage
   must reconcile, reliable H1 carrier/Pack drops must remain zero, Pack waits
@@ -447,7 +558,7 @@ suggest reclaim; high live heap/goroutines with low pool retention suggests
 flow/topology; low live heap with high runtime suggests stacks, fragmentation,
 or allocator spans. Forced GC or trim is diagnostic, not a steady-memory fix.
 
-If a sample exceeds 24 MiB, preserve the clean run first. Then use a separately
+If a sample exceeds 28 MiB, preserve the clean run first. Then use a separately
 stamped `urnetworkMemoryProfileRateBytes=65536` build, take before/peak/after
 snapshots and a private heap profile, and reproduce the same bounded load in a
 simulator or host test. Never compare the profiled run's peak or forced-GC
@@ -456,7 +567,7 @@ recovery with the clean acceptance distribution.
 ## Regression deep dive and repair loop
 
 For every `REGRESSION`, `MIXED`, hard failure, corruption, timeout, video stall,
-or >24-MiB sample:
+or >28-MiB iOS-profile sample:
 
 1. Freeze the first failing artifacts and add a `diagnosing` entry to the tests
    ledger. Reproduce with the exact identity at least once; a disappearing

@@ -157,6 +157,12 @@ func solanaReconcileCredentialsPresent() bool {
 
 var solanaReconcileHasCredentials = solanaReconcileCredentialsPresent
 
+// The x402 leg reads only our own settled_not_granted events and retries the
+// grant locally; it needs no store credentials, so it always runs.
+var x402ReconcileHasCredentials = func() bool {
+	return true
+}
+
 // ----- apple App Store Server API client -----
 
 // The only genuinely new credential reconciliation needs: App Store Server
@@ -299,10 +305,13 @@ func appleDecodeJwsPayload(jws string) (map[string]any, error) {
 // ----- stripe API shapes (raw HTTP, via the stripeApiBaseUrl seam) -----
 
 type stripeReconcileSubscription struct {
-	Id                string            `json:"id"`
-	Status            string            `json:"status"`
-	CancelAtPeriodEnd bool              `json:"cancel_at_period_end"`
-	Metadata          map[string]string `json:"metadata"`
+	Id                  string            `json:"id"`
+	Status              string            `json:"status"`
+	CancelAtPeriodEnd   bool              `json:"cancel_at_period_end"`
+	Metadata            map[string]string `json:"metadata"`
+	CancellationDetails struct {
+		Reason string `json:"reason"`
+	} `json:"cancellation_details"`
 }
 
 // stripeSubscriptionOver applies the cancelled ≠ expired rule to a Stripe
@@ -375,8 +384,8 @@ type PaymentReconcileRunOptions struct {
 	// the real repair would carry, tagged dry_run.
 	DryRun bool
 	// Stores limits the pass to the named stores
-	// (model.SubscriptionMarketStripe | Apple | Google | Solana); empty runs
-	// all four. Filtered-out stores are untouched entirely: no events, no
+	// (model.SubscriptionMarketStripe | Apple | Google | Solana | X402); empty
+	// runs all of them. Filtered-out stores are untouched entirely: no events, no
 	// watermark.
 	Stores []string
 }
@@ -391,10 +400,6 @@ type PaymentReconcileStoreResult struct {
 	Errors               int  `json:"errors"`
 	Skipped              bool `json:"skipped,omitempty"`
 	BudgetExhausted      bool `json:"budget_exhausted,omitempty"`
-	// stripe only: how many invoice.paid credits since the last watermark
-	// resolved their network by the LEGACY customer-email fallback (S11) --
-	// surfaced, never repaired, until the fallback can be retired
-	EmailFallbacks int `json:"email_fallbacks,omitempty"`
 }
 
 type PaymentReconcileRunResult struct {
@@ -407,9 +412,6 @@ type PaymentReconcileRunResult struct {
 	Errors               int                                     `json:"errors"`
 	SkippedStores        []string                                `json:"skipped_stores,omitempty"`
 	StoreResults         map[string]*PaymentReconcileStoreResult `json:"store_results,omitempty"`
-	// the S11 email_fallback audit rows behind StoreResults' EmailFallbacks
-	// counts, so the CLI can print each one as a line
-	EmailFallbackEvents []*model.PaymentReconciliationEvent `json:"email_fallback_events,omitempty"`
 }
 
 type paymentReconcileRun struct {
@@ -430,8 +432,6 @@ type paymentReconcileRun struct {
 	storeDetails map[string]map[string]any
 	// per-store tallies for the run result (the CLI summary)
 	storeResults map[string]*PaymentReconcileStoreResult
-	// the S11 email_fallback rows surfaced this run (see reconcileStripe leg 0)
-	emailFallbackEvents []*model.PaymentReconciliationEvent
 }
 
 func paymentReconcileStoreCanAdvanceWatermark(complete bool, dryRun bool, errorsBefore int, errorsAfter int) bool {
@@ -481,22 +481,57 @@ func (self *paymentReconcileRun) record(
 }
 
 // recordCreditUnfulfillable is the narrow exception to record's best-effort
-// contract. This event is the only durable handle for a paid invoice that the
-// lifecycle lock refused to credit. If it is not persisted, count a store
+// contract. This event is the only durable handle for a paid invoice whose
+// destination is deleted or unresolved. If it is not persisted, count a store
 // error so the watermark stays fixed and the ordinary overlap retries it.
 // Completed credits/ends/metadata repairs retain their existing best-effort
 // audit behavior: their durable business writes must not be re-executed merely
 // because the secondary audit insert failed.
-func (self *paymentReconcileRun) recordCreditUnfulfillable(store string, evidence string) {
+func (self *paymentReconcileRun) recordCreditUnfulfillable(store string, evidence string, reason string) {
+	self.recordCreditUnfulfillableDetails(store, evidence, map[string]any{"reason": reason})
+}
+
+// recordCreditUnfulfillableDetails is recordCreditUnfulfillable with the
+// store identities support needs to place the payment (details must carry
+// "reason").
+func (self *paymentReconcileRun) recordCreditUnfulfillableDetails(store string, evidence string, details map[string]any) {
+	details["leg"] = "credit"
 	if !self.record(
 		store,
 		model.PaymentReconcileActionCreditUnfulfillable,
 		nil,
 		evidence,
-		map[string]any{"reason": "destination_deleted", "leg": "credit"},
+		details,
 	) {
 		self.errors += 1
 		self.storeResult(store).Errors += 1
+	}
+}
+
+// Terminal destination exceptions retain durable disposition evidence. All
+// provider, schema, and local persistence failures continue to block progress.
+func (self *paymentReconcileRun) recordStripeCreditError(invoice *StripeEventInvoiceObject, err error) {
+	evidence := invoice.Id
+	var unresolved *stripeInvoiceDestinationUnresolvedError
+	switch {
+	case errors.Is(err, model.ErrPaymentNetworkNotFound):
+		self.recordCreditUnfulfillable(model.SubscriptionMarketStripe, evidence, "destination_deleted")
+	case errors.As(err, &unresolved):
+		// a paid invoice that names no network (S11: no customer-email guess)
+		details := unresolved.details()
+		details["amount_total"] = invoice.Total
+		details["currency"] = invoice.Currency
+		self.recordCreditUnfulfillableDetails(model.SubscriptionMarketStripe, evidence, details)
+	case errors.Is(err, errStripeInvoiceDestinationUnresolved):
+		self.recordCreditUnfulfillable(model.SubscriptionMarketStripe, evidence, "destination_unresolved")
+	default:
+		self.record(
+			model.SubscriptionMarketStripe,
+			model.PaymentReconcileActionError,
+			nil,
+			evidence,
+			map[string]any{"error": err.Error(), "leg": "credit"},
+		)
 	}
 }
 
@@ -742,6 +777,7 @@ func runPaymentReconciliation(
 		{model.SubscriptionMarketApple, appleReconcileHasCredentials, reconcileApple},
 		{model.SubscriptionMarketGoogle, playReconcileHasCredentials, reconcilePlay},
 		{model.SubscriptionMarketSolana, solanaReconcileHasCredentials, reconcileSolana},
+		{model.SubscriptionMarketX402, x402ReconcileHasCredentials, reconcileX402},
 	}
 	if 0 < len(options.Stores) {
 		selected := map[string]bool{}
@@ -845,7 +881,6 @@ func runPaymentReconciliation(
 		Errors:               run.errors,
 		SkippedStores:        run.skipped,
 		StoreResults:         run.storeResults,
-		EmailFallbackEvents:  run.emailFallbackEvents,
 	}
 }
 
@@ -861,25 +896,6 @@ func runPaymentReconciliation(
 func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 	ctx := run.clientSession.Ctx
 	store := model.SubscriptionMarketStripe
-
-	// leg 0: surface, never repair -- every invoice.paid credit since the last
-	// watermark that resolved its network by the LEGACY customer-email
-	// fallback (S11). The webhook already credited (that is the point of the
-	// fallback); counting it here in the heartbeat, the run result, and the
-	// CLI summary is what keeps every use visible until the fallback can be
-	// retired. A DB read: costs no store API budget, safe in a dry run.
-	emailFallbackEvents := model.GetPaymentReconciliationEventsByAction(
-		ctx,
-		store,
-		model.PaymentReconcileActionEmailFallback,
-		since,
-		paymentReconcileRenewalLimit,
-	)
-	if 0 < len(emailFallbackEvents) {
-		run.storeResult(store).EmailFallbacks = len(emailFallbackEvents)
-		run.storeDetail(store)["email_fallbacks"] = len(emailFallbackEvents)
-		run.emailFallbackEvents = append(run.emailFallbackEvents, emailFallbackEvents...)
-	}
 
 	// leg 1: store-side listing -- paid invoices created since the watermark
 	// whose credit never landed (the lost invoice.paid repair)
@@ -926,58 +942,30 @@ func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 				return false, nil
 			}
 			if run.dryRun {
-				// resolve where the credit WOULD land without crediting: the
-				// expanded invoice's subscription metadata names the network
-				// for server-created checkouts (the first source the real
-				// credit path reads). The deeper fallbacks (checkout-session
-				// client reference, customer email) stay with the credit
-				// path, so a dry-run line can show no network id where a real
-				// run would still resolve one.
-				fullInvoice, err := server.HttpGetRequireStatusOk[*stripeReconcileInvoiceExpanded](
-					ctx,
-					fmt.Sprintf(
-						"%s/v1/invoices/%s?expand[]=subscription",
-						stripeApiBaseUrl,
-						url.PathEscape(invoice.Id),
-					),
-					func(header http.Header) {
-						header.Add("Authorization", fmt.Sprintf("Bearer %s", stripeApiTokenFunc()))
-					},
-					server.ResponseJsonObject[*stripeReconcileInvoiceExpanded],
-				)
+				credit, err := stripeResolveInvoiceCredit(invoice.Id, run.clientSession)
 				if err != nil {
-					run.record(
-						store,
-						model.PaymentReconcileActionError,
-						nil,
-						invoice.Id,
-						map[string]any{"error": err.Error(), "leg": "credit"},
-					)
+					run.recordStripeCreditError(invoice, err)
 					continue
 				}
-				if fullInvoice.Subscription == nil {
+				if credit == nil {
 					// a non-subscription invoice -- the real run would do nothing
 					continue
 				}
-				var networkId *server.Id
-				if id, err := server.ParseId(fullInvoice.Subscription.Metadata["network_id"]); err == nil {
-					networkId = &id
-				}
-				if networkId != nil && !model.NetworkExists(ctx, *networkId) {
+				if !model.NetworkExists(ctx, credit.networkId) {
 					// Match the real credit's lifecycle-lock refusal without
 					// consuming its ledger or pretending a different destination
 					// would receive the paid invoice.
-					run.recordCreditUnfulfillable(store, invoice.Id)
+					run.recordCreditUnfulfillable(store, invoice.Id, "destination_deleted")
 					continue
 				}
 				run.record(
 					store,
 					model.PaymentReconcileActionWouldCredit,
-					networkId,
+					&credit.networkId,
 					invoice.Id,
 					map[string]any{
 						"total":        invoice.Total,
-						"subscription": fullInvoice.Subscription.Id,
+						"subscription": credit.subscriptionId,
 					},
 				)
 				continue
@@ -986,21 +974,7 @@ func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 			// stripe_invoice ledger gate, so a racing late webhook delivery for
 			// the same invoice credits exactly once between the two of them
 			if _, err := stripeHandleInvoicePaid(invoice, run.clientSession); err != nil {
-				if errors.Is(err, model.ErrPaymentNetworkNotFound) {
-					// The paid invoice is real, but the named destination no
-					// longer exists. Keep that terminal business exception
-					// durable without classing it as an adapter failure that pins
-					// the entire Stripe listing watermark.
-					run.recordCreditUnfulfillable(store, invoice.Id)
-					continue
-				}
-				run.record(
-					store,
-					model.PaymentReconcileActionError,
-					nil,
-					invoice.Id,
-					map[string]any{"error": err.Error(), "leg": "credit"},
-				)
+				run.recordStripeCreditError(invoice, err)
 				continue
 			}
 			if networkId, credited := model.GetStripeInvoiceNetworkId(ctx, invoice.Id); credited {
@@ -1073,6 +1047,17 @@ func reconcileStripe(run *paymentReconcileRun, since time.Time) (bool, error) {
 		if fullInvoice.Subscription == nil {
 			continue
 		}
+		// Preserve a verified paid window through manual-payment grace even
+		// if Stripe marks the renewal unpaid or auto-cancels it early. A
+		// customer-requested cancellation is not a payment failure.
+		manualPaymentGrace := (fullInvoice.Subscription.Status == "unpaid" ||
+			(fullInvoice.Subscription.Status == "canceled" &&
+				fullInvoice.Subscription.CancellationDetails.Reason == "payment_failed")) &&
+			renewal.EndTime.After(run.now) &&
+			stripeRenewalMatchesInvoice(ctx, renewal, fullInvoice)
+		if manualPaymentGrace {
+			continue
+		}
 		if stripeSubscriptionOver(fullInvoice.Subscription.Status) {
 			run.end(
 				store,
@@ -1126,8 +1111,12 @@ func stripeRenewalMatchesInvoice(
 		if line.Subscription != nil && *line.Subscription != invoice.Subscription.Id {
 			continue
 		}
+		periodEnd := time.Unix(line.Period.End, 0)
 		if renewal.StartTime.Equal(time.Unix(line.Period.Start, 0)) &&
-			renewal.EndTime.Equal(time.Unix(line.Period.End, 0).Add(SubscriptionGracePeriod)) {
+			(renewal.EndTime.Equal(periodEnd.Add(manualPaymentGracePeriod)) ||
+				// Existing paid invoices retain the old 24-hour window until a
+				// separately verified migration extends them.
+				renewal.EndTime.Equal(periodEnd.Add(SubscriptionGracePeriod))) {
 			return true
 		}
 	}
@@ -1233,7 +1222,8 @@ func reconcileApple(run *paymentReconcileRun, since time.Time) (bool, error) {
 				)
 				continue
 			}
-			transaction, err := validateAppleTransaction(
+			transaction, err := validateAppleTransactionBound(
+				ctx,
 				AppleNotificationDecodedPayload{
 					SignedDate:      run.now.UnixMilli(),
 					TransactionInfo: claims,
@@ -1338,7 +1328,7 @@ func appleReconcileCreditTransaction(
 		SignedDate:      server.NowUtc().UnixMilli(),
 		TransactionInfo: transactionClaims,
 	}
-	transaction, err := validateAppleTransaction(notification, allowedProductIds, true)
+	transaction, err := validateAppleTransactionBound(ctx, notification, allowedProductIds, true)
 	if err != nil {
 		return false, server.Id{}, err
 	}
@@ -1458,6 +1448,18 @@ func reconcilePlay(run *paymentReconcileRun, since time.Time) (bool, error) {
 		}
 
 		if sub.SubscriptionState == "SUBSCRIPTION_STATE_ACTIVE" {
+			if playUnlinkedBoundElsewhere(run.clientSession, sub, renewal) {
+				// a purchase without an account link is bound to a different
+				// network than this renewal row: never credit the row's network
+				run.record(
+					store,
+					model.PaymentReconcileActionError,
+					&renewal.NetworkId,
+					purchaseToken,
+					map[string]any{"error": "purchase is bound to another network", "leg": "validate"},
+				)
+				continue
+			}
 			repairMatches, matchErr := playRenewalMatchesSubscription(
 				run.clientSession,
 				renewal,
@@ -1543,6 +1545,23 @@ func reconcilePlay(run *paymentReconcileRun, since time.Time) (bool, error) {
 	return true, nil
 }
 
+// playUnlinkedBoundElsewhere: the purchase carries no account identifiers
+// and its binding names a network other than the renewal row's. A purchase
+// that was never bound keeps the row's network (rows credited before the
+// binding existed).
+func playUnlinkedBoundElsewhere(
+	clientSession *session.ClientSession,
+	subscription *PlaySubscription,
+	renewal *model.ReconcileSubscriptionRenewal,
+) bool {
+	linkedNetworkId, validLink := playLinkedNetworkId(clientSession, subscription)
+	if !validLink || linkedNetworkId != nil {
+		return false
+	}
+	networkId, bound := playPurchaseBindingLookupFunc(clientSession.Ctx, renewal.PurchaseToken, subscription.LinkedPurchaseToken, false)
+	return bound && networkId != renewal.NetworkId
+}
+
 func playRenewalMatchesSubscription(
 	clientSession *session.ClientSession,
 	renewal *model.ReconcileSubscriptionRenewal,
@@ -1560,7 +1579,9 @@ func playRenewalMatchesSubscription(
 	if !ok || !sku.Supporter {
 		return false, nil
 	}
-	linkedNetworkId, validLink := playLinkedNetworkId(clientSession, subscription)
+	// the account link, or for a purchase without one the binding the verify
+	// endpoint made (read-only: a reconcile pass never writes a binding)
+	linkedNetworkId, validLink := playResolveNetworkId(clientSession, subscription, renewal.PurchaseToken, false)
 	if !validLink || linkedNetworkId == nil {
 		return false, nil
 	}
@@ -1758,4 +1779,91 @@ func solanaStatusConfirmsPayment(statusErr any, confirmationStatus *string) bool
 		return false
 	}
 	return *confirmationStatus == "confirmed" || *confirmationStatus == "finalized"
+}
+
+// ----- x402 -----
+//
+// decision table (our settled_not_granted events -> action):
+//
+//	unresolved, settle tx already granted       -> already_credited (resolves)
+//	unresolved, not granted                     -> grant (idempotent on the settle tx) -> credited
+//	unresolved, network deleted                 -> credit_unfulfillable (resolves)
+//	unresolved, grant fails otherwise           -> error (retried next run)
+//
+// There is no store to pull from: the facilitator already settled, so the
+// truth is our own record of the settle transaction (S9).
+
+var (
+	x402ListUnresolvedSettledNotGranted = func(ctx context.Context, limit int) []*model.PaymentReconciliationEvent {
+		return model.GetUnresolvedSettledNotGrantedEvents(ctx, model.SubscriptionMarketX402, limit)
+	}
+	x402ReconcileTransactionGranted = x402TransactionGranted
+)
+
+func reconcileX402(run *paymentReconcileRun, since time.Time) (bool, error) {
+	store := model.SubscriptionMarketX402
+	ctx := run.clientSession.Ctx
+
+	events := x402ListUnresolvedSettledNotGranted(ctx, paymentReconcileRenewalLimit)
+	for _, event := range events {
+		if !run.spend(store) {
+			return false, nil
+		}
+		run.examine(store)
+
+		transaction := event.Evidence
+		if event.NetworkId == nil {
+			run.recordCreditUnfulfillable(store, transaction, "destination_unresolved")
+			continue
+		}
+		networkId := *event.NetworkId
+
+		sku, network, err := x402SkuFromSettledNotGrantedDetails(event.Details)
+		if err != nil {
+			run.record(store, model.PaymentReconcileActionError, &networkId, transaction, map[string]any{
+				"error": err.Error(),
+				"leg":   "credit",
+			})
+			continue
+		}
+		details := map[string]any{
+			"sku_id":  sku.SkuId,
+			"network": network,
+			"leg":     "credit",
+		}
+
+		if x402ReconcileTransactionGranted(ctx, networkId, transaction) {
+			run.record(store, model.PaymentReconcileActionAlreadyCredited, &networkId, transaction, details)
+			continue
+		}
+		if run.dryRun {
+			run.record(store, model.PaymentReconcileActionWouldCredit, &networkId, transaction, details)
+			continue
+		}
+
+		err = func() error {
+			settleResponse := &X402SettleResponse{
+				Success:     true,
+				Transaction: transaction,
+				Network:     network,
+			}
+			netRevenue := model.UsdToNanoCents(sku.PriceUsd)
+			if sku.Pro {
+				return x402GrantProMonthFunc(ctx, networkId, sku, netRevenue, settleResponse)
+			}
+			return x402GrantDataFunc(ctx, networkId, sku, netRevenue, settleResponse)
+		}()
+		switch {
+		case errors.Is(err, model.ErrPaymentNetworkNotFound):
+			run.recordCreditUnfulfillable(store, transaction, "destination_deleted")
+		case err != nil:
+			run.record(store, model.PaymentReconcileActionError, &networkId, transaction, map[string]any{
+				"error": err.Error(),
+				"leg":   "credit",
+			})
+		default:
+			run.record(store, model.PaymentReconcileActionCredited, &networkId, transaction, details)
+		}
+	}
+	return true, nil
 }

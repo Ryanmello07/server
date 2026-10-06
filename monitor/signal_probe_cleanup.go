@@ -43,12 +43,6 @@ WITH clock AS MATERIALIZED (
         nc.active,
         nc.create_time,
         nc.deactivate_time,
-        EXISTS (
-            SELECT 1
-            FROM network_client_connection ncc
-            WHERE ncc.client_id = nc.client_id
-              AND ncc.connected
-        ) AS connected,
         k.now_utc
     FROM prober p
     INNER JOIN network_client nc
@@ -56,6 +50,20 @@ WITH clock AS MATERIALIZED (
      AND nc.source_client_id = p.client_id
     CROSS JOIN clock k
     WHERE nc.create_time >= k.now_utc - interval '6 hours'
+), mature_active AS MATERIALIZED (
+    SELECT
+        r.client_id,
+        r.create_time,
+        r.now_utc,
+        EXISTS (
+            SELECT 1
+            FROM network_client_connection ncc
+            WHERE ncc.client_id = r.client_id
+              AND ncc.connected
+        ) AS connected
+    FROM recent r
+    WHERE r.create_time < r.now_utc - interval '10 minutes'
+      AND r.active
 ), aggregate AS (
     SELECT
         count(*)::bigint AS created_6h,
@@ -67,29 +75,22 @@ WITH clock AS MATERIALIZED (
               AND NOT active
         )::bigint AS mature_inactive,
         count(*) FILTER (
-            WHERE create_time < now_utc - interval '10 minutes'
-              AND active
-              AND connected
-        )::bigint AS mature_active_connected,
-        count(*) FILTER (
-            WHERE create_time < now_utc - interval '10 minutes'
-              AND active
-              AND NOT connected
-        )::bigint AS mature_active_disconnected,
-        count(*) FILTER (
             WHERE create_time >= now_utc - interval '10 minutes'
               AND active
         )::bigint AS fresh_active,
         count(*) FILTER (
             WHERE NOT active
               AND deactivate_time IS NULL
-        )::bigint AS inactive_without_deactivate_time,
-        COALESCE(floor(max(extract(epoch FROM (now_utc - create_time))) FILTER (
-            WHERE create_time < now_utc - interval '10 minutes'
-              AND active
-              AND NOT connected
-        )), 0)::bigint AS oldest_active_disconnected_age_seconds
+        )::bigint AS inactive_without_deactivate_time
     FROM recent
+), mature_active_aggregate AS (
+    SELECT
+        count(*) FILTER (WHERE connected)::bigint AS mature_active_connected,
+        count(*) FILTER (WHERE NOT connected)::bigint AS mature_active_disconnected,
+        COALESCE(floor(max(extract(epoch FROM (now_utc - create_time))) FILTER (
+            WHERE NOT connected
+        )), 0)::bigint AS oldest_active_disconnected_age_seconds
+    FROM mature_active
 ), residual_connection_history AS MATERIALIZED (
     SELECT
         EXISTS (
@@ -97,10 +98,8 @@ WITH clock AS MATERIALIZED (
             FROM network_client_connection ncc
             WHERE ncc.client_id = r.client_id
         ) AS ever_connected
-    FROM recent r
-    WHERE r.create_time < r.now_utc - interval '10 minutes'
-      AND r.active
-      AND NOT r.connected
+    FROM mature_active r
+    WHERE NOT r.connected
 ), residual_aggregate AS (
     SELECT
         count(*) FILTER (WHERE NOT ever_connected)::bigint AS mature_active_disconnected_never_connected,
@@ -120,6 +119,7 @@ SELECT
     mature_active_disconnected_never_connected::text,
     mature_active_disconnected_ever_connected::text
 FROM aggregate
+CROSS JOIN mature_active_aggregate
 CROSS JOIN residual_aggregate;
 `
 }
@@ -268,12 +268,12 @@ func probeUnusedArgsRetirementFinding(snapshot probeCleanupSnapshot, severity st
 			"%d of %d mature egress-prober children never opened a connection and remain active",
 			snapshot.matureDisconnectedNeverConnected, snapshot.matureCreated,
 		),
-		mechanism: "A child with no lifetime connection row was discarded before it entered the generated-client channel path, such as an unused, late, expired, or failed client argument. Those direct RemoveClientArgs calls must be admitted to the generator retirement lifecycle and joined by shutdown; otherwise API cancellation can strand their asynchronous remove request.",
+		mechanism: "A child with no lifetime connection row can lose its committed identity before mint returns, or be discarded as an unused, late, expired, or failed client argument. An optional Redis cache fill must not turn a committed mint into an error with no identity. For returned arguments, direct RemoveClientArgs calls must be admitted to the generator retirement lifecycle and joined by shutdown; otherwise API cancellation can strand their asynchronous remove request.",
 		baseline:  "After a ten-minute close grace, every never-connected prober-derived client has been retired; fresh active children remain outside the mature cohort.",
 		observed:  probeCleanupObserved(snapshot),
 		evidence:  "The bounded query evaluates lifetime connection existence only for mature active-disconnected residuals and exports aggregate branch counts. Client, network, connection, and credential identifiers never leave PostgreSQL.",
-		context:   "This is the pre-channel/direct-argument cleanup branch. Children that previously opened a connection are independently reported as probe-child-retirement. It is a software lifecycle fault, not proof of provider capacity pressure and not authority for historical row deletion.",
-		action:    "Make live direct client-argument removal retirement-admitted and ensure generator CloseAndWait joins it before canceling the API. Retain generation-safe RemoveIfCurrent behavior, store preservation during shutdown, and bounded late-after-close best effort. Prove the ordering with a deterministic blocked remove-client response. Do not bulk-deactivate production rows.",
+		context:   "The aggregate does not identify which mint or cleanup step failed. This is the pre-channel/direct-argument cleanup branch. Children that previously opened a connection are independently reported as probe-child-retirement. It is a software lifecycle fault, not proof of provider capacity pressure and not authority for historical row deletion.",
+		action:    "Compare the running artifact and participating source with prior corrections before recommending deployment. Preserve the committed child identity through optional Redis cache fill failure, and prove it using a separate PostgreSQL connection with cancellation before and after commit. Make live direct client-argument removal retirement-admitted and ensure generator CloseAndWait joins it before canceling the API. Retain generation-safe RemoveIfCurrent behavior, store preservation during shutdown, and bounded late-after-close best effort. Prove cleanup ordering with a deterministic blocked remove-client response. Do not bulk-deactivate production rows.",
 		verify:    "After every affected process converges, start a post-rollout cohort and require zero mature never-connected residuals while §2.19 proves continuing probe work. Then require the complete rolling six-hour window plus the ten-minute grace to clear.",
 		playbook:  "SIGNALS.md §2.25, §2.19, §2.23, and §8.12",
 	}

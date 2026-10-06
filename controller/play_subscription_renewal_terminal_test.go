@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gagliardetto/solana-go"
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
@@ -237,6 +240,163 @@ func TestPlaySubscriptionRenewalTerminalStatesEndMatchingEntitlement(t *testing.
 	})
 }
 
+// A non-renewed subscription past its grace period must finish its post hook
+// even when a guest or wallet admin has no recipient for the optional notice.
+func TestPlaySubscriptionRenewalPostWithoutEmailCompletes(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		previousSender := GetAWSMessageSender()
+		sent := 0
+		SetMessageSender(&mockAWSMessageSender{
+			SendMessageFunc: func(string, Template, ...any) error {
+				sent++
+				return nil
+			},
+		})
+		defer SetMessageSender(previousSender)
+
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+		result := &PlaySubscriptionRenewalResult{ExpiryTime: server.NowUtc().Add(-2 * SubscriptionGracePeriod)}
+
+		for _, accountType := range []string{"guest", "wallet"} {
+			networkId := server.NewId()
+			if accountType == "guest" {
+				model.Testing_CreateGuestNetwork(ctx, networkId, "synthetic-no-email-guest", server.NewId())
+			} else {
+				wallet := solana.NewWallet()
+				message := "synthetic subscription notice fixture"
+				signature, err := wallet.PrivateKey.Sign([]byte(message))
+				if err != nil {
+					t.Fatal(err)
+				}
+				model.Testing_CreateNetworkByWallet(ctx, networkId, "synthetic-no-email-wallet", server.NewId(),
+					wallet.PublicKey().String(), base64.StdEncoding.EncodeToString(signature[:]), message)
+			}
+			args := playTerminalTestArgs(networkId, "synthetic.package", "synthetic-no-email-"+accountType)
+			var posts []server.PostFunction
+			var postErr error
+			server.Tx(ctx, func(tx server.PgTx) {
+				posts, postErr = PlaySubscriptionRenewalPost(args, result, clientSession, tx)
+			})
+			if postErr != nil || len(posts) != 0 {
+				t.Fatalf("%s completed post without recipient: posts=%d err=%v", accountType, len(posts), postErr)
+			}
+			if count, _ := countScheduledPlayRenewals(t, ctx, args.PurchaseToken); count != 0 {
+				t.Fatalf("%s completed post scheduled %d additional renewals, want none", accountType, count)
+			}
+		}
+		if sent != 0 {
+			t.Fatalf("sent %d notices without a recipient", sent)
+		}
+	})
+}
+
+// An existing recipient still receives exactly one notice with the intended
+// template when the completed renewal stops scheduling itself. The post sends
+// nothing in its transaction; it returns the send for after the commit.
+func TestPlaySubscriptionRenewalPostWithEmailSendsNotice(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkId := server.NewId()
+		userId := server.NewId()
+		model.Testing_CreateGuestNetwork(ctx, networkId, "synthetic-email-recipient", userId)
+		const recipient = "recipient@synthetic.example"
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx,
+				`UPDATE network_user SET user_auth = $1, auth_type = $2 WHERE user_id = $3`,
+				recipient, model.AuthTypePassword, userId))
+		})
+		previousSender := GetAWSMessageSender()
+		sent := 0
+		SetMessageSender(&mockAWSMessageSender{
+			SendMessageFunc: func(userAuth string, template Template, _ ...any) error {
+				if userAuth != recipient {
+					t.Errorf("notice recipient = %q, want %q", userAuth, recipient)
+				}
+				if _, ok := template.(*SubscriptionEndedTemplate); !ok {
+					t.Errorf("notice template = %T", template)
+				}
+				sent++
+				return nil
+			},
+		})
+		defer SetMessageSender(previousSender)
+
+		clientSession := session.Testing_CreateClientSession(ctx, nil)
+		args := playTerminalTestArgs(networkId, "synthetic.package", "synthetic-email-token")
+		result := &PlaySubscriptionRenewalResult{ExpiryTime: server.NowUtc().Add(-2 * SubscriptionGracePeriod)}
+		var posts []server.PostFunction
+		var postErr error
+		openSent := 0
+		server.Tx(ctx, func(tx server.PgTx) {
+			posts, postErr = PlaySubscriptionRenewalPost(args, result, clientSession, tx)
+			openSent = sent
+		})
+		if postErr != nil || openSent != 0 {
+			t.Fatalf("email completed post error=%v notices in its transaction=%d, want none", postErr, openSent)
+		}
+		// the worker runs the post's work after the finish commits
+		server.RunPosts(ctx, posts...)
+		if sent != 1 {
+			t.Fatalf("email completed post notices=%d, want one", sent)
+		}
+		if count, _ := countScheduledPlayRenewals(t, ctx, args.PurchaseToken); count != 0 {
+			t.Fatalf("email completed post scheduled %d additional renewals, want none", count)
+		}
+	})
+}
+
+// A canceled database lookup must remain a failed post even for an account
+// whose successful lookup would have produced the skippable recipient error.
+// The lookup reads on the post's transaction with the session's context, so the
+// failure is that context's cancellation.
+func TestPlaySubscriptionRenewalPostPreservesDatabaseCancellation(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		networkId := server.NewId()
+		model.Testing_CreateGuestNetwork(ctx, networkId, "synthetic-canceled-recipient", server.NewId())
+		previousSender := GetAWSMessageSender()
+		sent := 0
+		SetMessageSender(&mockAWSMessageSender{
+			SendMessageFunc: func(string, Template, ...any) error {
+				sent++
+				return nil
+			},
+		})
+		defer SetMessageSender(previousSender)
+
+		lookupCtx, cancel := context.WithCancel(ctx)
+		clientSession := session.Testing_CreateClientSession(lookupCtx, nil)
+		cancel()
+		args := playTerminalTestArgs(networkId, "synthetic.package", "synthetic-canceled-recipient-token")
+		result := &PlaySubscriptionRenewalResult{ExpiryTime: server.NowUtc().Add(-2 * SubscriptionGracePeriod)}
+		var postErr error
+		func() {
+			defer func() {
+				if value := recover(); value != nil {
+					var ok bool
+					if postErr, ok = value.(error); !ok {
+						panic(value)
+					}
+				}
+			}()
+			// Keep the transaction live so cancellation occurs in GetUserAuthInTx.
+			server.Tx(ctx, func(tx server.PgTx) {
+				_, postErr = PlaySubscriptionRenewalPost(args, result, clientSession, tx)
+			})
+		}()
+		if !errors.Is(postErr, context.Canceled) {
+			t.Fatalf("canceled lookup error = %v, want the session's cancellation", postErr)
+		}
+		if sent != 0 {
+			t.Fatalf("sent %d notices after failed recipient lookup", sent)
+		}
+		if count, _ := countScheduledPlayRenewals(t, ctx, args.PurchaseToken); count != 0 {
+			t.Fatalf("failed post scheduled %d additional renewals, want none", count)
+		}
+	})
+}
+
 // TestPlaySubscriptionRenewalFutureCancellationPreservesAndReschedules proves
 // cancel-at-period-end is not terminal: paid access remains and the task keeps
 // one poll at the maximum provider paid-through expiry.
@@ -299,8 +459,8 @@ func TestPlaySubscriptionRenewalFutureCancellationPreservesAndReschedules(t *tes
 		}
 
 		server.Tx(ctx, func(tx server.PgTx) {
-			if err := PlaySubscriptionRenewalPost(args, result, clientSession, tx); err != nil {
-				t.Fatalf("future cancellation post: %v", err)
+			if posts, err := PlaySubscriptionRenewalPost(args, result, clientSession, tx); err != nil || len(posts) != 0 {
+				t.Fatalf("future cancellation post: posts=%d err=%v", len(posts), err)
 			}
 		})
 		count, runAt := countScheduledPlayRenewals(t, ctx, purchaseToken)
@@ -317,13 +477,13 @@ func TestPlaySubscriptionRenewalFutureCancellationPreservesAndReschedules(t *tes
 		legacyToken := "synthetic-legacy-canceled"
 		legacyArgs := playTerminalTestArgs(networkId, env.packageName, legacyToken)
 		server.Tx(ctx, func(tx server.PgTx) {
-			if err := PlaySubscriptionRenewalPost(
+			if posts, err := PlaySubscriptionRenewalPost(
 				legacyArgs,
 				&PlaySubscriptionRenewalResult{Canceled: true},
 				clientSession,
 				tx,
-			); err != nil {
-				t.Fatalf("legacy canceled post: %v", err)
+			); err != nil || len(posts) != 0 {
+				t.Fatalf("legacy canceled post: posts=%d err=%v", len(posts), err)
 			}
 		})
 		if count, _ := countScheduledPlayRenewals(t, ctx, legacyToken); count != 0 {
@@ -337,7 +497,7 @@ func TestPlaySubscriptionRenewalFutureCancellationPreservesAndReschedules(t *tes
 		crossedArgs := playTerminalTestArgs(networkId, env.packageName, crossedToken)
 		beforePost := server.NowUtc()
 		server.Tx(ctx, func(tx server.PgTx) {
-			if err := PlaySubscriptionRenewalPost(
+			if posts, err := PlaySubscriptionRenewalPost(
 				crossedArgs,
 				&PlaySubscriptionRenewalResult{
 					Canceled:   true,
@@ -345,8 +505,8 @@ func TestPlaySubscriptionRenewalFutureCancellationPreservesAndReschedules(t *tes
 				},
 				clientSession,
 				tx,
-			); err != nil {
-				t.Fatalf("crossed-boundary canceled post: %v", err)
+			); err != nil || len(posts) != 0 {
+				t.Fatalf("crossed-boundary canceled post: posts=%d err=%v", len(posts), err)
 			}
 		})
 		afterPost := server.NowUtc()
@@ -485,8 +645,8 @@ func TestPlaySubscriptionRenewalGoneEndsIdempotentlyAndStops(t *testing.T) {
 			t.Fatalf("first gone result = %+v, want terminal end", first)
 		}
 		server.Tx(ctx, func(tx server.PgTx) {
-			if err := PlaySubscriptionRenewalPost(args, first, clientSession, tx); err != nil {
-				t.Fatalf("gone renewal post: %v", err)
+			if posts, err := PlaySubscriptionRenewalPost(args, first, clientSession, tx); err != nil || len(posts) != 0 {
+				t.Fatalf("gone renewal post: posts=%d err=%v", len(posts), err)
 			}
 		})
 		if count, _ := countScheduledPlayRenewals(t, ctx, purchaseToken); count != 0 {

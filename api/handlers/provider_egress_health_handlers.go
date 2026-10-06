@@ -6,18 +6,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/urnetwork/glog"
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/qualityprobe/egresshealth"
 )
 
 // maxProviderEgressHealthBody bounds the request body. It is larger than the
 // bandwidth endpoints' 4 KiB cap because this body carries a per-class map plus
-// two joined destination-name lists, and a run against a wide table can name a
-// dozen failed destinations.
-const maxProviderEgressHealthBody = 16 * 1024
+// five joined destination-name lists, each of which the prober bounds to 512
+// bytes.
+const maxProviderEgressHealthBody = 128 * 1024
 
 // providerEgressHealthReputationClass is the class name that must never appear
 // inside class_results. See ProviderEgressHealthResult for why this is checked
@@ -31,24 +33,26 @@ type ProviderEgressHealthClassResult struct {
 	Total int `json:"total"`
 }
 
-// SubmitProviderEgressHealthArgs is one egress-health run for one provider, as
-// the prober measured it.
-//
-// There is deliberately no measured_at field: the server stamps arrival time,
-// exactly as the bandwidth result endpoint does. A caller-supplied timestamp
-// would be one more thing to validate and one more way for a skewed prober
-// clock to write a row that looks stale or future-dated.
+// One immutable URL outcome, or an older aggregate retained only for audit.
+// Validated URL evidence preserves its measurement time rather than arrival
+// time, so delayed publication cannot refresh rolling eligibility. Timestamps
+// more than one minute in the future are rejected. Legacy evidence without a
+// policy timestamp uses arrival time but cannot satisfy the URL-policy gate.
 type SubmitProviderEgressHealthArgs struct {
-	ClientId server.Id `json:"client_id"`
-	// OKCount/TotalCount cover the SCORED classes only. Reputation is not part
-	// of them and must never be added to them.
+	ClientId         server.Id                      `json:"client_id"`
+	RunId            server.Id                      `json:"run_id"`
+	CycleStartedAt   time.Time                      `json:"cycle_started_at,omitempty"`
+	UrlProbeEvidence *egresshealth.UrlProbeEvidence `json:"url_probe_evidence,omitempty"`
+	// OKCount/TotalCount cover every class over the measured scored loads. A
+	// load that was not measured, and a canary, is in neither.
 	OKCount    int `json:"ok_count"`
 	TotalCount int `json:"total_count"`
-	// ClassResults is the per-class tally for the scored classes. Its ok and
-	// total must sum to exactly OKCount and TotalCount.
+	// ClassResults is the per-class tally. Its ok and total must sum to
+	// exactly OKCount and TotalCount.
 	ClassResults map[string]ProviderEgressHealthClassResult `json:"class_results"`
-	// ReputationOK/ReputationTotal are stored beside the health figures and
-	// never inside them.
+	// ReputationOK/ReputationTotal/ReputationFailedNames are the dissolved
+	// reputation class's: its sites are scored with the rest now. They are
+	// accepted, always zero from a current prober, and ignored.
 	ReputationOK          int    `json:"reputation_ok"`
 	ReputationTotal       int    `json:"reputation_total"`
 	FailedNames           string `json:"failed_names"`
@@ -57,6 +61,18 @@ type SubmitProviderEgressHealthArgs struct {
 	// cannot authenticate the requested HTTPS host is a hard integrity failure,
 	// even when unrelated destinations make ok_count/total_count look healthy.
 	TLSAuthenticationFailure bool `json:"tls_authentication_failure"`
+	// NotMeasuredCount/NotMeasuredNames are the loads whose tunnel was gone and
+	// could not be re-created in time: already out of ok_count and
+	// total_count, and never counted against the exit.
+	NotMeasuredCount int    `json:"not_measured_count"`
+	NotMeasuredNames string `json:"not_measured_names"`
+	// CanaryPassedNames/CanaryFailedNames are the unscored canaries of the
+	// run, loaded from a place their site is marked incompatible with.
+	CanaryPassedNames string `json:"canary_passed_names"`
+	CanaryFailedNames string `json:"canary_failed_names"`
+	// ShortClasses is the comma-joined classes too thin, for the provider's
+	// place, to fill their sample.
+	ShortClasses string `json:"short_classes"`
 }
 
 // readStrictOperatorRequestBody reads a bounded operator request body and
@@ -93,13 +109,8 @@ func readStrictOperatorRequestBody(w http.ResponseWriter, r *http.Request, out a
 }
 
 // ProviderEgressHealthResult ingests one egress-health run from the operator's
-// prober. The prober runs the check over the same tunnel the geolocation probe
-// opened, and until now only logged the result -- so the one signal that says
-// whether a provider carries traffic at all rolled off with the container
-// logs. This stores it.
-//
-// The route is operator-to-server, gated by the same operator secret as the
-// egress-location and bandwidth ingest endpoints. There is no network jwt.
+// prober. The route is operator-to-server, gated by the same operator secret as
+// the egress-location and bandwidth ingest endpoints. There is no network jwt.
 //
 // # Everything is validated before anything is stored
 //
@@ -108,23 +119,20 @@ func readStrictOperatorRequestBody(w http.ResponseWriter, r *http.Request, out a
 // measurement for that provider. That is why every rule below returns 400
 // before the store, and why none of them is a stored-then-flagged warning.
 //
-// # Reputation is not health
+// # What counts
 //
-// reputation_ok/reputation_total are stored and never folded into
-// ok_count/total_count, and a "reputation" key inside class_results is
-// rejected outright. The reputation class measures whether large vendors treat
-// the exit ip as a datacenter address; nearly every honest hosted provider
-// fails most of it, because it IS hosted. Folding it in would score a provider
-// that carried every byte it was asked for as partly broken, and would punish
-// the well-run datacenter providers hardest.
+// The counts are the prober's, over the loads it measured after their
+// retries, with one server-side cut: a failed load of a site the pool has on
+// probation, or of one marked incompatible with the provider's place, leaves
+// the counts and is named in unscored_failed_names (model.
+// ScoreProviderEgressHealth). The probe task submits runs already cut this way,
+// passes included; the cut here is what the wire allows for any other
+// submitter, since a run names its failures and not its passes.
 //
-// The explicit rejection exists because the alternative is worse than a
-// rejection. If a caller ever put reputation inside class_results, the sum
-// check would fail and every submission would 400 -- and the obvious "fix" is
-// to relax the sum check, at which point reputation is silently inside the
-// health score and nothing says so. The operator-proxy's egresshealth package
-// calls this exact mistake "the one thing in this package most likely to be
-// 'fixed' into a bug"; this is the server-side half of that guard.
+// A "reputation" key inside class_results is still rejected outright. The
+// class dissolved into the sites, so no current prober sends one; a body that
+// carries one is from a prober that would have scored the class twice, and the
+// sum check below would otherwise be "fixed" by relaxing it.
 func ProviderEgressHealthResult(w http.ResponseWriter, r *http.Request) {
 	if !authorizeOperator(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -140,12 +148,43 @@ func ProviderEgressHealthResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing client id.", http.StatusBadRequest)
 		return
 	}
+	if err := args.UrlProbeEvidence.ValidateOutcome(args.OKCount, args.TotalCount, args.TLSAuthenticationFailure); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if args.UrlProbeEvidence != nil && args.UrlProbeEvidence.MeasuredAt.After(server.NowUtc().Add(time.Minute)) {
+		http.Error(w, "URL evidence timestamp is in the future.", http.StatusBadRequest)
+		return
+	}
+	if args.UrlProbeEvidence != nil && args.RunId == (server.Id{}) {
+		http.Error(w, "A versioned URL result requires an immutable run id.", http.StatusBadRequest)
+		return
+	}
+	securityOnly := args.TotalCount == 0 && args.UrlProbeEvidence != nil && len(args.UrlProbeEvidence.Security) > 0
+	if !args.CycleStartedAt.IsZero() && (args.RunId == (server.Id{}) || args.UrlProbeEvidence == nil || (args.TotalCount != 1 && !securityOnly)) {
+		http.Error(w, "A scheduled URL probe requires a run id and versioned evidence for one measured outcome or independent TLS security evidence.", http.StatusBadRequest)
+		return
+	}
+	if args.UrlProbeEvidence != nil {
+		tlsFailure := false
+		for _, event := range args.UrlProbeEvidence.Security {
+			tlsFailure = tlsFailure || event.TlsFailure
+		}
+		if tlsFailure != args.TLSAuthenticationFailure {
+			http.Error(w, "URL security evidence disagrees with the aggregate TLS flag.", http.StatusBadRequest)
+			return
+		}
+	}
 	if args.OKCount < 0 || args.TotalCount < 0 {
 		http.Error(w, "ok_count and total_count must be non-negative.", http.StatusBadRequest)
 		return
 	}
 	if args.ReputationOK < 0 || args.ReputationTotal < 0 {
 		http.Error(w, "reputation_ok and reputation_total must be non-negative.", http.StatusBadRequest)
+		return
+	}
+	if args.NotMeasuredCount < 0 {
+		http.Error(w, "not_measured_count must be non-negative.", http.StatusBadRequest)
 		return
 	}
 	if args.TotalCount < args.OKCount {
@@ -203,18 +242,40 @@ func ProviderEgressHealthResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	model.SetProviderEgressHealth(r.Context(), &model.ProviderEgressHealth{
-		ClientId:                 args.ClientId,
-		MeasuredAt:               server.NowUtc(),
-		OKCount:                  args.OKCount,
-		Total:                    args.TotalCount,
-		ClassResults:             classResults,
-		ReputationOK:             args.ReputationOK,
-		ReputationTotal:          args.ReputationTotal,
+	health := &model.ProviderEgressHealth{
+		ClientId:         args.ClientId,
+		RunId:            args.RunId,
+		CycleStartedAt:   args.CycleStartedAt,
+		MeasuredAt:       server.NowUtc(),
+		OKCount:          args.OKCount,
+		Total:            args.TotalCount,
+		ClassResults:     classResults,
+		UrlProbeEvidence: args.UrlProbeEvidence,
+		// the reputation class dissolved into the sites (GEOMAP §11.3):
+		// whatever an older prober sends here is not a measurement anything
+		// reads, and is stored as none
+		ReputationOK:             0,
+		ReputationTotal:          0,
 		FailedNames:              args.FailedNames,
-		ReputationFailedNames:    args.ReputationFailedNames,
+		ReputationFailedNames:    "",
 		TLSAuthenticationFailure: args.TLSAuthenticationFailure,
-	})
+		NotMeasuredCount:         args.NotMeasuredCount,
+		NotMeasuredNames:         args.NotMeasuredNames,
+		CanaryPassedNames:        args.CanaryPassedNames,
+		CanaryFailedNames:        args.CanaryFailedNames,
+		ShortClasses:             args.ShortClasses,
+	}
+	if args.UrlProbeEvidence != nil {
+		health.MeasuredAt = args.UrlProbeEvidence.MeasuredAt
+	}
+	// Preserve legacy scoring semantics only for legacy diagnostic reports.
+	// Every versioned URL error remains in its policy-version denominator.
+	if args.UrlProbeEvidence == nil {
+		place := model.GetProviderEgressPlaces(r.Context(), []server.Id{args.ClientId})[args.ClientId]
+		health = model.ScoreProviderEgressHealth(health, place, model.GetProviderEgressHealthScoring(r.Context()))
+	}
+
+	model.SetProviderEgressHealth(r.Context(), health)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]any{}); err != nil {

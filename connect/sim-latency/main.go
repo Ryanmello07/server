@@ -20,7 +20,9 @@ package main
 //   compare   decide whether run set A is statistically better than B
 //   score-baseline
 //             validate trusted same-round baseline artifacts and write the
-//             signed-manifest payload consumed by score
+//             authenticated manifest payload consumed by score
+//   score-progress
+//             compare completed candidate live metrics to the frozen control
 //   score     validate and score a complete candidate artifact bundle
 //   source-check
 //             verify one frozen source epoch against the measured repositories
@@ -30,6 +32,8 @@ package main
 //             verify immutable staging branches alias frozen baseline source
 //   epoch-review
 //             enumerate, reject, or approve ranked significant candidates
+//   staging-review
+//             inspect and explicitly approve a finalized staging winner
 //   promote   publish a significant winner or no-winner source transition
 //   launch-preflight
 //             prove frozen source, image, API, MinIO, Grafana, and heartbeat
@@ -71,6 +75,7 @@ Usage:
   sim-latency baseline --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] [--replicates=<n>] [--out-dir=<dir>] [--alpha=<a>] [--out=<path>] [--providers=<path>] [--site-home=<dir>] [--ramp=<d>] [--prewarm=<d>] [--settle=<d>] [--client-warmup-timeout=<d>] [--duration=<d>] [--request-timeout=<d>] [--fleet-shards=<n>] [--site-listen=<addr>] [--hosts=<n>] [--api-port=<p>] [--pipeline-interval=<d>] [--test-timeout=<d>] [--announce-timeout=<d>] [--no-impair]
   sim-latency compare --a=<paths> --b=<paths> [--baseline=<path>] [--p=<a>] [--window=<w>] [--json]
   sim-latency score-baseline --run=<paths> --stderr=<paths> --accounting=<paths> --samples=<paths> --resource-report=<paths> --marker=<paths> --round-id=<id> --takeover-margin=<m> [--out=<path>]
+  sim-latency score-progress --run=<paths> --baseline=<path>
   sim-latency score --run=<paths> --stderr=<paths> --baseline=<path> --accounting=<paths> --samples=<paths> --resource-report=<paths> --marker=<paths> [--out=<path>]
   sim-latency source-check --epoch=<n> [--source-config=<path>] [--repos-root=<dir>] [--json]
   sim-latency source-record --epoch=<n> [--source-config=<path>] [--repos-root=<dir>]
@@ -79,6 +84,8 @@ Usage:
   sim-latency epoch-review --epoch=<n> export-winner --job-id=<id> [--out-dir=<dir>]
   sim-latency epoch-review --epoch=<n> reject --job-id=<id> --reviewer=<id> --reason=<text> --evidence=<path> [--out-dir=<dir>]
   sim-latency epoch-review --epoch=<n> approve --job-id=<id> --reviewer=<id> --reason=<text> --evidence=<path>
+  sim-latency staging-review --epoch=<n> next [--out-dir=<dir>]
+  sim-latency staging-review --epoch=<n> approve --job-id=<id> --reviewer=<id> --reason=<text> --evidence=<path>
   sim-latency promote --epoch=<n> (--winner=<dir> --winner-job-id=<id> | --no-winner) [--message=<text>] [--source-config=<path>] [--repos-root=<dir>] [--dry-run]
   sim-latency launch-preflight --epoch=<n> --evaluator-image=<digest> --operator-token-file=<path> --grafana-url=<url> --grafana-token-file=<path> --metrics-url=<url> --metrics-token-file=<path> [--api-url=<url>] [--openapi=<path>] [--artifact-capacity-bytes=<n>] [--source-config=<path>] [--repos-root=<dir>] [--out=<path>]
   sim-latency handoff-manifest --epoch=<n> --evaluator-image=<digest> --openapi=<path> --baseline-manifest=<path> --preflight=<path> [--staging-evidence=<paths>] [--source-config=<path>] [--repos-root=<dir>] [--out=<path>]
@@ -159,14 +166,14 @@ Options:
   --shard=<i/n>          Fleet shard index/count.
   --api-url=<url>        Api url (fleet).
   --ws-urls=<urls>       Comma-separated exchange ws urls (fleet).
-  --run=<path>           A run artifact; score accepts comma-separated candidate CSV replicates.
+  --run=<path>           A run artifact; score, score-baseline and score-progress require comma-separated results CSV paths with run-manifest sidecars.
   --runs=<paths>         Comma-separated existing replicate artifacts (csv or run.json);
                          without it, baseline measures --replicates fresh runs itself.
   --replicates=<n>       Baseline replicate runs to measure [default: 5].
   --out-dir=<dir>        Directory for measured replicate artifacts [default: baseline-runs].
   --a=<paths>            Side A run artifact(s), comma-separated.
   --b=<paths>            Side B run artifact(s), comma-separated.
-  --baseline=<path>      Compare noise floor, or signed score baseline manifest (score).
+  --baseline=<path>      Compare noise floor, or authenticated score baseline manifest (score).
   --round-id=<id>        Competition round id bound into a score baseline manifest.
   --takeover-margin=<m>  Frozen fractional improvement required for takeover.
   --stderr=<paths>       Comma-separated candidate stderr artifacts (score).
@@ -207,6 +214,8 @@ Options:
 		runCompare(opts)
 	case optBool(opts, "score-baseline"):
 		runScoreBaseline(opts)
+	case optBool(opts, "score-progress"):
+		runScoreProgress(opts)
 	case optBool(opts, "score"):
 		runScore(opts)
 	case optBool(opts, "source-check"):
@@ -218,6 +227,9 @@ Options:
 	case optBool(opts, "epoch-review"):
 		requireMainEnvironment("epoch-review")
 		runEpochReview(opts)
+	case optBool(opts, "staging-review"):
+		requireMainEnvironment("staging-review")
+		runStagingReview(opts)
 	case optBool(opts, "promote"):
 		requireMainEnvironment("promote")
 		runPromote(opts)
@@ -418,7 +430,7 @@ func validateEnvironment(command string, env string) error {
 				env,
 			)
 		}
-	case "epoch-review", "promote", "launch-preflight", "credentials":
+	case "epoch-review", "staging-review", "promote", "launch-preflight", "credentials":
 		if env != "main" {
 			return fmt.Errorf(
 				"sim-latency %s is main-only: refusing WARP_ENV=%q",

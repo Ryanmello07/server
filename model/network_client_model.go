@@ -22,6 +22,7 @@ import (
 	// "github.com/twmb/murmur3"
 	"maps"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/urnetwork/glog"
@@ -133,6 +134,45 @@ func FindActiveClientNetwork(
 		})
 	})
 
+	return
+}
+
+// Reads both active mappings in one fresh statement and pool acquisition.
+// Nil identifies an absent or inactive endpoint independently; callers retain
+// their source/destination error precedence. This read does not lock either
+// row or replace the contract transaction's lifecycle validation.
+func FindActiveClientPairNetworks(
+	ctx context.Context,
+	sourceId server.Id,
+	destinationId server.Id,
+) (sourceNetworkId *server.Id, destinationNetworkId *server.Id) {
+	defer server.EnterContractCreationStage(ctx, server.ContractStageEndpointLookup)()
+	server.Db(ctx, func(conn server.PgConn) {
+		sourceNetworkId, destinationNetworkId = findActiveClientPairNetworks(ctx, conn, sourceId, destinationId)
+	})
+	return
+}
+
+// Two primary-key probes share one statement snapshot, including a same-client
+// pair. Scalar subqueries return one row even when both mappings are absent.
+func findActiveClientPairNetworks(
+	ctx context.Context,
+	query server.PgCanQuery,
+	sourceId server.Id,
+	destinationId server.Id,
+) (sourceNetworkId *server.Id, destinationNetworkId *server.Id) {
+	result, err := query.Query(ctx, `
+		SELECT
+			(SELECT network_id FROM network_client WHERE client_id = $1 AND active),
+			(SELECT network_id FROM network_client WHERE client_id = $2 AND active)
+	`, sourceId, destinationId)
+	server.WithPgResult(result, err, func() {
+		if !result.Next() {
+			server.Raise(result.Err())
+			server.Raise(pgx.ErrNoRows)
+		}
+		server.Raise(result.Scan(&sourceNetworkId, &destinationNetworkId))
+	})
 	return
 }
 
@@ -259,6 +299,12 @@ func AuthNetworkClient(
 	authClient *AuthNetworkClientArgs,
 	session *session.ClientSession,
 ) (authClientResult *AuthNetworkClientResult, authClientError error) {
+	return authNetworkClient(authClient, session, nil)
+}
+
+// The optional registration owner is created only by the versioned endpoint.
+// Ordinary client creation retains its original request and response contract.
+func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.ClientSession, registration *networkClientRegistrationOwner) (authClientResult *AuthNetworkClientResult, authClientError error) {
 	if authClient.ClientId == nil {
 		roles, principal, message := validateClientIdentityArgs(authClient.Roles, authClient.Principal, session)
 		if message != "" {
@@ -270,6 +316,108 @@ func AuthNetworkClient(
 			return
 		}
 
+		// the hosted proxy device applies the initial performance profile at
+		// every creation, so a profile connect refuses is refused here, before
+		// anything is created. The profile is client input: a refusal is
+		// counted, its detail is logged only at V(1), and the message names
+		// only the caller's own values.
+		validateProxyConfigArgs := func() string {
+			proxyConfig := authClient.ProxyConfig
+			if proxyConfig == nil || proxyConfig.InitialDeviceState == nil {
+				return ""
+			}
+			err := validatePerformanceProfile(proxyConfig.InitialDeviceState.PerformanceProfile)
+			if err == nil {
+				return ""
+			}
+			proxyInvalidPerformanceProfilesAuthClient.Inc()
+			if glog.V(1) {
+				glog.Infof("[proxy][%s]auth-client refused the initial performance profile: %s\n", session.ByJwt.NetworkId, err)
+			}
+			return fmt.Sprintf("Invalid performance profile: %s", err)
+		}
+		message = validateProxyConfigArgs()
+		if message != "" {
+			authClientResult = &AuthNetworkClientResult{
+				Error: &AuthNetworkClientError{
+					Message: message,
+				},
+			}
+			return
+		}
+
+		// the proxy's lock subnets and initial device state are resolved before
+		// anything is created too, so a refusal creates nothing
+		var proxyLockSubnets []netip.Prefix
+		var proxyInitialDeviceState *ProxyDeviceState
+		if proxyConfig := authClient.ProxyConfig; proxyConfig != nil {
+			if proxyConfig.LockCallerIp {
+				// the caller's ip is the server's own input, so this is an error,
+				// not a refusal
+				addr, _, err := session.ParseClientIpPort()
+				if err != nil {
+					authClientError = fmt.Errorf("Could not lock caller ip")
+					return
+				}
+				prefix, _ := addr.Prefix(addr.BitLen())
+				proxyLockSubnets = append(proxyLockSubnets, prefix)
+			}
+			for _, lockIp := range proxyConfig.LockIpList {
+				addr, err := netip.ParseAddr(lockIp)
+				if err == nil {
+					prefix, _ := addr.Prefix(addr.BitLen())
+					proxyLockSubnets = append(proxyLockSubnets, prefix)
+				} else {
+					prefix, err := netip.ParsePrefix(lockIp)
+					if err != nil {
+						authClientResult = &AuthNetworkClientResult{
+							Error: &AuthNetworkClientError{
+								Message: fmt.Sprintf("Could not parse lock ip %s", lockIp),
+							},
+						}
+						return
+					}
+					proxyLockSubnets = append(proxyLockSubnets, prefix)
+				}
+			}
+
+			// InitialDeviceState is optional -- it is a pointer tagged
+			// `omitempty`, so a caller may legitimately send a proxy_config
+			// without it. Dereferencing it unconditionally panicked the whole
+			// request into a 500 with no usable message.
+			//
+			// A zero value falls through to the "Invalid location" refusal
+			// below, which is exactly what a caller who sent an empty device
+			// state already got. That keeps the failure a clean, described
+			// error instead of a crash.
+			initialDeviceState := proxyConfig.InitialDeviceState
+			if initialDeviceState == nil {
+				initialDeviceState = &ExtendedProxyDeviceState{}
+			}
+
+			proxyDeviceState := initialDeviceState.ProxyDeviceState
+			if proxyDeviceState.Location == nil {
+				// try the country code
+				proxyDeviceState.Location = GetConnectLocationForCountryCode(
+					session.Ctx,
+					initialDeviceState.CountryCode,
+				)
+			}
+			if proxyDeviceState.Location == nil {
+				authClientResult = &AuthNetworkClientResult{
+					Error: &AuthNetworkClientError{
+						Message: "Invalid location",
+					},
+				}
+				return
+			}
+			proxyDeviceState.DnsResolverSettings = proxyDnsResolverSettings(
+				proxyDeviceState.DnsResolverSettings,
+				proxyDeviceState.Location.CountryCode,
+			)
+			proxyInitialDeviceState = &proxyDeviceState
+		}
+
 		// Client-creation gate for the plan's concurrent connected-client limit:
 		// Do not provision a new top-level client while the network is already at its
 		// connected limit. Only top-level clients count and public providers are
@@ -278,8 +426,8 @@ func AuthNetworkClient(
 		// NetworkConcurrentClientsExceeded. Checked before the tx so the lookup does
 		// not hold it open. Connection activation applies the same limit; see
 		// CanConnectNetworkPeer.
-		if authClient.SourceClientId == nil &&
-			NetworkConcurrentClientsExceeded(session.Ctx, session.ByJwt.NetworkId) {
+		concurrentLimitExceeded := authClient.SourceClientId == nil && NetworkConcurrentClientsExceeded(session.Ctx, session.ByJwt.NetworkId)
+		if concurrentLimitExceeded && registration == nil {
 			authClientResult = &AuthNetworkClientResult{
 				Error: &AuthNetworkClientError{
 					ClientLimitExceeded: true,
@@ -290,13 +438,99 @@ func AuthNetworkClient(
 			return
 		}
 
+		// the proxy's rows are written in the client's own transaction, so a
+		// failure to create the proxy rolls the client back with it and hands
+		// out nothing. What that transaction cannot decide is settled before it:
+		// a server with no proxy hosts refuses with nothing created, and the
+		// plan's features are read live, outside the transaction.
+		var serverProxyConfig ServerProxyConfig
+		var proxyClientOptions CreateProxyClientOptions
+		if authClient.ProxyConfig != nil {
+			networkId := session.ByJwt.NetworkId
+
+			serverProxyConfig = LoadServerProxyConfig()
+			if len(serverProxyConfig.Hosts) == 0 {
+				// Log the real cause. The message returned to the caller
+				// stays generic on purpose -- it crosses a trust boundary
+				// and the underlying errors name server-side config -- but
+				// discarding it entirely turned a one-line diagnosis
+				// ("No proxy hosts available", i.e. proxy.yml has no hosts
+				// block) into a multi-hour one, because the operator saw
+				// only this sentence.
+				glog.Errorf(
+					"[proxy]could not create proxy client for network %s: %s\n",
+					networkId,
+					errNoProxyHosts,
+				)
+				authClientResult = &AuthNetworkClientResult{
+					Error: &AuthNetworkClientError{
+						Message: "Could not create proxy client",
+					},
+				}
+				return
+			}
+
+			// SOCKS and WireGuard are Pro-only (pro.yml features): a
+			// free-tier client is issued neither a SOCKS url nor a WireGuard
+			// config.
+			//
+			// NetworkFeatureAllowed resolves Pro live (never from the jwt's
+			// claim, which is stale for a user who just upgraded -- handing a
+			// fresh subscriber a config with no SOCKS/WireGuard until they
+			// re-auth is exactly the broken upgrade we are avoiding), and it
+			// short-circuits while enforce_features is dark, so today this
+			// costs no lookup and every tier still gets them.
+			proxyClientOptions = CreateProxyClientOptions{
+				HttpsRequireAuth: authClient.ProxyConfig.HttpsRequireAuth,
+				EnableSocks:      NetworkFeatureAllowed(session.Ctx, networkId, FeatureSocksProxy),
+				EnableWg: authClient.ProxyConfig.EnableWg &&
+					NetworkFeatureAllowed(session.Ctx, networkId, FeatureWireguardProxy),
+			}
+		}
+
 		var clientId server.Id
+		// the proxy's mirror json and its proxy client, from the transaction
+		// that committed, for the redis writes after the commit
+		var proxyDeviceConfigJson []byte
+		var proxyClient *ProxyClient
+
 		// A client JWT is durable, so entitlement must come from the source of
 		// truth. Resolve it before opening the write transaction: IsProFresh
 		// performs its own PostgreSQL read and Redis cache refresh.
 		isPro := IsProFresh(session.Ctx, &session.ByJwt.NetworkId)
 
+		var registrationTxOptions []any
+		if registration != nil {
+			// The first statement waits for the network's allocation lock.
+			// Its following lookup must see the preceding owner's commit.
+			registrationTxOptions = []any{server.TxReadCommitted}
+		}
 		server.Tx(session.Ctx, func(tx server.PgTx) {
+			// reset in case the tx is retried on a transient error: only the
+			// attempt that commits may answer or leave a proxy to publish
+			authClientResult = nil
+			authClientError = nil
+			proxyDeviceConfigJson = nil
+			proxyClient = nil
+
+			if err := lockProberShardClientAdmissionInTx(session.Ctx, tx, session.ByJwt.NetworkId); err != nil {
+				authClientError = err
+				return
+			}
+			if registration != nil {
+				retained, found := registration.resumeInTx(tx, session, isPro, roles, principal)
+				if found {
+					authClientResult = retained
+					if retained.ClientId != nil {
+						clientId = *retained.ClientId
+					}
+					return
+				}
+				if concurrentLimitExceeded {
+					authClientResult = &AuthNetworkClientResult{Error: &AuthNetworkClientError{ClientLimitExceeded: true, UpgradeRequired: true, Message: "Your plan's concurrent client limit is reached."}}
+					return
+				}
+			}
 			createTime := server.NowUtc()
 
 			clientId = server.NewId()
@@ -367,6 +601,7 @@ func AuthNetworkClient(
 			} else {
 				// copy the device id from the source
 				// important: validate the source client id is in the same network
+				sourceFound := false
 				result, err := tx.Query(
 					session.Ctx,
 					`
@@ -383,15 +618,19 @@ func AuthNetworkClient(
 				server.WithPgResult(result, err, func() {
 					if result.Next() {
 						server.Raise(result.Scan(&deviceId))
-					} else {
-						authClientResult = &AuthNetworkClientResult{
-							Error: &AuthNetworkClientError{
-								Message: "Client does not exist.",
-							},
-						}
-						return
+						sourceFound = true
 					}
 				})
+				// the refusal must return from the transaction callback, not
+				// from the result callback above, so that nothing is written
+				if !sourceFound {
+					authClientResult = &AuthNetworkClientResult{
+						Error: &AuthNetworkClientError{
+							Message: "Client does not exist.",
+						},
+					}
+					return
+				}
 			}
 
 			// device_name/device_spec are written once at device creation, so a
@@ -471,6 +710,34 @@ func AuthNetworkClient(
 					}
 				})
 			}
+			if registration != nil {
+				registration.bindInTx(tx, session, clientId, deviceId)
+			}
+
+			// a failure here panics, which rolls back the client, its device
+			// and its roles with the proxy
+			if authClient.ProxyConfig != nil {
+				proxyDeviceConfig := &ProxyDeviceConfig{
+					ProxyDeviceConnection: ProxyDeviceConnection{
+						ClientId: clientId,
+					},
+					LockSubnets:        proxyLockSubnets,
+					InitialDeviceState: proxyInitialDeviceState,
+				}
+				var err error
+				proxyDeviceConfigJson, err = createProxyDeviceConfigInTx(session.Ctx, tx, proxyDeviceConfig)
+				server.Raise(err)
+				proxyClient, err = createProxyClientInTx(
+					session.Ctx,
+					tx,
+					serverProxyConfig,
+					proxyDeviceConfig.ProxyId,
+					proxyDeviceConfig.ClientId,
+					proxyDeviceConfig.InstanceId,
+					proxyClientOptions,
+				)
+				server.Raise(err)
+			}
 
 			// re-derive Pro from the source of truth rather than copying the caller's
 			// (possibly stale) jwt claim: a network that turned Pro after the caller's
@@ -495,134 +762,31 @@ func AuthNetworkClient(
 				ByClientJwt: &byClientJwtSigned,
 				ClientId:    &clientId,
 			}
-		})
+			if proxyClient != nil {
+				authClientResult.ProxyConfigResult = &ProxyConfigResult{
+					ProxyClient: *proxyClient,
+				}
+			}
+		}, registrationTxOptions...)
 
+		// only redis is written after the commit. The identity cache, the proxy
+		// device config mirror and the proxy hosts' wakeup are caches and a
+		// wakeup over the committed rows (their readers fall back to postgres,
+		// and the proxy hosts also poll), so a failure is logged and the call
+		// still returns the client it committed.
 		if authClientResult != nil && authClientResult.Error == nil {
 			setClientIdentityCache(session.Ctx, clientId, &ClientIdentity{
 				Roles:     roles,
 				Principal: principal,
 			})
-		}
 
-		if authClientResult != nil && authClientResult.Error == nil && authClient.ProxyConfig != nil {
-			var lockSubnets []netip.Prefix
-			if authClient.ProxyConfig.LockCallerIp {
-				addr, _, err := session.ParseClientIpPort()
-				if err != nil {
-					authClientError = fmt.Errorf("Could not lock caller ip")
-					return
-				}
-				prefix, _ := addr.Prefix(addr.BitLen())
-				lockSubnets = append(lockSubnets, prefix)
-			}
-			for _, lockIp := range authClient.ProxyConfig.LockIpList {
-				addr, err := netip.ParseAddr(lockIp)
-				if err == nil {
-					prefix, _ := addr.Prefix(addr.BitLen())
-					lockSubnets = append(lockSubnets, prefix)
-				} else {
-					prefix, err := netip.ParsePrefix(lockIp)
-					if err != nil {
-						authClientError = fmt.Errorf("Could not parse lock ip %s", lockIp)
-						return
-					}
-					lockSubnets = append(lockSubnets, prefix)
-				}
-			}
-
-			// InitialDeviceState is optional -- it is a pointer tagged
-			// `omitempty`, so a caller may legitimately send a proxy_config
-			// without it. Dereferencing it unconditionally panicked the whole
-			// request into a 500 with no usable message.
-			//
-			// A zero value falls through to the "Invalid location" branch
-			// below, which is exactly what a caller who sent an empty device
-			// state already got. That keeps the failure a clean, described
-			// error instead of a crash.
-			initialDeviceState := authClient.ProxyConfig.InitialDeviceState
-			if initialDeviceState == nil {
-				initialDeviceState = &ExtendedProxyDeviceState{}
-			}
-
-			proxyDeviceState := initialDeviceState.ProxyDeviceState
-			if proxyDeviceState.Location == nil {
-				// try the country code
-				proxyDeviceState.Location = GetConnectLocationForCountryCode(
-					session.Ctx,
-					initialDeviceState.CountryCode,
-				)
-			}
-
-			if proxyDeviceState.Location == nil {
-				authClientResult.Error = &AuthNetworkClientError{
-					Message: "Invalid location",
-				}
-			} else {
-				if proxyDeviceState.Location.CountryCode != "" {
-					proxyDeviceState.DnsResolverSettings = connect.RegionalDnsResolverSettings(proxyDeviceState.Location.CountryCode)
-				}
-
-				proxyDeviceConfig := &ProxyDeviceConfig{
-					ProxyDeviceConnection: ProxyDeviceConnection{
-						ClientId: clientId,
-					},
-					LockSubnets:        lockSubnets,
-					InitialDeviceState: &proxyDeviceState,
-				}
-				err := CreateProxyDeviceConfig(session.Ctx, proxyDeviceConfig)
-				if err == nil {
-
-					// SOCKS and WireGuard are Pro-only (pro.yml features): a
-					// free-tier client is issued neither a SOCKS url nor a WireGuard
-					// config.
-					//
-					// NetworkFeatureAllowed resolves Pro LIVE (never from the jwt's
-					// claim, which is stale for a user who just upgraded -- handing a
-					// fresh subscriber a config with no SOCKS/WireGuard until they
-					// re-auth is exactly the broken upgrade we are avoiding), and it
-					// short-circuits while enforce_features is dark, so today this
-					// costs no lookup and every tier still gets them.
-					networkId := session.ByJwt.NetworkId
-					opts := CreateProxyClientOptions{
-						HttpsRequireAuth: authClient.ProxyConfig.HttpsRequireAuth,
-						EnableSocks:      NetworkFeatureAllowed(session.Ctx, networkId, FeatureSocksProxy),
-						EnableWg: authClient.ProxyConfig.EnableWg &&
-							NetworkFeatureAllowed(session.Ctx, networkId, FeatureWireguardProxy),
-					}
-					proxyClient, err := CreateProxyClient(
-						session.Ctx,
-						proxyDeviceConfig.ProxyId,
-						proxyDeviceConfig.ClientId,
-						proxyDeviceConfig.InstanceId,
-						opts,
-					)
-
-					if err == nil {
-						authClientResult.ProxyConfigResult = &ProxyConfigResult{
-							ProxyClient: *proxyClient,
-						}
-					} else {
-						// Log the real cause. The message returned to the caller
-						// stays generic on purpose -- it crosses a trust boundary
-						// and the underlying errors name server-side config -- but
-						// discarding it entirely turned a one-line diagnosis
-						// ("No proxy hosts available", i.e. proxy.yml has no hosts
-						// block) into a multi-hour one, because the operator saw
-						// only this sentence.
-						glog.Errorf(
-							"[proxy]could not create proxy client for %s: %s\n",
-							proxyDeviceConfig.ProxyId,
-							err,
-						)
-						authClientResult.Error = &AuthNetworkClientError{
-							Message: "Could not create proxy client",
-						}
-					}
-				} else {
-					authClientResult.Error = &AuthNetworkClientError{
-						Message: "Could not create proxy device",
-					}
-				}
+			if proxyClient != nil {
+				server.HandleError(func() {
+					setProxyDeviceConfigMirror(session.Ctx, proxyClient.ProxyId, proxyDeviceConfigJson)
+				})
+				server.HandleError(func() {
+					publishProxyClient(session.Ctx, proxyClient)
+				})
 			}
 		}
 	} else {
@@ -645,24 +809,35 @@ func AuthNetworkClient(
 
 		// important: must check `network_id = session network_id`
 		server.Tx(session.Ctx, func(tx server.PgTx) {
-			tag := server.RaisePgResult(tx.Exec(
+			if err := lockProberShardClientAdmissionInTx(session.Ctx, tx, session.ByJwt.NetworkId); err != nil {
+				authClientError = err
+				return
+			}
+			// the client and its device are checked before either is written,
+			// so a refusal writes nothing. The client row is still locked
+			// before the device row.
+			clientFound := false
+			var deviceId *server.Id
+			result, err := tx.Query(
 				session.Ctx,
 				`
-					UPDATE network_client
-					SET
-						description = $3,
-						auth_time = $4
+					SELECT device_id FROM network_client
 					WHERE
 						client_id = $1 AND
 						network_id = $2 AND
 						active = true
+					FOR NO KEY UPDATE
 				`,
 				authClient.ClientId,
 				session.ByJwt.NetworkId,
-				authClient.Description,
-				server.NowUtc(),
-			))
-			if tag.RowsAffected() == 0 {
+			)
+			server.WithPgResult(result, err, func() {
+				if result.Next() {
+					server.Raise(result.Scan(&deviceId))
+					clientFound = true
+				}
+			})
+			if !clientFound {
 				authClientResult = &AuthNetworkClientResult{
 					Error: &AuthNetworkClientError{
 						Message: "Client does not exist.",
@@ -670,23 +845,6 @@ func AuthNetworkClient(
 				}
 				return
 			}
-
-			result, err := tx.Query(
-				session.Ctx,
-				`
-					SELECT device_id FROM network_client
-					WHERE client_id = $1
-				`,
-				authClient.ClientId,
-			)
-			var deviceId *server.Id
-			server.WithPgResult(result, err, func() {
-				if result.Next() {
-					var deviceIdValue server.Id
-					server.Raise(result.Scan(&deviceIdValue))
-					deviceId = &deviceIdValue
-				}
-			})
 
 			if deviceId == nil {
 				authClientResult = &AuthNetworkClientResult{
@@ -697,7 +855,7 @@ func AuthNetworkClient(
 				return
 			}
 
-			tag = server.RaisePgResult(tx.Exec(
+			tag := server.RaisePgResult(tx.Exec(
 				session.Ctx,
 				`
 					UPDATE device
@@ -717,6 +875,24 @@ func AuthNetworkClient(
 				}
 				return
 			}
+
+			server.RaisePgResult(tx.Exec(
+				session.Ctx,
+				`
+					UPDATE network_client
+					SET
+						description = $3,
+						auth_time = $4
+					WHERE
+						client_id = $1 AND
+						network_id = $2 AND
+						active = true
+				`,
+				authClient.ClientId,
+				session.ByJwt.NetworkId,
+				authClient.Description,
+				server.NowUtc(),
+			))
 
 			// the client jwt carries the client's stored identity
 			var principal string
@@ -774,6 +950,16 @@ func AuthNetworkClient(
 	}
 
 	return
+}
+
+// A caller's explicit resolver is authoritative. Only an unset resolver may
+// receive the SDK/Connect regional recommendation; unsupported countries keep
+// the default resolver behavior in the device instead of storing an empty one.
+func proxyDnsResolverSettings(configured *connect.DnsResolverSettings, countryCode string) *connect.DnsResolverSettings {
+	if configured != nil {
+		return configured
+	}
+	return connect.RegionalDnsResolverSettings(countryCode)
 }
 
 type RemoveNetworkClientArgs struct {
@@ -1229,25 +1415,12 @@ type NetworkClientsResult struct {
 	Clients []*NetworkClientInfo `json:"clients"`
 }
 
+// NetworkClientInfo is one row of the network's device list. The client's
+// resident (`NetworkClientResident`: the exchange host, service, block and
+// internal ports the platform runs it on) is internal routing state and is
+// not part of the api view.
 type NetworkClientInfo struct {
-	// ClientId server.Id `json:"client_id"`
-	// NetworkId server.Id `json:"network_id"`
-	// Description string `json:"description"`
-	// DeviceSpec string `json:"device_spec"`
-
-	// CreateTime time.Time `json:"create_time"`
-	// AuthTime time.Time `json:"auth_time"`
-
-	// InstanceId server.Id `json:"client_id"`
-	// ResidentId server.Id `json:"resident_id"`
-	// ResidentHost string `json:"resident_host"`
-	// ResidentService string `json:"resident_service"`
-	// ResidentBlock string `json:"resident_block"`
-	// ResidentInternalPorts []int `json:"resident_internal_ports"`
-
 	NetworkClient
-
-	Resident *NetworkClientResident `json:"resident,omitempty"`
 
 	Connections []*NetworkClientConnection `json:"connections,omitempty"`
 }
@@ -1671,7 +1844,7 @@ const (
 )
 
 // NetworkClientSourceOwner is a server-derived, bounded owner class for a
-// contract source. It distinguishes the durable egress-prober network from
+// contract endpoint. It distinguishes the durable egress-prober network from
 // every other known network and keeps incomplete identity state explicit. The
 // value is safe for a metric label because it is never accepted from a client
 // and cannot carry a client, network, device, or application identifier.
@@ -1688,6 +1861,7 @@ type ProvideRelationshipDetails struct {
 	SourceLifecycle      NetworkClientLifecycle
 	DestinationLifecycle NetworkClientLifecycle
 	SourceOwner          NetworkClientSourceOwner
+	DestinationOwner     NetworkClientSourceOwner
 }
 
 func networkClientLifecycle(active *bool, sourceClientId *server.Id) NetworkClientLifecycle {
@@ -1707,11 +1881,11 @@ func networkClientLifecycle(active *bool, sourceClientId *server.Id) NetworkClie
 }
 
 // GetProvideRelationshipDetails resolves the same relationship as
-// GetProvideRelationship while carrying bounded endpoint lifecycle and source
+// GetProvideRelationship while carrying bounded endpoint lifecycle and both
 // owner classes from that exact database snapshot. CreateContract already
 // needs this lookup; returning the extra columns makes failure telemetry causal
 // without an additional query on the hot path. Ownership compares the source's
-// network with the durable prober network, so client credential rotation and
+// network with the durable prober ownership, so client credential rotation and
 // arbitrarily nested derived clients retain the same bounded owner without
 // exposing either identity.
 func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, clientIdB server.Id) ProvideRelationshipDetails {
@@ -1720,6 +1894,7 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 		SourceLifecycle:      NetworkClientLifecycleMissing,
 		DestinationLifecycle: NetworkClientLifecycleMissing,
 		SourceOwner:          NetworkClientSourceOwnerUnknown,
+		DestinationOwner:     NetworkClientSourceOwnerUnknown,
 	}
 	if clientIdA == clientIdB {
 		details.Mode = ProvideModeNetwork
@@ -1736,7 +1911,9 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 				b.network_id,
 				b.active,
 				b.source_client_id,
-				prober.network_id
+				prober.network_id,
+				EXISTS (SELECT 1 FROM prober_shard_run WHERE network_id=a.network_id),
+				EXISTS (SELECT 1 FROM prober_shard_run WHERE network_id=b.network_id)
 			FROM (VALUES (true)) AS seed(value)
 			LEFT JOIN network_client a ON a.client_id = $1
 			LEFT JOIN network_client b ON b.client_id = $2
@@ -1754,6 +1931,7 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 				var activeB *bool
 				var sourceClientIdB *server.Id
 				var proberNetworkId *server.Id
+				var shardA, shardB bool
 				server.Raise(result.Scan(
 					&networkIdA,
 					&activeA,
@@ -1762,14 +1940,23 @@ func GetProvideRelationshipDetails(ctx context.Context, clientIdA server.Id, cli
 					&activeB,
 					&sourceClientIdB,
 					&proberNetworkId,
+					&shardA,
+					&shardB,
 				))
 				details.SourceLifecycle = networkClientLifecycle(activeA, sourceClientIdA)
 				details.DestinationLifecycle = networkClientLifecycle(activeB, sourceClientIdB)
-				if networkIdA != nil && proberNetworkId != nil {
-					if *networkIdA == *proberNetworkId {
+				if networkIdA != nil && (proberNetworkId != nil || shardA) {
+					if shardA || *networkIdA == *proberNetworkId {
 						details.SourceOwner = NetworkClientSourceOwnerEgressProber
 					} else {
 						details.SourceOwner = NetworkClientSourceOwnerOther
+					}
+				}
+				if networkIdB != nil && (proberNetworkId != nil || shardB) {
+					if shardB || *networkIdB == *proberNetworkId {
+						details.DestinationOwner = NetworkClientSourceOwnerEgressProber
+					} else {
+						details.DestinationOwner = NetworkClientSourceOwnerOther
 					}
 				}
 				if networkIdA != nil && networkIdB != nil && *networkIdA == *networkIdB {
@@ -1806,10 +1993,15 @@ func setClientIdentityCache(ctx context.Context, clientId server.Id, identity *C
 	if err != nil {
 		return
 	}
-	server.Redis(ctx, func(r server.RedisClient) {
-		// the identity is immutable post-create; the ttl only bounds the
-		// cache -- `GetClientIdentity` refills it from the db on a miss
-		r.Set(ctx, clientIdentityKey(clientId), identityJson, provideMirrorTtl)
+	// This optional fill can run after the client and its credential commit.
+	// Even the Redis wrapper's acquisition/PING can raise on cancellation;
+	// it must not discard the committed identity before its owner can retire it.
+	server.HandleError(func() {
+		server.Redis(ctx, func(r server.RedisClient) {
+			// the identity is immutable post-create; the ttl only bounds the
+			// cache -- `GetClientIdentity` refills it from the db on a miss
+			r.Set(ctx, clientIdentityKey(clientId), identityJson, provideMirrorTtl)
+		})
 	})
 }
 
@@ -2221,6 +2413,9 @@ func SetProvide(
 			changeTime,
 		))
 
+		// Public re-entry must not wait for the next fleet reliability rollup.
+		updateProviderUrlProbeEligibilityForClient(ctx, tx, clientId)
+
 	})
 
 	server.Redis(ctx, func(r server.RedisClient) {
@@ -2373,12 +2568,15 @@ func ConnectNetworkClient(
 // family the transport declared it intends to prove: 0 (legacy), 4 or 6. The
 // observed family is derived here from the client address and stored beside
 // the intent; see ConnectionProvenIpFamily for how the pair is judged.
+// Transport callers pass their authenticated network so a late handshake is
+// ordered with disposable probe-account teardown, even after client deletion.
 func ConnectNetworkClientWithIpFamily(
 	ctx context.Context,
 	clientId server.Id,
 	clientAddress string,
 	handlerId server.Id,
 	ipFamilyIntent int,
+	authenticatedNetworkIds ...server.Id,
 ) (
 	connectionId server.Id,
 	clientIp string,
@@ -2387,6 +2585,7 @@ func ConnectNetworkClientWithIpFamily(
 	err error,
 ) {
 	clientIp, clientPort, err = server.SplitClientAddress(clientAddress)
+	ctx = providerWorkSessionContext(ctx)
 	if err != nil {
 		return
 	}
@@ -2423,7 +2622,15 @@ func ConnectNetworkClientWithIpFamily(
 
 	connectTime := server.NowUtc()
 	server.Tx(ctx, func(tx server.PgTx) {
+		err = nil
+		for _, networkId := range authenticatedNetworkIds {
+			if err = lockProberShardClientAdmissionInTx(ctx, tx, networkId); err != nil {
+				return
+			}
+		}
 		connectionId = server.NewId()
+		providerWorkLockSessionMutationInTx(ctx, tx, clientId)
+		providerWorkSessionGenesisInTx(ctx, tx, clientId)
 
 		host, _ := server.Host()
 		service, _ := server.Service()
@@ -2463,6 +2670,7 @@ func ConnectNetworkClientWithIpFamily(
 			ipFamilyIntent,
 			extenderId,
 		))
+		providerWorkRetainSessionEventsInTx(ctx, tx, clientId)
 
 		// refresh auth_time as a durable last-seen marker. connection rows are
 		// retained only briefly by `RemoveDisconnectedNetworkClients`, so the
@@ -2508,6 +2716,9 @@ func ConnectNetworkClientWithIpFamily(
 		))
 	})
 
+	if err != nil {
+		return
+	}
 	// the durable connection history for the onboarding results: one
 	// connect.day event per network per UTC day, its own transaction after
 	// the connection is committed, cached per process, never failing this
@@ -2517,10 +2728,20 @@ func ConnectNetworkClientWithIpFamily(
 	return
 }
 
+// Endpoint conflicts retry within Tx's bound. If transport cancellation exhausts
+// that bound, handler expiry retires the remaining connection asynchronously.
 func DisconnectNetworkClient(ctx context.Context, connectionId server.Id) error {
+	ctx = providerWorkSessionContext(ctx)
 	var disconnectErr error
 
 	server.Tx(ctx, func(tx server.PgTx) {
+		var originalClientId *server.Id
+		providerWorkOptionalSchemaInTx(ctx, tx, func(optional server.PgTx) error {
+			return optional.QueryRow(ctx, `SELECT client_id FROM network_client_connection WHERE connection_id=$1`, connectionId).Scan(&originalClientId)
+		})
+		if originalClientId != nil {
+			providerWorkLockSessionMutationInTx(ctx, tx, *originalClientId)
+		}
 		disconnectTime := server.NowUtc()
 		tag, err := tx.Exec(
 			ctx,
@@ -2539,6 +2760,9 @@ func DisconnectNetworkClient(ctx context.Context, connectionId server.Id) error 
 		if tag.RowsAffected() != 1 {
 			disconnectErr = errors.New("Connection does not exist.")
 			return
+		}
+		if originalClientId != nil {
+			providerWorkRetainSessionEventsInTx(ctx, tx, *originalClientId)
 		}
 	})
 
@@ -2947,7 +3171,8 @@ func removeReapedClientRedisState(ctx context.Context, clientIds []server.Id) {
 					for egressHashHex := range entries {
 						// Atomic compare-delete: a recycled address may already
 						// belong to another client, which must not be clobbered.
-						server.RedisRemoveIfEqual(pipe, ctx, verifyEgressKeyFromHex(egressHashHex), []byte(clientId.String()))
+						removeVerifyEgressAddressForClient(ctx, pipe, clientId, egressHashHex)
+						pipe.Del(ctx, verifyClientEgressLeaseKey(clientId, egressHashHex))
 						forwardEntryCount++
 					}
 				}
@@ -2987,9 +3212,8 @@ func clearReleasedProxyEgress(ctx context.Context, released []releasedProxyEgres
 			// The HMAC key is deliberately unavailable in the model cleanup
 			// layer. The reverse index is authoritative and lets release remove
 			// every keyed entry for this client without guessing a namespace.
-			// Any surviving direct connection is fail-closed briefly and restores
-			// its observed egress on its next bounded refresh.
-			RemoveVerifyEgressForClient(ctx, item.ClientID)
+			// Direct transports own independent leases and survive allocation release.
+			clearVerifyProxyEgressForClient(ctx, item.ClientID)
 			cleared[item.ClientID] = true
 		}
 	}
@@ -3630,6 +3854,7 @@ func HeartbeatNetworkClientHandler(ctx context.Context, handlerId server.Id) (re
 }
 
 func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
+	ctx = providerWorkSessionContext(ctx)
 	disconnectTime := server.NowUtc()
 	server.MaintenanceTx(ctx, func(tx server.PgTx) {
 		server.RaisePgResult(tx.Exec(
@@ -3641,6 +3866,28 @@ func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
 			`,
 			minTime.UTC(),
 		))
+		var originalClientIds []server.Id
+		boundedRetirement := providerWorkOptionalSchemaInTx(ctx, tx, func(optional server.PgTx) error {
+			rows, err := optional.Query(ctx, `SELECT DISTINCT client_id FROM network_client_connection c
+			 WHERE c.connected AND NOT EXISTS(SELECT 1 FROM network_client_handler h WHERE h.handler_id=c.handler_id)
+			 ORDER BY client_id LIMIT 4096`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var clientId server.Id
+				if err := rows.Scan(&clientId); err != nil {
+					return err
+				}
+				originalClientIds = append(originalClientIds, clientId)
+			}
+			return rows.Err()
+		})
+		if boundedRetirement && len(originalClientIds) == 0 {
+			return
+		}
+		boundedRetirement = boundedRetirement && providerWorkLockSessionMutationInTx(ctx, tx, originalClientIds...)
 
 		// A handler row and its connections deliberately have no foreign key:
 		// handlers are ephemeral, while connection history is retained. That
@@ -3658,6 +3905,7 @@ func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
 					disconnect_time = $1
 				WHERE
 					network_client_connection.connected = true AND
+					(NOT $2::boolean OR network_client_connection.client_id=ANY($3::uuid[])) AND
 					NOT EXISTS (
 						SELECT 1
 						FROM network_client_handler
@@ -3666,7 +3914,10 @@ func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
 					)
 			`,
 			disconnectTime,
+			boundedRetirement,
+			originalClientIds,
 		))
+		providerWorkRetainSessionEventsInTx(ctx, tx, originalClientIds...)
 	})
 }
 

@@ -130,6 +130,7 @@ type fullTunPath struct {
 	deviceCarrierTun             *clientconnect.Tun
 	deviceCarrierNode            string
 	multiClient                  *clientconnect.RemoteUserNatMultiClient
+	multiClientCancel            context.CancelFunc
 	apiGenerator                 *clientconnect.ApiMultiClientGenerator
 	deviceTransports             *platformTransportOwner
 	deviceClient                 *atomic.Pointer[clientconnect.Client]
@@ -152,6 +153,8 @@ type fullTunPath struct {
 	deviceStats                  *clientconnect.P2pDataPlaneStats
 	providerProbeTrace           *p2pProbeEventTrace
 	deviceProbeTrace             *p2pProbeEventTrace
+	providerProgressTrace        *perfvarProgressTrace
+	deviceProgressTrace          *perfvarProgressTrace
 	providerSendRoutes           *platformSendRouteController
 	deviceSendRoutes             *platformSendRouteController
 	platformSendRoutes           []*platformSendRouteController
@@ -185,10 +188,16 @@ type fullTunPath struct {
 	afterUdpTerminalMarkerForTest       func(context.Context, bool, int) error
 	beforeUdpTerminalReceiptForTest     func(context.Context, bool)
 	afterUdpTerminalReceiptForTest      func(bool)
+	afterUdpRegistrationForTest         func(context.Context, net.Conn) error
 	beforeWarmedTcpAckForTest           func(context.Context, bool) error
 	beforeWarmedTcpMeasuredForTest      func(bool)
+	downloadCompletionPhaseForTest      func(fullTunDownloadCompletionEvent)
+	beforeDownloadCompletionForTest     func(context.Context) error
+	beforeDownloadCompletionReadForTest func(context.Context) error
 	readinessProbePayloadForTest        []byte
 	beforeReadinessClientWriteForTest   func()
+	readinessClientConnectionForTest    func(net.Conn)
+	readinessRequestReaderForTest       func(net.Conn) io.Reader
 	beforeReadinessServerCloseForTest   func()
 	beforeWorkloadServerCloseForTest    func()
 	workloadFlowServerSettingsForTest   *logicalTCPFlowServerSettings
@@ -275,7 +284,13 @@ type fullTunConstructionTestHooks struct {
 	configureProviderPlatformSettings func(*clientconnect.PlatformTransportSettings)
 	configureDeviceClientSettings     func(*clientconnect.ClientSettings)
 	configureDevicePlatformSettings   func(*clientconnect.PlatformTransportSettings)
+	configureDeviceGeneratorSettings  func(*clientconnect.ApiMultiClientGeneratorSettings)
+	configureApplicationTunSettings   func(*clientconnect.TunSettings)
 }
+
+// An explicitly selected diagnostic can reuse construction-only hooks without
+// attaching packet observers. Canonical execution leaves this factory nil.
+var newFullTunConstructionHooksForTest func() *fullTunConstructionTestHooks
 
 // The transaction owns the partial path until commit transfers every acquired
 // resource to the returned fullTunPath. Any return before commit rolls back the
@@ -474,7 +489,7 @@ func (self *noAckSendTracker) run() {
 			if !ok || !entry.state.CompareAndSwap(0, 1) {
 				self.invalid.Store(true)
 			} else {
-				if observation.Err != nil {
+				if observation.Err != nil && !(observation.RecoveredByOwner && !observation.OwnerTrackingOverflow && observation.Err == clientconnect.ErrNoAckSendNotAdmitted) {
 					self.failureCount.Add(1)
 				}
 				self.completedCount.Add(1)
@@ -551,6 +566,22 @@ func (self *noAckSendTracker) waitThrough(
 // error rather than an apparent modeled packet loss.
 func (self *noAckSendTracker) failures() uint64 {
 	return self.failureCount.Load()
+}
+
+// An invalid observer history can fail a boundary while the workload context
+// is healthy. Keep that evidence distinct from cancellation and avoid wrapping
+// a nil context error into an unreadable failure diagnostic.
+func (self *noAckSendTracker) boundaryError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if self.invalid.Load() {
+		return fmt.Errorf("invalid NoAck observation history: started=%d completed=%d", self.startedCount.Load(), self.completedCount.Load())
+	}
+	if err := self.ctx.Err(); err != nil {
+		return fmt.Errorf("NoAck observer owner stopped: %w", err)
+	}
+	return errors.New("NoAck source boundary unavailable")
 }
 
 // Cancellation stops the owner without ever closing its producer-facing
@@ -1367,18 +1398,20 @@ func (self *platformSendRouteController) hasLiveEndpointP2pRouteWithLock() bool 
 	return false
 }
 
-// Every connection receives a fresh wrapper sharing the controller's
-// immutable destination snapshot and the production receive route.
+// P2P scenarios use H1 for their separate platform connection, including the
+// discovery/readiness phase before P2P promotion. Preserve the physical type
+// through this matching-only wrapper: Unknown disables existing H1 pacing,
+// grouping and recovery policies even though the socket is really H1.
 func (self *platformSendRouteController) newTransportPair() (
 	sendTransport clientconnect.Transport,
 	receiveTransport clientconnect.Transport,
 ) {
 	return &platformDataSendTransport{
-		Transport:                     clientconnect.NewSendGatewayTransport(),
+		Transport:                     clientconnect.NewSendGatewayTransportWithType(clientconnect.TransportTypeH1),
 		policy:                        &self.policy,
 		rejectedDestinationMatchCount: &self.rejectedDestinationMatchCount,
 		fallbackViolationCount:        &self.fallbackViolationCount,
-	}, clientconnect.NewReceiveGatewayTransport()
+	}, clientconnect.NewReceiveGatewayTransportWithType(clientconnect.TransportTypeH1)
 }
 
 // Applying a state rematches existing selectors against the same live route.
@@ -3401,8 +3434,8 @@ func fullTunClientSettingsWithFeatures(
 	}
 	for _, feature := range features {
 		// The harness builds against several Connect revisions in one
-		// campaign, and a setting that ships off by default exists only from
-		// the commit that introduced it. Set it by name, and fail the run
+		// campaign, and a setting may exist only from the commit that
+		// introduced it. Set it by name, and fail the run
 		// loudly when an arm cannot honor a requested feature rather than
 		// silently measuring the default.
 		var target any
@@ -3418,6 +3451,9 @@ func fullTunClientSettingsWithFeatures(
 		case perfvarFeatureLaneRule, perfvarFeatureNoLaneRule:
 			target, field = settings.SendBufferSettings, "ReliableLaneProvenRecovery"
 			value = feature == perfvarFeatureLaneRule
+		case perfvarFeatureUdpTransferAck, perfvarFeatureUdpTransferNoAck:
+			// Applied to the provider and MultiClient settings together below.
+			continue
 		default:
 			panic(fmt.Sprintf("unknown PERFVAR feature %q", feature))
 		}
@@ -3642,6 +3678,10 @@ func tryNewFullTunPathWithTopology(
 	resources tunResourceProfile,
 	p2pHopCount int,
 ) (*fullTunPath, error) {
+	var hooks *fullTunConstructionTestHooks
+	if newFullTunConstructionHooksForTest != nil {
+		hooks = newFullTunConstructionHooksForTest()
+	}
 	return tryNewFullTunPathWithTopologyHooks(
 		ctx,
 		t,
@@ -3650,7 +3690,7 @@ func tryNewFullTunPathWithTopology(
 		useExtender,
 		resources,
 		p2pHopCount,
-		nil,
+		hooks,
 	)
 }
 
@@ -3689,6 +3729,8 @@ func tryNewFullTunPathWithTopologyHooks(
 		devicePlatformReceiveStats:   &clientconnect.PlatformTransportReceiveStats{},
 		providerH3DatagramStats:      &clientconnect.H3DatagramStats{},
 		deviceH3DatagramStats:        &clientconnect.H3DatagramStats{},
+		providerProgressTrace:        newPerfvarProgressTrace(),
+		deviceProgressTrace:          newPerfvarProgressTrace(),
 	}
 	owner := newFullTunConstructionOwner(path)
 	defer func() {
@@ -3803,6 +3845,9 @@ func tryNewFullTunPathWithTopologyHooks(
 	var providerProbeTrace *p2pProbeEventTrace
 	var deviceProbeTrace *p2pProbeEventTrace
 	if isP2p {
+		if platformMode != clientconnect.TransportModeH1 {
+			return nil, fmt.Errorf("P2P platform route controller requires explicit H1, got %s", platformMode)
+		}
 		providerSendRoutes = newPlatformSendRouteController(clientconnect.Id(deviceClientId))
 		deviceSendRoutes = newPlatformSendRouteController(clientconnect.Id(providerClientId))
 		path.providerSendRoutes = providerSendRoutes
@@ -3839,6 +3884,7 @@ func tryNewFullTunPathWithTopologyHooks(
 		resources.LogicalDataLaneCount,
 		resources.Features,
 	)
+	path.providerProgressTrace.configure(providerSettings)
 	if hooks != nil && hooks.configureProviderClientSettings != nil {
 		hooks.configureProviderClientSettings(providerSettings)
 	}
@@ -3889,6 +3935,7 @@ func tryNewFullTunPathWithTopologyHooks(
 		providerPlatformBudget,
 	)
 	providerPlatformSettings.H3DatagramStats = path.providerH3DatagramStats
+	path.providerProgressTrace.configurePlatform(providerPlatformSettings)
 	if hooks != nil && hooks.configureProviderPlatformSettings != nil {
 		hooks.configureProviderPlatformSettings(providerPlatformSettings)
 	}
@@ -3936,6 +3983,9 @@ func tryNewFullTunPathWithTopologyHooks(
 		return nil, err
 	}
 	providerRemoteNatSettings := clientconnect.DefaultRemoteUserNatProviderSettings()
+	if err := applyPerfvarUdpTransferPolicy(providerRemoteNatSettings, resources.Features); err != nil {
+		return nil, err
+	}
 	providerRemoteNatSettings.ReturnSendObserver = providerReturns.observe
 	providerRemoteNat := clientconnect.NewRemoteUserNatProvider(
 		providerClient,
@@ -4003,6 +4053,7 @@ func tryNewFullTunPathWithTopologyHooks(
 			resources.LogicalDataLaneCount,
 			resources.Features,
 		)
+		path.deviceProgressTrace.configure(settings)
 		if deviceSendRoutes != nil {
 			settings.StreamManagerSettings.StreamBufferSettings.P2pTransportSettings.RouteStateObserver =
 				func(state clientconnect.P2pRouteState) {
@@ -4031,6 +4082,9 @@ func tryNewFullTunPathWithTopologyHooks(
 	}
 	generatorSettings := clientconnect.DefaultApiMultiClientGeneratorSettings()
 	generatorSettings.PlatformTransportMode = platformMode
+	if hooks != nil && hooks.configureDeviceGeneratorSettings != nil {
+		hooks.configureDeviceGeneratorSettings(generatorSettings)
+	}
 	devicePlatformBudget := newFullTunEndpointPlatformBudget()
 	generatorSettings.PlatformTransportSettingsGenerator = func() *clientconnect.PlatformTransportSettings {
 		settings := fullTunPlatformSettings(
@@ -4041,6 +4095,7 @@ func tryNewFullTunPathWithTopologyHooks(
 			devicePlatformBudget,
 		)
 		settings.H3DatagramStats = path.deviceH3DatagramStats
+		path.deviceProgressTrace.configurePlatform(settings)
 		if hooks != nil && hooks.configureDevicePlatformSettings != nil {
 			hooks.configureDevicePlatformSettings(settings)
 		}
@@ -4114,6 +4169,9 @@ func tryNewFullTunPathWithTopologyHooks(
 	}
 	applyFullTunApplicationDialSettings(appSettings, readinessPath)
 	applyTunResourceProfile(appSettings, resources)
+	if hooks != nil && hooks.configureApplicationTunSettings != nil {
+		hooks.configureApplicationTunSettings(appSettings)
+	}
 	appTun, err := clientconnect.CreateTun(ctx, appSettings)
 	if err != nil {
 		return nil, fmt.Errorf("create application TUN: %w", err)
@@ -4122,8 +4180,14 @@ func tryNewFullTunPathWithTopologyHooks(
 	if err := afterStage(fullTunConstructionStageApplicationTun); err != nil {
 		return nil, err
 	}
+	multiClientCtx, multiClientCancel := context.WithCancel(ctx)
+	path.multiClientCancel = multiClientCancel
+	multiClientSettings := fullTunMultiClientSettings(readinessPath)
+	if err := applyPerfvarUdpTransferPolicy(multiClientSettings, resources.Features); err != nil {
+		return nil, err
+	}
 	multiClient := clientconnect.NewRemoteUserNatMultiClient(
-		ctx,
+		multiClientCtx,
 		generator,
 		func(
 			source clientconnect.TransferPath,
@@ -4134,7 +4198,7 @@ func tryNewFullTunPathWithTopologyHooks(
 			_, _ = appTun.Write(packet)
 		},
 		protocol.ProvideMode_Network,
-		fullTunMultiClientSettings(readinessPath),
+		multiClientSettings,
 	)
 	path.multiClient = multiClient
 	multiClient.SetReceivePacketsCallback(func(
@@ -4166,51 +4230,7 @@ func tryNewFullTunPathWithTopologyHooks(
 		path.streamP2pStats = append(path.streamP2pStats, providerStats)
 		path.streamP2pRouteTraces = append(path.streamP2pRouteTraces, providerRouteStateTrace)
 	}
-	path.bridgeWaitGroup.Add(1)
-	go func() {
-		defer path.bridgeWaitGroup.Done()
-		packets := make([][]byte, max(1, resources.BatchSize))
-		sendPacketBatch := func(packetBatch [][]byte) int {
-			return multiClient.SendPacketBatch(
-				clientconnect.SourceId(deviceId),
-				protocol.ProvideMode_Network,
-				packetBatch,
-				-1,
-			)
-		}
-		if resources.SingularBridgeSend {
-			sendPacketBatch = func(packetBatch [][]byte) int {
-				sentPacketCount := 0
-				for _, packet := range packetBatch {
-					if multiClient.SendPacket(
-						clientconnect.SourceId(deviceId),
-						protocol.ProvideMode_Network,
-						packet,
-						-1,
-					) {
-						sentPacketCount += 1
-					} else {
-						clientconnect.MessagePoolReturn(packet)
-					}
-				}
-				return sentPacketCount
-			}
-		}
-		for {
-			packetCount, readErr := appTun.ReadBatch(packets)
-			if readErr != nil {
-				return
-			}
-			sendFullTunBridgeBatch(
-				bridgeSends,
-				packets[:packetCount],
-				resources.AppDelay,
-				time.Sleep,
-				sendPacketBatch,
-			)
-		}
-	}()
-	path.bridgeStarted = true
+	path.startBridge(resources, appTun.ReadBatch)
 	if err := afterStage(fullTunConstructionStageBridge); err != nil {
 		return nil, err
 	}
@@ -4299,6 +4319,61 @@ func tryNewFullTunPathWithTopologyHooks(
 		return nil, err
 	}
 	return owner.commit(), nil
+}
+
+// The read seam lets rollback tests park the actual bridge in a no-provider
+// send without constructing live exchanges, database records, or device TUNs.
+func (self *fullTunPath) startBridge(
+	resources tunResourceProfile,
+	readBatch func([][]byte) (int, error),
+) {
+	self.bridgeWaitGroup.Add(1)
+	go func() {
+		defer self.bridgeWaitGroup.Done()
+		packets := make([][]byte, max(1, resources.BatchSize))
+		sendPacketBatch := func(packetBatch [][]byte, accepted []bool) int {
+			return self.multiClient.SendPacketBatchWithResults(
+				clientconnect.SourceId(self.deviceClientId),
+				protocol.ProvideMode_Network,
+				packetBatch,
+				-1,
+				accepted,
+			)
+		}
+		if resources.SingularBridgeSend {
+			sendPacketBatch = func(packetBatch [][]byte, accepted []bool) int {
+				sentPacketCount := 0
+				for packetIndex, packet := range packetBatch {
+					if self.multiClient.SendPacket(
+						clientconnect.SourceId(self.deviceClientId),
+						protocol.ProvideMode_Network,
+						packet,
+						-1,
+					) {
+						sentPacketCount += 1
+						accepted[packetIndex] = true
+					} else {
+						clientconnect.MessagePoolReturn(packet)
+					}
+				}
+				return sentPacketCount
+			}
+		}
+		for {
+			packetCount, readErr := readBatch(packets)
+			if readErr != nil {
+				return
+			}
+			sendFullTunBridgeBatch(
+				self.bridgeSends,
+				packets[:packetCount],
+				resources.AppDelay,
+				time.Sleep,
+				sendPacketBatch,
+			)
+		}
+	}()
+	self.bridgeStarted = true
 }
 
 // Auto readiness is stronger than PlatformTransport.IsConnected: both direct
@@ -4397,6 +4472,7 @@ func probeFullTunPath(
 		payload,
 		&readinessEchoServerSettings{
 			beforeSuccessfulConnectionClose: path.beforeReadinessServerCloseForTest,
+			requestReaderForTest:            path.readinessRequestReaderForTest,
 			afterCompleteRequest: func() {
 				serverRequestNanos.Store(int64(time.Since(probeStartTime)))
 				serverStage.Store(2)
@@ -4433,6 +4509,9 @@ func probeFullTunPath(
 	observation.DialRetryCount = dialRetryCount
 	if err != nil {
 		return failure("dial readiness path", err)
+	}
+	if path.readinessClientConnectionForTest != nil {
+		path.readinessClientConnectionForTest(connection)
 	}
 	if noDelayConnection, ok := connection.(interface{ SetNoDelay(bool) error }); ok {
 		if err := noDelayConnection.SetNoDelay(true); err != nil {
@@ -4925,6 +5004,8 @@ func waitForMinimumRouteCount(
 // carriers, and continues through every independent cleanup after an error.
 // It is nil-safe because construction rollback owns a partially built path.
 func (self *fullTunPath) closeAndWait(ctx context.Context) error {
+	self.deviceProgressTrace.dump(self.t, "device")
+	self.providerProgressTrace.dump(self.t, "provider")
 	var closeErr error
 	complete := func(resource fullTunConstructionResource, err error) {
 		if err != nil {
@@ -4948,9 +5029,15 @@ func (self *fullTunPath) closeAndWait(ctx context.Context) error {
 	for _, sendRoutes := range self.platformSendRoutes {
 		sendRoutes.setDisabled(false)
 	}
-	// Closing the application TUN stops bridge admission. Join the bridge
-	// before flushing or closing its multi-client consumer so every pooled
-	// packet read before Close has one live ownership handoff or local return.
+	// Closing the application TUN stops bridge admission. Cancel the owned
+	// multi-client context before joining: a bridge SendPacket[Batch](-1)
+	// cannot otherwise leave its no-provider wait until the fixture parent
+	// expires, silently overrunning the rollback deadline. Cancellation only
+	// releases pending sends here; defer destructive consumer cleanup until
+	// every pooled packet has a terminal handoff or local return.
+	if self.multiClientCancel != nil {
+		self.multiClientCancel()
+	}
 	self.bridgeWaitGroup.Wait()
 	if self.bridgeStarted {
 		complete(fullTunConstructionResourceBridge, nil)
@@ -5046,8 +5133,14 @@ func (self *fullTunPath) closeAndWait(ctx context.Context) error {
 			complete(fullTunConstructionResourceNoAckTracker, nil)
 		}
 	}
-	for _, tracker := range []*sendPackLifecycleTracker{self.devicePackSends, self.providerPackSends} {
+	for trackerIndex, tracker := range []*sendPackLifecycleTracker{self.devicePackSends, self.providerPackSends} {
 		if tracker != nil {
+			if self.t != nil && tracker.healthProbeStarted.Load() != 0 {
+				_, joined := tracker.boundary(ctx)
+				self.t.Logf("[perfvar] health-probe-packs tracker=%d started=%d failures=%d workload-failures=%d all-failures=%d joined=%t",
+					trackerIndex, tracker.healthProbeStarted.Load(), tracker.healthProbeFailures.Load(),
+					tracker.workloadFailures.Load(), tracker.failures.Load(), joined)
+			}
 			tracker.close()
 			complete(fullTunConstructionResourcePackTracker, nil)
 		}
@@ -5252,8 +5345,9 @@ func (self *fullTunPath) joinSourcePackCarrierBoundary(
 }
 
 // A measured interval rejects terminal failures newer than its exact
-// workload-local start unless the Pack's caller identified an enclosing TCP
-// state that retains the exact bytes or can regenerate the control packet.
+// workload-local start unless the exact native input owner proves successful
+// final admission after an enqueue refusal, or the provider's enclosing TCP
+// state retains the exact bytes or can regenerate the control packet.
 // Setup candidate failures remain before the floor; UDP outside an explicitly
 // lossy probe, public callbacks, and unclassified failures remain fatal.
 func (self *fullTunPath) validateMeasuredPackFailures(
@@ -5266,11 +5360,14 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 	}
 	packFailures := carrierEnd.packFailures
 	if packFailures.deviceFailureCount < packFailureFloor.deviceFailureCount ||
+		packFailures.deviceRecoveredAdmissionFailureCount < packFailureFloor.deviceRecoveredAdmissionFailureCount ||
 		packFailures.providerFailureCount < packFailureFloor.providerFailureCount ||
 		packFailures.providerRecoverableFailureCount <
 			packFailureFloor.providerRecoverableFailureCount ||
 		packFailures.providerDatagramFailureCount <
-			packFailureFloor.providerDatagramFailureCount {
+			packFailureFloor.providerDatagramFailureCount ||
+		packFailures.providerRecoverableDatagramFailureCount <
+			packFailureFloor.providerRecoverableDatagramFailureCount {
 		return fmt.Errorf(
 			"Pack failure counters moved backward: start=%+v end=%+v",
 			*packFailureFloor,
@@ -5279,6 +5376,12 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 	}
 	deviceFailureCount := packFailures.deviceFailureCount -
 		packFailureFloor.deviceFailureCount
+	deviceRecoveredAdmissionFailureCount := packFailures.deviceRecoveredAdmissionFailureCount -
+		packFailureFloor.deviceRecoveredAdmissionFailureCount
+	if deviceRecoveredAdmissionFailureCount > deviceFailureCount {
+		return fmt.Errorf("device recovered admission failures exceeded all failures: start=%+v end=%+v", *packFailureFloor, packFailures)
+	}
+	deviceUnrecoveredFailureCount := deviceFailureCount - deviceRecoveredAdmissionFailureCount
 	providerFailureCount := packFailures.providerFailureCount -
 		packFailureFloor.providerFailureCount
 	providerRecoverableFailureCount :=
@@ -5287,16 +5390,26 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 	providerDatagramFailureCount :=
 		packFailures.providerDatagramFailureCount -
 			packFailureFloor.providerDatagramFailureCount
+	providerRecoverableDatagramFailureCount :=
+		packFailures.providerRecoverableDatagramFailureCount -
+			packFailureFloor.providerRecoverableDatagramFailureCount
+	if providerRecoverableDatagramFailureCount > providerRecoverableFailureCount ||
+		providerRecoverableDatagramFailureCount > providerDatagramFailureCount {
+		return fmt.Errorf("provider Pack failure overlap exceeded a category: start=%+v end=%+v", *packFailureFloor, packFailures)
+	}
 	providerAllowedFailureCount := providerRecoverableFailureCount
 	if allowProviderDatagramFailures {
-		providerAllowedFailureCount += providerDatagramFailureCount
+		// The same owned UDP refusal belongs to both raw categories. Count
+		// their union, never two allowances for one failed Pack attempt.
+		providerAllowedFailureCount += providerDatagramFailureCount - providerRecoverableDatagramFailureCount
 	}
 	if providerFailureCount < providerAllowedFailureCount {
 		return fmt.Errorf(
-			"provider allowed Pack failures exceeded all failures: total=%d recoverable=%d datagram=%d allow-datagram=%t start=%+v end=%+v",
+			"provider allowed Pack failures exceeded all failures: total=%d recoverable=%d datagram=%d overlap=%d allow-datagram=%t start=%+v end=%+v",
 			providerFailureCount,
 			providerRecoverableFailureCount,
 			providerDatagramFailureCount,
+			providerRecoverableDatagramFailureCount,
 			allowProviderDatagramFailures,
 			*packFailureFloor,
 			packFailures,
@@ -5304,7 +5417,7 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 	}
 	providerUnrecoverableFailureCount :=
 		providerFailureCount - providerAllowedFailureCount
-	if deviceFailureCount == 0 && providerUnrecoverableFailureCount == 0 {
+	if deviceUnrecoveredFailureCount == 0 && providerUnrecoverableFailureCount == 0 {
 		if !self.advanceActivePackFailureFloor(*packFailureFloor, packFailures) {
 			return fmt.Errorf(
 				"Pack failure floor changed while validating: start=%+v end=%+v",
@@ -5323,11 +5436,14 @@ func (self *fullTunPath) validateMeasuredPackFailures(
 		providerFailureSamples = self.providerPackSends.workloadFailureSnapshot()
 	}
 	return fmt.Errorf(
-		"measured Pack terminal failures device=%d provider=%d provider-recoverable=%d provider-datagram=%d allow-provider-datagram=%t provider-unrecoverable=%d start=%+v end=%+v lifetime-device-samples=%+v lifetime-provider-samples=%+v",
+		"measured Pack terminal failures device=%d provider=%d device-recovered-admission=%d device-unrecovered=%d provider-recoverable=%d provider-datagram=%d provider-overlap=%d allow-provider-datagram=%t provider-unrecoverable=%d start=%+v end=%+v lifetime-device-samples=%+v lifetime-provider-samples=%+v",
 		deviceFailureCount,
 		providerFailureCount,
+		deviceRecoveredAdmissionFailureCount,
+		deviceUnrecoveredFailureCount,
 		providerRecoverableFailureCount,
 		providerDatagramFailureCount,
+		providerRecoverableDatagramFailureCount,
 		allowProviderDatagramFailures,
 		providerUnrecoverableFailureCount,
 		*packFailureFloor,
@@ -7058,8 +7174,16 @@ func measureFullTunDownloadWithWarmupAndStartHook(
 				}
 				remaining -= int64(len(chunk))
 			}
+			if path.beforeDownloadCompletionReadForTest != nil {
+				if err := path.beforeDownloadCompletionReadForTest(ctx); err != nil {
+					return err
+				}
+			}
 			ack := make([]byte, 1)
-			_, readErr := io.ReadFull(connection, ack)
+			readCount, readErr := io.ReadFull(connection, ack)
+			path.observeDownloadCompletionForTest(fullTunDownloadCompletionEvent{
+				Phase: "server-read", Count: int64(readCount), Value: ack[0], Err: readErr,
+			})
 			return readErr
 		},
 		path.workloadFlowServerSettingsForTest,
@@ -7177,8 +7301,26 @@ func measureFullTunDownloadWithWarmupAndStartHook(
 	if readByteCount != byteCount || !bytes.Equal(actualHash.Sum(nil), expectedHash.Sum(nil)) {
 		return workloadResult{}, fmt.Errorf("full-TUN download content mismatch bytes=%d", readByteCount)
 	}
-	if err := writeFullTunAll(connection, []byte{1}); err != nil {
-		return workloadResult{}, err
+	if path.downloadCompletionPhaseForTest != nil {
+		path.observeDownloadCompletionForTest(fullTunDownloadCompletionEvent{
+			Phase: "body-verified", Count: readByteCount, Hash: fmt.Sprintf("%x", actualHash.Sum(nil)),
+		})
+	}
+	if path.beforeDownloadCompletionForTest != nil {
+		if err := path.beforeDownloadCompletionForTest(ctx); err != nil {
+			return workloadResult{}, err
+		}
+	}
+	completionWriteErr := writeFullTunAll(connection, []byte{1})
+	completionWriteCount := int64(-1)
+	if completionWriteErr == nil {
+		completionWriteCount = 1
+	}
+	path.observeDownloadCompletionForTest(fullTunDownloadCompletionEvent{
+		Phase: "client-write", Count: completionWriteCount, Value: 1, Err: completionWriteErr,
+	})
+	if completionWriteErr != nil {
+		return workloadResult{}, completionWriteErr
 	}
 	if err := flowServer.Wait(); err != nil {
 		return workloadResult{}, contextBoundWorkloadError(ctx, err)

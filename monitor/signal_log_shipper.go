@@ -125,6 +125,43 @@ if [ "$restarts" -gt 0 ]; then
     restart_reason=prometheus-histogram-decoder-crash
   fi
 fi
+journal_reader_state=unobservable
+journal_reader_errors_10m=0
+journal_reader_ebadmsg_errors_10m=0
+journal_reader_output=$(timeout 15 journalctl -b -u fluent-bit.service -n 401 \
+  --since '10 minutes ago' --no-pager --quiet -o cat \
+  --grep='sd_journal_next[(][)] returned error -[0-9]+' 2>/dev/null)
+journal_reader_status=$?
+if [ "$journal_reader_status" -eq 0 ] || \
+   { [ "$journal_reader_status" -eq 1 ] && [ -z "$journal_reader_output" ]; }; then
+  journal_reader_reduction=$(printf '%s\n' "$journal_reader_output" | LC_ALL=C awk '
+    NF {
+      rows++
+      if ($0 ~ /sd_journal_next\(\) returned error -[0-9]+; journal is re-opened, unread logs are lost; sd_journal_seek_head\(\) returned -?[0-9]+/) {
+        errors++
+        if ($0 ~ /sd_journal_next\(\) returned error -74;/) ebadmsg++
+      }
+    }
+    END {printf "%d %d %d\n", rows+0, errors+0, ebadmsg+0}
+  ')
+  set -- $journal_reader_reduction
+  journal_reader_rows=$1
+  journal_reader_errors_10m=$2
+  journal_reader_ebadmsg_errors_10m=$3
+  if [ "$journal_reader_rows" -ne "$journal_reader_errors_10m" ]; then
+    journal_reader_state=unobservable
+    journal_reader_errors_10m=0
+    journal_reader_ebadmsg_errors_10m=0
+  elif [ "$journal_reader_rows" -ge 401 ]; then
+    journal_reader_state=truncated
+  elif [ "$journal_reader_errors_10m" -eq 0 ]; then
+    journal_reader_state=healthy
+  elif [ "$journal_reader_errors_10m" -eq "$journal_reader_ebadmsg_errors_10m" ]; then
+    journal_reader_state=ebadmsg
+  else
+    journal_reader_state=other-error
+  fi
+fi
 redis_exporter_state=unobservable
 redis_latency_histogram_policy=unobservable
 redis_process_root=/proc
@@ -174,7 +211,7 @@ elif [ "$redis_load_state" = loaded ]; then
   fi
 fi
 printf '%s\n' \
-  'observation_schema=3' \
+  'observation_schema=4' \
   "active_state=$(read_property ActiveState)" \
   "sub_state=$(read_property SubState)" \
   "result=$(read_property Result)" \
@@ -183,6 +220,9 @@ printf '%s\n' \
   "nofile_soft=$(read_property LimitNOFILESoft)" \
   "fluent_bit_version=$fluent_bit_version" \
   "restart_reason=$restart_reason" \
+  "journal_reader_state=$journal_reader_state" \
+  "journal_reader_errors_10m=$journal_reader_errors_10m" \
+  "journal_reader_ebadmsg_errors_10m=$journal_reader_ebadmsg_errors_10m" \
   "redis_exporter_state=$redis_exporter_state" \
   "redis_latency_histogram_policy=$redis_latency_histogram_policy"
 `
@@ -204,6 +244,9 @@ type logShipperSample struct {
 	nofileSoft                  uint64
 	version                     string
 	restartReason               string
+	journalReaderState          string
+	journalReaderErrors         int
+	journalReaderEBADMSGErrors  int
 	redisExporterState          string
 	redisLatencyHistogramPolicy string
 }
@@ -215,7 +258,7 @@ type logShipperResult struct {
 }
 
 func logShipperHosts(cfg *monitorConfig) []*host {
-	roles := []string{"services", "pg-primary", "redis-cluster", "subtensor", "backup"}
+	roles := []string{"services", "pg-primary", "redis-cluster", "subtensor", "backup", "vpn-server"}
 	hosts := []*host{}
 	for _, target := range cfg.hosts {
 		for _, role := range roles {
@@ -288,6 +331,7 @@ func parseLogShipperSample(raw string) (logShipperSample, error) {
 	required := []string{
 		"observation_schema", "active_state", "sub_state", "result", "restarts",
 		"nofile_hard", "nofile_soft", "fluent_bit_version", "restart_reason",
+		"journal_reader_state", "journal_reader_errors_10m", "journal_reader_ebadmsg_errors_10m",
 		"redis_exporter_state", "redis_latency_histogram_policy",
 	}
 	allowed := map[string]bool{}
@@ -314,7 +358,7 @@ func parseLogShipperSample(raw string) (logShipperSample, error) {
 			return logShipperSample{}, fmt.Errorf("log shipper: observation omitted %s", key)
 		}
 	}
-	if values["observation_schema"] != "3" {
+	if values["observation_schema"] != "4" {
 		return logShipperSample{}, fmt.Errorf("log shipper: unsupported observation schema")
 	}
 	restarts, err := strconv.Atoi(values["restarts"])
@@ -344,6 +388,39 @@ func parseLogShipperSample(raw string) (logShipperSample, error) {
 	if (restarts == 0) != (restartReason == logShipperRestartNone) {
 		return logShipperSample{}, fmt.Errorf("log shipper: restart reason does not match restart count")
 	}
+	journalReaderErrors, err := strconv.Atoi(values["journal_reader_errors_10m"])
+	if err != nil || journalReaderErrors < 0 {
+		return logShipperSample{}, fmt.Errorf("log shipper: invalid journal reader error count")
+	}
+	journalReaderEBADMSGErrors, err := strconv.Atoi(values["journal_reader_ebadmsg_errors_10m"])
+	if err != nil || journalReaderEBADMSGErrors < 0 || journalReaderEBADMSGErrors > journalReaderErrors {
+		return logShipperSample{}, fmt.Errorf("log shipper: invalid journal reader EBADMSG count")
+	}
+	journalReaderState := values["journal_reader_state"]
+	switch journalReaderState {
+	case "healthy":
+		if journalReaderErrors != 0 || journalReaderEBADMSGErrors != 0 {
+			return logShipperSample{}, fmt.Errorf("log shipper: healthy journal reader has errors")
+		}
+	case "ebadmsg":
+		if journalReaderErrors == 0 || journalReaderEBADMSGErrors != journalReaderErrors {
+			return logShipperSample{}, fmt.Errorf("log shipper: inconsistent journal reader EBADMSG state")
+		}
+	case "other-error":
+		if journalReaderErrors == 0 || journalReaderEBADMSGErrors == journalReaderErrors {
+			return logShipperSample{}, fmt.Errorf("log shipper: inconsistent other journal reader error state")
+		}
+	case "truncated":
+		if journalReaderErrors < 401 {
+			return logShipperSample{}, fmt.Errorf("log shipper: inconsistent truncated journal reader state")
+		}
+	case "unobservable":
+		if journalReaderErrors != 0 || journalReaderEBADMSGErrors != 0 {
+			return logShipperSample{}, fmt.Errorf("log shipper: unobservable journal reader retained counts")
+		}
+	default:
+		return logShipperSample{}, fmt.Errorf("log shipper: invalid journal reader state")
+	}
 	redisExporterState := values["redis_exporter_state"]
 	switch redisExporterState {
 	case "not-applicable", "active", "inactive", "unobservable":
@@ -366,6 +443,9 @@ func parseLogShipperSample(raw string) (logShipperSample, error) {
 		activeState: values["active_state"], subState: values["sub_state"],
 		result: values["result"], restarts: restarts, nofileHard: hard, nofileSoft: soft,
 		version: values["fluent_bit_version"], restartReason: restartReason,
+		journalReaderState:          journalReaderState,
+		journalReaderErrors:         journalReaderErrors,
+		journalReaderEBADMSGErrors:  journalReaderEBADMSGErrors,
 		redisExporterState:          redisExporterState,
 		redisLatencyHistogramPolicy: redisLatencyHistogramPolicy,
 	}, nil
@@ -384,11 +464,11 @@ func evaluateLogShipper(target string, sample logShipperSample, redisClusterHost
 			probeId: "observability/log-shipper", tier: tierPage,
 			class: "log-shipper-down", target: target, sustain: 1,
 			symptom:   fmt.Sprintf("%s is not shipping host logs and metrics", target),
-			mechanism: "The host-managed fluent-bit unit is not active/running. Warp containers can remain healthy while this independent unit permanently stops, removing that host's Mimir telemetry and any configured Warp log stream from Loki.",
-			baseline:  "fluent-bit.service is active/running on every managed Warp, database, Redis, backup, and Subtensor host.", observed: observed,
+			mechanism: "The required host-managed fluent-bit unit is absent or not active/running. Managed workloads can remain healthy while this independent publisher is unavailable, removing that host's Mimir telemetry and any configured Warp log stream from Loki.",
+			baseline:  "fluent-bit.service is active/running on every managed Warp, database, Redis, backup, Subtensor, and VPN-server host.", observed: observed,
 			evidence: fmt.Sprintf("service=%s/%s result=%s", sample.activeState, sample.subState, sample.result),
-			context:  "This is affirmative shipper-process loss. It does not identify whether the original trigger was configuration, fd exhaustion, credentials, or an output failure.",
-			action:   "Inspect the bounded fluent-bit journal and effective unit limits, fix the first startup/output failure, then restart only fluent-bit. Do not reboot the host or infer workload failure from missing telemetry.",
+			context:  "This is affirmative shipper-process absence. It does not distinguish missing provisioning from configuration, fd exhaustion, credentials, or an output failure.",
+			action:   "If the unit or configuration is absent, converge the owning Xops host role after authorization. Otherwise inspect the bounded fluent-bit journal and effective unit limits, fix the first startup/output failure, then restart only fluent-bit. Do not reboot the host or infer workload failure from missing telemetry.",
 			verify:   "Require active/running state, the expected fd budget, and fresh per-host Mimir metrics. Require a fresh labeled Loki record only where a managed Warp log source exists.",
 			playbook: "SIGNALS.md §11.14",
 		})
@@ -445,16 +525,47 @@ func evaluateLogShipper(target string, sample logShipperSample, redisClusterHost
 			probeId: "observability/log-shipper", tier: tierWarn,
 			class: "log-shipper-churn", target: target, sustain: 2,
 			symptom:   fmt.Sprintf("%s Fluent Bit has restarted within its current unit activation", target),
-			mechanism: "systemd recorded one or more automatic restarts. The retry policy avoids permanent failure, but repeated starts can create telemetry gaps and usually preserve an actionable first error in the unit journal.",
-			baseline:  "NRestarts remains zero during steady state.", observed: observed,
+			mechanism: "systemd's NRestarts is a cumulative current-activation counter. A positive value proves at least one automatic restart, but does not prove current or recurring churn. Establish event timing and cause from bounded generation-specific evidence before attributing a new incident.",
+			baseline:  "NRestarts=0 means this activation has no retained automatic-restart history.", observed: observed,
 			evidence: fmt.Sprintf("restarts=%d result=%s", sample.restarts, sample.result),
-			context:  "This is process churn, not proof of missing downstream data; verify freshness in each configured output independently.",
-			action:   "Inspect the first bounded error before the restart and repair that cause. Do not clear the counter or reboot merely to hide the evidence.",
-			verify:   "Require a stable process and fresh data in each configured output for ten minutes. Require a fresh labeled Loki record only where a managed Warp log source exists.",
+			context:  "This WARN preserves restart history, not a rate or proof of current shipper failure or missing downstream data. A recovered stable process may retain it; verify output freshness and any independent journal-reader fault separately.",
+			action:   "Preserve the activation counter and inspect any retained bounded restart evidence. Repair only a proven cause. Do not reset the counter, restart the unit, or reboot solely to silence this WARN.",
+			verify:   "Ten stable minutes with fresh data in each configured output verify operational recovery, but do not clear the current-activation counter; this retained-history WARN can therefore remain. Require a fresh labeled Loki record only where a managed Warp log source exists.",
 			playbook: "SIGNALS.md §11.14",
 		})
 	} else {
 		findings = append(findings, healthyFinding("observability/log-shipper", tierWarn, "log-shipper-churn", target))
+	}
+
+	journalObserved := fmt.Sprintf(
+		"journal_reader_state=%s journal_reader_errors_10m=%d journal_reader_ebadmsg_errors_10m=%d",
+		sample.journalReaderState,
+		sample.journalReaderErrors,
+		sample.journalReaderEBADMSGErrors,
+	)
+	if sample.journalReaderState == "unobservable" {
+		findings = append(findings, cannotObserveFinding(
+			target+"/log-shipper-journal-reader", fmt.Errorf("bounded Fluent Bit journal-reader evidence unavailable"),
+		))
+	} else if sample.journalReaderErrors > 0 {
+		findings = append(findings, finding{
+			probeId: "observability/log-shipper", tier: tierPage,
+			class: "log-shipper-journal-read-loss", target: target, sustain: 1,
+			symptom: fmt.Sprintf(
+				"%s Fluent Bit lost its position while reading the system journal",
+				target,
+			),
+			mechanism: "Fluent Bit received a negative sd_journal_next result and its systemd input sought to the retained journal head. The upstream handler explicitly reports that unread records are lost; seeking the head can also replay the oldest retained records into Loki while the unit remains active and its restart counter stays zero.",
+			baseline:  "Zero Fluent Bit sd_journal_next loss events in every bounded ten-minute host window.",
+			observed:  journalObserved,
+			evidence:  "The host reducer retains only the bounded event count and whether every event was errno -74 (EBADMSG). Journal text, paths, entries, cursors, and workload identifiers are omitted.",
+			context:   "EBADMSG establishes a corrupt or transiently inconsistent journal entry, not its cause. systemd has documented online verification and high-write rotation races, so journalctl --verify against an active file cannot by itself prove durable media corruption. Correlate the exact generation with rotation pressure, stale Loki source times, kernel storage errors, and an offline check of closed files.",
+			action:    "Preserve the Fluent Bit and journald generations and correlate the bounded event times with journal rotation plus privacy-reduced stale-tail arrivals. Check kernel/storage health, then verify closed journal files outside active writes. If files and storage are healthy, treat the systemd journal-reader/rotation path as the boundary and remove proven producer log amplification or stage a supported OS fix; do not delete journals, seek to the head, reboot, or restart the shipper merely to clear the observation.",
+			verify:    "For ten continuous minutes spanning normal journal rotation, the bounded error count remains zero, Fluent Bit stays on one process, per-host metrics and current-source Loki controls remain fresh, two overlap reconciliations complete, and no stale-tail arrival or pre-cursor summary recurs. Any offline file or kernel fault remains a separate storage incident.",
+			playbook:  "SIGNALS.md §1.5 and §11.14",
+		})
+	} else {
+		findings = append(findings, healthyFinding("observability/log-shipper", tierPage, "log-shipper-journal-read-loss", target))
 	}
 
 	if redisClusterHost {

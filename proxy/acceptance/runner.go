@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/urnetwork/server/proxy/flowtrace"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -63,6 +65,10 @@ type Options struct {
 	// device-wide return-path switch that makes those protocols steal packets
 	// from one another.
 	OverlapProtocols bool
+	// TraceTLSFlows explicitly arms bounded TLS and UDP DNS egress/return
+	// metadata for this temporary fixture, using the same shared capacity.
+	// It requires a server that positively advertises DNS trace support.
+	TraceTLSFlows bool
 	// Progress receives identity-free, redacted campaign milestones. It is
 	// optional so package callers that only consume the result matrix remain
 	// silent.
@@ -96,6 +102,7 @@ type loginResult struct {
 }
 
 type proxyConfigResult struct {
+	flowTrace     *flowTraceClient
 	SocksProxyURL string           `json:"socks_proxy_url"`
 	HTTPProxyURL  string           `json:"http_proxy_url"`
 	APIBaseURL    string           `json:"api_base_url"`
@@ -169,18 +176,38 @@ type httpsRequestTrace struct {
 	dialAddress       string
 	resolvedAddresses string
 	peerAddress       string
+	originAddress     netip.AddrPort
+	originLocalPort   uint16
+	dnsQueries        []flowtrace.DnsQuery
 	certificate       string
 	gotConn           bool
 	reused            bool
+	// Zero means CONNECT is not in use; -1 means its response is still pending.
+	proxyConnectStatus int
+}
+
+type httpsRequestTraceContextKey struct{}
+
+// Called by an origin dialer before TLS starts. Proxy-listener addresses and
+// resolver candidates are not evidence of the connected origin endpoint.
+func recordHTTPSOrigin(ctx context.Context, address netip.AddrPort) {
+	trace, ok := ctx.Value(httpsRequestTraceContextKey{}).(*httpsRequestTrace)
+	if !ok || !address.IsValid() {
+		return
+	}
+	trace.stateLock.Lock()
+	defer trace.stateLock.Unlock()
+	trace.originAddress = address
 }
 
 // Retains one request's time boundary so terminal campaign handling can add a
 // bounded local-host diagnostic without querying the host on readiness retries.
 type httpsRequestFailure struct {
-	started  time.Time
-	finished time.Time
-	detail   string
-	cause    error
+	started       time.Time
+	finished      time.Time
+	originAddress netip.AddrPort
+	detail        string
+	cause         error
 }
 
 // Preserves the existing identity-free request trace.
@@ -541,8 +568,8 @@ func appendLocalNetworkFailureDiagnostic(err error, collect localNetworkFailureC
 }
 
 // Summarizes the public peer chain without retaining certificate contents.
-// TLSHandshakeDone supplies the parsed peer certificates even when normal
-// verification rejects the chain, which distinguishes origin and exit faults.
+// Failed net/http handshakes instead retain this chain in the verification
+// error; both paths use the same bounded public certificate summary.
 func tlsPeerCertificateDiagnostic(state tls.ConnectionState) string {
 	if len(state.PeerCertificates) == 0 {
 		return "peer_certs=none"
@@ -569,11 +596,17 @@ func tlsPeerCertificateDiagnostic(state tls.ConnectionState) string {
 	)
 }
 
-// The Go TLS trace can report an empty ConnectionState on a failed handshake
-// even though x509 already parsed and rejected the leaf. UnknownAuthorityError
-// retains that certificate. Use it only as a bounded diagnostic fallback; the
-// ordinary verifier remains authoritative and the request still fails.
+// net/http supplies an empty ConnectionState on failed TLS handshakes, but
+// CertificateVerificationError retains the full unverified peer chain. A bare
+// UnknownAuthorityError holds only the certificate where building its chain
+// failed, which can be an intermediate or root. Neither path changes verification.
 func tlsVerificationErrorCertificateDiagnostic(err error) string {
+	var verification *tls.CertificateVerificationError
+	if errors.As(err, &verification) && len(verification.UnverifiedCertificates) != 0 {
+		return tlsPeerCertificateDiagnostic(tls.ConnectionState{
+			PeerCertificates: verification.UnverifiedCertificates,
+		}) + " certificate_source=verification_error"
+	}
 	var unknownAuthority x509.UnknownAuthorityError
 	if !errors.As(err, &unknownAuthority) || unknownAuthority.Cert == nil {
 		return ""
@@ -581,7 +614,7 @@ func tlsVerificationErrorCertificateDiagnostic(err error) string {
 	certificate := unknownAuthority.Cert
 	fingerprint := sha256.Sum256(certificate.Raw)
 	return fmt.Sprintf(
-		"peer_certs=unavailable verified_chains=0 rejected_leaf=%s>%s/%x",
+		"peer_certs=unavailable verified_chains=0 rejected_cert=%s>%s/%x",
 		compactDiagnosticToken(certificate.Subject.CommonName),
 		compactDiagnosticToken(certificate.Issuer.CommonName),
 		fingerprint[:6],
@@ -617,7 +650,7 @@ func (self *httpsRequestTrace) clientTrace() *httptrace.ClientTrace {
 		ConnectStart: func(_, address string) {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
-			self.phase = "connecting_tunnel"
+			self.phase = "connecting_tcp"
 			self.dialAddress = compactDiagnosticToken(address)
 		},
 		ConnectDone: func(_, address string, err error) {
@@ -625,9 +658,9 @@ func (self *httpsRequestTrace) clientTrace() *httptrace.ClientTrace {
 			defer self.stateLock.Unlock()
 			self.dialAddress = compactDiagnosticToken(address)
 			if err != nil {
-				self.phase = "connecting_tunnel_failed"
+				self.phase = "connecting_tcp_failed"
 			} else {
-				self.phase = "tunnel_connected"
+				self.phase = "tcp_connected"
 			}
 		},
 		TLSHandshakeStart: func() { setPhase("tls_handshake") },
@@ -678,6 +711,11 @@ func (self *httpsRequestTrace) wrap(err error, finished time.Time) error {
 		}
 	}
 	path := ""
+	if self.proxyConnectStatus < 0 {
+		path += "; proxy_connect_status pending"
+	} else if self.proxyConnectStatus > 0 {
+		path += fmt.Sprintf("; proxy_connect_status %d", self.proxyConnectStatus)
+	}
 	if self.dialAddress != "" {
 		path += "; dial " + self.dialAddress
 	}
@@ -686,6 +724,11 @@ func (self *httpsRequestTrace) wrap(err error, finished time.Time) error {
 	}
 	if self.resolvedAddresses != "" {
 		path += "; resolved " + self.resolvedAddresses
+	}
+	if self.originAddress.IsValid() {
+		path += "; origin " + self.originAddress.String()
+	} else {
+		path += "; origin unavailable"
 	}
 	if self.certificate != "" {
 		path += "; " + self.certificate
@@ -699,12 +742,14 @@ func (self *httpsRequestTrace) wrap(err error, finished time.Time) error {
 		path,
 	)
 	started := self.started
+	originAddress := self.originAddress
 	self.stateLock.Unlock()
 	return &httpsRequestFailure{
-		started:  started,
-		finished: finished,
-		detail:   detail,
-		cause:    err,
+		started:       started,
+		finished:      finished,
+		originAddress: originAddress,
+		detail:        detail,
+		cause:         err,
 	}
 }
 
@@ -930,6 +975,22 @@ func (r *runner) runIteration(ctx context.Context) map[string]error {
 				r.progressf("hosted device diagnostics started")
 			}
 		}
+		var traceErr error
+		if r.opts.TraceTLSFlows {
+			provisioned.ProxyConfigResult.flowTrace, traceErr = startFlowTrace(ctx, provisioned.ProxyConfigResult, r.opts.TargetURL)
+			if traceErr != nil {
+				r.progressf("provider flow diagnostics unavailable: %v", traceErr)
+			} else {
+				defer func() {
+					if err := provisioned.ProxyConfigResult.flowTrace.stop(); err != nil {
+						r.progressf("provider flow diagnostics disarm unconfirmed: %v", err)
+					} else {
+						r.progressf("provider flow diagnostics disarmed")
+					}
+				}()
+				r.progressf("provider flow diagnostics armed; local channel aliases are not provider identities")
+			}
+		}
 		probes := r.newProbes(provisioned.ProxyConfigResult)
 		// Establish an isolated baseline first. HTTP stays first because it opens
 		// and warms a newly placed hosted device; the optional concurrent pass
@@ -1092,14 +1153,17 @@ func (a *apiClient) post(ctx context.Context, path string, body any, jwt string,
 	if jwt != "" {
 		request.Header.Set("Authorization", "Bearer "+jwt)
 	}
+	requestTrace := newAPIRequestTrace()
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), requestTrace.clientTrace()))
 	response, err := a.client.Do(request)
 	if err != nil {
-		return err
+		return requestTrace.failure(path, err, 0)
 	}
 	defer response.Body.Close()
+	requestTrace.responseReceived(response.StatusCode)
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxAPIResponseBytes+1))
 	if err != nil {
-		return err
+		return requestTrace.failure(path, err, len(data))
 	}
 	if len(data) > maxAPIResponseBytes {
 		return fmt.Errorf("%s response exceeded %d bytes", path, maxAPIResponseBytes)
@@ -1131,13 +1195,13 @@ func (r *runner) productionProbes(config *proxyConfigResult) map[string]protocol
 				return errors.New("HTTP proxy URL is invalid")
 			}
 			proxyURL.User = url.UserPassword(config.AuthToken, "acceptance")
-			transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+			transport := newHTTPConnectTransport(proxyURL)
 			defer transport.CloseIdleConnections()
 			_, err = probeHTTPSCampaign(
 				ctx,
 				"HTTP CONNECT",
 				r.opts.TargetURL,
-				transport,
+				withFlowTrace(config, "http", transport),
 				r.opts.ProbeTimeout,
 				r.opts.SoakDuration,
 				r.opts.SoakInterval,
@@ -1169,7 +1233,7 @@ func (r *runner) productionProbes(config *proxyConfigResult) map[string]protocol
 				ctx,
 				"SOCKS5",
 				r.opts.TargetURL,
-				transport,
+				withFlowTrace(config, "socks", transport),
 				r.opts.ProbeTimeout,
 				r.opts.SoakDuration,
 				r.opts.SoakInterval,
@@ -1195,7 +1259,7 @@ func (r *runner) productionProbes(config *proxyConfigResult) map[string]protocol
 				ctx,
 				"WireGuard",
 				r.opts.TargetURL,
-				transport,
+				withFlowTrace(config, "wireguard", transport),
 				r.opts.ProbeTimeout,
 				r.opts.SoakDuration,
 				r.opts.SoakInterval,
@@ -1235,6 +1299,9 @@ func probeHTTPSCampaign(
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, retryWindow)
 	defer cancel()
+	dnsReadiness := new(wireGuardDNSReadiness)
+	probeCtx = context.WithValue(probeCtx, wireGuardDNSReadinessKey{}, dnsReadiness)
+	defer dnsReadiness.freeze()
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 	var lastErr error
 	for {
@@ -1244,23 +1311,24 @@ func probeHTTPSCampaign(
 		}
 		var statusErr *targetHTTPStatusError
 		if errors.As(lastErr, &statusErr) && statusErr.statusCode == http.StatusTooManyRequests {
-			return 0, fmt.Errorf("%s readiness was rate limited: %w", protocol, lastErr)
+			return 0, fmt.Errorf("%s readiness was rate limited: %w", protocol, dnsReadiness.failure(lastErr))
 		}
 		if probeCtx.Err() != nil {
 			if ctx.Err() != nil {
 				return 0, ctx.Err()
 			}
-			lastErr = appendLocalNetworkFailureDiagnostic(lastErr, collectLocalNetworkFailure)
+			lastErr = appendLocalNetworkFailureDiagnostic(dnsReadiness.failure(lastErr), collectLocalNetworkFailure)
 			return 0, fmt.Errorf("%s path did not reach the HTTPS target within %s: %w", protocol, retryWindow, lastErr)
 		}
 		if err := wait(probeCtx, readinessRetryInterval); err != nil {
 			if ctx.Err() != nil {
 				return 0, ctx.Err()
 			}
-			lastErr = appendLocalNetworkFailureDiagnostic(lastErr, collectLocalNetworkFailure)
+			lastErr = appendLocalNetworkFailureDiagnostic(dnsReadiness.failure(lastErr), collectLocalNetworkFailure)
 			return 0, fmt.Errorf("%s path did not reach the HTTPS target within %s: %w", protocol, retryWindow, lastErr)
 		}
 	}
+	dnsReadiness.freeze() // successful readiness must not retain tuples through the soak
 
 	successfulRequests := 1
 	sustainedRequests := int(soakDuration / soakInterval)
@@ -1293,18 +1361,32 @@ func probeHTTPSCampaign(
 }
 
 func probeHTTPSRequest(ctx context.Context, client *http.Client, target string) error {
+	flowTransport, traceEnabled := client.Transport.(flowTraceTransport)
+	var flowBefore flowtrace.Snapshot
+	var flowBeforeErr error
+	if traceEnabled {
+		flowBefore, flowBeforeErr = flowTransport.trace.call(ctx, http.MethodGet, "?cursor_only=1", nil)
+	}
 	requestTrace := &httpsRequestTrace{started: time.Now(), phase: "starting_request"}
+	wrapFailure := func(err error) error {
+		finished := time.Now()
+		if traceEnabled {
+			err = flowTransport.failure(ctx, requestTrace, flowBefore, flowBeforeErr, err)
+		}
+		return requestTrace.wrap(err, finished)
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return err
 	}
-	request = request.WithContext(httptrace.WithClientTrace(request.Context(), requestTrace.clientTrace()))
+	traceCtx := context.WithValue(request.Context(), httpsRequestTraceContextKey{}, requestTrace)
+	request = request.WithContext(httptrace.WithClientTrace(traceCtx, requestTrace.clientTrace()))
 	request.Header.Set("Accept", "text/plain, */*")
 	request.Header.Set("User-Agent", "urnetwork-proxy-acceptance/1")
 	request.Close = true
 	response, err := client.Do(request)
 	if err != nil {
-		return requestTrace.wrap(err, time.Now())
+		return wrapFailure(err)
 	}
 	requestTrace.stateLock.Lock()
 	requestTrace.phase = "reading_response_body"
@@ -1312,17 +1394,17 @@ func probeHTTPSRequest(ctx context.Context, client *http.Client, target string) 
 	_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, maxProbeResponseBytes))
 	closeErr := response.Body.Close()
 	if readErr != nil {
-		return requestTrace.wrap(readErr, time.Now())
+		return wrapFailure(readErr)
 	}
 	if closeErr != nil {
-		return requestTrace.wrap(closeErr, time.Now())
+		return wrapFailure(closeErr)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		// A target-side status is still boundary evidence: preserve when the
 		// request started and prove that the tunnel, TLS handshake, response
 		// headers, and body all completed. Without the trace, an LB-generated
 		// 429 looked indistinguishable from a WireGuard transport failure.
-		return requestTrace.wrap(&targetHTTPStatusError{statusCode: response.StatusCode}, time.Now())
+		return wrapFailure(&targetHTTPStatusError{statusCode: response.StatusCode})
 	}
 	return nil
 }

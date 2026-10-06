@@ -23,13 +23,13 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/urfoundation/sn/merkle"
+	"github.com/urfoundation/sn/protocol"
 	"github.com/urfoundation/sn/ss58"
 
 	"github.com/urnetwork/glog"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
 	"github.com/urnetwork/server/session"
-	"github.com/urnetwork/server/startifact"
 )
 
 type SnSetWalletArgs struct {
@@ -49,12 +49,33 @@ type SnSetWalletArgs struct {
 	Message   string `json:"message,omitempty"`
 }
 
+// Stable machine codes for a refused wallet set. Apps pick a localized
+// message from the code and fall back to `Message`.
+const (
+	// the signature is well formed but does not verify for the coldkey over
+	// the challenge: in practice the user signed with another account than the
+	// address they typed (or signed other text). sr25519 cannot name the key
+	// that did sign. Malformed input and a wrong, used or expired challenge
+	// carry no code. A wallet mapping consent signed by another account than
+	// the coldkey it names carries it too. The same value as the wallet
+	// sign-in refusals.
+	SnSetWalletErrorCodeSignatureMismatch = model.WalletAuthErrorCodeSignatureMismatch
+)
+
+// the coded refusal's message, which clients that do not know the code show
+const snSetWalletSignatureMismatchMessage = "The signature does not match this coldkey address. Sign the challenge with this address."
+
 type SnSetWalletError struct {
+	// one of the `SnSetWalletErrorCode*` values. Added after `Message`; older
+	// clients ignore it.
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 
 type SnSetWalletResult struct {
-	Error *SnSetWalletError `json:"error,omitempty"`
+	Error             *SnSetWalletError `json:"error,omitempty"`
+	MappingHash       string            `json:"mapping_hash,omitempty"`
+	MappingGeneration uint64            `json:"mapping_generation,omitempty"`
 }
 
 // SnSetWallet sets the caller network's subnet claim wallet — the ss58
@@ -66,8 +87,18 @@ func SnSetWallet(
 	setWallet *SnSetWalletArgs,
 	clientSession *session.ClientSession,
 ) (*SnSetWalletResult, error) {
+	if setWallet == nil {
+		return nil, protocol.ErrWalletMappingIntegrity
+	}
+	if strings.HasPrefix(setWallet.Message, protocol.WalletMappingConsentPrefix) {
+		return snAcceptWalletMapping(setWallet, clientSession)
+	}
 	fail := func(message string) (*SnSetWalletResult, error) {
 		return &SnSetWalletResult{Error: &SnSetWalletError{Message: message}}, nil
+	}
+	clientId, ownerErr := snWalletClientOwner(setWallet.ClientId, clientSession)
+	if ownerErr != nil {
+		return fail("Client does not match the authenticated provider.")
 	}
 	coldkeySs58 := strings.TrimSpace(setWallet.ColdkeySs58)
 	coldkeyPubkey, err := ss58.DecodeWithPrefix(coldkeySs58, ss58.BittensorPrefix)
@@ -96,6 +127,12 @@ func SnSetWallet(
 			return nil, useErr
 		}
 		if !use.Valid {
+			if use.SignatureMismatch {
+				return &SnSetWalletResult{Error: &SnSetWalletError{
+					Code:    SnSetWalletErrorCodeSignatureMismatch,
+					Message: snSetWalletSignatureMismatchMessage,
+				}}, nil
+			}
 			message := "Invalid wallet signature."
 			if use.Error != nil {
 				message = use.Error.Message
@@ -105,20 +142,17 @@ func SnSetWallet(
 	}
 	setWallet.ColdkeySs58 = coldkeySs58
 
-	clientId := setWallet.ClientId
-	if clientId == nil {
-		clientId = clientSession.ByJwt.ClientId
-	}
 	if clientId != nil {
 		networkId, findErr := model.FindClientNetwork(clientSession.Ctx, *clientId)
 		if findErr != nil || networkId != clientSession.ByJwt.NetworkId {
 			return &SnSetWalletResult{Error: &SnSetWalletError{Message: "Client does not belong to this network."}}, nil
 		}
 	}
-	model.SetStWallet(clientSession.Ctx, clientSession.ByJwt.NetworkId, setWallet.ColdkeySs58, coldkeyPubkey)
-	if clientId != nil {
-		model.SetStProviderWallet(clientSession.Ctx, *clientId, clientSession.ByJwt.NetworkId, setWallet.ColdkeySs58, coldkeyPubkey)
+	var originalMessage, originalSignature *string
+	if setWallet.Message != "" && strings.TrimSpace(setWallet.Signature) != "" {
+		originalMessage, originalSignature = &setWallet.Message, &setWallet.Signature
 	}
+	model.SetStWalletOriginal(clientSession.Ctx, clientSession.ByJwt.NetworkId, clientId, setWallet.ColdkeySs58, coldkeyPubkey, originalMessage, originalSignature)
 
 	return &SnSetWalletResult{}, nil
 }
@@ -128,6 +162,8 @@ func SnSetWallet(
 // (Epoch 0 is a real contract epoch, so absence is a nil, not a zero.)
 type SnPoolClaimArgs struct {
 	Epoch *uint64
+	// Explicit original coldkey for legacy proof reads; never provider ownership.
+	LegacyColdkey string
 }
 
 type SnPoolClaimError struct {
@@ -158,7 +194,7 @@ type SnPoolClaimResult struct {
 	Error                  *SnPoolClaimError `json:"error,omitempty"`
 }
 
-// SnPoolClaim rebuilds the caller network's merkle pool claim for an epoch:
+// SnPoolClaim rebuilds the authenticated provider's merkle pool claim for an epoch:
 // wallet coldkey -> payout leaf -> proof against the committed payout root.
 // The tree is rebuilt from the stored leaves in leaf_index order — the
 // exact input order the committed root was built from — and the proof is
@@ -201,45 +237,13 @@ func SnPoolClaim(
 		}, nil
 	}
 
-	var leaf *model.StPayoutLeaf
-	var artifactRecord *model.StPayoutArtifact
-	artifactRecord = model.GetStPayoutArtifact(ctx, deploymentKey, stEpoch.Epoch, cfg.NoId)
-	// Provider identity, payout ownership, and head exclusion are all frozen in
-	// the immutable epoch artifact. Never apply the caller's current wallet to
-	// an old epoch after a rotation.
-	if clientSession.ByJwt.ClientId != nil && artifactRecord != nil {
-		store, available := server.LoadBlobStore()
-		if !available {
-			return nil, fmt.Errorf("payout artifact store unavailable")
-		}
-		artifact, _, readErr := startifact.Read(ctx, store, artifactRecord.ContentHash)
-		if readErr != nil {
-			return nil, fmt.Errorf("payout artifact integrity failure: %w", readErr)
-		}
-		clientId := stId16(*clientSession.ByJwt.ClientId)
-		for _, provider := range artifact.Providers {
-			if provider.ClientID != clientId {
-				continue
-			}
-			for _, candidate := range model.GetStPayoutLeaves(ctx, deploymentKey, stEpoch.Epoch, artifact.NoID) {
-				if candidate.Coldkey == provider.Coldkey {
-					leaf = candidate
-					break
-				}
-			}
-			break
-		}
-	}
-	// Backward-compatible lookup for a network-scoped JWT/legacy epoch.
-	if leaf == nil {
-		if wallet := model.GetStWallet(ctx, clientSession.ByJwt.NetworkId); wallet != nil {
-			if noId, ok := getStPayoutNoIdForColdkey(ctx, deploymentKey, stEpoch.Epoch, wallet.ColdkeyPubkey); ok {
-				leaf = model.GetStPayoutLeafForColdkey(ctx, deploymentKey, stEpoch.Epoch, noId, wallet.ColdkeyPubkey)
-			}
-		}
+	artifactRecord := model.GetStPayoutArtifact(ctx, deploymentKey, stEpoch.Epoch, cfg.NoId)
+	leaf, err := snPoolClaimOwnedLeaf(poolClaim, clientSession, cfg, stEpoch, artifactRecord)
+	if err != nil {
+		return nil, err
 	}
 	if leaf == nil {
-		result := &SnPoolClaimResult{Epoch: stEpoch.Epoch}
+		result := &SnPoolClaimResult{Epoch: stEpoch.Epoch, Error: &SnPoolClaimError{Message: "Provider claim is not ready: no owned payout leaf; legacy reads require an explicit original coldkey and retained network-only evidence."}}
 		if artifactRecord != nil {
 			result.ArtifactHash = artifactRecord.ContentHash
 			result.ArtifactUri = "/sn/artifact?hash=" + artifactRecord.ContentHash
@@ -253,6 +257,10 @@ func SnPoolClaim(
 	if err != nil {
 		// a proof that does not self-verify is a server bug; never hand it out
 		return nil, err
+	}
+
+	if artifactRecord != nil && root != artifactRecord.PayoutRoot {
+		return nil, fmt.Errorf("payout leaf set differs from its retained artifact root")
 	}
 
 	result := &SnPoolClaimResult{

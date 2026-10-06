@@ -53,16 +53,19 @@ COPY source/glog /workspace/glog
 COPY source/goidenticons /workspace/goidenticons
 COPY source/userwireguard /workspace/userwireguard
 COPY source/sn /workspace/sn
+COPY source/operator-proxy /workspace/operator-proxy
+COPY source/warp /workspace/warp
 COPY source-lock.json /opt/urnetwork/source-lock.json
 COPY sim-latency.yml /opt/urnetwork/sim-latency.yml
 COPY evaluator/entrypoint.sh /usr/local/libexec/competition-container
 COPY evaluator/official-run.sh /usr/local/libexec/competition-official-run
 
 # Scorers run unprivileged against the root-owned built-in tree, while runners
-# see equivalent remapped read-only mounts. Trust only the exact eight
+# see equivalent remapped read-only mounts. Trust only the exact ten
 # repositories authenticated by source-lock.json.
 RUN test "$(git -C /workspace/server rev-parse HEAD)" = "${BASE_SHA}" \
-    && test -z "$(git -C /workspace/server status --porcelain --untracked-files=all)" \
+    && source_status="$(git -C /workspace/server status --porcelain --untracked-files=all)" \
+    && test -z "$source_status" \
     && test "$(sha256sum /opt/urnetwork/source-lock.json | awk '{print $1}')" = "${SOURCE_LOCK_SHA256}" \
     && chmod -R go-w,a+rX /workspace \
     && git config --system --add safe.directory /workspace/server \
@@ -73,6 +76,8 @@ RUN test "$(git -C /workspace/server rev-parse HEAD)" = "${BASE_SHA}" \
     && git config --system --add safe.directory /workspace/goidenticons \
     && git config --system --add safe.directory /workspace/userwireguard \
     && git config --system --add safe.directory /workspace/sn \
+    && git config --system --add safe.directory /workspace/operator-proxy \
+    && git config --system --add safe.directory /workspace/warp \
     && chmod 0555 /usr/local/libexec/competition-container /usr/local/libexec/competition-official-run \
     && install -d -m 0755 /opt/urnetwork/bin /opt/urnetwork/submission /opt/urnetwork/go
 
@@ -82,12 +87,37 @@ WORKDIR /workspace/server
 # season base image. Every per-submission Dockerfile step uses network=none.
 RUN go mod download \
     && GOFLAGS=-mod=readonly go list -deps -test ./connect/... >/dev/null
+# Resolve the complete candidate check surface before publishing the base.
+# Listing dependencies does not type-check test-only cross-repository APIs.
+RUN --network=none GOFLAGS=-mod=readonly GOPROXY=off GOSUMDB=off go vet ./connect/...
 RUN GOFLAGS=-mod=readonly go build -trimpath -o /usr/local/libexec/competitionpatch ./cli/competitionpatch \
     && GOFLAGS=-mod=readonly go build -trimpath -o /usr/local/libexec/competitiondbinit ./cli/competitiondbinit \
     && GOFLAGS=-mod=readonly go build -trimpath -o /opt/urnetwork/bin/sim-latency ./connect/sim-latency
+RUN --network=none GOFLAGS=-mod=readonly go test -list '^TestDbClassifiesWrappedConnectionWriteTimeout$' . \
+        | grep -Fx 'TestDbClassifiesWrappedConnectionWriteTimeout' \
+    && GOFLAGS=-mod=readonly go test -list '^TestDbRejectsUnsafePgprotoWriteRetry$' . \
+        | grep -Fx 'TestDbRejectsUnsafePgprotoWriteRetry' \
+    && GOFLAGS=-mod=readonly go test \
+        -run '^(TestDbClassifiesWrappedConnectionWriteTimeout|TestDbRejectsUnsafePgprotoWriteRetry)$' \
+        -count=1 .
 RUN --network=none GOFLAGS=-mod=readonly go test -list '^TestScoreProducesSharedContract$' ./connect/sim-latency \
         | grep -Fx 'TestScoreProducesSharedContract' \
     && GOFLAGS=-mod=readonly go test -run '^TestScoreProducesSharedContract$' -count=1 ./connect/sim-latency
+RUN --network=none GOFLAGS=-mod=readonly go test -list '^TestBuildScoreBaselineAuthenticatesDriverCsvPrecision$' ./connect/sim-latency \
+        | grep -Fx 'TestBuildScoreBaselineAuthenticatesDriverCsvPrecision' \
+    && GOFLAGS=-mod=readonly go test -run '^TestBuildScoreBaselineAuthenticatesDriverCsvPrecision$' -count=1 ./connect/sim-latency
+RUN --network=none GOFLAGS=-mod=readonly go test -list '^TestSimulationExchangeSettingsUseOnlyH1Listeners$' ./connect/sim-latency \
+        | grep -Fx 'TestSimulationExchangeSettingsUseOnlyH1Listeners' \
+    && GOFLAGS=-mod=readonly go test -list '^TestSimulationHandlerHeartbeatsStopBeforeNextRefresh$' ./connect/sim-latency \
+        | grep -Fx 'TestSimulationHandlerHeartbeatsStopBeforeNextRefresh' \
+    && GOFLAGS=-mod=readonly go test -list '^TestSimulationHandlerHeartbeatFailureStopsServices$' ./connect/sim-latency \
+        | grep -Fx 'TestSimulationHandlerHeartbeatFailureStopsServices' \
+    && GOFLAGS=-mod=readonly go test \
+        -run '^(TestSimulationExchangeSettingsUseOnlyH1Listeners|TestSimulationHandlerHeartbeatsStopBeforeNextRefresh|TestSimulationHandlerHeartbeatFailureStopsServices)$' \
+        -count=1 ./connect/sim-latency
+RUN --network=none GOFLAGS=-mod=readonly go test -list '^TestIsDoneErrorRequiresExplicitShutdownSignal$' . \
+        | grep -Fx 'TestIsDoneErrorRequiresExplicitShutdownSignal' \
+    && GOFLAGS=-mod=readonly go test -run '^TestIsDoneErrorRequiresExplicitShutdownSignal$' -count=1 .
 RUN test "$(sha256sum /opt/urnetwork/sim-latency.yml | awk '{print $1}')" = "${SOURCE_CONFIG_SHA256}" \
     && /opt/urnetwork/bin/sim-latency source-check \
         --epoch "${SOURCE_EPOCH}" \
@@ -108,7 +138,8 @@ RUN install -m 0444 /dev/null /opt/urnetwork/submission/canonical.patch \
         '{schema: 1, image_kind: "evaluator-base", base_sha: $base_sha, build_sha: $base_sha, source_epoch: $source_epoch, source_config_sha256: $source_config_sha256, patch_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", policy_sha256: null, source_lock_sha256: $source_lock_sha256, simulator_sha256: $simulator_sha256, paths: []}' \
         > /opt/urnetwork/image-identity.json \
     && chmod 0444 /opt/urnetwork/image-identity.json /opt/urnetwork/source-lock.json /opt/urnetwork/sim-latency.yml \
-    && test -z "$(git -C /workspace/server status --porcelain --untracked-files=all)"
+    && source_status="$(git -C /workspace/server status --porcelain --untracked-files=all)" \
+    && test -z "$source_status"
 
 LABEL org.opencontainers.image.title="URnetwork sim-latency evaluator base" \
       org.opencontainers.image.revision="${BASE_SHA}" \
@@ -123,5 +154,6 @@ USER 65532:65532
 WORKDIR /workspace/server
 RUN --network=none test -r /workspace/server/go.mod \
     && test "$(git -C /workspace/server rev-parse HEAD)" = "${BASE_SHA}" \
-    && test -z "$(git -C /workspace/server status --porcelain --untracked-files=all)"
+    && source_status="$(git -C /workspace/server status --porcelain --untracked-files=all)" \
+    && test -z "$source_status"
 CMD ["identity"]

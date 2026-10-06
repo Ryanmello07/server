@@ -68,9 +68,18 @@ type x402FacilitatorConfig struct {
 }
 
 type X402Config struct {
-	Enabled       bool                     `yaml:"enabled"`
-	Facilitator   x402FacilitatorConfig    `yaml:"facilitator"`
-	PayTo         string                   `yaml:"pay_to"`
+	Enabled     bool                  `yaml:"enabled"`
+	Facilitator x402FacilitatorConfig `yaml:"facilitator"`
+	// PayTo is the settlement address PER NETWORK, keyed by the same names as
+	// Networks.
+	//
+	// It is a map and not one string because the address is network-specific
+	// and the forms are not interchangeable: Base and Tempo settle to an EVM
+	// 0x address, Solana to a base58 account. Quoting one string across all
+	// three would hand an agent an address that does not exist on two of the
+	// chains it was offered, and USDC sent there is gone. A network with no
+	// entry here is not quoted at all.
+	PayTo         map[string]string        `yaml:"pay_to"`
 	Networks      []string                 `yaml:"networks"`
 	Asset         string                   `yaml:"asset"`
 	Skus          map[string]x402SkuConfig `yaml:"skus"`
@@ -86,13 +95,28 @@ func x402ConfigUsable(c *X402Config) bool {
 	if !c.Enabled {
 		return false
 	}
-	if c.Facilitator.Url == "" || c.Facilitator.ApiKey == "" || c.PayTo == "" {
+	if c.Facilitator.Url == "" || c.Facilitator.ApiKey == "" {
 		return false
 	}
 	if len(c.Networks) == 0 {
 		return false
 	}
+	// Every network we would quote needs its own settlement address. Missing
+	// one is not a network we quietly drop -- it means the operator believes
+	// they configured a chain they did not, so the whole feature stays off
+	// rather than silently offering fewer chains than the vault lists.
+	for _, network := range c.Networks {
+		if c.PayTo[network] == "" {
+			return false
+		}
+	}
 	return true
+}
+
+// X402PayTo is the settlement address for one network, or empty when that
+// network has none.
+func (c *X402Config) X402PayTo(network string) string {
+	return c.PayTo[network]
 }
 
 // x402Config loads vault/<env>/x402.yml. The resource is OPTIONAL: an env with no
@@ -110,7 +134,8 @@ var x402Config = sync.OnceValue(func() *X402Config {
 	if c.Enabled && !x402ConfigUsable(c) {
 		glog.Errorf(
 			"[x402]enabled but not fully configured " +
-				"(facilitator.url, facilitator.api_key, pay_to, networks); x402 is off\n",
+				"(facilitator.url, facilitator.api_key, networks, and a pay_to " +
+				"address for every network); x402 is off\n",
 		)
 		c.Enabled = false
 	}
@@ -301,7 +326,7 @@ func x402PaymentRequiredForConfig(
 			Resource:          resource,
 			Description:       sku.Description,
 			MimeType:          "application/json",
-			PayTo:             c.PayTo,
+			PayTo:             c.PayTo[network],
 			Asset:             c.Asset,
 			MaxTimeoutSeconds: 300,
 		})
@@ -513,22 +538,14 @@ func X402Purchase(
 	}
 
 	// paid. grant it.
-	netRevenue := model.UsdToNanoCents(sku.PriceUsd)
+	if err := x402GrantSettled(ctx, networkId, sku, settleResponse); err != nil {
+		return nil, err
+	}
 
-	if sku.Pro {
-		err = x402GrantProMonth(ctx, networkId, sku, netRevenue, settleResponse)
-	} else {
-		err = x402GrantData(ctx, networkId, sku, netRevenue, settleResponse)
-	}
-	if err != nil {
-		// The money moved but the grant did not. Loudly: this needs manual repair,
-		// and the transaction id is the thread to pull.
-		glog.Errorf(
-			"[x402]SETTLED BUT NOT GRANTED network=%s sku=%s tx=%s err=%s\n",
-			networkId, sku.SkuId, settleResponse.Transaction, err,
-		)
-		return nil, fmt.Errorf("x402 grant failed after settlement: %w", err)
-	}
+	// Record the settled transfer in Stripe. The money is already on chain and
+	// the entitlement is already granted, so this is bookkeeping: a failure is
+	// logged loudly and never propagated (see x402RecordStripePayment).
+	x402RecordStripePayment(ctx, sku, requirements, settleResponse)
 
 	if c.Receipt.Enabled && purchase.Email != "" {
 		x402SendReceipt(ctx, purchase.Email, sku, settleResponse)
@@ -547,6 +564,97 @@ func X402Purchase(
 		Transaction: settleResponse.Transaction,
 		Network:     settleResponse.Network,
 	}, nil
+}
+
+// x402 grant seams, so the settle->grant failure path is testable without Postgres
+var (
+	x402GrantProMonthFunc = x402GrantProMonth
+	x402GrantDataFunc     = x402GrantData
+)
+
+// x402GrantSettled grants a settled purchase. The money has already moved, so a
+// grant failure is recorded durably as a settled_not_granted reconciliation event
+// keyed by the settle transaction; the payment reconciler retries the grant from
+// it (the grant is idempotent on that transaction), so repair no longer depends
+// on someone reading the logs.
+func x402GrantSettled(
+	ctx context.Context,
+	networkId server.Id,
+	sku *X402Sku,
+	settleResponse *X402SettleResponse,
+) error {
+	netRevenue := model.UsdToNanoCents(sku.PriceUsd)
+
+	var err error
+	if sku.Pro {
+		err = x402GrantProMonthFunc(ctx, networkId, sku, netRevenue, settleResponse)
+	} else {
+		err = x402GrantDataFunc(ctx, networkId, sku, netRevenue, settleResponse)
+	}
+	if err != nil {
+		glog.Errorf(
+			"[x402]SETTLED BUT NOT GRANTED network=%s sku=%s tx=%s err=%s\n",
+			networkId, sku.SkuId, settleResponse.Transaction, err,
+		)
+		recordErr := addPaymentReconciliationEvent(ctx, &model.PaymentReconciliationEvent{
+			// a fresh provenance id, like the other webhook-time events
+			RunId:     server.NewId(),
+			Store:     model.SubscriptionMarketX402,
+			NetworkId: &networkId,
+			Action:    model.PaymentReconcileActionSettledNotGranted,
+			Evidence:  settleResponse.Transaction,
+			Details:   x402SettledNotGrantedDetails(sku, settleResponse, err),
+		})
+		if recordErr != nil {
+			// the log line above is now the only record
+			glog.Errorf(
+				"[x402]SETTLED BUT NOT GRANTED tx=%s could not be recorded for the reconciler: %s\n",
+				settleResponse.Transaction, recordErr,
+			)
+		}
+		return fmt.Errorf("x402 grant failed after settlement: %w", err)
+	}
+	return nil
+}
+
+// x402SettledNotGrantedDetails is what the reconciler needs to retry the grant
+// exactly as bought: the price paid and the amount, not the current config.
+func x402SettledNotGrantedDetails(sku *X402Sku, settleResponse *X402SettleResponse, err error) map[string]any {
+	return map[string]any{
+		"sku_id":     sku.SkuId,
+		"pro":        sku.Pro,
+		"byte_count": int64(sku.ByteCount),
+		"price_usd":  sku.PriceUsd,
+		"network":    settleResponse.Network,
+		"error":      err.Error(),
+	}
+}
+
+// x402SkuFromSettledNotGrantedDetails reverses x402SettledNotGrantedDetails
+// (json numbers decode as float64).
+func x402SkuFromSettledNotGrantedDetails(details map[string]any) (*X402Sku, string, error) {
+	skuId, _ := details["sku_id"].(string)
+	pro, proOk := details["pro"].(bool)
+	byteCount, byteCountOk := details["byte_count"].(float64)
+	priceUsd, priceUsdOk := details["price_usd"].(float64)
+	network, _ := details["network"].(string)
+	if skuId == "" || !proOk || !byteCountOk || !priceUsdOk {
+		return nil, "", fmt.Errorf("settled_not_granted details are incomplete: %v", details)
+	}
+	return &X402Sku{
+		SkuId:     skuId,
+		PriceUsd:  priceUsd,
+		Pro:       pro,
+		ByteCount: model.ByteCount(byteCount),
+	}, network, nil
+}
+
+// x402TransactionGranted is x402AlreadyGrantedForTransaction in its own read.
+func x402TransactionGranted(ctx context.Context, networkId server.Id, transaction string) (granted bool) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		granted = x402AlreadyGrantedForTransaction(ctx, tx, networkId, transaction)
+	}, server.TxReadCommitted)
+	return
 }
 
 // x402PaymentNetwork reads the network out of the signed payment payload. Per the
@@ -723,7 +831,7 @@ func x402GrantProMonth(
 	settleResponse *X402SettleResponse,
 ) (returnErr error) {
 	startTime := server.NowUtc()
-	endTime := startTime.Add(x402ProMonthDuration + SubscriptionGracePeriod)
+	endTime := startTime.Add(x402ProMonthDuration + manualPaymentGracePeriod)
 
 	granted := false
 	server.Tx(ctx, func(tx server.PgTx) {

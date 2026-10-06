@@ -1,6 +1,7 @@
 package model
 
 import (
+	"cmp"
 	"context"
 	// "encoding/hex"
 	"strings"
@@ -13,9 +14,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	// "math"
+	"math"
 	mathrand "math/rand"
+	"net"
 	"slices"
 	"unicode/utf8"
 
@@ -27,6 +28,7 @@ import (
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/server"
+	"github.com/urnetwork/server/geo"
 	"github.com/urnetwork/server/search"
 	"github.com/urnetwork/server/session"
 	"github.com/urnetwork/server/stats"
@@ -75,6 +77,7 @@ const (
 type clientScoreRedisSet struct {
 	key   string
 	value []byte
+	flush bool
 }
 
 type clientScoreTargetManifestDocument struct {
@@ -121,6 +124,14 @@ type clientScoreExportPayload struct {
 	counts       []int
 	encodeSample func(int) []byte
 	facets       map[ipFamilyFacet]clientScoreFacetPayload
+	nativeFacets map[ipFamilyFacet]clientScoreFacetPayload
+}
+
+// Native publication has its own commit boundary; legacy aliases and online
+// union keys remain compatible with readers deployed before this schema.
+type clientScoreNativeFanout struct {
+	publish func(server.Id, map[ipFamilyFacet]clientScoreFacetPayload) error
+	alias   func(server.Id) error
 }
 
 type clientScoreTargetEncode func(map[server.Id]*ClientScore) clientScoreExportPayload
@@ -198,6 +209,7 @@ func emitClientScoreTargetFanout(
 	writeLegacyUnchanged bool,
 	writeUnfacetedPayload bool,
 	emit func(clientScoreRedisSet) error,
+	nativeFanouts ...*clientScoreNativeFanout,
 ) error {
 	return emitClientScoreTargetFanoutWithMetrics(
 		clientLocationIds,
@@ -209,6 +221,7 @@ func emitClientScoreTargetFanout(
 		writeUnfacetedPayload,
 		emit,
 		updateClientScoresPhaseMetrics,
+		nativeFanouts...,
 	)
 }
 
@@ -222,7 +235,12 @@ func emitClientScoreTargetFanoutWithMetrics(
 	writeUnfacetedPayload bool,
 	emit func(clientScoreRedisSet) error,
 	metrics *updateClientScoresPhaseMetricSet,
+	nativeFanouts ...*clientScoreNativeFanout,
 ) error {
+	var nativeFanout *clientScoreNativeFanout
+	if 0 < len(nativeFanouts) {
+		nativeFanout = nativeFanouts[0]
+	}
 	targetSpan := metrics.start(updateClientScoresPhaseTargetExport)
 	defer targetSpan.finish()
 	metrics.addWork(updateClientScoresPhaseTargetExport, 1, 0)
@@ -311,12 +329,25 @@ func emitClientScoreTargetFanoutWithMetrics(
 	if err := emitPayload(baselineAndLegacyCallers, payload); err != nil {
 		return err
 	}
+	if nativeFanout != nil {
+		if err := emit(clientScoreRedisSet{flush: true}); err != nil {
+			return err
+		}
+		if err := nativeFanout.publish(server.Id{}, payload.nativeFacets); err != nil {
+			return err
+		}
+	}
 	for _, clientLocationId := range unchangedClientLocationIds {
 		if err := emit(clientScoreRedisSet{
 			key:   keys.alias(clientLocationId),
 			value: []byte(clientScoreAliasBaselineValue),
 		}); err != nil {
 			return err
+		}
+		if nativeFanout != nil {
+			if err := nativeFanout.alias(clientLocationId); err != nil {
+				return err
+			}
 		}
 	}
 	for _, clientLocationId := range changedClientLocationIds {
@@ -325,8 +356,17 @@ func emitClientScoreTargetFanoutWithMetrics(
 			excludeLocationNetworkIds[clientLocationId],
 			metrics,
 		)
-		if err := emitPayload([]server.Id{clientLocationId}, encode(activeClientScores)); err != nil {
+		payload := encode(activeClientScores)
+		if err := emitPayload([]server.Id{clientLocationId}, payload); err != nil {
 			return err
+		}
+		if nativeFanout != nil {
+			if err := emit(clientScoreRedisSet{flush: true}); err != nil {
+				return err
+			}
+			if err := nativeFanout.publish(clientLocationId, payload.nativeFacets); err != nil {
+				return err
+			}
 		}
 		if err := emit(clientScoreRedisSet{
 			key:   keys.alias(clientLocationId),
@@ -447,6 +487,14 @@ func runClientScoreExportStream(
 		return nil
 	}
 	emit := func(set clientScoreRedisSet) error {
+		// Native snapshot publication has its own bounded stream. Release the
+		// legacy tail before entering it, never retain two payload budgets.
+		if set.flush {
+			if set.key != "" || len(set.value) != 0 {
+				return fmt.Errorf("client score export barrier contains a payload")
+			}
+			return flush()
+		}
 		setBytes := len(set.key) + len(set.value)
 		// Count and bytes are independent guards. Encoded samples vary with
 		// provider population, so a 512-command batch alone is not a bounded
@@ -657,10 +705,11 @@ func resetCountryCodeLocationIds() {
 var countryCodeLocationIds func() map[string]server.Id
 
 type locationDirectoryEntry struct {
-	Name        string
-	CountryCode string
-	Latitude    *float64
-	Longitude   *float64
+	Name         string
+	CountryCode  string
+	LocationType LocationType
+	Latitude     *float64
+	Longitude    *float64
 }
 
 type locationDirectorySnapshot struct {
@@ -798,11 +847,12 @@ const locationDirectoryRedisKey = "location_directory"
 // MarshalText, so it cannot be a json map key — the cache carries a list and the
 // map is rebuilt on read.
 type locationDirectoryRow struct {
-	LocationId  server.Id `json:"location_id"`
-	Name        string    `json:"name"`
-	CountryCode string    `json:"country_code"`
-	Latitude    *float64  `json:"latitude,omitempty"`
-	Longitude   *float64  `json:"longitude,omitempty"`
+	LocationId   server.Id    `json:"location_id"`
+	Name         string       `json:"name"`
+	CountryCode  string       `json:"country_code"`
+	LocationType LocationType `json:"location_type,omitempty"`
+	Latitude     *float64     `json:"latitude,omitempty"`
+	Longitude    *float64     `json:"longitude,omitempty"`
 }
 
 // getLocationDirectoryCache reads the fleet-shared directory, or nil on miss.
@@ -824,10 +874,11 @@ func getLocationDirectoryCache(ctx context.Context) map[server.Id]*locationDirec
 		entries = map[server.Id]*locationDirectoryEntry{}
 		for _, row := range rows {
 			entries[row.LocationId] = &locationDirectoryEntry{
-				Name:        row.Name,
-				CountryCode: row.CountryCode,
-				Latitude:    row.Latitude,
-				Longitude:   row.Longitude,
+				Name:         row.Name,
+				CountryCode:  row.CountryCode,
+				LocationType: row.LocationType,
+				Latitude:     row.Latitude,
+				Longitude:    row.Longitude,
 			}
 		}
 	})
@@ -842,11 +893,12 @@ func setLocationDirectoryCache(
 	rows := make([]*locationDirectoryRow, 0, len(entries))
 	for locationId, entry := range entries {
 		rows = append(rows, &locationDirectoryRow{
-			LocationId:  locationId,
-			Name:        entry.Name,
-			CountryCode: entry.CountryCode,
-			Latitude:    entry.Latitude,
-			Longitude:   entry.Longitude,
+			LocationId:   locationId,
+			Name:         entry.Name,
+			CountryCode:  entry.CountryCode,
+			LocationType: entry.LocationType,
+			Latitude:     entry.Latitude,
+			Longitude:    entry.Longitude,
 		})
 	}
 	rowsJson, err := json.Marshal(rows)
@@ -935,6 +987,7 @@ func queryLocationDirectory(ctx context.Context) map[server.Id]*locationDirector
 				location.location_id,
 				location.location_name,
 				location.country_code,
+				location.location_type,
 				location.latitude,
 				location.longitude
 			FROM location
@@ -963,6 +1016,7 @@ func queryLocationDirectory(ctx context.Context) map[server.Id]*locationDirector
 					&locationId,
 					&entry.Name,
 					&entry.CountryCode,
+					&entry.LocationType,
 					&entry.Latitude,
 					&entry.Longitude,
 				))
@@ -979,26 +1033,85 @@ const DefaultMaxDistanceFraction = float32(0.2)
 
 const StrongPrivacyLaws = "Strong Privacy Laws and Internet Freedom"
 
+// The canonical place list the seeder reads
+// (connect/GEOMAP.md §4.1). server/cli/geolite2export writes it into the dated
+// directory of the GeoLite2 database it is exported from, and the deploy
+// flattens that directory as it does for the database.
+const placesResource = "mmdb/places.yml"
+
 // called from db_migrations to add default locations and groups
+//
+// Countries, regions and cities come from the canonical place list and are
+// matched, created and refreshed by geoname id (connect/GEOMAP.md §4.2): a row
+// seeded from the old city list, or created by a lookup before geoname ids, is
+// matched by name and gets its id filled in, and nothing is deleted. Every
+// country is seeded. `cityLimit` caps the cities -- 0 for none, negative for
+// every city -- taken in the list's order, so a limited run seeds the same
+// cities every time; each city's region is created with it.
 func AddDefaultLocations(ctx context.Context, cityLimit int) {
-	createCountry := func(countryCode string, country string) {
+	// The process's list, loaded here unless a use before this loaded it: the
+	// seeded rows and every stored row are resolved against it
+	// (location_match.go), and every later use in this process shares this
+	// one copy. A deployment without one cannot seed, and panics rather than
+	// seeding nothing.
+	names, err := currentLocationPlaceNamesLoad().get()
+	if err != nil {
+		panic(err)
+	}
+	places := names.places
+
+	createCountry := func(country *geo.Country) {
 		location := &Location{
-			LocationType: LocationTypeCountry,
-			Country:      country,
-			CountryCode:  countryCode,
+			LocationType:     LocationTypeCountry,
+			Country:          country.Name,
+			CountryCode:      country.Code,
+			CountryGeonameId: country.GeonameId,
 		}
-		CreateLocation(ctx, location)
+		if location.Country == "" {
+			if _, ok := resolveCountryName(country.Code); !ok {
+				// nothing names it, and no row is stored without a name
+				glog.Infof("[loc]skip unnamed country %s\n", country.Code)
+				return
+			}
+		}
+		seedLocation(ctx, location)
 	}
 
-	createCity := func(countryCode string, country string, region string, city string) {
+	// exact is the first pass: the city is seeded only when its geoname id or
+	// its exact name finds a row, and false is returned otherwise
+	createCity := func(place *geo.Place, exact bool) bool {
 		location := &Location{
-			LocationType: LocationTypeCity,
-			Country:      country,
-			CountryCode:  countryCode,
-			Region:       region,
-			City:         city,
+			LocationType:    LocationTypeCity,
+			City:            place.City,
+			Region:          place.Region,
+			CountryCode:     place.CountryCode,
+			Latitude:        place.Latitude,
+			Longitude:       place.Longitude,
+			Timezone:        place.TimeZone,
+			CityGeonameId:   place.GeonameId,
+			RegionGeonameId: place.RegionGeonameId,
 		}
-		CreateLocation(ctx, location)
+		if country := places.Country(place.CountryCode); country != nil {
+			location.Country = country.Name
+			location.CountryGeonameId = country.GeonameId
+		}
+		if exact {
+			return seedLocationExactly(ctx, location)
+		}
+		seedLocation(ctx, location)
+		return true
+	}
+
+	// a location-group member takes the place list's ids where the list has
+	// the place, so it resolves to the seeded row by id
+	withPlaceGeonameIds := func(location *Location) *Location {
+		if country := places.Country(location.CountryCode); country != nil && location.CountryGeonameId == 0 {
+			location.CountryGeonameId = country.GeonameId
+		}
+		if location.Region != "" && location.RegionGeonameId == 0 {
+			location.RegionGeonameId = places.RegionGeonameId(location.CountryCode, location.Region)
+		}
+		return location
 	}
 
 	createLocationGroup := func(promoted bool, name string, members ...any) {
@@ -1021,12 +1134,21 @@ func AddDefaultLocations(ctx context.Context, cityLimit int) {
 				// with no `Country` at all, and `CreateLocation` writes
 				// `location_name` from `Country` -- so every country reachable
 				// only through a location group (i.e. every code below that
-				// iso-country-list.yml does not name) was inserted with an empty
-				// name. That single omission produced 161 blank-named country
-				// rows on the live beta deployment.
+				// the deployment's country list did not name) was inserted with
+				// an empty name. That single omission produced 161 blank-named
+				// country rows on the live beta deployment. The place list names
+				// every country GeoLite2 knows, and the ISO table the rest.
 				countryCode := strings.ToLower(v)
-				country, ok := resolveCountryName(countryCode)
-				if !ok {
+				location := &Location{
+					LocationType: LocationTypeCountry,
+					CountryCode:  countryCode,
+				}
+				if country := places.Country(countryCode); country != nil && country.Name != "" {
+					location.Country = country.Name
+					location.CountryGeonameId = country.GeonameId
+				} else if country, ok := resolveCountryName(countryCode); ok {
+					location.Country = country
+				} else {
 					// deliberately fatal: the member lists below are hardcoded
 					// country codes, so an unresolvable one is a typo in this
 					// file, not a data condition to tolerate.
@@ -1036,18 +1158,13 @@ func AddDefaultLocations(ctx context.Context, cityLimit int) {
 						v,
 					))
 				}
-				location := &Location{
-					LocationType: LocationTypeCountry,
-					Country:      country,
-					CountryCode:  countryCode,
-				}
 				CreateLocation(ctx, location)
 				memberLocationIds = append(memberLocationIds, location.LocationId)
 			case Location:
-				CreateLocation(ctx, &v)
+				CreateLocation(ctx, withPlaceGeonameIds(&v))
 				memberLocationIds = append(memberLocationIds, v.LocationId)
 			case *Location:
-				CreateLocation(ctx, v)
+				CreateLocation(ctx, withPlaceGeonameIds(v))
 				memberLocationIds = append(memberLocationIds, v.LocationId)
 			}
 		}
@@ -1063,61 +1180,40 @@ func AddDefaultLocations(ctx context.Context, cityLimit int) {
 		CreateLocationGroup(ctx, locationGroup)
 	}
 
-	// country code -> name
-	countries := server.Config.RequireSimpleResource("iso-country-list.yml").Parse()
-
-	// country code -> region -> []city
-	cities := server.Config.RequireSimpleResource("city-list.yml").Parse()
-
-	countryCodesToRemoveFromCities := []string{}
-	for countryCode, _ := range cities {
-		if _, ok := countries[countryCode]; !ok {
-			// server.Logger().Printf("Missing country for %s", countryCode)
-			countryCodesToRemoveFromCities = append(countryCodesToRemoveFromCities, countryCode)
-		}
-	}
-	for _, countryCode := range countryCodesToRemoveFromCities {
-		delete(cities, countryCode)
-	}
-
 	func() {
 		// countries
-		countryCount := len(countries)
-		countryIndex := 0
-		for countryCode, country := range countries {
-			countryIndex += 1
-			glog.Infof("[loc][%d/%d] %s, %s\n", countryIndex, countryCount, countryCode, country)
-			createCountry(countryCode, country.(string))
+		countries := places.Countries()
+		for i, country := range countries {
+			glog.Infof("[loc][%d/%d] %s, %s\n", i+1, len(countries), country.Code, country.Name)
+			createCountry(country)
 		}
 	}()
 
 	func() {
-		// cities
-		cityCount := 0
-		for _, regions := range cities {
-			for _, cities := range regions.(map[string]any) {
-				for range cities.([]any) {
-					cityCount += 1
-				}
+		// cities, in two passes: first every city that its geoname id or a
+		// stored row anchored to it finds, then the rest, which adopt a row
+		// that resolves to them loosely or are created. Resolution already
+		// keeps one city from taking another's row; the order keeps every
+		// exact match settled before any loose one is considered.
+		cityCount := places.CityCount()
+		if 0 <= cityLimit {
+			cityCount = min(cityCount, cityLimit)
+		}
+		unmatched := []*geo.Place{}
+		cityIndex := 0
+		for place := range places.Cities() {
+			if cityCount <= cityIndex {
+				break
+			}
+			cityIndex += 1
+			glog.Infof("[loc][%d/%d] %s, %s, %s\n", cityIndex, cityCount, place.CountryCode, place.Region, place.City)
+			if !createCity(place, true) {
+				unmatched = append(unmatched, place)
 			}
 		}
-		cityIndex := 0
-		for countryCode, regions := range cities {
-			for region, cities := range regions.(map[string]any) {
-				country_, ok := countries[countryCode]
-				if !ok {
-					panic(fmt.Errorf("Missing country for %s", countryCode))
-				}
-				country := country_.(string)
-				for _, city := range cities.([]any) {
-					cityIndex += 1
-					if 0 <= cityLimit && cityLimit < cityIndex {
-						return
-					}
-					glog.Infof("[loc][%d/%d] %s, %s, %s\n", cityIndex, cityCount, countryCode, region, city)
-					createCity(countryCode, country, region, city.(string))
-				}
-			}
+		for i, place := range unmatched {
+			glog.Infof("[loc][%d/%d unmatched] %s, %s, %s\n", i+1, len(unmatched), place.CountryCode, place.Region, place.City)
+			createCity(place, false)
 		}
 	}()
 
@@ -1558,6 +1654,13 @@ func AddDefaultLocations(ctx context.Context, cityLimit int) {
 		// server.Logger().Printf("Create group %s\n", name)
 		createLocationGroup(false, name, members...)
 	}
+
+	// merge the rows that resolve to one place, the seeded ones included
+	// (connect/GEOMAP.md §4.2); a refusal leaves the table as it is and the
+	// seeding done
+	if _, err := deduplicateLocations(ctx, names); err != nil {
+		glog.Errorf("[loc]location de-duplication refused: %s\n", err)
+	}
 }
 
 type LocationType = string
@@ -1583,6 +1686,12 @@ type Location struct {
 	Latitude          float64
 	Longitude         float64
 	Timezone          string
+	// The GeoNames ids GeoLite2 carries for the city, region and country
+	// (connect/GEOMAP.md §4), the canonical key a place is matched on. Zero
+	// when the location did not come from the database.
+	CityGeonameId    uint32
+	RegionGeonameId  uint32
+	CountryGeonameId uint32
 }
 
 func (self *Location) GuessLocationType() (LocationType, error) {
@@ -1666,47 +1775,74 @@ func (self *Location) CityLocation() (*Location, error) {
 }
 
 // resolveCountryName resolves the display name of an ISO-3166-1 alpha-2
-// country code.
+// country code from the built-in ISO table.
 //
-// The order matters. The deployment's own `iso-country-list.yml` wins wherever
-// it has an entry, because some deployments deliberately use their own naming
-// ("South Korea", not "Korea, Republic of"). The built-in ISO table is the
-// fallback for the codes that file omits -- which on the live beta deployment
-// is 191 of the 249 assigned codes.
+// A deployment's names come from the canonical place list instead
+// (connect/GEOMAP.md §4): AddDefaultLocations seeds every country GeoLite2
+// names, under GeoLite2's name, and a country row is matched on its code, so a
+// code-only location resolves to the seeded row and keeps that name (see
+// countryLocationInTx). This table only names a country row that does not
+// exist yet -- a location-group member on a database the seeder has not run
+// on, or a location created before it.
 //
-// The fallback lives in Go rather than in config on purpose:
-// `iso-country-list.yml` is a per-deployment vault resource and only one
-// deployment's copy is in this repo, so a config-only fix would repair that one
-// deployment and leave every other one inserting blank names.
-//
-// ok is false when the code is in neither, which means it is not a country.
-// Callers must NOT substitute the code for the name -- a location row named
-// "cn" is the same bug wearing a different hat, just quieter.
+// ok is false when the code is not in the table. Callers must NOT substitute
+// the code for the name -- a location row named "cn" is the same bug wearing
+// a different hat, just quieter.
 func resolveCountryName(countryCode string) (string, bool) {
 	code := strings.ToLower(countryCode)
 	if len(code) != 2 {
 		return "", false
 	}
-
-	// unlike `AddDefaultLocations`, this does not *require* the config
-	// resource: `CreateLocation` is also a runtime path, and a deployment
-	// without the file must fall through to the Go table rather than panic.
-	if resource, err := server.Config.SimpleResource("iso-country-list.yml"); err == nil {
-		// the file is keyed by upper case code (`AE: United Arab Emirates`)
-		for configCode, configName := range resource.Parse() {
-			if !strings.EqualFold(configCode, code) {
-				continue
-			}
-			if name, ok := configName.(string); ok && name != "" {
-				return name, true
-			}
-		}
-	}
-
 	return ISOCountryName(code)
 }
 
+// Finds or creates the rows of a location -- its country, its region and its
+// city, as far as its type goes -- and replaces the location in place with the
+// resolved one, whose ids, names and geoname ids are the stored rows'.
+//
+// A place from GeoLite2 carries GeoNames ids (connect/GEOMAP.md §4.2), which
+// are matched before any name: a city already stored under its id resolves in
+// one indexed read, whatever its row is named. A stored row that predates the
+// ids is adopted, and gets the id filled in, when it resolves to the place by
+// the rule of location_match.go -- its name anchors to the place in the
+// canonical place list, or is within reach of that place alone -- or, when no
+// place list is loaded, when its name is exactly the lookup's. A new row stores
+// the id. A row that carries a different id is a different place, even under
+// the same name; the newcomer's row takes the " (geoname <id>)" suffix the
+// place list uses to tell such places apart. Rows are never deleted or moved.
 func CreateLocation(ctx context.Context, location *Location) {
+	createLocation(ctx, location, createLocationOptions{})
+}
+
+// CreateLocation for a place of the canonical place list (AddDefaultLocations).
+// A row keyed by the place's geoname id -- matched on it, or given it here --
+// also takes the list's name and coordinates. A lookup never overwrites those:
+// it carries one network's coordinate, where the list carries the one most of
+// the city's networks share.
+func seedLocation(ctx context.Context, location *Location) {
+	createLocation(ctx, location, createLocationOptions{seed: true})
+}
+
+// The seeder's first pass: seedLocation for a city that its geoname id finds,
+// or a stored row that anchors to it (location_match.go), and false, with no
+// city row adopted loosely and none created, for one that neither finds. The
+// seeder takes the rest only after every exact match is settled.
+func seedLocationExactly(ctx context.Context, location *Location) bool {
+	return createLocation(ctx, location, createLocationOptions{seed: true, exactCity: true})
+}
+
+// How createLocation resolves a location. The zero value is a lookup's
+// (CreateLocation); the seeder sets seed, and its first pass exactCity too.
+type createLocationOptions struct {
+	// refresh a row keyed by the place's geoname id from the place list
+	seed bool
+	// match a city by geoname id or exact name only, and create none
+	exactCity bool
+}
+
+// Resolves the location in place and reports whether it did; only an exactCity
+// city that nothing exactly matches is left unresolved.
+func createLocation(ctx context.Context, location *Location, options createLocationOptions) bool {
 	var countryCode string
 	if location.CountryCode != "" {
 		countryCode = strings.ToLower(location.CountryCode)
@@ -1748,18 +1884,32 @@ func CreateLocation(ctx context.Context, location *Location) {
 		server.Raise(fmt.Errorf("Unknown location type \"%s\".", location.LocationType))
 	}
 	if location.Country == "" {
-		country, ok := resolveCountryName(countryCode)
-		if !ok {
-			// not a country. There is no ancestor to fall back to, and
-			// inventing a name (or reusing the code as one) is what made this
-			// class of bug invisible in the first place.
-			glog.Errorf(
-				"[loc]refusing to create a location: \"%s\" is not a known country code.\n",
-				countryCode,
-			)
-			server.Raise(fmt.Errorf("Unknown country code \"%s\".", countryCode))
+		if country, ok := resolveCountryName(countryCode); ok {
+			location.Country = country
+		} else if len(countryCode) != 2 {
+			// not a country code at all. There is no ancestor to fall back to,
+			// and inventing a name (or reusing the code as one) is what made
+			// this class of bug invisible in the first place.
+			refuseUnknownCountryCode(countryCode)
 		}
-		location.Country = country
+		// Otherwise a code the ISO table does not name (GeoLite2's `xk`). The
+		// stored country row names it when there is one, and the transaction
+		// refuses it when there is not (countryLocationInTx).
+	}
+	if location.LocationType == LocationTypeCity &&
+		location.City != "" &&
+		location.Region == "" &&
+		location.CityGeonameId != 0 &&
+		location.Country != "" {
+		// GeoLite2 files some cities under no subdivision (hk, sg, pr, mc,
+		// ...). The place list keeps them under a region named for the
+		// country, the convention the blank-region backfill set
+		// (db_migrations.go), so a lookup of one resolves to the city the
+		// seeder stored instead of degrading to the country. That region is not
+		// a subdivision and takes no subdivision's id. A city without a geoname
+		// id did not come from GeoLite2, and degrades below as before.
+		location.Region = location.Country
+		location.RegionGeonameId = 0
 	}
 	if location.LocationType == LocationTypeCity && location.City == "" {
 		glog.Infof(
@@ -1778,312 +1928,1365 @@ func CreateLocation(ctx context.Context, location *Location) {
 		location.LocationType = LocationTypeCountry
 	}
 
-	// country
+	// The transaction reads only this copy and publishes into `resolved`, so
+	// an attempt that server.Tx re-runs starts from the caller's location
+	// rather than from what a failed attempt resolved it to.
+	input := *location
+	// A located lookup resolves stored rows against the place list, which is
+	// read once per process -- before the transaction, so the first read never
+	// holds a database connection open -- and only for a lookup whose place is
+	// not yet stored under its geoname id, the one case the transaction
+	// consults it for (regionLocationInTx, cityLocationInTx). So a process
+	// whose lookups all find their place by id never reads the list, whose
+	// parse keeps ~300 MB resident (location_place_names.go). A place removed
+	// between the check and the transaction is matched as without a list, by
+	// geoname id and exact name.
+	var names *locationPlaceNames
+	if input.CityGeonameId != 0 || input.RegionGeonameId != 0 {
+		// the boolean an EXISTS query answers
+		exists := func(sql string, args ...any) bool {
+			exists := false
+			server.Db(ctx, func(conn server.PgConn) {
+				result, err := conn.Query(ctx, sql, args...)
+				server.WithPgResult(result, err, func() {
+					if result.Next() {
+						server.Raise(result.Scan(&exists))
+					}
+				})
+			})
+			return exists
+		}
+		// Whether the transaction resolves the place by its geoname id alone:
+		// a country, a city stored under its id with its region and country
+		// rows (cityLocationByGeonameIdInTx, which a seed skips), or a region
+		// stored under its id beneath the country row the transaction takes
+		// (countryLocationInTx, regionLocationInTx).
+		storedByGeonameId := func() bool {
+			switch {
+			case input.LocationType == LocationTypeCountry:
+				return true
+			case input.LocationType == LocationTypeCity && input.CityGeonameId != 0 && !options.seed:
+				return exists(
+					`
+						SELECT EXISTS (
+							SELECT 1
+							FROM location AS city
+							INNER JOIN location AS region ON region.location_id = city.region_location_id
+							INNER JOIN location AS country ON country.location_id = city.country_location_id
+							WHERE
+								city.geoname_id = $1 AND
+								city.location_type = $2
+						)
+					`,
+					int64(input.CityGeonameId),
+					LocationTypeCity,
+				)
+			case input.LocationType == LocationTypeRegion && input.RegionGeonameId != 0:
+				return exists(
+					`
+						SELECT EXISTS (
+							SELECT 1
+							FROM location AS region
+							WHERE
+								region.location_type = $1 AND
+								region.geoname_id = $2 AND
+								region.country_location_id = (
+									SELECT location_id
+									FROM location
+									WHERE
+										location_type = $3 AND
+										(
+											country_code = $4 OR
+											geoname_id = $5
+										)
+									ORDER BY
+										COALESCE(geoname_id = $5, false) DESC,
+										location_id
+									LIMIT 1
+								)
+						)
+					`,
+					LocationTypeRegion,
+					int64(input.RegionGeonameId),
+					LocationTypeCountry,
+					countryCode,
+					geonameIdArg(input.CountryGeonameId),
+				)
+			default:
+				return false
+			}
+		}
+		load := currentLocationPlaceNamesLoad()
+		if placeNames, loaded := load.peek(); loaded {
+			names = placeNames
+		} else if !storedByGeonameId() {
+			names, _ = load.get()
+		}
+	}
+	var resolved *Location
 	server.Tx(ctx, func(tx server.PgTx) {
-		var countryLocation *Location
-		var regionLocation *Location
-		var cityLocation *Location
+		resolved = nil
 
-		result, err := tx.Query(
-			ctx,
-			`
-                SELECT
-                    location_id
-                FROM location
-                WHERE
-                    location_type = $1 AND
-                    country_code = $2
-            `,
-			LocationTypeCountry,
-			countryCode,
-		)
-
-		server.WithPgResult(result, err, func() {
-			if result.Next() {
-				var locationId server.Id
-				server.Raise(result.Scan(&locationId))
-				countryLocation = &Location{
-					LocationType:      LocationTypeCountry,
-					Country:           location.Country,
-					CountryCode:       countryCode,
-					LocationId:        locationId,
-					CountryLocationId: locationId,
-				}
-			}
-		})
-
-		if countryLocation == nil {
-			locationId := server.NewId()
-			_, err = tx.Exec(
-				ctx,
-				`
-                    INSERT INTO location (
-                        location_id,
-                        location_type,
-                        location_name,
-                        country_location_id,
-                        country_code,
-                        location_full_name
-                    )
-                    VALUES ($1, $2, $3, $1, $4, $5)
-                `,
-				locationId,
-				LocationTypeCountry,
-				location.Country,
-				countryCode,
-				countryCode,
-			)
-			server.Raise(err)
-
-			countryLocation = &Location{
-				LocationType:      LocationTypeCountry,
-				Country:           location.Country,
-				CountryCode:       countryCode,
-				LocationId:        locationId,
-				CountryLocationId: locationId,
-			}
-
-			// add to the search
-			for i, searchStr := range countryLocation.SearchStrings() {
-				locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+		if !options.seed && input.LocationType == LocationTypeCity && input.CityGeonameId != 0 {
+			if cityLocation := cityLocationByGeonameIdInTx(ctx, tx, &input); cityLocation != nil {
+				resolved = cityLocation
+				return
 			}
 		}
 
-		if location.LocationType == LocationTypeCountry {
-			*location = *countryLocation
+		countryLocation := countryLocationInTx(ctx, tx, &input, countryCode, options.seed)
+		if input.LocationType == LocationTypeCountry {
+			resolved = countryLocation
 			return
 		}
 
-		// A blank-name backfill can leave a legacy row alongside the canonical
-		// region when both full names would otherwise collide. Prefer the row
-		// that owns the normally-composed full name; the id tie-breaker keeps
-		// selection deterministic when only legacy rows exist.
-		result, err = tx.Query(
-			ctx,
-			`
-                SELECT
-                    location_id
-                FROM location
-                WHERE
-                    location_type = $1 AND
-                    country_code = $2 AND
-                    location_name = $3 AND
-                    country_location_id = $4
-				ORDER BY
-					(location_full_name = $5) DESC,
-					location_id
-				LIMIT 1
-            `,
-			LocationTypeRegion,
-			countryCode,
-			location.Region,
-			countryLocation.LocationId,
-			fmt.Sprintf("%s, %s", location.Region, countryCode),
-		)
+		regionLocation := regionLocationInTx(ctx, tx, &input, countryCode, countryLocation, names, options.seed)
+		if input.LocationType == LocationTypeRegion {
+			resolved = regionLocation
+			return
+		}
 
-		server.WithPgResult(result, err, func() {
-			if result.Next() {
-				var locationId server.Id
-				server.Raise(result.Scan(&locationId))
-				regionLocation = &Location{
-					LocationType:      LocationTypeRegion,
-					Region:            location.Region,
-					Country:           countryLocation.Country,
-					CountryCode:       countryCode,
-					LocationId:        locationId,
-					RegionLocationId:  locationId,
-					CountryLocationId: countryLocation.LocationId,
-				}
+		resolved = cityLocationInTx(ctx, tx, &input, countryCode, countryLocation, regionLocation, names, options)
+	})
+	if resolved == nil {
+		return false
+	}
+	*location = *resolved
+	return true
+}
+
+// Logs and raises (panics) for a country code with no known country name,
+// rather than create a location row without one.
+func refuseUnknownCountryCode(countryCode string) {
+	glog.Errorf(
+		"[loc]refusing to create a location: \"%s\" is not a known country code.\n",
+		countryCode,
+	)
+	server.Raise(fmt.Errorf("Unknown country code \"%s\".", countryCode))
+}
+
+// A geoname id as a query argument: NULL for 0, which means the location did
+// not come from GeoLite2.
+func geonameIdArg(geonameId uint32) *int64 {
+	if geonameId == 0 {
+		return nil
+	}
+	arg := int64(geonameId)
+	return &arg
+}
+
+// Reads a stored geoname id: 0 for NULL or a value out of range.
+func geonameIdValue(geonameId *int64) uint32 {
+	if geonameId == nil || *geonameId <= 0 || math.MaxUint32 < *geonameId {
+		return 0
+	}
+	return uint32(*geonameId)
+}
+
+// Gives a row that predates geoname ids its id, and reports whether the row
+// now holds it. Another row already holding the id (a place GeoNames moved, or
+// bad data) leaves this row as it was rather than failing the transaction on
+// the unique index -- which server.Tx would retry until its deadline, since a
+// constraint violation reads as transient. A holder committed concurrently,
+// after this transaction's snapshot, is the one case that does meet the index,
+// and its retry sees the holder.
+func backfillGeonameIdInTx(ctx context.Context, tx server.PgTx, locationId server.Id, geonameId uint32) bool {
+	tag, err := tx.Exec(
+		ctx,
+		`
+			UPDATE location
+			SET geoname_id = $2
+			WHERE
+				location_id = $1 AND
+				geoname_id IS NULL AND
+				NOT EXISTS (
+					SELECT 1
+					FROM location AS holder
+					WHERE holder.geoname_id = $2
+				)
+		`,
+		locationId,
+		int64(geonameId),
+	)
+	server.Raise(err)
+	return tag.RowsAffected() == 1
+}
+
+// The geoname id a new row stores: NULL when the place has none, or when a row
+// the lookups did not match already holds it -- another kind of place, or a
+// region under another country row (bad data, which the new row survives the
+// way a legacy row does, found by name). server.Tx runs at repeatable read, so
+// the lookups and this check see one snapshot: a row of this very place that a
+// concurrent transaction commits after it is invisible here, and meets this
+// row on the unique index instead, which server.Tx retries with a fresh
+// snapshot that finds it.
+func newRowGeonameIdInTx(ctx context.Context, tx server.PgTx, geonameId uint32) *int64 {
+	if geonameId == 0 {
+		return nil
+	}
+	held := false
+	result, err := tx.Query(
+		ctx,
+		`SELECT EXISTS (SELECT 1 FROM location WHERE geoname_id = $1)`,
+		int64(geonameId),
+	)
+	server.WithPgResult(result, err, func() {
+		if result.Next() {
+			server.Raise(result.Scan(&held))
+		}
+	})
+	if held {
+		return nil
+	}
+	return geonameIdArg(geonameId)
+}
+
+// Whether any location row already holds the full name (`location_full_name`
+// is unique).
+func locationFullNameTakenInTx(ctx context.Context, tx server.PgTx, fullName string) bool {
+	taken := false
+	result, err := tx.Query(
+		ctx,
+		`SELECT EXISTS (SELECT 1 FROM location WHERE location_full_name = $1)`,
+		fullName,
+	)
+	server.WithPgResult(result, err, func() {
+		if result.Next() {
+			server.Raise(result.Scan(&taken))
+		}
+	})
+	return taken
+}
+
+// Picks the name and full name of a new region or city row.
+// `location_full_name` is unique, and a place with a geoname id whose plain
+// full name is already stored is a different place of the same name (a row of
+// the same id, or a legacy row of the name, would have matched first), so it
+// takes the suffix the place list gives the later of two such places. A place
+// without an id keeps the plain name, as before.
+func newRowNameInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	name string,
+	geonameId uint32,
+	fullName func(name string) string,
+) (string, string) {
+	if geonameId == 0 || !locationFullNameTakenInTx(ctx, tx, fullName(name)) {
+		return name, fullName(name)
+	}
+	suffixedName := geo.GeonameSuffixedName(name, geonameId)
+	if locationFullNameTakenInTx(ctx, tx, fullName(suffixedName)) {
+		// a row neither of this id nor of this name holds it; refuse plainly
+		// rather than retry against the unique index until the deadline
+		server.Raise(fmt.Errorf("Location \"%s\" is taken by another place.", fullName(suffixedName)))
+	}
+	return suffixedName, fullName(suffixedName)
+}
+
+// Gives a seeded row keyed by its geoname id the place list's name, and its
+// search strings with it, and reports whether it did. It leaves the row as it
+// is when another row already holds the full name the new name composes: that
+// is a row of the same place from before geoname ids, and both stay
+// resolvable.
+func renameLocationInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	locationId server.Id,
+	name string,
+	fullName string,
+	searchLocation *Location,
+) bool {
+	tag, err := tx.Exec(
+		ctx,
+		`
+			UPDATE location
+			SET
+				location_name = $2,
+				location_full_name = $3
+			WHERE
+				location_id = $1 AND
+				(location_name <> $2 OR location_full_name <> $3) AND
+				NOT EXISTS (
+					SELECT 1
+					FROM location AS holder
+					WHERE
+						holder.location_full_name = $3 AND
+						holder.location_id <> $1
+				)
+		`,
+		locationId,
+		name,
+		fullName,
+	)
+	server.Raise(err)
+	if tag.RowsAffected() == 0 {
+		return false
+	}
+	locationSearch().RemoveInTx(ctx, locationId, tx)
+	for i, searchStr := range searchLocation.SearchStrings() {
+		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+	}
+	return true
+}
+
+// Finds or creates the country row. A country code names one country, so a
+// row is matched on the country's geoname id or its code, the id first; a row
+// matched on its code alone gets the id filled in. The stored name is the
+// name: the seeder writes GeoLite2's name, and a lookup that names the country
+// another way does not rename it.
+func countryLocationInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	location *Location,
+	countryCode string,
+	seed bool,
+) *Location {
+	var countryLocation *Location
+	result, err := tx.Query(
+		ctx,
+		`
+			SELECT
+				location_id,
+				location_name,
+				country_code,
+				geoname_id
+			FROM location
+			WHERE
+				location_type = $1 AND
+				(
+					country_code = $2 OR
+					geoname_id = $3
+				)
+			ORDER BY
+				COALESCE(geoname_id = $3, false) DESC,
+				location_id
+			LIMIT 1
+		`,
+		LocationTypeCountry,
+		countryCode,
+		geonameIdArg(location.CountryGeonameId),
+	)
+	server.WithPgResult(result, err, func() {
+		if result.Next() {
+			var locationId server.Id
+			var name string
+			var storedCountryCode string
+			var geonameId *int64
+			server.Raise(result.Scan(
+				&locationId,
+				&name,
+				&storedCountryCode,
+				&geonameId,
+			))
+			countryLocation = &Location{
+				LocationType:      LocationTypeCountry,
+				Country:           name,
+				CountryCode:       strings.ToLower(storedCountryCode),
+				LocationId:        locationId,
+				CountryLocationId: locationId,
+				CountryGeonameId:  geonameIdValue(geonameId),
 			}
-		})
+		}
+	})
 
-		if regionLocation == nil {
-			// create a new location
+	if countryLocation != nil {
+		keyed := countryLocation.CountryGeonameId != 0 && countryLocation.CountryGeonameId == location.CountryGeonameId
+		if countryLocation.CountryGeonameId == 0 && location.CountryGeonameId != 0 {
+			if backfillGeonameIdInTx(ctx, tx, countryLocation.LocationId, location.CountryGeonameId) {
+				countryLocation.CountryGeonameId = location.CountryGeonameId
+				keyed = true
+			}
+		}
+		if seed && keyed && location.Country != "" && location.Country != countryLocation.Country {
+			renamed := &Location{
+				LocationType: LocationTypeCountry,
+				Country:      location.Country,
+				CountryCode:  countryLocation.CountryCode,
+			}
+			// a country row's full name is its code
+			if renameLocationInTx(ctx, tx, countryLocation.LocationId, location.Country, countryLocation.CountryCode, renamed) {
+				countryLocation.Country = location.Country
+			}
+		}
+		return countryLocation
+	}
 
-			locationId := server.NewId()
+	if location.Country == "" {
+		refuseUnknownCountryCode(countryCode)
+	}
 
-			_, err = tx.Exec(
-				ctx,
-				`
-                    INSERT INTO location (
-                        location_id,
-                        location_type,
-                        location_name,
-                        region_location_id,
-                        country_location_id,
-                        country_code,
-                        location_full_name
-                    )
-                    VALUES ($1, $2, $3, $1, $4, $5, $6)
-                `,
-				locationId,
-				LocationTypeRegion,
-				location.Region,
-				countryLocation.LocationId,
-				countryCode,
-				fmt.Sprintf("%s, %s", location.Region, countryCode),
+	locationId := server.NewId()
+	geonameId := newRowGeonameIdInTx(ctx, tx, location.CountryGeonameId)
+	server.RaisePgResult(tx.Exec(
+		ctx,
+		`
+			INSERT INTO location (
+				location_id,
+				location_type,
+				location_name,
+				country_location_id,
+				country_code,
+				location_full_name,
+				geoname_id
 			)
-			server.Raise(err)
+			VALUES ($1, $2, $3, $1, $4, $5, $6)
+		`,
+		locationId,
+		LocationTypeCountry,
+		location.Country,
+		countryCode,
+		countryCode,
+		geonameId,
+	))
 
+	countryLocation = &Location{
+		LocationType:      LocationTypeCountry,
+		Country:           location.Country,
+		CountryCode:       countryCode,
+		LocationId:        locationId,
+		CountryLocationId: locationId,
+		CountryGeonameId:  geonameIdValue(geonameId),
+	}
+
+	// add to the search
+	for i, searchStr := range countryLocation.SearchStrings() {
+		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+	}
+	return countryLocation
+}
+
+// Finds or creates the region row under the country row: by the subdivision's
+// geoname id first, then by name. A row of the same name that carries another
+// subdivision's id is a different region.
+func regionLocationInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	location *Location,
+	countryCode string,
+	countryLocation *Location,
+	names *locationPlaceNames,
+	seed bool,
+) *Location {
+	var regionLocation *Location
+	scanRegion := func(result server.PgResult) {
+		if result.Next() {
+			var locationId server.Id
+			var name string
+			var geonameId *int64
+			server.Raise(result.Scan(
+				&locationId,
+				&name,
+				&geonameId,
+			))
 			regionLocation = &Location{
 				LocationType:      LocationTypeRegion,
-				Region:            location.Region,
+				Region:            name,
 				Country:           countryLocation.Country,
 				CountryCode:       countryCode,
 				LocationId:        locationId,
 				RegionLocationId:  locationId,
 				CountryLocationId: countryLocation.LocationId,
-			}
-
-			// add to the search
-			for i, searchStr := range regionLocation.SearchStrings() {
-				locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+				RegionGeonameId:   geonameIdValue(geonameId),
+				CountryGeonameId:  countryLocation.CountryGeonameId,
 			}
 		}
+	}
 
-		if location.LocationType == LocationTypeRegion {
-			*location = *regionLocation
-			return
+	if location.RegionGeonameId != 0 {
+		result, err := tx.Query(
+			ctx,
+			`
+				SELECT
+					location_id,
+					location_name,
+					geoname_id
+				FROM location
+				WHERE
+					location_type = $1 AND
+					geoname_id = $2 AND
+					country_location_id = $3
+			`,
+			LocationTypeRegion,
+			int64(location.RegionGeonameId),
+			countryLocation.LocationId,
+		)
+		server.WithPgResult(result, err, func() {
+			scanRegion(result)
+		})
+	}
+	matchedByGeonameId := regionLocation != nil
+
+	// The list's region this lookup names, when the place list is loaded and
+	// knows it: a stored row without an id is adopted only when it resolves to
+	// that region (location_match.go), which an exact name alone does not show.
+	var listRegion *geo.RegionNames
+	if regionLocation == nil && names != nil {
+		listRegion = names.lookupRegion(countryCode, location)
+	}
+	if regionLocation == nil && listRegion != nil {
+		regionLocation = adoptRegionInTx(ctx, tx, names, listRegion, countryCode, countryLocation)
+	}
+
+	if regionLocation == nil && listRegion == nil {
+		// A blank-name backfill can leave a legacy row alongside the canonical
+		// region when both full names would otherwise collide. Prefer the row
+		// that owns the normally-composed full name; the id tie-breaker keeps
+		// selection deterministic when only legacy rows exist.
+		result, err := tx.Query(
+			ctx,
+			`
+				SELECT
+					location_id,
+					location_name,
+					geoname_id
+				FROM location
+				WHERE
+					location_type = $1 AND
+					country_code = $2 AND
+					location_name = $3 AND
+					country_location_id = $4 AND
+					(
+						geoname_id IS NULL OR
+						$6::bigint IS NULL
+					)
+				ORDER BY
+					(location_full_name = $5) DESC,
+					location_id
+				LIMIT 1
+			`,
+			LocationTypeRegion,
+			countryCode,
+			location.Region,
+			countryLocation.LocationId,
+			fmt.Sprintf("%s, %s", location.Region, countryCode),
+			geonameIdArg(location.RegionGeonameId),
+		)
+		server.WithPgResult(result, err, func() {
+			scanRegion(result)
+		})
+	}
+
+	if regionLocation != nil {
+		keyed := matchedByGeonameId
+		if !matchedByGeonameId && regionLocation.RegionGeonameId == 0 && location.RegionGeonameId != 0 {
+			if backfillGeonameIdInTx(ctx, tx, regionLocation.LocationId, location.RegionGeonameId) {
+				regionLocation.RegionGeonameId = location.RegionGeonameId
+				keyed = true
+			}
 		}
+		if seed && keyed && location.Region != regionLocation.Region {
+			renamed := &Location{
+				LocationType: LocationTypeRegion,
+				Region:       location.Region,
+				Country:      countryLocation.Country,
+				CountryCode:  countryCode,
+			}
+			fullName := fmt.Sprintf("%s, %s", location.Region, countryCode)
+			if renameLocationInTx(ctx, tx, regionLocation.LocationId, location.Region, fullName, renamed) {
+				regionLocation.Region = location.Region
+			}
+		}
+		return regionLocation
+	}
 
+	// create a new location
+	geonameId := newRowGeonameIdInTx(ctx, tx, location.RegionGeonameId)
+	// named by the place's id even when the row cannot store it, so a region
+	// of the same name elsewhere in the country never collides with it
+	name, fullName := newRowNameInTx(ctx, tx, location.Region, location.RegionGeonameId, func(name string) string {
+		return fmt.Sprintf("%s, %s", name, countryCode)
+	})
+	locationId := server.NewId()
+	server.RaisePgResult(tx.Exec(
+		ctx,
+		`
+			INSERT INTO location (
+				location_id,
+				location_type,
+				location_name,
+				region_location_id,
+				country_location_id,
+				country_code,
+				location_full_name,
+				geoname_id
+			)
+			VALUES ($1, $2, $3, $1, $4, $5, $6, $7)
+		`,
+		locationId,
+		LocationTypeRegion,
+		name,
+		countryLocation.LocationId,
+		countryCode,
+		fullName,
+		geonameId,
+	))
+
+	regionLocation = &Location{
+		LocationType:      LocationTypeRegion,
+		Region:            name,
+		Country:           countryLocation.Country,
+		CountryCode:       countryCode,
+		LocationId:        locationId,
+		RegionLocationId:  locationId,
+		CountryLocationId: countryLocation.LocationId,
+		RegionGeonameId:   geonameIdValue(geonameId),
+		CountryGeonameId:  countryLocation.CountryGeonameId,
+	}
+
+	// add to the search
+	for i, searchStr := range regionLocation.SearchStrings() {
+		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+	}
+	return regionLocation
+}
+
+// The list's region a lookup names, or nil: the region of its subdivision's
+// id, or, for a city GeoLite2 files under no subdivision, the region named for
+// its country.
+func (self *locationPlaceNames) lookupRegion(countryCode string, location *Location) *geo.RegionNames {
+	country := self.names.Country(countryCode)
+	if country == nil {
+		return nil
+	}
+	if location.RegionGeonameId != 0 {
+		return country.RegionByGeonameId(location.RegionGeonameId)
+	}
+	if region := country.Region(location.Region); region != nil && region.GeonameId == 0 {
+		return region
+	}
+	return nil
+}
+
+// A stored row without a geoname id that resolves to the place a lookup names.
+type adoptionCandidate struct {
+	locationId server.Id
+	name       string
+	resolution placeResolution
+	references int
+}
+
+// The stored region row, under the country row and without a geoname id, that
+// resolves to the list's region, or nil.
+func adoptRegionInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	names *locationPlaceNames,
+	listRegion *geo.RegionNames,
+	countryCode string,
+	countryLocation *Location,
+) *Location {
+	candidates := []*adoptionCandidate{}
+	result, err := tx.Query(
+		ctx,
+		`
+			SELECT
+				location_id,
+				location_name
+			FROM location
+			WHERE
+				location_type = $1 AND
+				country_code = $2 AND
+				country_location_id = $3 AND
+				geoname_id IS NULL
+		`,
+		LocationTypeRegion,
+		countryCode,
+		countryLocation.LocationId,
+	)
+	server.WithPgResult(result, err, func() {
+		for result.Next() {
+			var locationId server.Id
+			var name string
+			server.Raise(result.Scan(&locationId, &name))
+			resolution := names.resolveRegion(countryCode, name)
+			if resolution.resolved() && resolution.candidate.region == listRegion {
+				candidates = append(candidates, &adoptionCandidate{
+					locationId: locationId,
+					name:       name,
+					resolution: resolution,
+				})
+			}
+		}
+	})
+	candidate := chooseAdoptionInTx(ctx, tx, LocationTypeRegion, countryCode, candidates)
+	if candidate == nil {
+		return nil
+	}
+	glog.Infof("[loc]region \"%s\" in \"%s\" is %s (%s)\n", candidate.name, countryCode, listRegion.Name, candidate.resolution.kind)
+	return &Location{
+		LocationType:      LocationTypeRegion,
+		Region:            candidate.name,
+		Country:           countryLocation.Country,
+		CountryCode:       countryCode,
+		LocationId:        candidate.locationId,
+		RegionLocationId:  candidate.locationId,
+		CountryLocationId: countryLocation.LocationId,
+		CountryGeonameId:  countryLocation.CountryGeonameId,
+	}
+}
+
+// The stored city row, under the region row and without a geoname id, that
+// resolves to the list's place, or nil. The seeder's first pass takes only a
+// row that anchors to it.
+func adoptCityRowInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	names *locationPlaceNames,
+	listPlace *geo.Place,
+	countryCode string,
+	regionLocation *Location,
+	anchoredOnly bool,
+) *storedCityRow {
+	listRegion := names.cityRegion(listPlace)
+	rows := map[server.Id]*storedCityRow{}
+	candidates := []*adoptionCandidate{}
+	result, err := tx.Query(
+		ctx,
+		storedCityRowSelect+`
+			WHERE
+				city.location_type = $1 AND
+				city.country_code = $2 AND
+				city.region_location_id = $3 AND
+				city.geoname_id IS NULL
+		`,
+		LocationTypeCity,
+		countryCode,
+		regionLocation.LocationId,
+	)
+	server.WithPgResult(result, err, func() {
+		for {
+			row := scanStoredCityRow(result)
+			if row == nil {
+				return
+			}
+			resolution := names.resolveCity(countryCode, listRegion, row.name)
+			if !resolution.resolved() || resolution.candidate.city.Place.GeonameId != listPlace.GeonameId {
+				continue
+			}
+			if anchoredOnly && resolution.kind != placeAnchored {
+				continue
+			}
+			rows[row.locationId] = row
+			candidates = append(candidates, &adoptionCandidate{
+				locationId: row.locationId,
+				name:       row.name,
+				resolution: resolution,
+			})
+		}
+	})
+	candidate := chooseAdoptionInTx(ctx, tx, LocationTypeCity, countryCode, candidates)
+	if candidate == nil {
+		return nil
+	}
+	glog.Infof("[loc]city \"%s\" in \"%s\", \"%s\" is %s (%s)\n", candidate.name, regionLocation.Region, countryCode, listPlace.City, candidate.resolution.kind)
+	return rows[candidate.locationId]
+}
+
+// Picks, of several stored rows that resolve to one place, the one a lookup
+// adopts, or nil for none: an anchor before a loose match, then the nearer,
+// then the more referenced, then the older (location ids are time-ordered).
+// Counting every reference would read the connection history tables in full,
+// which a lookup on the connect path cannot afford, so a lookup counts only
+// what an index answers -- a region's cities, location group memberships and
+// network exclusions -- and the de-duplication, which counts everything and
+// merges the rest into the row adopted here, settles the others.
+func chooseAdoptionInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	locationType LocationType,
+	countryCode string,
+	candidates []*adoptionCandidate,
+) *adoptionCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	closer := func(a *adoptionCandidate, b *adoptionCandidate) int {
+		if aAnchored, bAnchored := a.resolution.kind == placeAnchored, b.resolution.kind == placeAnchored; aAnchored != bAnchored {
+			if aAnchored {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(a.resolution.distance, b.resolution.distance)
+	}
+	slices.SortFunc(candidates, closer)
+	tied := 1
+	for tied < len(candidates) && closer(candidates[0], candidates[tied]) == 0 {
+		tied += 1
+	}
+	candidates = candidates[:tied]
+	if 1 < len(candidates) {
+		locationIds := make([]server.Id, 0, len(candidates))
+		for _, candidate := range candidates {
+			locationIds = append(locationIds, candidate.locationId)
+		}
+		references := map[server.Id]int{}
+		count := func(sql string, args ...any) {
+			result, err := tx.Query(ctx, sql, args...)
+			server.WithPgResult(result, err, func() {
+				for result.Next() {
+					var locationId server.Id
+					var n int
+					server.Raise(result.Scan(&locationId, &n))
+					references[locationId] += n
+				}
+			})
+		}
+		if locationType == LocationTypeRegion {
+			count(
+				`
+					SELECT region_location_id, COUNT(*)
+					FROM location
+					WHERE
+						location_type = $1 AND
+						country_code = $2 AND
+						region_location_id = ANY($3::uuid[])
+					GROUP BY region_location_id
+				`,
+				LocationTypeCity,
+				countryCode,
+				locationIds,
+			)
+		}
+		count(
+			`
+				SELECT location_id, COUNT(*)
+				FROM location_group_member
+				WHERE location_id = ANY($1::uuid[])
+				GROUP BY location_id
+			`,
+			locationIds,
+		)
+		count(
+			`
+				SELECT client_location_id, COUNT(*)
+				FROM exclude_network_client_location
+				WHERE client_location_id = ANY($1::uuid[])
+				GROUP BY client_location_id
+			`,
+			locationIds,
+		)
+		for _, candidate := range candidates {
+			candidate.references = references[candidate.locationId]
+		}
+	}
+	slices.SortFunc(candidates, func(a *adoptionCandidate, b *adoptionCandidate) int {
+		if c := cmp.Compare(b.references, a.references); c != 0 {
+			return c
+		}
+		return a.locationId.Cmp(b.locationId)
+	})
+	return candidates[0]
+}
+
+// A city row with the region and country rows it is filed under.
+type storedCityRow struct {
+	locationId        server.Id
+	name              string
+	fullName          string
+	geonameId         uint32
+	latitude          *float64
+	longitude         *float64
+	countryCode       string
+	regionLocationId  server.Id
+	regionName        string
+	regionGeonameId   uint32
+	countryLocationId server.Id
+	countryName       string
+	countryGeonameId  uint32
+}
+
+const storedCityRowSelect = `
+	SELECT
+		city.location_id,
+		city.location_name,
+		city.location_full_name,
+		city.geoname_id,
+		city.latitude,
+		city.longitude,
+		city.country_code,
+		region.location_id,
+		region.location_name,
+		region.geoname_id,
+		country.location_id,
+		country.location_name,
+		country.geoname_id
+	FROM location AS city
+	LEFT JOIN location AS region ON region.location_id = city.region_location_id
+	LEFT JOIN location AS country ON country.location_id = city.country_location_id
+`
+
+// Reads the next row of a storedCityRowSelect, or nil when there is none. A
+// parent row that is missing leaves its fields zero.
+func scanStoredCityRow(result server.PgResult) *storedCityRow {
+	if !result.Next() {
+		return nil
+	}
+	row := &storedCityRow{}
+	var geonameId *int64
+	var regionLocationId *server.Id
+	var regionName *string
+	var regionGeonameId *int64
+	var countryLocationId *server.Id
+	var countryName *string
+	var countryGeonameId *int64
+	server.Raise(result.Scan(
+		&row.locationId,
+		&row.name,
+		&row.fullName,
+		&geonameId,
+		&row.latitude,
+		&row.longitude,
+		&row.countryCode,
+		&regionLocationId,
+		&regionName,
+		&regionGeonameId,
+		&countryLocationId,
+		&countryName,
+		&countryGeonameId,
+	))
+	row.geonameId = geonameIdValue(geonameId)
+	row.countryCode = strings.ToLower(row.countryCode)
+	if regionLocationId != nil {
+		row.regionLocationId = *regionLocationId
+		row.regionName = *regionName
+		row.regionGeonameId = geonameIdValue(regionGeonameId)
+	}
+	if countryLocationId != nil {
+		row.countryLocationId = *countryLocationId
+		row.countryName = *countryName
+		row.countryGeonameId = geonameIdValue(countryGeonameId)
+	}
+	return row
+}
+
+// Whether the region and country rows the city is filed under both exist.
+func (self *storedCityRow) complete() bool {
+	return self.regionLocationId != (server.Id{}) && self.countryLocationId != (server.Id{})
+}
+
+// Fills a missing region or country row with the ones the top-down lookup
+// resolved, so the returned hierarchy is never partly zero.
+func (self *storedCityRow) withParents(countryLocation *Location, regionLocation *Location) *storedCityRow {
+	if self.regionLocationId == (server.Id{}) {
+		self.regionLocationId = regionLocation.LocationId
+		self.regionName = regionLocation.Region
+		self.regionGeonameId = regionLocation.RegionGeonameId
+	}
+	if self.countryLocationId == (server.Id{}) {
+		self.countryLocationId = countryLocation.LocationId
+		self.countryName = countryLocation.Country
+		self.countryGeonameId = countryLocation.CountryGeonameId
+	}
+	return self
+}
+
+// The row as a city Location, with the ids, names and geoname ids of the region
+// and country rows it is filed under. Its coordinates are not carried.
+func (self *storedCityRow) location() *Location {
+	return &Location{
+		LocationType:      LocationTypeCity,
+		City:              self.name,
+		Region:            self.regionName,
+		Country:           self.countryName,
+		CountryCode:       self.countryCode,
+		LocationId:        self.locationId,
+		CityLocationId:    self.locationId,
+		RegionLocationId:  self.regionLocationId,
+		CountryLocationId: self.countryLocationId,
+		CityGeonameId:     self.geonameId,
+		RegionGeonameId:   self.regionGeonameId,
+		CountryGeonameId:  self.countryGeonameId,
+	}
+}
+
+// The city row stored under the geoname id, whatever it is filed under, or nil.
+func cityRowByGeonameIdInTx(ctx context.Context, tx server.PgTx, geonameId uint32) *storedCityRow {
+	var row *storedCityRow
+	result, err := tx.Query(
+		ctx,
+		storedCityRowSelect+`
+			WHERE
+				city.geoname_id = $1 AND
+				city.location_type = $2
+		`,
+		int64(geonameId),
+		LocationTypeCity,
+	)
+	server.WithPgResult(result, err, func() {
+		row = scanStoredCityRow(result)
+	})
+	return row
+}
+
+// the mmdb uses 0,0 for unknown coordinates, and a genuine 0,0 city is
+// effectively impossible, so 0,0 is stored as NULL (unknown)
+func hasLocationCoordinates(location *Location) bool {
+	return location.Latitude != 0 || location.Longitude != 0
+}
+
+// Fills the lookup's coordinates into a row stored without any, such as one
+// created before coordinates were stored. It never overwrites stored ones.
+func healCityCoordinatesInTx(ctx context.Context, tx server.PgTx, row *storedCityRow, location *Location) {
+	if row.latitude != nil || !hasLocationCoordinates(location) {
+		return
+	}
+	server.RaisePgResult(tx.Exec(
+		ctx,
+		`
+			UPDATE location
+			SET
+				latitude = $2,
+				longitude = $3
+			WHERE
+				location_id = $1 AND
+				latitude IS NULL
+		`,
+		row.locationId,
+		location.Latitude,
+		location.Longitude,
+	))
+}
+
+// Resolves a city already stored under its geoname id with one indexed read,
+// whatever region and country rows it is filed under, or nil. This is the
+// steady state of the connect-announce path once a city has been seen: no name
+// matching and no parent lookups.
+func cityLocationByGeonameIdInTx(ctx context.Context, tx server.PgTx, location *Location) *Location {
+	row := cityRowByGeonameIdInTx(ctx, tx, location.CityGeonameId)
+	if row == nil || !row.complete() {
+		// a city whose parents are gone resolves through the lookups below,
+		// which supply them
+		return nil
+	}
+	healCityCoordinatesInTx(ctx, tx, row, location)
+	return row.location()
+}
+
+// Finds or creates the city row: by geoname id first (anywhere, as the fast
+// path above), then by name under the region. A row of the same name that
+// carries another city's id is a different city. With exactCity it creates
+// none, and returns nil when nothing matches exactly.
+func cityLocationInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	location *Location,
+	countryCode string,
+	countryLocation *Location,
+	regionLocation *Location,
+	names *locationPlaceNames,
+	options createLocationOptions,
+) *Location {
+	seed := options.seed
+	var row *storedCityRow
+	if location.CityGeonameId != 0 {
+		row = cityRowByGeonameIdInTx(ctx, tx, location.CityGeonameId)
+	}
+	matchedByGeonameId := row != nil
+
+	// When the place list is loaded and knows the place, a stored row without
+	// an id is adopted only when it resolves to it (location_match.go): a row
+	// spelled exactly like this lookup may still be another place, as a
+	// suffixed twin's lookup shows ("Springfield" is the Springfield of the
+	// smaller id).
+	var listPlace *geo.Place
+	if row == nil && location.CityGeonameId != 0 && names != nil {
+		if listPlace = names.places.CityByGeonameId(location.CityGeonameId); listPlace != nil {
+			row = adoptCityRowInTx(ctx, tx, names, listPlace, countryCode, regionLocation, options.exactCity)
+		}
+	}
+
+	if row == nil && listPlace == nil {
 		// A non-conflicting legacy city may have had its full name normalized
 		// while retaining its legacy region id. The globally-unique full name is
 		// therefore a safe fallback when the canonical region lookup above does
-		// not find the city under that exact region id. Scan the stored region id
-		// so the returned hierarchy remains internally consistent.
-		result, err = tx.Query(
+		// not find the city under that exact region id. The stored region is
+		// read back so the returned hierarchy remains internally consistent.
+		result, err := tx.Query(
 			ctx,
-			`
-                SELECT 
-					location_id,
-					region_location_id
-                FROM location
-                WHERE
-                    location_type = $1 AND
-                    country_code = $2 AND
-                    location_name = $3 AND
-					country_location_id = $5 AND
+			storedCityRowSelect+`
+				WHERE
+					city.location_type = $1 AND
+					city.country_code = $2 AND
+					city.location_name = $3 AND
+					city.country_location_id = $5 AND
 					(
-						region_location_id = $4 OR
-						location_full_name = $6
+						city.region_location_id = $4 OR
+						city.location_full_name = $6
+					) AND
+					(
+						city.geoname_id IS NULL OR
+						$7::bigint IS NULL
 					)
 				ORDER BY
-					(region_location_id = $4) DESC,
-					location_id
+					(city.region_location_id = $4) DESC,
+					city.location_id
 				LIMIT 1
-            `,
+			`,
 			LocationTypeCity,
 			countryCode,
 			location.City,
 			regionLocation.LocationId,
 			countryLocation.LocationId,
-			fmt.Sprintf("%s, %s, %s", location.City, location.Region, countryCode),
+			fmt.Sprintf("%s, %s, %s", location.City, regionLocation.Region, countryCode),
+			geonameIdArg(location.CityGeonameId),
 		)
-
 		server.WithPgResult(result, err, func() {
-			if result.Next() {
-				var locationId server.Id
-				var actualRegionLocationId server.Id
-				server.Raise(result.Scan(&locationId, &actualRegionLocationId))
-				cityLocation = &Location{
-					LocationType:      LocationTypeCity,
-					City:              location.City,
-					Region:            regionLocation.Region,
-					Country:           countryLocation.Country,
-					CountryCode:       countryCode,
-					LocationId:        locationId,
-					CityLocationId:    locationId,
-					RegionLocationId:  actualRegionLocationId,
-					CountryLocationId: countryLocation.LocationId,
-				}
-			}
+			row = scanStoredCityRow(result)
 		})
+	}
 
-		// the mmdb uses 0,0 for unknown coordinates, and a genuine 0,0 city is
-		// effectively impossible, so 0,0 is stored as NULL (unknown)
-		hasCoordinates := location.Latitude != 0 || location.Longitude != 0
+	if row == nil && options.exactCity {
+		return nil
+	}
 
-		if cityLocation != nil {
-			if hasCoordinates {
-				// self-heal rows created before coordinates were stored
-				_, err = tx.Exec(
-					ctx,
-					`
-                    UPDATE location
-                    SET
-                        latitude = $2,
-                        longitude = $3
-                    WHERE
-                        location_id = $1 AND
-                        latitude IS NULL
-                `,
-					cityLocation.LocationId,
-					location.Latitude,
-					location.Longitude,
-				)
-				server.Raise(err)
-			}
-		} else {
-			// create a new location
-
-			locationId := server.NewId()
-
-			var latitude *float64
-			var longitude *float64
-			if hasCoordinates {
-				latitude = &location.Latitude
-				longitude = &location.Longitude
-			}
-
-			_, err = tx.Exec(
-				ctx,
-				`
-                    INSERT INTO location (
-                        location_id,
-                        location_type,
-                        location_name,
-                        city_location_id,
-                        region_location_id,
-                        country_location_id,
-                        country_code,
-                        location_full_name,
-                        latitude,
-                        longitude
-                    )
-                    VALUES ($1, $2, $3, $1, $4, $5, $6, $7, $8, $9)
-                `,
-				locationId,
-				LocationTypeCity,
-				location.City,
-				regionLocation.LocationId,
-				countryLocation.LocationId,
-				countryCode,
-				fmt.Sprintf("%s, %s, %s", location.City, location.Region, countryCode),
-				latitude,
-				longitude,
-			)
-			server.Raise(err)
-
-			cityLocation = &Location{
-				LocationType:      LocationTypeCity,
-				City:              location.City,
-				Region:            regionLocation.Region,
-				Country:           countryLocation.Country,
-				CountryCode:       countryLocation.CountryCode,
-				LocationId:        locationId,
-				CityLocationId:    locationId,
-				RegionLocationId:  regionLocation.LocationId,
-				CountryLocationId: countryLocation.LocationId,
-			}
-
-			// add to the search
-			for i, searchStr := range cityLocation.SearchStrings() {
-				locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+	if row != nil {
+		row.withParents(countryLocation, regionLocation)
+		keyed := matchedByGeonameId
+		if !matchedByGeonameId && row.geonameId == 0 && location.CityGeonameId != 0 {
+			if backfillGeonameIdInTx(ctx, tx, row.locationId, location.CityGeonameId) {
+				row.geonameId = location.CityGeonameId
+				keyed = true
 			}
 		}
+		if seed && keyed {
+			// the place list's coordinate is canonical for its city
+			if hasLocationCoordinates(location) &&
+				(row.latitude == nil || *row.latitude != location.Latitude ||
+					row.longitude == nil || *row.longitude != location.Longitude) {
+				server.RaisePgResult(tx.Exec(
+					ctx,
+					`
+						UPDATE location
+						SET
+							latitude = $2,
+							longitude = $3
+						WHERE location_id = $1
+					`,
+					row.locationId,
+					location.Latitude,
+					location.Longitude,
+				))
+			}
+			// the full name is composed with the region the row is filed
+			// under, which may not be the region the list names
+			fullName := fmt.Sprintf("%s, %s, %s", location.City, row.regionName, row.countryCode)
+			if location.City != row.name || fullName != row.fullName {
+				renamed := &Location{
+					LocationType: LocationTypeCity,
+					City:         location.City,
+					Region:       row.regionName,
+					Country:      row.countryName,
+					CountryCode:  row.countryCode,
+				}
+				if renameLocationInTx(ctx, tx, row.locationId, location.City, fullName, renamed) {
+					row.name = location.City
+				}
+			}
+		} else {
+			healCityCoordinatesInTx(ctx, tx, row, location)
+		}
+		return row.location()
+	}
 
-		*location = *cityLocation
+	// create a new location
+
+	var latitude *float64
+	var longitude *float64
+	if hasLocationCoordinates(location) {
+		latitude = &location.Latitude
+		longitude = &location.Longitude
+	}
+
+	geonameId := newRowGeonameIdInTx(ctx, tx, location.CityGeonameId)
+	name, fullName := newRowNameInTx(ctx, tx, location.City, location.CityGeonameId, func(name string) string {
+		return fmt.Sprintf("%s, %s, %s", name, regionLocation.Region, countryCode)
 	})
+	locationId := server.NewId()
+	server.RaisePgResult(tx.Exec(
+		ctx,
+		`
+			INSERT INTO location (
+				location_id,
+				location_type,
+				location_name,
+				city_location_id,
+				region_location_id,
+				country_location_id,
+				country_code,
+				location_full_name,
+				latitude,
+				longitude,
+				geoname_id
+			)
+			VALUES ($1, $2, $3, $1, $4, $5, $6, $7, $8, $9, $10)
+		`,
+		locationId,
+		LocationTypeCity,
+		name,
+		regionLocation.LocationId,
+		countryLocation.LocationId,
+		countryCode,
+		fullName,
+		latitude,
+		longitude,
+		geonameId,
+	))
+
+	cityLocation := &Location{
+		LocationType:      LocationTypeCity,
+		City:              name,
+		Region:            regionLocation.Region,
+		Country:           countryLocation.Country,
+		CountryCode:       countryLocation.CountryCode,
+		LocationId:        locationId,
+		CityLocationId:    locationId,
+		RegionLocationId:  regionLocation.LocationId,
+		CountryLocationId: countryLocation.LocationId,
+		CityGeonameId:     geonameIdValue(geonameId),
+		RegionGeonameId:   regionLocation.RegionGeonameId,
+		CountryGeonameId:  countryLocation.CountryGeonameId,
+	}
+
+	// add to the search
+	for i, searchStr := range cityLocation.SearchStrings() {
+		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+	}
+	return cityLocation
+}
+
+// Reads a location row with the city, region and
+// country rows it is filed under: their ids, names and geoname ids, and the
+// row's own coordinates.
+const locationHierarchySelect = `
+	SELECT
+		location.location_id,
+		location.location_type,
+		location.country_code,
+		location.latitude,
+		location.longitude,
+		city.location_id,
+		city.location_name,
+		city.geoname_id,
+		region.location_id,
+		region.location_name,
+		region.geoname_id,
+		country.location_id,
+		country.location_name,
+		country.geoname_id
+	FROM location
+	LEFT JOIN location AS city ON city.location_id = location.city_location_id
+	LEFT JOIN location AS region ON region.location_id = location.region_location_id
+	LEFT JOIN location AS country ON country.location_id = location.country_location_id
+`
+
+// Reads the one location row a condition on `location` selects, as a full
+// Location, or nil. The hierarchy ids of a granularity the row does not reach
+// (the city of a country row) stay zero.
+func getLocationWhere(ctx context.Context, where string, args ...any) *Location {
+	var location *Location
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			locationHierarchySelect+" WHERE "+where,
+			args...,
+		)
+		server.WithPgResult(result, err, func() {
+			if result.Next() {
+				location = scanLocationHierarchy(result)
+			}
+		})
+	})
+	return location
+}
+
+// Scans the current row of a locationHierarchySelect into a Location.
+func scanLocationHierarchy(result server.PgResult) *Location {
+	location := &Location{}
+	var latitude *float64
+	var longitude *float64
+	// city_location_id/region_location_id are only set once the row's
+	// hierarchy reaches that granularity (a country row has both NULL),
+	// and server.Id.Scan errors on a nil source, so every joined column
+	// scans through a pointer
+	var cityLocationId *server.Id
+	var city *string
+	var cityGeonameId *int64
+	var regionLocationId *server.Id
+	var region *string
+	var regionGeonameId *int64
+	var countryLocationId *server.Id
+	var country *string
+	var countryGeonameId *int64
+	server.Raise(result.Scan(
+		&location.LocationId,
+		&location.LocationType,
+		&location.CountryCode,
+		&latitude,
+		&longitude,
+		&cityLocationId,
+		&city,
+		&cityGeonameId,
+		&regionLocationId,
+		&region,
+		&regionGeonameId,
+		&countryLocationId,
+		&country,
+		&countryGeonameId,
+	))
+	location.CountryCode = strings.ToLower(location.CountryCode)
+	if latitude != nil && longitude != nil {
+		location.Latitude = *latitude
+		location.Longitude = *longitude
+	}
+	if cityLocationId != nil {
+		location.CityLocationId = *cityLocationId
+		location.City = *city
+		location.CityGeonameId = geonameIdValue(cityGeonameId)
+	}
+	if regionLocationId != nil {
+		location.RegionLocationId = *regionLocationId
+		location.Region = *region
+		location.RegionGeonameId = geonameIdValue(regionGeonameId)
+	}
+	if countryLocationId != nil {
+		location.CountryLocationId = *countryLocationId
+		location.Country = *country
+		location.CountryGeonameId = geonameIdValue(countryGeonameId)
+	}
+	return location
+}
+
+// Reads many location rows at once, with the hierarchy GetLocation reads for
+// one, keyed by location id. An id with no row is absent.
+func GetLocations(ctx context.Context, locationIds []server.Id) map[server.Id]*Location {
+	locations := map[server.Id]*Location{}
+	if len(locationIds) == 0 {
+		return locations
+	}
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
+			ctx,
+			locationHierarchySelect+" WHERE location.location_id = ANY($1)",
+			locationIds,
+		)
+		server.WithPgResult(result, err, func() {
+			for result.Next() {
+				location := scanLocationHierarchy(result)
+				locations[location.LocationId] = location
+			}
+		})
+	})
+	return locations
+}
+
+// Returns the location row a GeoNames id is stored on -- a city, region or
+// country -- with its hierarchy, or nil.
+func GetLocationByGeonameId(ctx context.Context, geonameId uint32) *Location {
+	if geonameId == 0 {
+		return nil
+	}
+	return getLocationWhere(ctx, "location.geoname_id = $1", int64(geonameId))
 }
 
 type LocationGroup struct {
@@ -2252,12 +3455,34 @@ func UpdateLocationGroup(ctx context.Context, locationGroup *LocationGroup) bool
 }
 
 type ConnectionLocationScores struct {
-	NetTypeHosting int
-	NetTypePrivacy int
-	NetTypeVirtual int
-	NetTypeForeign int
+	// Explicit exceptions from the ARIN database, independent of ranking scores.
+	ArinRisk               bool
+	ArinNonQuality         bool
+	ArinQualityVerified    bool
+	ArinLookupAt           *time.Time
+	ArinDatabaseBuildEpoch int64
+	NetTypeHosting         int
+	NetTypePrivacy         int
+	NetTypeVirtual         int
+	NetTypeForeign         int
+	// the lookup's accuracy radius in km, the genesis confidence of
+	// connect/GEOMAP.md §5.1; nil (NULL) for a location with none, such as an
+	// egress-probed one. It describes the genesis location below when one is
+	// stored, else the stored location.
+	AccuracyKm *float32
+	// The location the connection's own address lookup resolved to, its
+	// genesis (connect/GEOMAP.md §5.1), stored beside the location the
+	// connection is published at. The two differ once a derived location is
+	// published (§6): the derive phase must then still read the lookup as the
+	// node's genesis, and never its own last answer, or each derivation would
+	// anchor to the one before and a node could be walked away from where
+	// GeoLite2 places it one run at a time. nil for a location the egress
+	// probe placed, whose genesis the derive phase reads from the probe.
+	GenesisLocationId *server.Id
 }
 
+// Persist location and classification together. A fresh token on every write
+// lets the database revoke positive facts when an older writer updates the row.
 func SetConnectionLocation(
 	ctx context.Context,
 	connectionId server.Id,
@@ -2362,9 +3587,17 @@ func SetConnectionLocation(
 		            net_type_privacy,
 		            net_type_virtual,
 		            net_type_foreign,
-		            network_id
+		            network_id,
+		            accuracy_km,
+		            genesis_location_id,
+		            arin_risk,
+		            arin_non_quality,
+		            arin_lookup_at,
+		            arin_database_build_epoch,
+		            arin_quality_verified,
+		            arin_quality_write_token
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 ON CONFLICT (connection_id) DO UPDATE
                 SET
                     client_id = $2,
@@ -2375,7 +3608,15 @@ func SetConnectionLocation(
                     net_type_privacy = $7,
                     net_type_virtual = $8,
                     net_type_foreign = $9,
-                    network_id = $10
+                    network_id = $10,
+                    accuracy_km = $11,
+                    genesis_location_id = $12,
+                    arin_risk = $13,
+                    arin_non_quality = $14,
+                    arin_lookup_at = $15,
+                    arin_database_build_epoch = $16,
+                    arin_quality_verified = $17,
+                    arin_quality_write_token = $18
             `,
 			connectionId,
 			clientId,
@@ -2387,6 +3628,14 @@ func SetConnectionLocation(
 			connectionLocationScores.NetTypeVirtual,
 			connectionLocationScores.NetTypeForeign,
 			networkId,
+			connectionLocationScores.AccuracyKm,
+			connectionLocationScores.GenesisLocationId,
+			connectionLocationScores.ArinRisk,
+			connectionLocationScores.ArinNonQuality,
+			connectionLocationScores.ArinLookupAt,
+			connectionLocationScores.ArinDatabaseBuildEpoch,
+			connectionLocationScores.ArinQualityVerified,
+			server.NewId(),
 		))
 	})
 	return
@@ -2582,33 +3831,9 @@ func distinctIds(ids ...*server.Id) []server.Id {
 	return distinct
 }
 
-// The share of destinations a provider must reach to count as healthy: 90%,
-// as 9/10. Compared exactly as `10*ok >= 9*total` rather than through a float
-// division, so the boundary is the same for every denominator.
-//
-// 90% because it cleanly separates working from broken on the real
-// population: the healthy fleet measures 129-131 of 131 destinations, while
-// a dead proxy measures 0 of 131. Nothing observed sits near the line, so
-// the exact figure is not load bearing -- it only has to be far above 0 and
-// below the ~98% a genuinely working provider always clears.
-//
-// Package scope, not function scope: both UpdateClientScores and
-// UpdateClientLocations gate on this now, and two copies could drift.
-const minEgressHealthOKNumerator = 9
-const minEgressHealthOKDenominator = 10
-
 const providerConfigResourceName = "provider.yml"
 
-// providerEgressTestEnabled controls whether broad egress health and observed-
-// country evidence are eligibility requirements. The probe pipeline can still
-// run while this is false. A current explicit blackhole verdict remains an
-// eligibility requirement independently of this rollout switch.
-//
-// Defaulting to false is deliberate. A deployment can introduce the server
-// side of the probe pipeline before any prober has populated its tables. In
-// that state, treating every missing measurement as an individual failure
-// publishes an empty FindProviders2 cache even though the connected provider
-// fleet is healthy.
+// Retains the old rollout setting for diagnostics; it no longer changes admission.
 func providerEgressTestEnabled() bool {
 	return providerEgressTestEnabledFromResource(
 		server.Config.SimpleResource(providerConfigResourceName),
@@ -2623,178 +3848,122 @@ func providerEgressTestEnabledFromResource(resource *server.SimpleResource, err 
 	return len(enabled) == 1 && enabled[0]
 }
 
-// providerCountFilter answers one question: does this provider count as real,
-// reachable supply?
-//
-// It exists so the advertised provider_count (UpdateClientLocations) and the
-// gated membership (UpdateClientScores) apply an IDENTICAL predicate. They ran
-// different rules before: membership was gated on egress health while the count
-// was not, so a location could survive the gate and still advertise providers
-// that no probe had ever reached.
-//
-// Current hard-failure evidence is always loaded: an explicit blackhole verdict
-// or an unauthenticated TLS identity is conclusive per-provider evidence, not a
-// dependency on broad fleet probe coverage. Health and observed-country
-// evidence are loaded only when the broad egress qualification gate is enabled.
-// These loops run over the entire provider population, so a per-provider query
-// here is one round trip per provider.
+// Bulk evidence for the shared provider decision. Database lookups are once per
+// publication pass; request paths use its complete hard-exclusion snapshot.
 type providerCountFilter struct {
-	healthCounts map[server.Id]ProviderEgressHealthCounts
-	countryCodes map[server.Id]string
-	// blackholed is the FAILING set only, not a verdict for every provider:
-	// absent means "no current evidence this provider is dark", which covers
-	// both a passing check and no check at all. See
-	// GetAllProviderBlackholedClientIds for why it fails in that direction.
+	now               time.Time
+	arinRisk          map[server.Id]bool
+	arinNonQuality    map[server.Id]bool
+	reliabilityFailed map[server.Id]bool
+	healthCounts      map[server.Id]ProviderEgressHealthCounts
+	healthWindowEnd   time.Time
+	countryCodes      map[server.Id]string
+	// Legacy diagnostic only; it never changes bucket admission.
 	blackholed map[server.Id]bool
-	// tlsAuthenticationFailed is positive integrity-failure evidence. It is
-	// loaded and enforced even while broad percentage/location qualification is
-	// disabled, just like a current explicit blackhole verdict.
+	// Security exceptions persist until later authenticated TLS from the same URL.
 	tlsAuthenticationFailed map[server.Id]bool
 }
 
+// Complete means disconnected history too. The partial covering index supplies
+// only ARIN exceptions; one scan of failing scores supplies the independent
+// reliability pass. Missing scores are neutral, and missing rollups retain their
+// old scope. Rechecking every observed score against the same score table would
+// duplicate that work without changing the set of failed clients.
+func providerCountFilterCommonSql() string {
+	return providerCountFilterSql(false)
+}
+
+// The common SQL, or with clientScoped the same predicates over only the
+// client ids in $1 (providerCountFilterClientSql). Unscoped, the scope
+// fragments are empty and the text is exactly the fleet query.
+func providerCountFilterSql(clientScoped bool) string {
+	minimums := providerReliabilityMinimums()
+	reliabilityScope := ""
+	exceptionScope := ""
+	exceptionScopeEnd := ""
+	if clientScoped {
+		reliabilityScope = "provider_reliability.client_id = ANY($1) AND "
+		exceptionScope = "client_id = ANY($1) AND ("
+		exceptionScopeEnd = ")"
+	}
+	return fmt.Sprintf(`WITH failed_reliability AS MATERIALIZED (
+		SELECT DISTINCT provider_reliability.client_id
+		FROM client_connection_reliability_score AS provider_reliability
+		WHERE %sprovider_reliability.independent_reliability_weight < CASE provider_reliability.lookback_index
+			WHEN 1 THEN %g WHEN 2 THEN %g WHEN 3 THEN %g ELSE 0 END
+	)
+	SELECT client_id, arin_risk, arin_non_quality, false
+	FROM network_client_location_reliability
+	WHERE %sarin_risk OR arin_non_quality%s
+	UNION ALL
+	SELECT failed_reliability.client_id, false, false, true
+	FROM failed_reliability
+	WHERE EXISTS (
+		SELECT 1 FROM network_client_location_reliability AS provider_location
+		WHERE provider_location.client_id = failed_reliability.client_id
+	)`, reliabilityScope, minimums[1], minimums[2], minimums[3], exceptionScope, exceptionScopeEnd)
+}
+
+// Load complete exception maps once for publication and provider diagnostics.
 func newProviderCountFilter(ctx context.Context, loadEgressEvidence bool) providerCountFilter {
 	f := providerCountFilter{
-		blackholed:              GetAllProviderBlackholedClientIds(ctx),
+		now:                     server.NowUtc(),
+		arinRisk:                map[server.Id]bool{},
+		arinNonQuality:          map[server.Id]bool{},
+		reliabilityFailed:       map[server.Id]bool{},
 		tlsAuthenticationFailed: GetAllProviderEgressTLSAuthenticationFailedClientIds(ctx),
+		countryCodes:            GetAllProviderEgressCountryCodes(ctx),
 	}
-	if loadEgressEvidence {
-		f.healthCounts = GetAllProviderEgressHealthCounts(ctx)
-		f.countryCodes = GetAllProviderEgressCountryCodes(ctx)
-	}
+	f.healthCounts, f.healthWindowEnd = getAllProviderEgressHealthCountsSnapshot(ctx)
+	server.Db(ctx, func(conn server.PgConn) {
+		rows, err := conn.Query(ctx, providerCountFilterCommonSql())
+		server.WithPgResult(rows, err, func() {
+			for rows.Next() {
+				var clientId server.Id
+				var risk, nonQuality, reliabilityFailed bool
+				server.Raise(rows.Scan(&clientId, &risk, &nonQuality, &reliabilityFailed))
+				if risk {
+					f.arinRisk[clientId] = true
+				}
+				if nonQuality {
+					f.arinNonQuality[clientId] = true
+				}
+				if reliabilityFailed {
+					f.reliabilityFailed[clientId] = true
+				}
+			}
+		})
+	})
 	return f
 }
 
-func (f providerCountFilter) isBlackholed(clientId server.Id) bool {
-	return f.blackholed[clientId]
+func (self providerCountFilter) isBlackholed(clientId server.Id) bool {
+	return self.blackholed[clientId]
 }
 
-func (f providerCountFilter) hasHardEgressFailure(clientId server.Id) bool {
-	return f.isBlackholed(clientId) || f.tlsAuthenticationFailed[clientId]
+func (self providerCountFilter) hasHardEgressFailure(clientId server.Id) bool {
+	return self.arinRisk[clientId] || self.reliabilityFailed[clientId] || self.tlsAuthenticationFailed[clientId]
 }
 
-// passesHealth reports whether a probe has MEASURED this provider healthy.
-// Fail closed: no record at all (never probed) does not pass, and neither does
-// a record with no destinations in it, which is not a measurement of anything.
-// Guarding total also keeps the ratio well defined.
-//
-// Compared exactly as 10*ok >= 9*total rather than through a float, so the 90%
-// boundary cannot drift with rounding.
-func (f providerCountFilter) passesHealth(clientId server.Id) bool {
-	// Hard failures override a passing percentage. The hourly blackhole check
-	// catches a provider that went dark after its last health sweep; the TLS bit
-	// catches a provider for which one authenticated destination failed even if
-	// enough unrelated destinations passed to clear 90%. Neither is a ranking
-	// input: both only remove unsafe/unusable supply.
-	if f.hasHardEgressFailure(clientId) {
+// Reports the indexer's accepted URL ratio after the common safety gates.
+func (self providerCountFilter) passesHealth(clientId server.Id) bool {
+	// A passing success ratio cannot override a common gate failure.
+	if self.hasHardEgressFailure(clientId) {
 		return false
 	}
 
-	counts, ok := f.healthCounts[clientId]
+	counts, ok := self.healthCounts[clientId]
 	if !ok {
 		return false
 	}
 	if counts.Total <= 0 {
 		return false
 	}
-	return minEgressHealthOKDenominator*counts.OKCount >= minEgressHealthOKNumerator*counts.Total
+	settings := egressIndexSettings()
+	return settings.QualityOkDenominator*counts.OKCount >= settings.QualityOkNumerator*counts.Total
 }
 
-// passesEligibility always honors hard per-provider failures, then optionally
-// applies the broader health qualification. This distinction lets a rollout
-// leave broad egress testing disabled without publishing a provider that a
-// current fast check proved dark or a health check proved TLS-intercepting.
-func (f providerCountFilter) passesEligibility(clientId server.Id, requireEgressEvidence bool) bool {
-	if f.hasHardEgressFailure(clientId) {
-		return false
-	}
-	return !requireEgressEvidence || f.passesHealth(clientId)
-}
-
-// countsTowardCountry reports whether this provider counts as supply for
-// countryCode. It must both be measured healthy and have been OBSERVED
-// egressing from that country.
-//
-// The two locations are different claims. network_client_location is where the
-// provider says it is, derived from its own connection. provider_egress_location
-// is where a probe actually watched its traffic leave. Counting on the claim
-// alone advertises providers in countries they do not egress from -- measured
-// on beta at 3 of 152 healthy providers claiming `at` while egressing from `gb`
-// -- which is what an adversarial provider would exploit at scale.
-//
-// A provider with no observed location is not counted, matching the health rule.
-func (f providerCountFilter) countsTowardCountry(clientId server.Id, countryCode string) bool {
-	if !f.passesHealth(clientId) {
-		return false
-	}
-	observed, ok := f.countryCodes[clientId]
-	if !ok {
-		return false
-	}
-	return observed == strings.ToLower(countryCode)
-}
-
-// shouldSkipCountGate reports whether broad health/location qualification
-// should be skipped for this pass, falling back to connected + valid + Public
-// key supply after still excluding current blackholes.
-//
-// Both maps are checked, not just healthCounts, because they are fed by two
-// INDEPENDENT pipelines that can stall separately: health arrives over the
-// external push endpoint (api/handlers/provider_egress_health_handlers.go),
-// while the observed egress location comes from a separate internal job
-// (controller/provider_egress_location_controller.go). If only the health
-// pipeline stalls (or vice versa), the healthy-but-unlocated -- or
-// located-but-unhealthy -- provider still fails closed in countsTowardCountry
-// and locationClientCounts still empties fleet-wide, which is exactly the
-// wiped-list failure this gate exists to prevent. Do NOT collapse this back
-// to a single condition: either map being empty is "we know nothing from that
-// pipeline", which must not be treated as "everything failed."
-func (f providerCountFilter) shouldSkipCountGate() bool {
-	return len(f.healthCounts) == 0 || len(f.countryCodes) == 0
-}
-
-// shouldRecountUngated is the SECOND half of the fleet-wide floor, applied
-// after a gated counting pass instead of before it: gated says the gate was
-// actually applied to this pass, providerRows is how many connected + valid +
-// Public rows the count query returned, and countedLocations is how many
-// locations came out of it with any supply at all.
-//
-// This is NOT redundant with shouldSkipCountGate, and a future reader must not
-// collapse the two. They answer different questions and neither implies the
-// other:
-//
-//   - shouldSkipCountGate asks "did either probe pipeline produce ANY rows at
-//     all". It reads the two input maps.
-//   - this asks "did rows that exist produce ANY counted supply". It reads the
-//     OUTPUT of the pass.
-//
-// Non-empty inputs can still yield an empty output, by more than one route: a
-// fleet-wide mismatch between claimed and observed countries, a location-table
-// anomaly that makes every claimed country NULL (see the countryCode == nil
-// branch below), a partially drained egress-location table whose surviving rows
-// all belong to churned clients, or any future gate term added to
-// countsTowardCountry. In every one of those, the input maps are non-empty so
-// shouldSkipCountGate stays false, and yet locationClientCounts comes out
-// empty.
-//
-// An empty locationClientCounts is not a benign "no supply" result: every
-// location then misses the lookup below and lands in removeClientLocations,
-// which DELs every clientLocationKey from redis and publishes an empty
-// initialClientLocations -- /network/provider-locations returns nothing to
-// every app. Treat "rows existed but nothing counted" as "this pass learned
-// nothing" and redo it with the gate off, which is the same fallback
-// shouldSkipCountGate selects.
-//
-// providerRows > 0 is what separates this from a genuinely empty fleet. If the
-// count query returned no rows at all, there really is no connected + valid +
-// Public supply and emptying the published list is the correct answer.
-func shouldRecountUngated(gated bool, providerRows int, countedLocations int) bool {
-	return gated && providerRows > 0 && countedLocations == 0
-}
-
-// providerCountRow is one connected + valid + Public provider row from the
-// count query, held in memory so the pass can be counted twice (with broad
-// qualification, then without it if the first pass came out empty) without
-// issuing a second query. Both passes exclude current blackholes.
+// A connected, valid, publicly reachable provider and its rollup diagnostics.
 type providerCountRow struct {
 	clientId          server.Id
 	cityLocationId    server.Id
@@ -2803,6 +3972,10 @@ type providerCountRow struct {
 	// the country the provider CLAIMS. nil when the claimed country has no
 	// `location` row to resolve it against.
 	claimedCountryCode *string
+	// the rollup's egress columns; a nil index is a row the new rollup has not
+	// written
+	egressIndex   *int
+	egressQuality *bool
 }
 
 func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr error) {
@@ -2815,39 +3988,34 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 
 	initialClientLocations := &InitialClientLocations{}
 
-	// One bulk load per pass, outside the tx: this loop runs over the whole
-	// provider population. Current blackhole and TLS-authentication verdicts are
-	// always eligibility evidence. The broader health and observed-country
-	// tables are queried only when their gate is enabled.
+	// Counts and score export use one bulk snapshot of the common gates.
 	egressTestEnabled := providerEgressTestEnabled()
+	egressSettings := egressIndexSettings()
 	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
 
-	// An empty health OR countryCodes map means one of the two probe
-	// pipelines has told us nothing yet -- stalled job, truncated table, cold
-	// environment -- NOT "every provider measured unhealthy" or "every
-	// provider is mislocated". Per-provider fail-closed (an individual
-	// provider with no record does not count) is the intended behavior; but
-	// applying it fleet-wide when an entire pipeline has produced zero rows
-	// would empty locationClientCounts entirely, which sends every single
-	// location through removeClientLocations below and DELs every key from
-	// redis -- wiping the whole public provider list because one prober
-	// died, not because supply is actually gone. That is a different, worse
-	// failure mode than the one this gate exists to fix, so skip the gate
-	// for this pass and count as before (connected + valid + Public key
-	// only) instead. See shouldSkipCountGate for why BOTH maps are checked.
-	// Do NOT remove this as "redundant" with passesHealth's per-provider
-	// check -- it is a fleet-wide floor, not a per-provider one.
-	//
-	// This is only the input-side half of that floor: empty inputs are not the
-	// only way to reach an emptied count. See shouldRecountUngated, applied to
-	// the counted result below, for the other half.
-	skipCountGate := !egressTestEnabled || countFilter.shouldSkipCountGate()
-	if skipCountGate {
-		if egressTestEnabled {
-			glog.Infof("[nclm]egress health or location records are empty; skipping broad provider count qualification for this pass; hard egress exclusions remain enabled\n")
-		} else {
-			glog.Infof("[nclm]provider egress test is disabled; skipping broad provider count qualification for this pass; hard egress exclusions remain enabled\n")
+	// Publish the complete common-gate exclusion snapshot atomically, including
+	// a versioned marker for an authoritative empty set. Missing snapshots use SQL.
+	hardExcludedMembers := []any{providerHardExclusionsReadyMember}
+	seenHardExcludedClientIds := map[server.Id]bool{}
+	for _, exclusions := range []map[server.Id]bool{countFilter.arinRisk, countFilter.reliabilityFailed, countFilter.tlsAuthenticationFailed} {
+		for clientId, failed := range exclusions {
+			if failed && !seenHardExcludedClientIds[clientId] {
+				hardExcludedMembers = append(hardExcludedMembers, clientId.String())
+				seenHardExcludedClientIds[clientId] = true
+			}
 		}
+	}
+	var hardExclusionsErr error
+	server.Redis(ctx, func(r server.RedisClient) {
+		_, hardExclusionsErr = r.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Del(ctx, providerHardExclusionsKey)
+			pipe.SAdd(ctx, providerHardExclusionsKey, hardExcludedMembers...)
+			pipe.Expire(ctx, providerHardExclusionsKey, ttl)
+			return nil
+		})
+	})
+	if hardExclusionsErr != nil {
+		return fmt.Errorf("publish provider hard exclusions: %w", hardExclusionsErr)
 	}
 
 	server.Tx(ctx, func(tx server.PgTx) {
@@ -2864,7 +4032,12 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 	        	network_client_location_reliability.country_location_id,
 	        	-- the country the provider CLAIMS, to check against the country a
 	        	-- probe observed it egressing from
-	        	country_location.country_code
+	        	country_location.country_code,
+	        	-- the rollup's egress verdict (connect/GEOMAP.md §10.4): a row
+	        	-- it has written counts by the new rules, one it has not by the
+	        	-- old ones
+	        	network_client_location_reliability.egress_index,
+	        	network_client_location_reliability.egress_quality
 
 	        FROM network_client_location_reliability
 
@@ -2939,44 +4112,35 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 					&row.regionLocationId,
 					&row.countryLocationId,
 					&row.claimedCountryCode,
+					&row.egressIndex,
+					&row.egressQuality,
 				))
 				providerCountRows = append(providerCountRows, row)
 			}
 		})
 
-		// counted from the retained rows rather than inline in the scan loop, so
-		// the same pass can be counted a second time with the gate off without
-		// re-querying. See shouldRecountUngated.
-		countProviderRows := func(gated bool) map[server.Id]int {
+		// Count the same common-gate passes exposed as online supply.
+		countProviderRows := func() map[server.Id]int {
 			locationClientCounts := map[server.Id]int{}
 			for _, row := range providerCountRows {
-				// A current blackhole or TLS-authentication verdict is conclusive
-				// per-provider evidence and is never part of the fleet-wide
-				// health/location fallback. Otherwise that fallback would
-				// immediately resurrect the exact unsafe provider.
+				// Common gate failures never contribute advertised supply.
 				if countFilter.hasHardEgressFailure(row.clientId) {
 					continue
 				}
 
-				// This is the number every app shows when a user picks a
-				// location, so count only providers a probe has MEASURED
-				// healthy and OBSERVED egressing from the country they claim.
-				// Counting on the claim alone advertised providers that were
-				// either unreachable or in a different country entirely.
-				//
-				// claimedCountryCode is NULL when the claimed country has no
-				// location row, which cannot be verified against anything --
-				// fail closed, same as an unobserved provider.
-				//
-				// Unless the gate is off for this pass (see skipCountGate
-				// above and shouldRecountUngated below) -- an unprobed fleet is
-				// "unknown", not "unhealthy", and must not empty the public
-				// list.
-				if gated {
-					if row.claimedCountryCode == nil {
-						continue
-					}
-					if !countFilter.countsTowardCountry(row.clientId, *row.claimedCountryCode) {
+				// Ordinary URL errors and missing probes still count online.
+				{
+					decision := decideProviderEgress(
+						countFilter.egressFacts(
+							row.clientId,
+							row.claimedCountryCode,
+							row.egressIndex,
+							row.egressQuality,
+							egressSettings,
+						),
+						egressTestEnabled,
+					)
+					if !decision.counted {
 						continue
 					}
 				}
@@ -3004,21 +4168,7 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 			return locationClientCounts
 		}
 
-		gated := !skipCountGate
-		locationClientCounts := countProviderRows(gated)
-
-		// the output-side half of the fleet-wide floor. shouldSkipCountGate
-		// guards the INPUTS (did a probe pipeline produce rows); this guards
-		// the OUTPUT (did those rows produce any counted supply). Neither
-		// implies the other -- see shouldRecountUngated for why they must not
-		// be collapsed.
-		if shouldRecountUngated(gated, len(providerCountRows), len(locationClientCounts)) {
-			glog.Infof(
-				"[nclm]broad count qualification emptied all %d connected provider rows fleet-wide; recounting without health/location qualification; hard egress exclusions remain enabled\n",
-				len(providerCountRows),
-			)
-			locationClientCounts = countProviderRows(false)
-		}
+		locationClientCounts := countProviderRows()
 
 		server.CreateTempTableInTx(
 			ctx,
@@ -3069,18 +4219,28 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 			}
 		})
 
-		// create top links
+		// The rollup's counted hierarchy can lag current location metadata.
+		// Link only counted parents; missing metadata does not invent supply.
 		for locationId, clientLocation := range clientLocations {
 			switch clientLocation.LocationType {
 			case LocationTypeCity:
-				regionClientLocation := clientLocations[*(clientLocation.RegionLocationId)]
-				regionClientLocation.TopCityLocationIdCounts[locationId] = clientLocation.ClientCount
+				if clientLocation.RegionLocationId != nil {
+					if regionClientLocation := clientLocations[*clientLocation.RegionLocationId]; regionClientLocation != nil {
+						regionClientLocation.TopCityLocationIdCounts[locationId] = clientLocation.ClientCount
+					}
+				}
 
-				countryClientLocation := clientLocations[*(clientLocation.CountryLocationId)]
-				countryClientLocation.TopCityLocationIdCounts[locationId] = clientLocation.ClientCount
+				if clientLocation.CountryLocationId != nil {
+					if countryClientLocation := clientLocations[*clientLocation.CountryLocationId]; countryClientLocation != nil {
+						countryClientLocation.TopCityLocationIdCounts[locationId] = clientLocation.ClientCount
+					}
+				}
 			case LocationTypeRegion:
-				countryClientLocation := clientLocations[*(clientLocation.CountryLocationId)]
-				countryClientLocation.TopRegionLocationIdCounts[locationId] = clientLocation.ClientCount
+				if clientLocation.CountryLocationId != nil {
+					if countryClientLocation := clientLocations[*clientLocation.CountryLocationId]; countryClientLocation != nil {
+						countryClientLocation.TopRegionLocationIdCounts[locationId] = clientLocation.ClientCount
+					}
+				}
 			}
 		}
 		filterTop := func(locationIdCounts map[server.Id]int, n int) map[server.Id]int {
@@ -3226,8 +4386,11 @@ func loadClientLocations(
 				v := pipe.Get(ctx, clientLocationKey(locationId))
 				clientLocationCmds[locationId] = v
 			}
-			// note ignore the error for GET since it will include missing key
-			pipe.Exec(ctx)
+			// Missing metadata is legitimate. A failed GET must not turn typed
+			// search into a successful partial or empty result.
+			if err := execClientScoreReadPipeline(ctx, pipe); err != nil {
+				return err
+			}
 
 			for locationId, clientLocationCmd := range clientLocationCmds {
 				clientLocationBytes, _ := clientLocationCmd.Bytes()
@@ -3299,7 +4462,12 @@ func loadInitialClientLocations(ctx context.Context) (initialClientLocations *In
 
 		cmd := r.Get(ctx, initialClientLocationsKey())
 
-		initialClientLocationsBytes, _ := cmd.Bytes()
+		initialClientLocationsBytes, err := cmd.Bytes()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			providerPickerMetrics.readInitial.Inc()
+			returnErr = err
+			return
+		}
 		if len(initialClientLocationsBytes) == 0 {
 			return
 		}
@@ -3308,6 +4476,7 @@ func loadInitialClientLocations(ctx context.Context) (initialClientLocations *In
 		var initialClientLocations_ InitialClientLocations
 		returnErr = e.Decode(&initialClientLocations_)
 		if returnErr != nil {
+			providerPickerMetrics.readInitial.Inc()
 			return
 		}
 
@@ -3355,8 +4524,13 @@ func loadLocationStables(
 			}
 			locationFilterCmds[locationId] = read
 		}
-		// note ignore the error for GET since it will include missing key
-		pipe.Exec(ctx)
+		// Missing keys are legitimate; a failed command is not an empty filter.
+		// Exec can report redis.Nil while a later command has a real error.
+		if returnErr = execClientScoreReadPipeline(ctx, pipe); returnErr != nil {
+			providerPickerMetrics.readFilters.Inc()
+			locationStables = nil
+			return
+		}
 
 		for locationId, read := range locationFilterCmds {
 			_, filterBytes := selectClientScorePayload(
@@ -3374,6 +4548,8 @@ func loadLocationStables(
 			var filter ClientFilter
 			returnErr = e.Decode(&filter)
 			if returnErr != nil {
+				providerPickerMetrics.readFilters.Inc()
+				locationStables = nil
 				return
 			}
 			if 0 < filter.Count {
@@ -3389,9 +4565,16 @@ func loadLocationStables(
 func FindProviderLocations(
 	findLocations *FindLocationsArgs,
 	session *session.ClientSession,
-) (*FindLocationsResult, error) {
+) (result *FindLocationsResult, returnErr error) {
+	surface := "search"
+	defer func() { providerPickerMetrics.observe(surface, result, returnErr) }()
+	observation := &providerPickerObservation{metrics: providerPickerMetrics, surface: surface}
+	defer observation.finish()
 	query := strings.TrimSpace(findLocations.Query)
 	if clientId, err := server.ParseId(query); err == nil {
+		surface = "direct"
+		observation.surface = surface
+		observation.enter("format_result")
 		device := &LocationDeviceResult{
 			ClientId:   clientId,
 			DeviceName: fmt.Sprintf("%s", clientId),
@@ -3408,6 +4591,7 @@ func FindProviderLocations(
 		}, nil
 	} else {
 		// note group search is no longer supported
+		observation.enter("caller_location")
 
 		rankMode := RankModeQuality
 		if findLocations.RankMode != "" {
@@ -3430,9 +4614,13 @@ func FindProviderLocations(
 		var matchDistances map[server.Id]int
 		var clientLocations map[server.Id]*ClientLocation
 		if query == "" {
+			observation.enter("initial_cache")
 			initialClientLocations, err := loadInitialClientLocations(session.Ctx)
 			if err != nil {
 				return nil, err
+			}
+			if initialClientLocations == nil {
+				initialClientLocations = &InitialClientLocations{}
 			}
 			matchDistances = map[server.Id]int{}
 			clientLocations = map[server.Id]*ClientLocation{}
@@ -3440,6 +4628,7 @@ func FindProviderLocations(
 				clientLocations[clientLocation.LocationId] = clientLocation
 			}
 		} else {
+			observation.enter("search_index")
 			maxSearchDistance := 2
 			locationSearchResults := locationSearch().AroundIds(
 				session.Ctx,
@@ -3453,6 +4642,7 @@ func FindProviderLocations(
 				locationIds[locationId] = true
 			}
 			var err error
+			observation.enter("location_cache")
 			clientLocations, err = loadClientLocations(session.Ctx, locationIds)
 			if err != nil {
 				return nil, err
@@ -3468,9 +4658,9 @@ func FindProviderLocations(
 			}
 		}
 
-		// ignore if this meta data can't be loaded
-		// in that case, all locations will be considered unstable
-		locationStables, _ := loadLocationStables(
+		// An absent entry excludes the location, so read errors must propagate.
+		observation.enter("filters")
+		locationStables, err := loadLocationStables(
 			session.Ctx,
 			slices.Collect(maps.Keys(clientLocations)),
 			// user-facing search: only surface locations that meet the bar
@@ -3478,9 +4668,13 @@ func FindProviderLocations(
 			rankMode,
 			clientLocationId,
 		)
+		if err != nil {
+			return nil, err
+		}
 		if locationStables == nil {
 			locationStables = map[server.Id]bool{}
 		}
+		observation.enter("format_result")
 
 		locationResults := []*LocationResult{}
 
@@ -3524,7 +4718,11 @@ func FindProviderLocations(
 // since there are no promoted groups, this call can be replaced with `FindProviderLocations` with an empty query
 func GetProviderLocations(
 	session *session.ClientSession,
-) (*FindLocationsResult, error) {
+) (result *FindLocationsResult, returnErr error) {
+	defer func() { providerPickerMetrics.observe("initial", result, returnErr) }()
+	observation := &providerPickerObservation{metrics: providerPickerMetrics, surface: "initial"}
+	defer observation.finish()
+	observation.enter("caller_location")
 	rankMode := RankModeQuality
 
 	// the caller ip is used to match against provider excluded lists
@@ -3542,6 +4740,7 @@ func GetProviderLocations(
 		glog.V(2).Infof("[GetProviderLocations] could not parse client ip: %s\n", err)
 	}
 
+	observation.enter("initial_cache")
 	initialClientLocations, err := loadInitialClientLocations(session.Ctx)
 	if err != nil {
 		return nil, err
@@ -3555,9 +4754,9 @@ func GetProviderLocations(
 		locationIds = append(locationIds, clientLocation.LocationId)
 	}
 
-	// ignore if this meta data can't be loaded
-	// in that case, all locations will be considered unstable
-	locationStables, _ := loadLocationStables(
+	// An unavailable filter cannot be reported as an empty successful picker.
+	observation.enter("filters")
+	locationStables, err := loadLocationStables(
 		session.Ctx,
 		locationIds,
 		// user-facing listing: only surface locations that meet the bar
@@ -3565,9 +4764,13 @@ func GetProviderLocations(
 		rankMode,
 		clientLocationId,
 	)
+	if err != nil {
+		return nil, err
+	}
 	if locationStables == nil {
 		locationStables = map[server.Id]bool{}
 	}
+	observation.enter("format_result")
 
 	locationResults := []*LocationResult{}
 	locationGroupResults := []*LocationGroupResult{}
@@ -3609,7 +4812,7 @@ func GetProviderLocations(
 		locationResult.Country = clientLocationName(locationsById, locationResult.CountryLocationId)
 	}
 
-	result := &FindLocationsResult{
+	result = &FindLocationsResult{
 		Locations: locationResults,
 		Groups:    locationGroupResults,
 		Devices:   []*LocationDeviceResult{},
@@ -3686,14 +4889,18 @@ type FindProviders2Result struct {
 }
 
 type FindProvidersProvider struct {
-	ClientId                   server.Id         `json:"client_id"`
-	EstimatedBytesPerSecond    ByteCount         `json:"estimated_bytes_per_second"`
-	HasEstimatedBytesPerSecond bool              `json:"has_estimated_bytes_per_second"`
-	Tier                       int               `json:"tier"`
-	IntermediaryIds            []server.Id       `json:"intermediary_ids"`
-	NetworkOnly                bool              `json:"network_only,omitempty"`
-	ReputationFailedNames      string            `json:"reputation_failed_names,omitempty"`
-	Location                   *ProviderLocation `json:"location,omitempty"`
+	ClientId                   server.Id `json:"client_id"`
+	EstimatedBytesPerSecond    ByteCount `json:"estimated_bytes_per_second"`
+	HasEstimatedBytesPerSecond bool      `json:"has_estimated_bytes_per_second"`
+	Tier                       int       `json:"tier"`
+	// IntermediaryIds is reserved for future multi-hop routes (the
+	// intermediaries to reach ClientId through, in order). Find-providers
+	// never returns multi-hop routes today, so it is never populated and is
+	// omitted from the response rather than sent as null.
+	IntermediaryIds       []server.Id       `json:"intermediary_ids,omitempty"`
+	NetworkOnly           bool              `json:"network_only,omitempty"`
+	ReputationFailedNames string            `json:"reputation_failed_names,omitempty"`
+	Location              *ProviderLocation `json:"location,omitempty"`
 	// IpFamily is the provider's proven category: "dualstack", "v4-only" or
 	// "v6-only". Empty for a fixed client-id spec, which bypasses discovery.
 	IpFamily string `json:"ip_family,omitempty"`
@@ -3717,6 +4924,10 @@ type ProviderLocation struct {
 }
 
 type ClientScore struct {
+	// A cached passing ratio is valid only until its first contributing result
+	// leaves the eight-hour window. A later export recalculates the ratio.
+	EgressValidUntil             *time.Time
+	UrlProbeSuccessWeight        float64
 	ClientId                     server.Id
 	NetworkId                    server.Id
 	Scores                       map[string]int
@@ -3750,6 +4961,9 @@ type ClientScore struct {
 	// NetworkOnly: an entry written before this field existed must keep
 	// today's behavior. See IpFamily and network_client_ip_family.go.
 	IpFamilies uint8
+	// Every common-gate pass belongs to online, including native quality/speed
+	// members. PassesMinimums distinguishes each mode's native membership.
+	Online bool
 
 	// set only on the top-level score, never on the `LookbackClientScores`
 	// copies: each score is gob-serialized into thousands of cache key
@@ -3764,6 +4978,9 @@ type ClientScore struct {
 
 	ScaledWeights  map[string]float32
 	PassesMinimums map[string]bool
+
+	// Performance-only score for sampling weights. It never changes admission.
+	minimumScores map[string]int
 }
 
 type ClientFilter struct {
@@ -3775,6 +4992,19 @@ type ClientFilter struct {
 // scores are [0, max], where 0 is best
 const MaxClientScore = 50
 const ClientScoreSampleCount = 200
+
+// The width of a tier in score points: a tier is a score's twentieths, so a
+// missing latency or throughput test (two tiers) costs 40.
+const ClientScorePerTier = 20
+
+// The tier of a provider past a mode's latency or throughput cutoff: one past
+// MaxNativeClientScoreTier, the highest tier a
+// score within the cutoffs can reach. FindProviders2 draws a mode's own
+// providers from those within its cutoffs, and treats the rest as backfill.
+const ClientScoreCutoffTier = (MaxClientScore + ClientScorePerTier - 1) / ClientScorePerTier
+
+// The highest tier a provider within a mode's cutoffs carries.
+const MaxNativeClientScoreTier = MaxClientScore / ClientScorePerTier
 
 // choose a filter that has at least this number of providers
 // FIXME this scale based on traffic for region
@@ -3903,6 +5133,7 @@ func clientScoreLocationGroupFacetSampleKey(forceMinimum bool, rankMode RankMode
 }
 
 func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (returnErr error) {
+	nativeSourceStartedAt := server.NowUtc()
 	aliasesReady, err := clientScoreAliasReady(ctx)
 	if err != nil {
 		return fmt.Errorf("read client score alias migration state: %w", err)
@@ -3937,85 +5168,17 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	locationClientScores := map[server.Id]map[server.Id]*ClientScore{}
 	locationGroupClientScores := map[server.Id]map[server.Id]*ClientScore{}
 
-	type performanceTarget struct {
-		relativeLatencyMillisThreshold int
-		relativeLatencyMillisCutoff    int
-		relativeLatencyMillisPerScore  int
-		bytesPerSecondThreshold        ByteCount
-		bytesPerSecondCutoff           ByteCount
-		bytesPerSecondPerScore         ByteCount
+	// What the rules of connect/GEOMAP.md §10.3 read about a provider from its
+	// rollup row, the same in both pool queries.
+	type clientScoreEgress struct {
+		egressIndex   *int
+		egressQuality *bool
+		// the country of the rollup's location, which the country gate
+		// compares with a fresh probe's
+		publishedCountryCode *string
 	}
 
-	scorePerTier := 20
-	missingLatencyScore := 2 * scorePerTier
-	missingSpeedScore := 2 * scorePerTier
-
-	performanceTargets := map[RankMode]performanceTarget{
-		RankModeQuality: performanceTarget{
-			relativeLatencyMillisThreshold: 50,
-			relativeLatencyMillisCutoff:    200,
-			relativeLatencyMillisPerScore:  20,
-			bytesPerSecondThreshold:        8 * Mib,
-			bytesPerSecondCutoff:           800 * Kib,
-			bytesPerSecondPerScore:         200 * Kib,
-		},
-		RankModeSpeed: performanceTarget{
-			relativeLatencyMillisThreshold: 20,
-			relativeLatencyMillisCutoff:    50,
-			relativeLatencyMillisPerScore:  5,
-			bytesPerSecondThreshold:        40 * Mib,
-			bytesPerSecondCutoff:           4 * Mib,
-			bytesPerSecondPerScore:         1 * Mib,
-		},
-	}
-
-	setScore := func(
-		clientScore *ClientScore,
-		netTypeScores map[RankMode]int,
-		minRelativeLatencyMillis int,
-		maxBytesPerSecond ByteCount,
-		hasLatencyTest bool,
-		hasSpeedTest bool,
-	) {
-		for rankMode, target := range performanceTargets {
-			exclude := false
-			scoreAdjust := 0
-
-			if hasLatencyTest {
-				if target.relativeLatencyMillisCutoff < minRelativeLatencyMillis {
-					exclude = true
-				} else if d := minRelativeLatencyMillis - target.relativeLatencyMillisThreshold; 0 < d {
-					scoreAdjust += (d + target.relativeLatencyMillisPerScore/2) / target.relativeLatencyMillisPerScore
-				}
-			} else {
-				scoreAdjust += missingLatencyScore
-			}
-
-			if hasSpeedTest {
-				if maxBytesPerSecond < target.bytesPerSecondCutoff {
-					exclude = true
-				} else if d := target.bytesPerSecondThreshold - maxBytesPerSecond; 0 < d {
-					scoreAdjust += int((d + target.bytesPerSecondPerScore/2) / target.bytesPerSecondPerScore)
-				}
-			} else {
-				scoreAdjust += missingSpeedScore
-			}
-
-			if !exclude {
-				score := min(
-					scorePerTier*netTypeScores[rankMode]+scoreAdjust,
-					MaxClientScore,
-				)
-				clientScore.Scores[rankMode] = score
-				clientScore.Tiers[rankMode] = score / scorePerTier
-			} else {
-				clientScore.Scores[rankMode] = 0
-				clientScore.Tiers[rankMode] = (MaxClientScore + scorePerTier - 1) / scorePerTier
-			}
-		}
-	}
-
-	loadClientScore := func(result server.PgResult) (lookbackClientScore *ClientScore, cityLocationXId *server.Id, regionLocationXId *server.Id, countryLocationXId *server.Id, reputationFailedNames string) {
+	loadClientScore := func(result server.PgResult) (lookbackClientScore *ClientScore, cityLocationXId *server.Id, regionLocationXId *server.Id, countryLocationXId *server.Id, reputationFailedNames string, egress *clientScoreEgress) {
 		var clientId server.Id
 		var networkId server.Id
 		var netTypeScore int
@@ -4030,6 +5193,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		var publiclyUsable bool
 		var ipv4Proven bool
 		var ipv6Proven bool
+		egress = &clientScoreEgress{}
 		server.Raise(result.Scan(
 			&cityLocationXId,
 			&regionLocationXId,
@@ -4049,6 +5213,9 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			&reputationFailedNames,
 			&ipv4Proven,
 			&ipv6Proven,
+			&egress.egressIndex,
+			&egress.egressQuality,
+			&egress.publishedCountryCode,
 		))
 		lookbackClientScore = &ClientScore{
 			ClientId:                     clientId,
@@ -4066,14 +5233,11 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			Tiers:                        map[string]int{},
 		}
 
-		netTypeScores := map[RankMode]int{
-			RankModeQuality: netTypeScore,
-			RankModeSpeed:   netTypeScoreSpeed,
-		}
-
-		setScore(
+		rankModeBases, rankModeMinimumBases := clientScoreRankModeBases(netTypeScore, netTypeScoreSpeed, egress.egressIndex)
+		setClientScoreRanks(
 			lookbackClientScore,
-			netTypeScores,
+			rankModeBases,
+			rankModeMinimumBases,
 			minRelativeLatencyMillis,
 			maxBytesPerSecond,
 			hasLatencyTest,
@@ -4082,6 +5246,15 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 
 		return
 	}
+
+	// Load common gates and accepted URL history once before assembling any
+	// location or group pool. Every advertised count uses this same decision.
+	egressTestEnabled := providerEgressTestEnabled()
+	egressSettings := egressIndexSettings()
+	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
+	clientIdEgresses := map[server.Id]*clientScoreEgress{}
+	hardExcludedClientIds := map[server.Id]bool{}
+	shadowScoreCapture := beginArinShadowScoreCapture()
 
 	server.Db(ctx, func(conn server.PgConn) {
 		result, err := conn.Query(
@@ -4115,12 +5288,20 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	            ),
 	            COALESCE(provider_egress_health.reputation_failed_names, ''),
 	            network_client_location_reliability.ipv4_proven,
-	            network_client_location_reliability.ipv6_proven
+	            network_client_location_reliability.ipv6_proven,
+	            -- the egress index (connect/GEOMAP.md §10.4) and the country
+	            -- the provider is published under, which the country gate reads
+	            network_client_location_reliability.egress_index,
+	            network_client_location_reliability.egress_quality,
+	            country_location.country_code
 
 	        FROM network_client_location_reliability
 
 	        INNER JOIN network_client ON
 	            network_client.client_id = network_client_location_reliability.client_id
+
+	        LEFT JOIN location AS country_location ON
+	            country_location.location_id = network_client_location_reliability.country_location_id
 
 	        -- fix(beta): same class of issue as UpdateClientLocations above --
 	        -- an INNER JOIN here requires a reliability score to already exist
@@ -4175,7 +5356,15 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
 				sourceRows++
-				lookbackClientScore, cityLocationId, regionLocationId, countryLocationId, reputationFailedNames := loadClientScore(result)
+				lookbackClientScore, cityLocationId, regionLocationId, countryLocationId, reputationFailedNames, egress := loadClientScore(result)
+				if shadowScoreCapture != nil {
+					shadowScoreCapture.observe(lookbackClientScore, egress.publishedCountryCode, countFilter.egressFacts(lookbackClientScore.ClientId, egress.publishedCountryCode, egress.egressIndex, egress.egressQuality, egressSettings), egressTestEnabled)
+				}
+				if countFilter.hasHardEgressFailure(lookbackClientScore.ClientId) {
+					hardExcludedClientIds[lookbackClientScore.ClientId] = true
+					continue
+				}
+				clientIdEgresses[lookbackClientScore.ClientId] = egress
 
 				// top-level only; the lookback copies stay nil (see `ClientScore`)
 				setLocationIds := func(clientScore *ClientScore) {
@@ -4233,12 +5422,20 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	                ),
 	                COALESCE(provider_egress_health.reputation_failed_names, ''),
 	                network_client_location_reliability.ipv4_proven,
-	                network_client_location_reliability.ipv6_proven
+	                network_client_location_reliability.ipv6_proven,
+	                -- the egress index and the published country; see the
+	                -- per-location query above
+	                network_client_location_reliability.egress_index,
+	                network_client_location_reliability.egress_quality,
+	                country_location.country_code
 
 	            FROM network_client_location_reliability
 
 	            INNER JOIN network_client ON
 	                network_client.client_id = network_client_location_reliability.client_id
+
+	            LEFT JOIN location AS country_location ON
+	                country_location.location_id = network_client_location_reliability.country_location_id
 
 	            -- fix(beta): same class of issue as UpdateClientLocations/the query
             -- above this one -- treats an unscored client as neutral rather
@@ -4285,7 +5482,15 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
 				sourceRows++
-				lookbackClientScore, cityLocationGroupId, regionLocationGroupId, countryLocationGroupId, reputationFailedNames := loadClientScore(result)
+				lookbackClientScore, cityLocationGroupId, regionLocationGroupId, countryLocationGroupId, reputationFailedNames, egress := loadClientScore(result)
+				if shadowScoreCapture != nil {
+					shadowScoreCapture.observe(lookbackClientScore, egress.publishedCountryCode, countFilter.egressFacts(lookbackClientScore.ClientId, egress.publishedCountryCode, egress.egressIndex, egress.egressQuality, egressSettings), egressTestEnabled)
+				}
+				if countFilter.hasHardEgressFailure(lookbackClientScore.ClientId) {
+					hardExcludedClientIds[lookbackClientScore.ClientId] = true
+					continue
+				}
+				clientIdEgresses[lookbackClientScore.ClientId] = egress
 
 				// once per distinct group id. The three location columns can
 				// be the same id (a country-only client), in which case all
@@ -4306,18 +5511,6 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		})
 	})
 
-	type filter struct {
-		maxScore                         int
-		minIndependentReliabilityWeights map[int]float64
-		// minBytesPerSecond                ByteCount
-		// maxRelativeLatencyMillis         int
-	}
-	// filters are tested in order of declaration for `MinExportNetReliabilityWeight`
-	// to minimize the chance of bad providers in the `FindProviders2` randomized shuffle
-	// the last filter represents the worst case the network will expose to users
-	minFilter := filter{
-		maxScore: 2 * scorePerTier,
-	}
 	// keyed by lookback index (see ClientLookbacks): 1 = the hour, 2 = 12h.
 	// The hour threshold is the gate that decides whether a provider is in the
 	// market at all. It sat at 0.99 -- less than one bad block in 60 -- which
@@ -4326,109 +5519,51 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	// invalid however tolerant the rule is). 0.95 allows three such blocks an
 	// hour. Repeated reconnects still fail it: they are real user impact, and
 	// `client_reliability_valid` only forgives ONE per block.
-	if NormalNetworkConditions() {
-		minFilter.minIndependentReliabilityWeights = map[int]float64{
-			1: float64(0.95),
-			2: float64(0.7),
-			3: float64(0.6),
+	minIndependentReliabilityWeights := providerReliabilityMinimums()
+
+	// The rules of connect/GEOMAP.md §10.3 for every provider of the pool, once
+	// each: a client sits in several location and group maps, each with its
+	// own ClientScore, and must be decided the same way in all of them.
+	clientIdEgressDecisions := map[server.Id]providerEgressDecision{}
+	reasonCounts := map[string]int{}
+	onlineCount := 0
+	for clientId, egress := range clientIdEgresses {
+		decision := decideProviderEgress(
+			countFilter.egressFacts(
+				clientId,
+				egress.publishedCountryCode,
+				egress.egressIndex,
+				egress.egressQuality,
+				egressSettings,
+			),
+			egressTestEnabled,
+		)
+		clientIdEgressDecisions[clientId] = decision
+		if decision.reason != "" {
+			reasonCounts[decision.reason] += 1
 		}
-	} else {
-		// some abormal conditions, loosen the stats as they reset
-		minFilter.minIndependentReliabilityWeights = map[int]float64{
-			1: float64(0.8),
-			2: float64(0.6),
-			3: float64(0.6),
+		if decision.online {
+			onlineCount += 1
 		}
 	}
-	minReliabilityWeightScale := 0.1
-	maxReliabilityWeightScale := 1.0
-	minScoreScale := 0.1
-	maxScoreScale := 1.0
+	glog.Infof(
+		"[nclm]egress rules: %d providers decided, %d hard excluded from the pool, out of a bucket by reason %v, %d unprobed for the online bucket\n",
+		len(clientIdEgressDecisions),
+		len(hardExcludedClientIds),
+		reasonCounts,
+		onlineCount,
+	)
 
-	// health is loaded once for the whole pass rather than per client: this
-	// walks every provider, and the table is one row per ever-probed provider.
-	//
-	// # Staleness
-	//
-	// A record is used however old it is, deliberately. Nothing sweeps
-	// provider_egress_health and SetProviderEgressHealth upserts on client_id,
-	// so a row is always that provider's most recent measurement -- there is no
-	// such thing as a superseded row still sitting in the table. Ageing records
-	// out would mean that if the prober ever stalls, the entire public list
-	// silently empties, which is a far worse failure than trusting a
-	// measurement that is a day old.
-	//
-	// The asymmetry that leaves is intended. A stale *good* record keeps a
-	// provider visible; a stale *bad* record keeps it hidden until it is probed
-	// again. The full-probe queue therefore remains independent of health and TLS
-	// scores. Its only negative-evidence exception is a current blackhole failure:
-	// that independently proves the fixed tunnel cannot carry any destination,
-	// and the cheaper blackhole queue retries it without full-probe backoff. A
-	// passing recheck immediately restores full-probe eligibility, while a stale
-	// or missing check fails open after ProviderBlackholeCheckMaxAge. Gating the
-	// full queue on any other score could prevent an excluded provider from ever
-	// being re-measured.
-	// Shared with UpdateClientLocations so the gated membership and the
-	// advertised count can never disagree about what "healthy" means.
-	// UpdateClientScores uses health but not observed country: its candidate
-	// pool is not country-scoped. Current blackholes and TLS-authentication
-	// failures apply regardless of the broad egress-test rollout switch.
-	egressTestEnabled := providerEgressTestEnabled()
-	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
-	if !egressTestEnabled {
-		glog.Infof("[nclm]provider egress test is disabled; skipping broad provider score qualification for this pass; hard egress exclusions remain enabled\n")
-	}
-
-	// migration: set each client score to the lowest lookback index index
+	// set each client score to its lowest lookback, decided the same way in
+	// every location and group map it sits in
 	migrateClientScore := func(clientScore *ClientScore) {
-		lookbackIndexes := slices.Collect(maps.Keys(clientScore.LookbackClientScores))
-		slices.Sort(lookbackIndexes)
-		minLookbackIndex := lookbackIndexes[0]
-
-		minClientScore := clientScore.LookbackClientScores[minLookbackIndex]
-
-		clientScore.Scores = minClientScore.Scores
-		clientScore.ReliabilityWeight = minClientScore.ReliabilityWeight
-		clientScore.IndependentReliabilityWeight = minClientScore.IndependentReliabilityWeight
-		clientScore.Tiers = minClientScore.Tiers
-		clientScore.MinRelativeLatencyMillis = minClientScore.MinRelativeLatencyMillis
-		clientScore.MaxBytesPerSecond = minClientScore.MaxBytesPerSecond
-		clientScore.HasLatencyTest = minClientScore.HasLatencyTest
-		clientScore.HasSpeedTest = minClientScore.HasSpeedTest
-
-		clientScore.ScaledWeights = map[string]float32{}
-		clientScore.PassesMinimums = map[string]bool{}
-
-		// Provider eligibility does not vary by rank mode, so it is evaluated
-		// once per client and seeds every mode's minimum. It is a gate and
-		// nothing else: it can only take a provider out of the pool, and the
-		// scaled-weight arithmetic below is untouched, so every provider that
-		// still qualifies keeps exactly the weight and ordering it has today.
-		passesEligibility := countFilter.passesEligibility(clientScore.ClientId, egressTestEnabled)
-
-		for _, rankMode := range slices.Collect(maps.Keys(clientScore.Scores)) {
-			passesMinimum := passesEligibility
-			// all lookback thresholds must pass
-			for lookbackIndex, lookbackClientScore := range clientScore.LookbackClientScores {
-				if lookbackClientScore.IndependentReliabilityWeight < minFilter.minIndependentReliabilityWeights[lookbackIndex] {
-					passesMinimum = false
-					break
-				}
-				if minFilter.maxScore <= lookbackClientScore.Scores[rankMode] {
-					passesMinimum = false
-					break
-				}
-			}
-
-			if passesMinimum {
-				u := float64(minClientScore.IndependentReliabilityWeight-minFilter.minIndependentReliabilityWeights[minLookbackIndex]) / (1.0 - minFilter.minIndependentReliabilityWeights[minLookbackIndex])
-				reliabilityWeightScale := (1-u)*minReliabilityWeightScale + u*maxReliabilityWeightScale
-				v := float64(minFilter.maxScore-clientScore.Scores[rankMode]) / float64(minFilter.maxScore)
-				scoreScale := (1-v)*minScoreScale + v*maxScoreScale
-				clientScore.ScaledWeights[rankMode] = float32(reliabilityWeightScale * clientScore.ReliabilityWeight * scoreScale)
-				clientScore.PassesMinimums[rankMode] = true
-			}
-		}
+		rankClientScore(
+			clientScore,
+			clientIdEgressDecisions[clientScore.ClientId],
+			countFilter,
+			egressSettings,
+			minIndependentReliabilityWeights,
+		)
 	}
 	for _, clientScores := range locationClientScores {
 		for _, clientScore := range clientScores {
@@ -4440,6 +5575,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			migrateClientScore(clientScore)
 		}
 	}
+	nativeCensus := newClientScoreNativeCensus(nativeSourceStartedAt, server.NowUtc(), countFilter.healthWindowEnd, countFilter.healthCounts, locationClientScores, locationGroupClientScores)
 	// splitClientScoreSamples shuffles and buckets one list of scores into
 	// ClientScoreSampleCount-sized samples. Encode on demand so 48 parallel
 	// caller-location exporters retain at most one sample each, rather than
@@ -4478,10 +5614,17 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		defer mapSpan.finish()
 		clientScores := []*ClientScore{}
 		facetClientScores := map[ipFamilyFacet][]*ClientScore{}
+		nativeFacetClientScores := map[ipFamilyFacet][]*ClientScore{}
 		publicCount := 0
 		publicNetReliabilityWeight := float64(0)
 		for _, clientScore := range s {
-			if clientScore.PassesMinimums[rankMode] || forceMinimum {
+			if !forceMinimum && clientScore.PassesMinimums[rankMode] {
+				facet := clientScore.ipFamilyFacet()
+				nativeFacetClientScores[facet] = append(nativeFacetClientScores[facet], clientScore)
+			}
+			// an online provider sits in both modes' samples, native to
+			// neither: FindProviders2 borrows from it last
+			if clientScore.PassesMinimums[rankMode] || clientScore.Online || forceMinimum {
 				clientScores = append(clientScores, clientScore)
 				facet := clientScore.ipFamilyFacet()
 				facetClientScores[facet] = append(facetClientScores[facet], clientScore)
@@ -4511,6 +5654,14 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		updateClientScoresPhaseMetrics.addWork(updateClientScoresPhaseTargetMap, len(s), 0)
 		mapSpan.finish()
 		payload.countsBytes, payload.counts, payload.encodeSample = splitClientScoreSamples(clientScores)
+		if !forceMinimum {
+			payload.nativeFacets = map[ipFamilyFacet]clientScoreFacetPayload{}
+			for _, facet := range ipFamilyFacets {
+				nativePayload := clientScoreFacetPayload{}
+				nativePayload.countsBytes, nativePayload.counts, nativePayload.encodeSample = splitClientScoreSamples(nativeFacetClientScores[facet])
+				payload.nativeFacets[facet] = nativePayload
+			}
+		}
 		// every facet, an empty one included: see the key layout comment
 		for _, facet := range ipFamilyFacets {
 			facetPayload := clientScoreFacetPayload{}
@@ -4583,7 +5734,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	var exportCount atomic.Uint32
 	workerLimit := max(1, parallel)
 	returnErrs := make(chan error, workerLimit)
-	targetExportTotal := 2 * len(performanceTargets) * len(targets)
+	targetExportTotal := 2 * len(clientScorePerformanceTargets) * len(targets)
 	targetBlockSize := 0
 	if len(targets) != 0 {
 		targetBlockSize = (len(targets) + workerLimit - 1) / workerLimit
@@ -4598,7 +5749,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			connect.HandleError(func() {
 				server.Redis(ctx, func(r server.RedisClient) {
 					for _, forceMinimum := range []bool{false, true} {
-						for rankMode, _ := range performanceTargets {
+						for rankMode, _ := range clientScorePerformanceTargets {
 							// The sets are independent and hash to different cluster slots, so
 							// multi/exec cannot span them. Encode directly into the bounded
 							// writer. Partitioning by target, rather than caller, lets one gob
@@ -4666,6 +5817,10 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 											len(clientLocationIds),
 										)
 									}
+									var nativeFanout *clientScoreNativeFanout
+									if !forceMinimum {
+										nativeFanout = newClientScoreNativeFanout(ctx, r, keys.counts, ttl, nativeCensus, emit)
+									}
 									if err := emitClientScoreTargetFanout(
 										clientLocationIds,
 										target.clientScores,
@@ -4677,6 +5832,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 										writeLegacyUnchanged,
 										writeUnfacetedPayload,
 										emit,
+										nativeFanout,
 									); err != nil {
 										return err
 									}
@@ -4715,19 +5871,7 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 	wg.Wait()
 	close(returnErrs)
 
-	func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case err, ok := <-returnErrs:
-				if !ok {
-					return
-				}
-				returnErr = errors.Join(returnErr, err)
-			}
-		}
-	}()
+	returnErr = finishClientScoreExport(ctx, returnErrs)
 
 	if returnErr == nil {
 		if writeLegacyUnchanged {
@@ -4746,6 +5890,10 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			glog.Infof("[nclm]client score ip family facets ready; un-faceted payloads will expire naturally\n")
 		}
 		glog.Infof("[nclm]client score provider eligibility ready; derived and inactive clients excluded\n")
+		if err := writeClientScoreNativeCensus(ctx, nativeCensus, ttl); err != nil {
+			return fmt.Errorf("publish native client score census: %w", err)
+		}
+		shadowScoreCapture.publish(nativeCensus, locationClientScores, locationGroupClientScores)
 		glog.Infof(
 			"[nclm]update %d client locations x %d location scores, %d location group scores\n",
 			len(clientLocationIds),
@@ -4776,7 +5924,27 @@ func loadClientScores(
 	clientLocationId server.Id,
 	n int,
 	facets []ipFamilyFacet,
+	observations ...*findProviders2LoadObservation,
 ) (clientScores map[server.Id]*ClientScore, returnErr error) {
+	clientScores, _, returnErr = loadClientScoresWithCursor(forceMinimum, rankMode, ctx, locationIds, locationGroupIds, clientLocationId, n, facets, observations...)
+	return
+}
+
+func loadClientScoresWithCursor(
+	forceMinimum bool,
+	rankMode RankMode,
+	ctx context.Context,
+	locationIds map[server.Id]bool,
+	locationGroupIds map[server.Id]bool,
+	clientLocationId server.Id,
+	n int,
+	facets []ipFamilyFacet,
+	observations ...*findProviders2LoadObservation,
+) (clientScores map[server.Id]*ClientScore, cursor *clientScoreCursor, returnErr error) {
+	var observation *findProviders2LoadObservation
+	if 0 < len(observations) {
+		observation = observations[0]
+	}
 	server.Redis(ctx, func(r server.RedisClient) {
 		type countsRead struct {
 			caller   *redis.StringCmd
@@ -4836,13 +6004,17 @@ func loadClientScores(
 			}
 			locationGroupReads[locationGroupId] = read
 		}
-		// note ignore the error for GET since it will include missing key
-		pipe.Exec(ctx)
+		if err := execClientScoreReadPipeline(ctx, pipe); err != nil {
+			clientScoreReadMetrics.counts.Inc()
+			returnErr = fmt.Errorf("read client score counts: %w", err)
+			return
+		}
 
 		// sample keys grouped by draw order: one group per requested facet,
 		// then the un-faceted fallback group
 		groupCount := len(facets) + 1
 		groupSampleKeyCounts := make([]map[string]int, groupCount)
+		sourceIncomplete := false
 		for i := range groupSampleKeyCounts {
 			groupSampleKeyCounts[i] = map[string]int{}
 		}
@@ -4873,6 +6045,7 @@ func loadClientScores(
 			sampleKey func(effectiveClientLocationId server.Id, index int) string,
 		) {
 			faceted := false
+			facetCount := 0
 			for facetIndex, facet := range facets {
 				effectiveClientLocationId, counts, ok := decodeCounts(read.alias, read.facets[facet])
 				if returnErr != nil {
@@ -4882,16 +6055,24 @@ func loadClientScores(
 					continue
 				}
 				faceted = true
+				facetCount++
 				for i, count := range counts {
 					groupSampleKeyCounts[facetIndex][facetSampleKey(effectiveClientLocationId, facet, i)] = count
 				}
 			}
 			if faceted {
+				if facetCount != len(facets) {
+					sourceIncomplete = true
+				}
 				return
 			}
 			// written before the facets existed: fall back to the un-faceted buckets
 			effectiveClientLocationId, counts, ok := decodeCounts(read.alias, read.unfacted)
 			if returnErr != nil || !ok {
+				sourceIncomplete = true
+				if returnErr == nil && observation != nil {
+					observation.missingTargets++
+				}
 				return
 			}
 			for i, count := range counts {
@@ -4928,58 +6109,9 @@ func loadClientScores(
 			}
 		}
 
-		samples := []*redis.StringCmd{}
-		netCount := 0
-
-		pipe = r.Pipeline()
-		for _, sampleKeyCounts := range groupSampleKeyCounts {
-			if n <= netCount {
-				break
-			}
-			keys := slices.Collect(maps.Keys(sampleKeyCounts))
-			mathrand.Shuffle(len(keys), func(i int, j int) {
-				keys[i], keys[j] = keys[j], keys[i]
-			})
-			for _, key := range keys {
-				if n <= netCount {
-					break
-				}
-				c := sampleKeyCounts[key]
-				v := pipe.Get(ctx, key)
-				samples = append(samples, v)
-				netCount += c
-			}
-		}
-		// note ignore the error for GET since it will include missing key
-		pipe.Exec(ctx)
-
-		clientScores = map[server.Id]*ClientScore{}
-
-		for _, sampleCmd := range samples {
-			sampleBytes, _ := sampleCmd.Bytes()
-			if len(sampleBytes) == 0 {
-				continue
-			}
-			b := bytes.NewBuffer(sampleBytes)
-			e := gob.NewDecoder(b)
-			var sample []*ClientScore
-			returnErr = e.Decode(&sample)
-			if returnErr != nil {
-				return
-			}
-
-			for _, clientScore := range sample {
-				// a client can appear under multiple requested keys with
-				// identical ranking fields, but only location-keyed samples
-				// carry location ids. keep the copy that has them.
-				if existing, ok := clientScores[clientScore.ClientId]; ok {
-					if existing.CountryLocationId != nil && clientScore.CountryLocationId == nil {
-						continue
-					}
-				}
-				clientScores[clientScore.ClientId] = clientScore
-			}
-		}
+		cursor = newClientScoreCursor(groupSampleKeyCounts, observation)
+		cursor.sourceIncomplete = sourceIncomplete
+		clientScores, returnErr = cursor.readWithClient(ctx, r, n)
 	})
 
 	return
@@ -5053,11 +6185,33 @@ func findProvidersProviderFromClientScore(
 	}
 }
 
+// Keep the existing candidate budget for ordinary small exclusion sets. A
+// broad explicit exclusion history needs room for the requested survivors;
+// otherwise excluded rows can fill every sampled page before fallback runs.
+// Compensation is request-local and capped at the standard client's 2,400-id
+// runtime history. Page rounding stays unchanged; no retry or filter is added.
+func findProviders2LoadCount(count int, exclusionCount int) int {
+	base := max(10*count, 1000)
+	if count <= 0 {
+		return base
+	}
+	spare := base - min(count, base)
+	extra := max(0, min(exclusionCount, 2400)-spare)
+	return base + min(extra, int(^uint(0)>>1)-base)
+}
+
 func FindProviders2(
 	findProviders2 *FindProviders2Args,
 	session *session.ClientSession,
 ) (*FindProviders2Result, error) {
+	observation := newFindProviders2SelectionObservation(findProviders2)
+	defer observation.finish(session.Ctx)
 	providers := []*FindProvidersProvider{}
+	rankMode := RankModeQuality
+	if findProviders2.RankMode != "" {
+		rankMode = findProviders2.RankMode
+	}
+	callerCountryCode := ""
 
 	// an unknown filter is refused before any spec is read: a filter this
 	// server cannot interpret must not silently widen to "any family"
@@ -5069,17 +6223,22 @@ func FindProviders2(
 	locationIds := map[server.Id]bool{}
 	locationGroupIds := map[server.Id]bool{}
 
-	excludeFinalDestinations := sync.OnceValue(func() map[server.Id]bool {
-		excludeFinalDestinations := map[server.Id]bool{}
+	excludeFinalDestinations := sync.OnceValue(func() map[server.Id]uint8 {
+		// Preserve the union's eligibility behavior while retaining the two
+		// request fields that actually excluded sampled candidates.
+		excludeFinalDestinations := map[server.Id]uint8{}
 		for _, clientId := range findProviders2.ExcludeClientIds {
-			excludeFinalDestinations[clientId] = true
+			excludeFinalDestinations[clientId] |= 1
 		}
 		for _, destination := range findProviders2.ExcludeDestinations {
-			excludeFinalDestinations[destination[len(destination)-1]] = true
+			excludeFinalDestinations[destination[len(destination)-1]] |= 2
 		}
 		return excludeFinalDestinations
 	})
 
+	// the providers specs name by client id, held until the hard exclusions
+	// are read
+	specClientIds := []server.Id{}
 	for _, spec := range findProviders2.Specs {
 		if spec.LocationId != nil {
 			locationIds[*spec.LocationId] = true
@@ -5089,11 +6248,8 @@ func FindProviders2(
 		}
 		if spec.ClientId != nil {
 			clientId := *(spec.ClientId)
-			if !excludeFinalDestinations()[clientId] {
-				provider := &FindProvidersProvider{
-					ClientId: clientId,
-				}
-				providers = append(providers, provider)
+			if excludeFinalDestinations()[clientId] == 0 {
+				specClientIds = append(specClientIds, clientId)
 			}
 		}
 		if spec.BestAvailable {
@@ -5104,7 +6260,25 @@ func FindProviders2(
 		}
 	}
 
+	// Named providers precede discovery results and still pass the common
+	// reliability, ARIN risk and URL security exclusions.
+	appendSpecProviders := func(hardExcludedClientIds map[server.Id]bool) {
+		seenClientIds := map[server.Id]bool{}
+		for _, clientId := range specClientIds {
+			if hardExcludedClientIds[clientId] || seenClientIds[clientId] {
+				continue
+			}
+			seenClientIds[clientId] = true
+			providers = append(providers, &FindProvidersProvider{
+				ClientId: clientId,
+			})
+			observation.explicitReturned++
+		}
+	}
+
 	if 0 < len(locationIds) || 0 < len(locationGroupIds) {
+		observation.discovery = true
+		requestSettings := requestEgressIndexSettings()
 		// use a min block size to reduce db activity
 		var count int
 		if findProviders2.ForceCount {
@@ -5112,20 +6286,16 @@ func FindProviders2(
 		} else {
 			count = max(findProviders2.Count, 20)
 		}
+		observation.requestedCount = count
 
 		// the random process is
 		// 1. load (ideally this would be all, but is truncated for performance)
 		// 2. sample based on reliability * quality
 		// 3. band based on tier and keep the top `count`
-		minLoadCount := 1000
-		loadMultiplier := 10
-
-		rankMode := RankModeQuality
-		if findProviders2.RankMode != "" {
-			rankMode = findProviders2.RankMode
-		}
+		loadCount := findProviders2LoadCount(count, len(excludeFinalDestinations()))
 
 		// the caller ip is used to match against provider excluded lists
+		observation.enter("caller_location")
 		clientIp, _, err := session.ParseClientIpPort()
 		if err != nil {
 			return nil, err
@@ -5135,23 +6305,46 @@ func FindProviders2(
 		if err != nil {
 			return nil, err
 		}
+		callerCountryCode = ipInfo.CountryCode
 
-		clientLocationId := countryCodeLocationIds()[ipInfo.CountryCode]
+		countryLocations := countryCodeLocationIds()
+		clientLocationId := countryLocations[ipInfo.CountryCode]
+		var targetDirectory map[server.Id]*locationDirectoryEntry
+		if snapshot := currentLocationDirectory.snapshot.Load(); snapshot != nil {
+			targetDirectory = snapshot.entries
+		}
+		observation.targetKind = findProviders2TargetKind(findProviders2, countryLocations, targetDirectory)
 
+		observation.enter("load_primary")
 		loadStartTime := time.Now()
-		clientScores, err := loadClientScores(
+		clientScores, primaryCursor, err := loadPreferredClientScoresWithCursor(
+			requestSettings.NativeReaderEnabled,
 			findProviders2.ForceMinimum,
 			rankMode,
 			session.Ctx,
 			locationIds,
 			locationGroupIds,
 			clientLocationId,
-			max(loadMultiplier*count, minLoadCount),
+			loadCount,
 			facets,
+			&observation.load,
 		)
 		if err != nil {
-			return nil, err
+			if session.Ctx.Err() != nil || findProviders2.ForceMinimum {
+				return nil, err
+			}
+			// Native cache availability is not a security decision. Preserve
+			// validated pages and try the next same-target bucket; diagnostics
+			// keep this unknown source distinct from proven exhaustion.
+			observation.backfillUnavailable = true
+			if primaryCursor != nil {
+				primaryCursor.sourceIncomplete = true
+			}
 		}
+		if clientScores == nil {
+			clientScores = map[server.Id]*ClientScore{}
+		}
+		observation.loaded += len(clientScores)
 		loadEndTime := time.Now()
 		loadDuration := loadEndTime.Sub(loadStartTime)
 		loadMillis := float64(loadDuration) / float64(time.Millisecond)
@@ -5165,6 +6358,169 @@ func FindProviders2(
 				len(clientScores),
 			)
 		}
+
+		// The hard exclusions (connect/GEOMAP.md §10.3), read once for every
+		// provider this call could return, and applied here where the result
+		// is assembled rather than only where the pool's minimums were: the
+		// cached pool already leaves out what its last export saw excluded,
+		// but that export can be an hour old, a verdict issued since must hold
+		// now, and force_minimum reads the same pool with no minimums at all.
+		// Request-only refusals cannot appear in the answer and need no fresh
+		// security or subscriber read. Preserve the same predicates below.
+		var callerNetworkId server.Id
+		if session.ByJwt != nil {
+			callerNetworkId = session.ByJwt.NetworkId
+		}
+		requestFilter := clientScoreRequestFilter{
+			callerNetworkId:   callerNetworkId,
+			facets:            facets,
+			excludedClientIds: excludeFinalDestinations(),
+		}
+		hardExcludedClientIds := map[server.Id]bool{}
+		qualityExcludedClientIds := map[server.Id]bool{}
+		exclusionReadClientIds := map[server.Id]bool{}
+		qualityReadClientIds := map[server.Id]bool{}
+		var nativeClientScores map[server.Id]*ClientScore
+		var clientIds, borrowedClientIds []server.Id
+		// Draws up to n of the candidates by their weight in `mode` and bands
+		// the draw by their tier in `mode`. Weighted selection and tier banding
+		// run within each facet, and the preferred facet fills n first: a
+		// v4-capable request takes every dualstack provider it can before any
+		// v4-only one, so the single-family category only ever tops up a
+		// shortfall.
+		selectProviders := func(candidateClientScores map[server.Id]*ClientScore, mode RankMode, n int) []server.Id {
+			clientIds := []server.Id{}
+			for _, facet := range facets {
+				remainingCount := n - len(clientIds)
+				if remainingCount <= 0 {
+					break
+				}
+				facetClientIds := []server.Id{}
+				for clientId, clientScore := range candidateClientScores {
+					if clientScore.ipFamilyFacet() == facet {
+						facetClientIds = append(facetClientIds, clientId)
+					}
+				}
+				mathrand.Shuffle(len(facetClientIds), func(i int, j int) {
+					facetClientIds[i], facetClientIds[j] = facetClientIds[j], facetClientIds[i]
+				})
+
+				connect.WeightedSelectFunc(facetClientIds, remainingCount, func(clientId server.Id) float32 {
+					clientScore := candidateClientScores[clientId]
+					return clientScore.ScaledWeights[mode]
+				})
+				facetClientIds = facetClientIds[:min(remainingCount, len(facetClientIds))]
+
+				// band by tier
+				slices.SortStableFunc(facetClientIds, func(a server.Id, b server.Id) int {
+					clientScoreA := candidateClientScores[a]
+					clientScoreB := candidateClientScores[b]
+
+					return clientScoreA.Tiers[mode] - clientScoreB.Tiers[mode]
+				})
+				clientIds = append(clientIds, facetClientIds...)
+			}
+			return clientIds
+		}
+
+		validation := &providerQualityValidation{parent: session.Ctx}
+		defer validation.close()
+		pruneSelected := func() {
+			// A later bucket can expose common risk for an earlier selection.
+			// Revoke it before quota/refill counts or final answers use it.
+			rejectedSelection := func(clientId server.Id) bool {
+				if !hardExcludedClientIds[clientId] {
+					return false
+				}
+				delete(clientScores, clientId)
+				delete(nativeClientScores, clientId)
+				return true
+			}
+			clientIds = slices.DeleteFunc(clientIds, rejectedSelection)
+			borrowedClientIds = slices.DeleteFunc(borrowedClientIds, rejectedSelection)
+			providers = slices.DeleteFunc(providers, func(provider *FindProvidersProvider) bool { return hardExcludedClientIds[provider.ClientId] })
+			observation.explicitReturned = len(providers) - len(clientIds) - len(borrowedClientIds)
+		}
+		readQuality := func(ids []server.Id, strict bool) error {
+			if len(ids) == 0 {
+				return nil
+			}
+			observation.enter("hard_exclusions")
+			excluded, risky, err := validation.read(ids)
+			if err != nil {
+				if session.Ctx.Err() != nil || strict {
+					return err
+				}
+				observation.backfillUnavailable = true
+				return nil
+			}
+			maps.Copy(qualityExcludedClientIds, excluded)
+			maps.Copy(hardExcludedClientIds, risky)
+			for _, id := range ids {
+				qualityReadClientIds[id] = true
+			}
+			pruneSelected()
+			return nil
+		}
+
+		// Common refusals apply to every bucket. Subscriber refusals apply only
+		// to native Quality, including Quality borrowed by a Speed request.
+		readExclusions := func(scores map[server.Id]*ClientScore, mode RankMode, native bool, namedClientIds []server.Id) error {
+			observation.enter("hard_exclusions")
+			candidateClientIds := requestFilter.unchecked(scores, exclusionReadClientIds)
+			for _, clientId := range namedClientIds {
+				if !exclusionReadClientIds[clientId] {
+					candidateClientIds = append(candidateClientIds, clientId)
+				}
+			}
+			excluded, err := getProviderHardExclusions(session.Ctx, candidateClientIds)
+			if err != nil {
+				return err
+			}
+			maps.Copy(hardExcludedClientIds, excluded)
+			for _, clientId := range candidateClientIds {
+				exclusionReadClientIds[clientId] = true
+			}
+			qualityClientIds := []server.Id{}
+			if rankMode == RankModeQuality {
+				for _, id := range namedClientIds {
+					if !hardExcludedClientIds[id] && !qualityReadClientIds[id] {
+						qualityClientIds = append(qualityClientIds, id)
+					}
+				}
+			}
+			if err := readQuality(qualityClientIds, true); err != nil {
+				return err
+			}
+			// A later Quality page may expose common risk for an earlier
+			// Speed selection. Check that overlap before filterPool removes it.
+			if mode == RankModeQuality && native {
+				prior := []server.Id{}
+				now := server.NowUtc()
+				for _, provider := range providers {
+					id := provider.ClientId
+					if score := scores[id]; score != nil && !qualityReadClientIds[id] &&
+						!hardExcludedClientIds[id] && score.PassesMinimums[mode] &&
+						score.EgressValidUntil != nil && now.Before(*score.EgressValidUntil) {
+						prior = append(prior, id)
+					}
+				}
+				if err := readQuality(prior, findProviders2.ForceMinimum); err != nil {
+					return err
+				}
+			}
+
+			pruneSelected()
+			return nil
+		}
+		if err := readExclusions(clientScores, rankMode, true, specClientIds); err != nil {
+			return nil, err
+		}
+		namedExcludedClientIds := maps.Clone(hardExcludedClientIds)
+		if rankMode == RankModeQuality {
+			maps.Copy(namedExcludedClientIds, qualityExcludedClientIds)
+		}
+		appendSpecProviders(namedExcludedClientIds)
 
 		// drop providers this caller cannot contract with.
 		//
@@ -5184,86 +6540,425 @@ func FindProviders2(
 		//
 		// A session with no jwt yields the zero network id, which matches no
 		// provider -- fail closed rather than leak.
-		var callerNetworkId server.Id
-		if session.ByJwt != nil {
-			callerNetworkId = session.ByJwt.NetworkId
-		}
-		for clientId, clientScore := range clientScores {
-			if clientScore.NetworkOnly && clientScore.NetworkId != callerNetworkId {
-				delete(clientScores, clientId)
-			}
-		}
 
-		// a cache written without facets fell back to its un-faceted buckets,
-		// whose scores carry no proven family and read as v4-only
-		for clientId, clientScore := range clientScores {
-			if !slices.Contains(facets, clientScore.ipFamilyFacet()) {
-				delete(clientScores, clientId)
-			}
-		}
-
-		for clientId, _ := range excludeFinalDestinations() {
-			delete(clientScores, clientId)
-		}
-		if findProviders2.ForceMinimum {
+		// Applies the request's eligibility to one mode's loaded pool, then the
+		// request's weights in that mode. It runs on the requested mode's pool
+		// and, when that comes up short, on the other mode's, so a borrowed
+		// provider passes exactly what a native one does.
+		filterPool := func(clientScores map[server.Id]*ClientScore, mode RankMode, hardExcludedClientIds map[server.Id]bool) {
+			observation.enter("filter")
+			now := server.NowUtc()
 			for _, clientScore := range clientScores {
-				clientScore.ScaledWeights[rankMode] = 1.0
+				if clientScore.EgressValidUntil == nil || !now.Before(*clientScore.EgressValidUntil) {
+					// Older native cache records may not also set Online. Their
+					// prior native admission also admitted online fallback. Expiry
+					// removes only native evidence; request filters still run below.
+					if clientScore.PassesMinimums[RankModeQuality] || clientScore.PassesMinimums[RankModeSpeed] {
+						clientScore.Online = true
+					}
+					clientScore.PassesMinimums = nil
+					clientScore.UrlProbeSuccessWeight = 1
+				}
+			}
+			before := len(clientScores)
+			for clientId := range hardExcludedClientIds {
+				delete(clientScores, clientId)
+			}
+			for clientId := range qualityExcludedClientIds {
+				if clientScore := clientScores[clientId]; clientScore != nil {
+					if findProviders2.ForceMinimum && rankMode == RankModeQuality {
+						delete(clientScores, clientId)
+					} else if clientScore.PassesMinimums[RankModeQuality] {
+						// A stale Quality label cannot survive live revalidation.
+						// Its prior admission still supplies common-gated Online.
+						clientScore.Online = true
+						clientScore.PassesMinimums = maps.Clone(clientScore.PassesMinimums)
+						delete(clientScore.PassesMinimums, RankModeQuality)
+					}
+				}
+			}
+			for _, provider := range providers {
+				delete(clientScores, provider.ClientId)
+			}
+			observation.dropped[0] += before - len(clientScores)
+			// a cache written without facets fell back to its un-faceted
+			// buckets, whose scores carry no proven family and read as v4-only
+			requestFilter.apply(clientScores, observation)
+			observation.eligible += len(clientScores)
+			if findProviders2.ForceMinimum {
+				for _, clientScore := range clientScores {
+					clientScore.ScaledWeights[mode] = 1.0
+				}
+			}
+			// the final hop is excluded
+			// intermediaries have score reduced
+			intermediaryScale := float32(0.5)
+			for _, destination := range findProviders2.ExcludeDestinations {
+				for _, clientId := range destination[:len(destination)-1] {
+					if clientScore, ok := clientScores[clientId]; ok {
+						clientScore.ScaledWeights[mode] *= intermediaryScale
+					}
+				}
 			}
 		}
-		// the final hop is excluded
-		// intermediaries have score reduced
-		intermediaryScale := float32(0.5)
-		for _, destination := range findProviders2.ExcludeDestinations {
-			for _, clientId := range destination[:len(destination)-1] {
-				if clientScore, ok := clientScores[clientId]; ok {
-					clientScore.ScaledWeights[rankMode] *= intermediaryScale
+		filterPool(clientScores, rankMode, hardExcludedClientIds)
+		if primaryCursor != nil && primaryCursor.nativeOnly {
+			retainNativeClientScores(clientScores, rankMode)
+		}
+
+		// Read only the weighted native candidates needed after request filters.
+		// Unchecked Quality members remain available for refill but never count
+		// toward its native quota or enter a native response.
+		validateQualityPool := func(scores, priorScores map[server.Id]*ClientScore, mode RankMode, native bool) error {
+			if mode != RankModeQuality || (!native && !findProviders2.ForceMinimum) {
+				return nil
+			}
+
+			for {
+				pending := map[server.Id]*ClientScore{}
+				validated := 0
+				for id, score := range scores {
+					if hardExcludedClientIds[id] || qualityExcludedClientIds[id] {
+						if hardExcludedClientIds[id] || findProviders2.ForceMinimum {
+							delete(scores, id)
+						} else {
+							score.Online = true
+							score.PassesMinimums = maps.Clone(score.PassesMinimums)
+							delete(score.PassesMinimums, mode)
+						}
+						continue
+					}
+					if priorScores[id] != nil || (!findProviders2.ForceMinimum && !score.PassesMinimums[mode]) {
+						continue
+					}
+					if qualityReadClientIds[id] {
+						validated++
+					} else {
+						pending[id] = score
+					}
+				}
+				needed := count - len(priorScores) - validated
+				if needed <= 0 || len(pending) == 0 || validation.unavailable != nil {
+					return nil
+				}
+				// Query batches stay bounded even for unusually large requests.
+				ids := selectProviders(pending, mode, min(needed, 256))
+				if err := readQuality(ids, findProviders2.ForceMinimum); err != nil {
+					return err
 				}
 			}
 		}
 
-		// weighted selection and tier banding run within each facet, and the
-		// preferred facet fills `count` first: a v4-capable request takes
-		// every dualstack provider it can before any v4-only one, so the
-		// single-family category only ever tops up a shortfall
-		clientIds := []server.Id{}
-		for _, facet := range facets {
-			remainingCount := count - len(clientIds)
-			if remainingCount <= 0 {
-				break
+		// Native quota counts only native members after every request filter.
+		// Materialized native pages use bounded batches until quota or true
+		// exhaustion; online and pre-schema union reads keep their finite row
+		// allowance. Reaching that legacy limit is unknown, not exhaustion;
+		// degraded fallback still preserves availability and reports the gap.
+		refillPool := func(scores, priorScores map[server.Id]*ClientScore, mode RankMode, cursor *clientScoreCursor, knownHardExclusions map[server.Id]bool, backfill, native bool) error {
+			if count <= 0 {
+				return nil
 			}
-			facetClientIds := []server.Id{}
-			for clientId, clientScore := range clientScores {
-				if clientScore.ipFamilyFacet() == facet {
-					facetClientIds = append(facetClientIds, clientId)
+			if err := validateQualityPool(scores, priorScores, mode, native); err != nil {
+				return err
+			}
+			uniqueCount := func() int {
+				uniqueCount := 0
+				for clientId, score := range scores {
+					if mode == RankModeQuality && (native || findProviders2.ForceMinimum) && !qualityReadClientIds[clientId] {
+						continue
+					}
+					if !findProviders2.ForceMinimum && ((native && !score.PassesMinimums[mode]) || (!native && !score.Online)) {
+						continue
+					}
+					if priorScores[clientId] == nil {
+						uniqueCount++
+					}
+				}
+				return uniqueCount
+			}
+			unknown := cursor == nil || cursor.sourceIncomplete || 0 < cursor.missingPages
+			for cursor.hasMore() {
+				if mode == RankModeQuality && native && validation.unavailable != nil {
+					unknown = true
+					break
+				}
+				if count <= len(priorScores)+uniqueCount() {
+					break
+				}
+				discardedRows := max(0, cursor.readCount-uniqueCount())
+				limit := findProviders2RefillLoadCount(count, len(excludeFinalDestinations()), discardedRows)
+				additionalRows := limit - cursor.readCount
+				if native && cursor.nativeOnly {
+					additionalRows = loadCount
+				}
+				if additionalRows <= 0 {
+					if native {
+						unknown = true
+					}
+					break
+				}
+				if backfill {
+					observation.enter("load_backfill")
+				} else {
+					observation.enter("load_primary")
+				}
+				extraScores, err := cursor.read(session.Ctx, additionalRows)
+				if err != nil {
+					if session.Ctx.Err() != nil || (!native && !backfill) {
+						return err
+					}
+					unknown = true
+				}
+				readFailed := err != nil
+				unknown = unknown || cursor.sourceIncomplete || 0 < cursor.missingPages
+				observation.loaded += len(extraScores)
+				if err := readExclusions(extraScores, mode, native, nil); err != nil {
+					return err
+				}
+				filterPool(extraScores, mode, knownHardExclusions)
+				if native && cursor.nativeOnly {
+					retainNativeClientScores(extraScores, mode)
+				}
+				for clientId, clientScore := range extraScores {
+					if scores[clientId] == nil {
+						scores[clientId] = clientScore
+					}
+				}
+				if err := validateQualityPool(scores, priorScores, mode, native); err != nil {
+					return err
+				}
+				if readFailed {
+					break
 				}
 			}
-			mathrand.Shuffle(len(facetClientIds), func(i int, j int) {
-				facetClientIds[i], facetClientIds[j] = facetClientIds[j], facetClientIds[i]
-			})
+			unknown = unknown || (mode == RankModeQuality && native && validation.unavailable != nil)
+			if unknown {
+				observation.backfillUnavailable = true
+			}
+			if native {
+				outcome := "exhausted"
+				if unknown {
+					outcome = "unavailable"
+				} else if count <= len(priorScores)+uniqueCount() {
+					outcome = "quota"
+				}
+				observation.nativeSource(mode, backfill, outcome)
+			}
+			return nil
+		}
+		if err := refillPool(clientScores, nil, rankMode, primaryCursor, hardExcludedClientIds, false, !findProviders2.ForceMinimum); err != nil {
+			return nil, err
+		}
+		observation.primaryClientScores = clientScores
+		observation.enter("select")
 
-			connect.WeightedSelectFunc(facetClientIds, remainingCount, func(clientId server.Id) float32 {
-				clientScore := clientScores[clientId]
-				return clientScore.ScaledWeights[rankMode]
-			})
-			facetClientIds = facetClientIds[:min(remainingCount, len(facetClientIds))]
-
-			// band by tier
-			slices.SortStableFunc(facetClientIds, func(a server.Id, b server.Id) int {
-				clientScoreA := clientScores[a]
-				clientScoreB := clientScores[b]
-
-				return clientScoreA.Tiers[rankMode] - clientScoreB.Tiers[rankMode]
-			})
-			clientIds = append(clientIds, facetClientIds...)
+		// Takes up to n of the online bucket in its order
+		// (connect/GEOMAP.md §10.3): reliability weight, highest first, then
+		// the speed-mode performance adjustment -- the client-measured latency
+		// and throughput, past the speed cutoffs last. Missing measurements
+		// retain their ranking penalties without changing online admission.
+		// Each facet keeps the request's existing preference order.
+		selectOnline := func(candidateClientScores map[server.Id]*ClientScore, n int) []server.Id {
+			clientIds := []server.Id{}
+			for _, facet := range facets {
+				remainingCount := n - len(clientIds)
+				if remainingCount <= 0 {
+					break
+				}
+				facetClientIds := []server.Id{}
+				for clientId, clientScore := range candidateClientScores {
+					if clientScore.ipFamilyFacet() == facet {
+						facetClientIds = append(facetClientIds, clientId)
+					}
+				}
+				// full ties in no particular order
+				mathrand.Shuffle(len(facetClientIds), func(i int, j int) {
+					facetClientIds[i], facetClientIds[j] = facetClientIds[j], facetClientIds[i]
+				})
+				slices.SortStableFunc(facetClientIds, func(a server.Id, b server.Id) int {
+					clientScoreA := candidateClientScores[a]
+					clientScoreB := candidateClientScores[b]
+					weightA, weightB := clientScoreA.UrlProbeSuccessWeight, clientScoreB.UrlProbeSuccessWeight
+					if weightA == 0 {
+						weightA = 1
+					}
+					if weightB == 0 {
+						weightB = 1
+					}
+					switch {
+					case clientScoreB.ReliabilityWeight*weightB < clientScoreA.ReliabilityWeight*weightA:
+						return -1
+					case clientScoreA.ReliabilityWeight*weightA < clientScoreB.ReliabilityWeight*weightB:
+						return 1
+					}
+					if d := clientScoreA.Tiers[RankModeSpeed] - clientScoreB.Tiers[RankModeSpeed]; d != 0 {
+						return d
+					}
+					return clientScoreA.Scores[RankModeSpeed] - clientScoreB.Scores[RankModeSpeed]
+				})
+				clientIds = append(clientIds, facetClientIds[:min(remainingCount, len(facetClientIds))]...)
+			}
+			return clientIds
 		}
 
+		// Native membership comes only from the shared gate decision. The
+		// performance tier orders members within this bucket.
+		nativeClientScores = map[server.Id]*ClientScore{}
+		for clientId, clientScore := range clientScores {
+			if (findProviders2.ForceMinimum || clientScore.PassesMinimums[rankMode]) &&
+				(rankMode != RankModeQuality || qualityReadClientIds[clientId]) {
+				nativeClientScores[clientId] = clientScore
+			}
+		}
+		clientIds = selectProviders(nativeClientScores, rankMode, count)
+
+		observation.enter("directory")
 		directory := locationDirectory()
+		observation.targetKind = findProviders2TargetKind(findProviders2, countryLocations, directory)
+		observation.enter("select")
 
 		// output in order of `clientIds`
 		for _, clientId := range clientIds {
 			clientScore := clientScores[clientId]
 			providers = append(providers, findProvidersProviderFromClientScore(clientScore, rankMode, directory))
 		}
+
+		// Fill the requested bucket, then the other native bucket, then the
+		// online union. Every borrowed page passes the same request filters;
+		// tier offsets preserve its lower client-visible priority.
+		if otherRankMode, ok := backfillRankMode(rankMode); ok && !findProviders2.ForceMinimum {
+			remainingCount := func() int {
+				return count - len(clientIds) - len(borrowedClientIds)
+			}
+			borrow := func(clientScore *ClientScore, mode RankMode, tier int) {
+				provider := findProvidersProviderFromClientScore(clientScore, mode, directory)
+				provider.Tier = tier
+				providers = append(providers, provider)
+				borrowedClientIds = append(borrowedClientIds, clientScore.ClientId)
+			}
+			if 0 < remainingCount() {
+				backfillTierOffset := requestSettings.BackfillTierOffset
+
+				observation.enter("load_backfill")
+				otherClientScores, otherCursor, err := loadPreferredClientScoresWithCursor(
+					requestSettings.NativeReaderEnabled,
+					false,
+					otherRankMode,
+					session.Ctx,
+					locationIds,
+					locationGroupIds,
+					clientLocationId,
+					loadCount,
+					facets,
+					&observation.load,
+				)
+				if err != nil {
+					if session.Ctx.Err() != nil {
+						return nil, err
+					}
+					observation.backfillUnavailable = true
+					if otherCursor != nil {
+						otherCursor.sourceIncomplete = true
+					}
+				}
+				if otherClientScores == nil {
+					otherClientScores = map[server.Id]*ClientScore{}
+				}
+				observation.loaded += len(otherClientScores)
+				if err := readExclusions(otherClientScores, otherRankMode, true, nil); err != nil {
+					return nil, err
+				}
+				filterPool(otherClientScores, otherRankMode, hardExcludedClientIds)
+				if otherCursor != nil && otherCursor.nativeOnly {
+					retainNativeClientScores(otherClientScores, otherRankMode)
+				}
+				if err := refillPool(otherClientScores, nativeClientScores, otherRankMode, otherCursor, hardExcludedClientIds, true, true); err != nil {
+					return nil, err
+				}
+				observation.backfillClientScores = otherClientScores
+				observation.enter("select")
+
+				// 1. the other bucket's natives
+				borrowableClientScores := map[server.Id]*ClientScore{}
+				for clientId, clientScore := range otherClientScores {
+					if !clientScore.PassesMinimums[otherRankMode] ||
+						(otherRankMode == RankModeQuality && !qualityReadClientIds[clientId]) {
+						continue
+					}
+					if _, native := nativeClientScores[clientId]; native {
+						continue
+					}
+					borrowableClientScores[clientId] = clientScore
+				}
+				for _, clientId := range selectProviders(borrowableClientScores, otherRankMode, remainingCount()) {
+					clientScore := otherClientScores[clientId]
+					borrow(clientScore, otherRankMode, clientScore.Tiers[otherRankMode]+backfillTierOffset)
+				}
+
+				// Healthy native sources are exhausted before online fallback.
+				// An unavailable source instead uses degraded fallback, keeping
+				// its explicit unknown diagnosis without blocking connectivity.
+				if 0 < remainingCount() {
+					answeredClientScores := map[server.Id]*ClientScore{}
+					for _, clientId := range clientIds {
+						answeredClientScores[clientId] = clientScores[clientId]
+					}
+					for _, clientId := range borrowedClientIds {
+						answeredClientScores[clientId] = otherClientScores[clientId]
+					}
+					onlineClientScores := map[server.Id]*ClientScore{}
+					for _, source := range []struct {
+						mode   RankMode
+						scores map[server.Id]*ClientScore
+						cursor *clientScoreCursor
+					}{
+						{mode: rankMode, scores: clientScores, cursor: primaryCursor},
+						{mode: otherRankMode, scores: otherClientScores, cursor: otherCursor},
+					} {
+						pool, cursor := source.scores, source.cursor
+						if cursor == nil || cursor.nativeOnly {
+							observation.enter("load_backfill")
+							var err error
+							pool, cursor, err = loadClientScoresWithCursor(false, source.mode, session.Ctx, locationIds, locationGroupIds, clientLocationId, loadCount, facets, &observation.load)
+							if err != nil {
+								if session.Ctx.Err() != nil {
+									return nil, err
+								}
+								observation.backfillUnavailable = true
+								if cursor != nil {
+									cursor.sourceIncomplete = true
+								}
+							}
+							if pool == nil {
+								pool = map[server.Id]*ClientScore{}
+							}
+							observation.loaded += len(pool)
+							if err := readExclusions(pool, source.mode, false, nil); err != nil {
+								return nil, err
+							}
+							filterPool(pool, source.mode, hardExcludedClientIds)
+						}
+						priorScores := maps.Clone(answeredClientScores)
+						maps.Copy(priorScores, onlineClientScores)
+						if err := refillPool(pool, priorScores, source.mode, cursor, hardExcludedClientIds, true, false); err != nil {
+							return nil, err
+						}
+						for clientId, clientScore := range pool {
+							if clientScore.Online && answeredClientScores[clientId] == nil && onlineClientScores[clientId] == nil {
+								onlineClientScores[clientId] = clientScore
+							}
+						}
+					}
+					for _, clientId := range selectOnline(onlineClientScores, remainingCount()) {
+						borrow(onlineClientScores[clientId], RankModeSpeed, 2*backfillTierOffset)
+					}
+				}
+			}
+			findProviders2BackfillProviders.WithLabelValues(rankMode).Observe(float64(len(borrowedClientIds)))
+			findProviders2AnsweredProviders.WithLabelValues(rankMode).Add(float64(len(clientIds) + len(borrowedClientIds)))
+		}
+		chosenClientIds := append(slices.Clone(clientIds), borrowedClientIds...)
+		observation.discoveryReturned = len(chosenClientIds)
 
 		// export one anonymized stats sample tracing this call's pool and
 		// selection. Best-effort and gated on stats being enabled, so it is
@@ -5277,25 +6972,40 @@ func FindProviders2(
 				ipInfo.CountryCode,
 				float64(loadDuration.Nanoseconds())/1e6,
 				clientScores,
-				clientIds,
+				chosenClientIds,
 			)
 		}
+	} else {
+		observation.enter("hard_exclusions")
+		hardExcludedClientIds, err := getProviderRequestExclusions(session.Ctx, specClientIds, rankMode)
+		if err != nil {
+			return nil, err
+		}
+		appendSpecProviders(hardExcludedClientIds)
 	}
 
 	// record provider "search interest": each provider that appeared in this
 	// result gets one match count, accumulated in redis (never pg on this hot
 	// path) and rolled up by RollupSearchProviderStats. Best-effort.
 	if 0 < len(providers) {
+		observation.enter("record_matches")
 		providerClientIds := make([]server.Id, 0, len(providers))
 		for _, provider := range providers {
 			providerClientIds = append(providerClientIds, provider.ClientId)
 		}
-		RecordProviderSearchMatches(session.Ctx, providerClientIds, server.NowUtc())
+		now := server.NowUtc()
+		RecordProviderSearchMatches(session.Ctx, providerClientIds, now)
+		// each provider's per-minute appearances, counted in process; the
+		// owner in the context writes them in the background
+		recordProviderAppearances(session.Ctx, providerClientIds, now)
 	}
 
-	return &FindProviders2Result{
+	result := &FindProviders2Result{
 		Providers: providers,
-	}, nil
+	}
+	recordFindProviders2Outcome(findProviders2, callerCountryCode, len(result.Providers))
+	observation.complete(len(result.Providers))
+	return result, nil
 }
 
 type CreateProviderSpecArgs struct {

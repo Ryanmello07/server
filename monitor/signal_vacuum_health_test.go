@@ -126,15 +126,15 @@ func TestVacuumHealthSignalExplainsReliabilityHorizon(t *testing.T) {
 	}
 	alert := requireAlertClass(t, alerts, "dead-tuples")
 	for _, detail := range []string{
-		"full running-window re-anchor",
-		"multi-billion-row transaction",
-		"restricted each vacuum to rows removable before that old horizon",
-		"four-hour reliability re-anchor cadence",
-		"waiting maintenance proceeds",
+		"references reliability running-state data",
+		"share this truncated prefix",
+		"does not establish the maintenance phase or deployed cadence",
+		"current drained-target distance",
+		"durable window markers advance",
 	} {
 		markdown := alert.Markdown()
 		if !strings.Contains(markdown, detail) {
-			t.Fatalf("reliability horizon alert missing %q:\n%s", detail, markdown)
+			t.Fatal("reliability horizon alert lost its phase/provenance qualifier")
 		}
 	}
 }
@@ -186,7 +186,9 @@ func TestVacuumHealthSignalExplainsBoundedCloseRecoveryWriter(t *testing.T) {
 		"bounded per-contract CloseExpiredContracts",
 		"not an old MVCC pin",
 		"open-contract signal is authoritative",
-		"25,000-contract task checkpoint",
+		"independent 25,000-row open and disputed scan caps",
+		"executor provenance proves the older limit",
+		"merged count above 25,000 alone does not prove an old artifact",
 		"Do not cancel the closer",
 		"Older open-contract buckets fall",
 	} {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -24,7 +25,6 @@ var (
 		"client.yml",
 		"coinbase.yml",
 		"helius.yml",
-		"ipinfo.yml",
 		"jwt.yml",
 		"jwt-local-evaluator.pem",
 		"password.yml",
@@ -51,8 +51,9 @@ var (
 	}
 	suiteProxyTestAllConfigResourceNames = []string{
 		"apple_roots.pem",
-		"city-list.yml",
-		"iso-country-list.yml",
+		// the place list the location seeder reads, which ships in the dated
+		// directory of the GeoLite2 database it is exported from
+		"mmdb/places.yml",
 		"pro.yml",
 	}
 )
@@ -198,7 +199,16 @@ func writeTestEnvironmentSuiteProxyResources(
 		}
 	}
 	for _, resourceName := range suiteProxyTestAllConfigResourceNames {
-		if err := os.WriteFile(filepath.Join(configAllDir, resourceName), []byte("{}\n"), 0o600); err != nil {
+		resourcePath := filepath.Join(configAllDir, filepath.FromSlash(resourceName))
+		if directory, name := path.Split(resourceName); directory != "" {
+			// a nested resource lives in a version directory, as the place list
+			// does beside its database (all/mmdb/<date>/places.yml)
+			resourcePath = filepath.Join(configAllDir, filepath.FromSlash(directory), "2026.9.23", name)
+		}
+		if err := os.MkdirAll(filepath.Dir(resourcePath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(resourcePath, []byte("{}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -244,11 +254,12 @@ func writeTestEnvironmentLauncherState(
 	if err := os.Mkdir(lockDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(lockDir, "owner"), []byte("test-owner\n"), 0o600); err != nil {
+	ownerToken, _ := startLocalAttestationOwnerProcess(t)
+	if err := os.WriteFile(filepath.Join(lockDir, "owner"), []byte(ownerToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	attestation := "format=urnetwork-server-run-local-ready-v1\n" +
-		"owner_token=test-owner\n" +
+		"owner_token=" + ownerToken + "\n" +
 		"host_ip=" + localDedicatedAddress + "\n" +
 		"postgres_host=" + postgresHost + "\n" +
 		"postgres_port=" + postgresPort + "\n" +
@@ -382,6 +393,127 @@ func TestLocalTestRunnersUseBash(t *testing.T) {
 		if firstLine != "#!/usr/bin/env bash" {
 			t.Errorf("%s interpreter = %q; want bash", scriptPath, firstLine)
 		}
+	}
+}
+
+// Copies the real connect runner and package selector into an isolated source
+// tree; the synthetic go command records each package and argument verbatim.
+func writeTestConnectRunnerFixture(t *testing.T, directories []string) (*exec.Cmd, string, string) {
+	t.Helper()
+	serverDir := filepath.Join(t.TempDir(), "server fixture")
+	binDir := filepath.Join(serverDir, "fixture-tools")
+	for _, directory := range append([]string{"connect", "fixture-tools"}, directories...) {
+		if err := os.MkdirAll(filepath.Join(serverDir, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, scriptPath := range []string{"connect/test.sh", "test-dirs.sh"} {
+		content, err := os.ReadFile(scriptPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(serverDir, scriptPath), content, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, directory := range directories {
+		if err := os.WriteFile(filepath.Join(serverDir, directory, "fixture_test.go"), []byte("package fixture\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "test-env.sh"), []byte("export TEST_CONNECT_ENV_READY=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	goScript := `#!/usr/bin/env bash
+[[ "$TEST_CONNECT_ENV_READY" == 1 ]] || exit 85
+printf '%s\0' "${PWD#"$TEST_CONNECT_SERVER_DIR"/}" "$@" >> "$TEST_CONNECT_RUN_RECORD"
+printf '\n' >> "$TEST_CONNECT_RUN_RECORD"
+printf 'synthetic package completed\n'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "go"), []byte(goScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(serverDir, "invocations")
+	cmd := exec.Command("bash", filepath.Join(serverDir, "connect/test.sh"), "-run", "^Test fixture$", "-count=1")
+	cmd.Dir = t.TempDir()
+	cmd.Env = testCommandEnvironment(map[string]string{
+		"PATH":                    binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"TEST_CONNECT_SERVER_DIR": serverDir,
+		"TEST_CONNECT_RUN_RECORD": recordPath,
+	}, "TEST_CONNECT_ENV_READY")
+	return cmd, serverDir, recordPath
+}
+
+// Connect runs each canonical source package once, including testdata packages,
+// while excluding immutable evidence and similarly named sibling subtrees.
+func TestConnectTestScriptUsesCanonicalPackageBoundaries(t *testing.T) {
+	keptDirectories := []string{
+		"connect",
+		"connect/perfvar",
+		"connect/sim-latency",
+		"connect/sim-latency/evaluator/container/testdata/resource-bomb",
+	}
+	ignoredDirectories := []string{
+		"connect/sim-latency/baseline/v1/independent-references/validation",
+		"connect/sim-latency/eval-fixture/snapshot",
+		"connect/build/copied-tests",
+		"connect/profile/copied-tests",
+		"connect/acceptance",
+		"connectivity",
+		"proxy",
+	}
+	cmd, _, recordPath := writeTestConnectRunnerFixture(t, append(slices.Clone(keptDirectories), ignoredDirectories...))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("connect runner: %v\n%s", err, output)
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directories := []string{}
+	for _, invocation := range bytes.Split(bytes.TrimSuffix(record, []byte("\n")), []byte("\n")) {
+		directory, _, _ := bytes.Cut(invocation, []byte{0})
+		directories = append(directories, string(directory))
+	}
+	if !slices.Equal(directories, keptDirectories) {
+		t.Fatalf("connect packages = %q; want %q", directories, keptDirectories)
+	}
+}
+
+// Packages without glog receive only Go test and caller arguments; an argument
+// containing spaces remains a single argument across the wrapper boundary.
+func TestConnectTestScriptPreservesPortableGoArguments(t *testing.T) {
+	directory := "connect/sim-latency/evaluator/container/testdata/resource-bomb"
+	cmd, _, recordPath := writeTestConnectRunnerFixture(t, []string{directory})
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("connect runner: %v\n%s", err, output)
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRecord := strings.Join([]string{directory, "test", "-timeout", "900m", "-run", "^Test fixture$", "-count=1", ""}, "\x00") + "\n"
+	if string(record) != wantRecord {
+		t.Fatalf("connect invocation = %q; want %q", record, wantRecord)
+	}
+}
+
+// A failed selector must stop before any partial package list is executed.
+func TestConnectTestScriptPropagatesDiscoveryFailure(t *testing.T) {
+	cmd, serverDir, recordPath := writeTestConnectRunnerFixture(t, []string{"connect"})
+	selector := "#!/usr/bin/env bash\nprintf './connect\\n'\nexit 43\n"
+	if err := os.WriteFile(filepath.Join(serverDir, "test-dirs.sh"), []byte(selector), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 43 {
+		t.Fatalf("selector failure = %v, %q; want exit 43", err, output)
+	}
+	if record, err := os.ReadFile(recordPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("selector failure ran packages: record=%q err=%v", record, err)
 	}
 }
 
@@ -871,6 +1003,88 @@ func TestTestEnvironmentScriptRejectsSuiteProxyConfigManifestGap(t *testing.T) {
 	}
 	if _, err := os.Stat(probeRecordPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing config resource reached probe: %v", err)
+	}
+}
+
+// A nested config resource (mmdb/places.yml) resolves as the Go resolver
+// resolves it: directly under a root, or through a version directory at any
+// level (the default layout above, all/mmdb/<date>/places.yml), but never
+// through a version-directory symlink; a missing one stops preflight before
+// the first service probe.
+func TestTestEnvironmentScriptResolvesSuiteProxyNestedConfigResource(t *testing.T) {
+	for _, layout := range []string{"flat", "missing", "symlinked version"} {
+		stateDir := writeTestEnvironmentSuiteProxyState(t, suiteProxyTestAddress, "15432", "16379")
+		vaultDir, configDir := writeTestEnvironmentSuiteProxyResources(
+			t,
+			"{{ env:BRINGYOUR_POSTGRES_HOSTNAME }}:15432",
+			"{{ env:BRINGYOUR_REDIS_HOSTNAME }}:16379",
+		)
+		versionDir := filepath.Join(configDir, "all", "mmdb", "2026.9.23")
+		switch layout {
+		case "flat":
+			// the portable fixture writes config/mmdb/places.yml
+			if err := os.MkdirAll(filepath.Join(configDir, "mmdb"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(versionDir, "places.yml"), filepath.Join(configDir, "mmdb", "places.yml")); err != nil {
+				t.Fatal(err)
+			}
+		case "missing":
+			if err := os.Remove(filepath.Join(versionDir, "places.yml")); err != nil {
+				t.Fatal(err)
+			}
+		case "symlinked version":
+			retainedDir := filepath.Join(t.TempDir(), "retained")
+			if err := os.Rename(versionDir, retainedDir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(retainedDir, versionDir); err != nil {
+				t.Fatal(err)
+			}
+		}
+		binDir := writeTestEnvironmentSuiteProxyTools(t)
+		probeRecordPath := filepath.Join(t.TempDir(), "probe-record")
+		probePath := filepath.Join(t.TempDir(), "probe")
+		if err := os.WriteFile(
+			probePath,
+			[]byte("#!/bin/sh\nprintf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> \"$WARP_TEST_ENV_PROBE_RECORD\"\n"),
+			0o700,
+		); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("bash", "./test-env.sh")
+		cmd.Env = testCommandEnvironment(
+			map[string]string{
+				"PATH":                                binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+				"SUITE_TEST_HOST_IP":                  suiteProxyTestAddress,
+				"SUITE_TEST_OWNER_TOKEN":              suiteProxyTestToken,
+				"WARP_CONFIG_HOME":                    configDir,
+				"WARP_TEST_ENV_PROBE_RECORD":          probeRecordPath,
+				"WARP_TEST_ENV_SUITE_PROXY_STATE_DIR": stateDir,
+				"WARP_TEST_ENV_TCP_PROBE":             probePath,
+				"WARP_VAULT_HOME":                     vaultDir,
+			},
+			"BRINGYOUR_POSTGRES_HOSTNAME",
+			"BRINGYOUR_REDIS_HOSTNAME",
+			"WARP_ENV",
+			"WARP_TEST_ENV_ALLOW_UNMANAGED_PORTABLE_SERVICES",
+			"WARP_TEST_ENV_USE_PORTABLE_RESOURCES",
+		)
+		output, err := cmd.CombinedOutput()
+		_, probeErr := os.Stat(probeRecordPath)
+		if layout == "flat" {
+			if err != nil || probeErr != nil {
+				t.Fatalf("%s place list = %v, probes %v, %q", layout, err, probeErr, output)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(string(output), "mmdb/places.yml") ||
+			!strings.Contains(string(output), "required resource is missing") {
+			t.Fatalf("%s place list = %v, %q", layout, err, output)
+		}
+		if !errors.Is(probeErr, os.ErrNotExist) {
+			t.Fatalf("%s place list reached probe: %v", layout, probeErr)
+		}
 	}
 }
 
@@ -1788,7 +2002,7 @@ func TestRunLocalReportsMissingTcpProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	binDir := t.TempDir()
-	for _, commandName := range []string{"dirname", "head", "sed", "uname"} {
+	for _, commandName := range []string{"dirname", "head", "od", "sed", "tr", "uname"} {
 		commandPath, err := exec.LookPath(commandName)
 		if err != nil {
 			t.Fatal(err)

@@ -65,12 +65,31 @@ type OnboardingAppleOfferCodesConfig struct {
 	// of the onboarding25 offer code. Empty = the top-up task is inert and the
 	// custom code stays the only App Store path.
 	OfferCodeId string `yaml:"offer_code_id"`
+	// OfferReferenceName is the offer code's reference name in App Store
+	// Connect. A redemption's transaction carries no appAccountToken; its
+	// offerIdentifier claim names the offer code (offerType 3), and only a
+	// redemption of this offer can be bound to a network that was issued a
+	// code. Empty = OnboardingAppleOfferReferenceNameDefault.
+	OfferReferenceName string `yaml:"offer_reference_name"`
 	// BatchSize per top-up (Apple's minimum is 500)
 	BatchSize int `yaml:"batch_size"`
 	// MinAvailable: a top-up runs when fewer unexpired, unassigned codes remain
 	MinAvailable int `yaml:"min_available"`
 	// ExpiryDays of a batch (the offer's validity, 5)
 	ExpiryDays int `yaml:"expiry_days"`
+}
+
+// OnboardingAppleOfferReferenceNameDefault is the reference name of the
+// welcome offer code in App Store Connect (the yearly subscription's Offer
+// Codes -> onboarding25).
+const OnboardingAppleOfferReferenceNameDefault = "onboarding25"
+
+// ReferenceName is the configured offer code reference name, or the default.
+func (c OnboardingAppleOfferCodesConfig) ReferenceName() string {
+	if name := strings.TrimSpace(c.OfferReferenceName); name != "" {
+		return name
+	}
+	return OnboardingAppleOfferReferenceNameDefault
 }
 
 // Template variant and locale fallbacks.
@@ -128,6 +147,14 @@ type OnboardingOfferConfig struct {
 	StripeCouponId string `yaml:"stripe_coupon_id"`
 	// Play offer tag on the discounted first cycle of the yearly base plan
 	PlayOfferTag string `yaml:"play_offer_tag"`
+	// PlayPromotionCode is a Play Console custom (vanity) promotion code that
+	// stands for the welcome offer. A purchase redeemed with it reports the
+	// code in lineItems[].signupPromotion.vanityCode.promotionCode and carries
+	// no obfuscated account id; it can be bound to a network that was issued
+	// the offer (controller/play_purchase_binding_controller.go). Empty = no
+	// code is recognized (one-time codes never are: subscriptionsv2 reports
+	// them without an identifier).
+	PlayPromotionCode string `yaml:"play_promotion_code"`
 	// config resource path of an App Store Connect one-time offer code batch csv
 	// (`code,expires` rows); loaded into the network_onboarding_apple_offer_code
 	// pool. Empty = no batch.

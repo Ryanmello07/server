@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/glog"
 	"github.com/urnetwork/sdk"
 	"github.com/urnetwork/server"
@@ -21,7 +23,7 @@ const deviceRpcPath = "/device-rpc"
 
 // deviceRpcHandler is the device rpc endpoint a DeviceRemote (e.g. a browser)
 // connects to directly on the proxy host to control the hosted proxy
-// DeviceLocal. It terminates the websocket, resolves the hosted DeviceLocal by
+// DeviceLocal. It terminates WebSocket or an enabled FramerXl upgrade, resolves the hosted DeviceLocal by
 // the caller's signed proxy id, and serves its DeviceLocalRpc — the DeviceLocal
 // lives in this process, so no connect-service or resident hop is involved.
 //
@@ -31,8 +33,8 @@ const deviceRpcPath = "/device-rpc"
 // into a plain listener and dial ws, the way server/connect exposes its handler
 // for tests.
 //
-// Auth is the signed proxy id, passed as the `proxy` query parameter (a browser
-// WebSocket cannot set request headers, but can set query params). The signed
+// Auth is the signed proxy id in native Authorization or the browser `proxy`
+// query parameter (a browser WebSocket cannot set request headers). The signed
 // proxy id is an HMAC bearer token — the same credential the wg and https data
 // planes authenticate with (see model.SignProxyId) — so no JWT is needed.
 type deviceRpcHandler struct {
@@ -76,12 +78,60 @@ type deviceRpcObservedWebsocket struct {
 	ingress    atomic.Bool
 	egress     atomic.Bool
 	closeClass atomic.Uint32
+	readLimit  atomic.Int64
 }
 
 var _ sdk.DeviceRpcWs = (*deviceRpcObservedWebsocket)(nil)
 
 func newDeviceRpcObservedWebsocket(ws deviceRpcWebsocket) *deviceRpcObservedWebsocket {
-	return &deviceRpcObservedWebsocket{ws: ws}
+	observed := &deviceRpcObservedWebsocket{ws: ws}
+	observed.readLimit.Store(3 * 1024 * 1024)
+	return observed
+}
+
+func (self *deviceRpcObservedWebsocket) WriteMessages(messages [][]byte) error {
+	var err error
+	if framed, ok := self.ws.(interface{ WriteMessages([][]byte) error }); ok {
+		err = framed.WriteMessages(messages)
+	} else {
+		for _, message := range messages {
+			if err = self.WriteMessage(websocket.BinaryMessage, message); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		self.observeError(err)
+		return err
+	}
+	for _, message := range messages {
+		if len(message) > 0 {
+			self.egress.Store(true)
+			break
+		}
+	}
+	return nil
+}
+
+func (self *deviceRpcObservedWebsocket) ReadPooledMessage() (int, []byte, error) {
+	var kind int
+	var message []byte
+	var err error
+	if framed, ok := self.ws.(interface{ ReadPooledMessage() (int, []byte, error) }); ok {
+		kind, message, err = framed.ReadPooledMessage()
+	} else {
+		var reader io.Reader
+		kind, reader, err = self.ws.NextReader()
+		if err == nil && kind == websocket.BinaryMessage {
+			message, err = connect.MessagePoolReadAllLimit(reader, self.readLimit.Load())
+		}
+	}
+	if err != nil {
+		self.observeError(err)
+	} else if kind == websocket.BinaryMessage && len(message) > 0 {
+		self.ingress.Store(true)
+	}
+	return kind, message, err
 }
 
 type deviceRpcObservedReader struct {
@@ -184,7 +234,9 @@ func (self *deviceRpcObservedWebsocket) WriteMessage(messageType int, data []byt
 }
 
 func (self *deviceRpcObservedWebsocket) WriteControl(messageType int, data []byte, deadline time.Time) error {
-	return self.ws.WriteControl(messageType, data, deadline)
+	err := self.ws.WriteControl(messageType, data, deadline)
+	self.observeError(err)
+	return err
 }
 
 func (self *deviceRpcObservedWebsocket) NextReader() (int, io.Reader, error) {
@@ -199,13 +251,20 @@ func (self *deviceRpcObservedWebsocket) NextReader() (int, io.Reader, error) {
 	return messageType, reader, nil
 }
 
-func (self *deviceRpcObservedWebsocket) Close() error             { return self.ws.Close() }
-func (self *deviceRpcObservedWebsocket) SetReadLimit(limit int64) { self.ws.SetReadLimit(limit) }
+func (self *deviceRpcObservedWebsocket) Close() error { return self.ws.Close() }
+func (self *deviceRpcObservedWebsocket) SetReadLimit(limit int64) {
+	self.readLimit.Store(limit)
+	self.ws.SetReadLimit(limit)
+}
 func (self *deviceRpcObservedWebsocket) SetReadDeadline(t time.Time) error {
-	return self.ws.SetReadDeadline(t)
+	err := self.ws.SetReadDeadline(t)
+	self.observeError(err)
+	return err
 }
 func (self *deviceRpcObservedWebsocket) SetWriteDeadline(t time.Time) error {
-	return self.ws.SetWriteDeadline(t)
+	err := self.ws.SetWriteDeadline(t)
+	self.observeError(err)
+	return err
 }
 func (self *deviceRpcObservedWebsocket) SetPongHandler(h func(string) error) {
 	self.ws.SetPongHandler(h)
@@ -229,8 +288,23 @@ func NewDeviceRpcHandler(
 }
 
 func (self *deviceRpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	custom := connect.IsFramedUpgrade(r, connect.H1FramerXlProtocol)
+	upgradeStart := time.Now()
+	if custom {
+		if !self.settings.EnableDeviceRpcH1Plus || !connect.H1PlusAvailable() {
+			http.Error(w, "upgrade unavailable", http.StatusUpgradeRequired)
+			return
+		}
+		if err := connect.ValidateFramedUpgradeRequest(r, connect.H1FramerXlProtocol); err != nil {
+			http.Error(w, "invalid upgrade", http.StatusBadRequest)
+			return
+		}
+	}
 	proxyId, err := deviceRpcSignedProxyId(r)
 	if err != nil {
+		if custom {
+			connect.RecordH1PlusSelection(self.settings.DeviceRpcH1PlusStats, time.Since(upgradeStart), &connect.HTTPUpgradeError{StatusCode: 401, Reason: "authorization", Terminal: true})
+		}
 		glog.Infof("[drpc]auth err = %s\n", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -243,7 +317,24 @@ func (self *deviceRpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ws, err := self.upgrader.Upgrade(w, r, nil)
+	var ws deviceRpcWebsocket
+	if custom {
+		conn, upgradeErr := connect.AcceptFramedUpgrade(w, r, connect.H1FramerXlProtocol, self.settings.ProxyWriteTimeout)
+		connect.RecordH1PlusSelection(self.settings.DeviceRpcH1PlusStats, time.Since(upgradeStart), upgradeErr)
+		if upgradeErr != nil {
+			return
+		}
+		// The RPC envelope includes the stream tag and preserves the SDK's
+		// established 3-MiB admission limit. Each direction has its own mux
+		// budget; this creates no maximum-sized per-session scratch buffer.
+		ws, err = connect.NewFramedMessageConn(conn, connect.H1FramerXlProtocol, 3*1024*1024, self.settings.DeviceRpcH1PlusStats)
+		if err != nil {
+			conn.Close()
+			return
+		}
+	} else {
+		ws, err = self.upgradeWebsocket(w, r)
+	}
 	if err != nil {
 		glog.Infof("[drpc][%s]ws upgrade err = %s\n", proxyId, err)
 		return
@@ -282,4 +373,27 @@ func deviceRpcSignedProxyId(r *http.Request) (server.Id, error) {
 		}
 	}
 	return server.Id{}, fmt.Errorf("missing signed proxy id")
+}
+
+// Preserves the authenticated handler's WebSocket upgrade branch as a narrow
+// owner boundary, independently testable without creating a hosted device.
+func (self *deviceRpcHandler) upgradeWebsocket(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
+	return self.upgrader.Upgrade(&deviceRpcDeadlineResponseWriter{ResponseWriter: w}, r, nil)
+}
+
+// Wraps only the socket whose ownership the successful hijack transfers to
+// Gorilla. HTTP behavior, buffered input and borrowed pre-hijack state stay intact.
+type deviceRpcDeadlineResponseWriter struct{ http.ResponseWriter }
+
+// Gorilla ignores inner deadline errors; the shared owned adapter latches them.
+func (self *deviceRpcDeadlineResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := self.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("device rpc response writer does not support hijacking")
+	}
+	conn, readWriter, err := hijacker.Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	return connect.NewWebSocketWriteBatchConn(conn), readWriter, nil
 }

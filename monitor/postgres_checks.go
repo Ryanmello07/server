@@ -13,24 +13,29 @@ import (
 )
 
 // pgOpenSetProbe is SIGNALS.md 2.6: the open-contract set size, the
-// close-backlog canary and the fuel of the 5.8 feedback loop.
+// close-backlog canary and the fuel of the 5.8 feedback loop. Counts below
+// the scan cap are exact; a cap hit is censored and cannot establish a trend.
 type pgOpenSetProbe struct {
-	lock        sync.Mutex
+	stateLock   sync.Mutex
 	initialized bool
 	lastCount   int
 }
+
+const pgOpenSetScanCap = 250_001
 
 func (self *pgOpenSetProbe) id() string             { return "pg/open-set-size" }
 func (self *pgOpenSetProbe) tier() string           { return tierWarn }
 func (self *pgOpenSetProbe) cadence() time.Duration { return 5 * time.Minute }
 
-// observe returns the immediately preceding sample. A process-local adjacent
-// sample is the only evidence needed for "rising"; defaulting that predicate
-// true while a longer trailing baseline warmed up made every monitor restart
-// mislabel a high-but-draining recovery set as growth.
-func (self *pgOpenSetProbe) observe(openCount int) (previous int, ready bool) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
+// An exact adjacent pair establishes a trend. A censored observation breaks
+// that pair without substituting its lower bound for the last exact count.
+func (self *pgOpenSetProbe) observe(openCount int, exact bool) (previous int, ready bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if !exact {
+		self.initialized = false
+		return 0, false
+	}
 	if !self.initialized {
 		self.initialized = true
 		self.lastCount = openCount
@@ -46,42 +51,69 @@ func (self *pgOpenSetProbe) check(ctx context.Context, env *probeEnv) ([]finding
 	if h := env.cfg.hostByRole("pg-primary"); h != nil {
 		target = h.name
 	}
-	rows, err := env.runner.pg(ctx, `
+	rows, err := env.runner.pg(ctx, fmt.Sprintf(`
+		WITH bounded_open AS MATERIALIZED (
+			SELECT create_time
+			FROM transfer_contract
+			WHERE open = true
+			ORDER BY create_time
+			LIMIT %d
+		)
 		SELECT count(*),
 		       count(*) FILTER (WHERE create_time < now() - interval '5 minutes'),
 		       count(*) FILTER (WHERE create_time < now() - interval '30 minutes')
-		FROM transfer_contract
-		WHERE open = true;
-	`)
+		FROM bounded_open;
+	`, pgOpenSetScanCap))
 	if err != nil {
 		return nil, err
 	}
-	openCount := atoiRow(rows[0], 0)
-	olderFiveMinutes := atoiRow(rows[0], 1)
-	olderThirtyMinutes := atoiRow(rows[0], 2)
+	counts, err := pgAggregateIntegers(rows, 3)
+	if err != nil {
+		return nil, err
+	}
+	if counts[0] > pgOpenSetScanCap || counts[1] > counts[0] || counts[2] > counts[1] {
+		return nil, fmt.Errorf("invalid response for bounded PostgreSQL open-set aggregate")
+	}
+	openCount := int(counts[0])
+	olderFiveMinutes := int(counts[1])
+	olderThirtyMinutes := int(counts[2])
+	exact := openCount < pgOpenSetScanCap
 
-	previous, trendReady := self.observe(openCount)
+	previous, trendReady := self.observe(openCount, exact)
 	rising := trendReady && previous < openCount
-	if openCount > 150_000 && (!trendReady || rising) {
+	if openCount > 150_000 && (!exact || !trendReady || rising) {
 		symptom := fmt.Sprintf("open-contract set = %d above threshold; trend is warming up", openCount)
-		observed := fmt.Sprintf("open_contracts=%d previous=unavailable older_5m=%d older_30m=%d", openCount, olderFiveMinutes, olderThirtyMinutes)
+		observed := fmt.Sprintf("open_contracts=%d previous=unavailable older_5m=%d older_30m=%d exact=true", openCount, olderFiveMinutes, olderThirtyMinutes)
+		evidence := fmt.Sprintf("open age buckets: total=%d older_5m=%d older_30m=%d exact=true", openCount, olderFiveMinutes, olderThirtyMinutes)
 		if trendReady {
 			symptom = fmt.Sprintf("open-contract set = %d and rising (previous %d)", openCount, previous)
-			observed = fmt.Sprintf("open_contracts=%d previous_open_contracts=%d delta=%d older_5m=%d older_30m=%d", openCount, previous, openCount-previous, olderFiveMinutes, olderThirtyMinutes)
+			observed = fmt.Sprintf("open_contracts=%d previous_open_contracts=%d delta=%d older_5m=%d older_30m=%d exact=true", openCount, previous, openCount-previous, olderFiveMinutes, olderThirtyMinutes)
 		}
-		return []finding{{
+		if !exact {
+			symptom = fmt.Sprintf("open-contract set is at least %d; above threshold, scan cap reached and trend is unknown", openCount)
+			observed = fmt.Sprintf("open_contracts>=%d older_5m>=%d older_30m>=%d exact=false trend=unknown scan_cap=%d", openCount, olderFiveMinutes, olderThirtyMinutes, pgOpenSetScanCap)
+			evidence = fmt.Sprintf("bounded oldest-first sample: total>=%d older_5m>=%d older_30m>=%d; lower bounds, not exact population counts", openCount, olderFiveMinutes, olderThirtyMinutes)
+		}
+		f := finding{
 			probeId: "pg/open-set-size", tier: tierWarn,
 			class: "open-set-size", target: target, sustain: 3,
 			symptom:   symptom,
-			mechanism: "CloseExpiredContracts settles contracts older than five minutes in checkpointed cohorts of up to 25,000 in current source (older deployments used 100,000). A growing old cohort means settlement throughput is below creation; a mostly-young spike instead points to demand or reconnect churn.",
+			mechanism: "CloseExpiredContracts selects contracts older than five minutes with independent open and disputed scans capped at 25,000 each in current source (older deployments used 100,000 per scan). Their deduplicated union can contain up to 50,000 candidates; selected rows are not verified closes. This open=true count excludes disputed nonfinal contracts and is not a census of reserved escrow. Age-band differences are not matched-cohort throughput: they mix aging, creation and exits from the open set, including newly disputed rows. A growing old cohort is a backlog clue; a mostly-young spike may reflect demand or reconnect churn.",
 			baseline:  "10–50k healthy (29,981 steady state after 2026-07-17); growth = closes not keeping up, and the 2.3 landmine plan degrades linearly with this number",
 			observed:  observed,
-			evidence:  fmt.Sprintf("open age buckets: total=%d older_5m=%d older_30m=%d", openCount, olderFiveMinutes, olderThirtyMinutes),
-			context:   "Compare CloseExpiredContracts live/completed duration with the retention-fanout signal and transfer_contract autovacuum phase. A full cohort with sub-second worker transactions can still be delayed by persisted write/vacuum debt after the retention query itself clears.",
-			action:    "Fix or roll out the bounded retention path and let vacuum plus scheduled close cohorts converge; do not raise closer concurrency while PostgreSQL write/vacuum debt is present.",
-			verify:    "The older-than-five-minute cohort falls on consecutive samples, close cohorts return to seconds, and the total open set drains toward 10–50k.",
-			playbook:  "SIGNALS.md 2.6 and 2.10",
-		}}, nil
+			evidence:  evidence,
+			context:   "Compare CloseExpiredContracts live/completed duration, complete stored error and next run time with the retention-fanout signal and transfer_contract autovacuum phase. A short accounting-rejected attempt can leave the singleton in long backoff despite independently committed siblings; a fast retry does not resolve the financial rejection. Filtered task-name logs can omit joined-error continuation lines. A full cohort with sub-second worker transactions can also be delayed by persisted write/vacuum debt after the retention query itself clears. The force_closed_total resolution counter can increment before close succeeds and is not terminal-verified throughput. Prefer same-call terminal_verified, unresolved_accounting and quarantined_accounting evidence with complete stored error/retry timing and the exact executor artifact; those summaries do not join to a sampled panic merely by timestamp.",
+			action:    "Correlate consecutive age buckets with CloseExpiredContracts duration/outcomes, complete stored error and next run time, retention-fanout evidence, and the transfer_contract autovacuum phase before changing code or deploying. A high or rising count alone does not establish a retention defect; apply the bounded retention correction only after that cause is confirmed in the running path. If exact private evidence verifies an underfunded disputed row, preserve its settlement guard and reservation; distinguish terminal-verified sibling progress with a prompt accounted-for retry from a long global backoff, without inferring that cause from the backlog count. Do not raise closer concurrency while PostgreSQL write/vacuum debt is present.",
+			verify:    "The older-than-five-minute cohort falls on consecutive samples and the total open set drains toward 10–50k. Confirm terminal-verified sibling progress and bounded next attempts; any unresolved financial rejection remains a task failure warning even when retries are prompt. A failed whole batch is not a successful task completion.",
+			playbook:  "SIGNALS.md 1.2, 2.6, 2.10 and 5.7",
+		}
+		if !exact {
+			f.mechanism += " The scan reached its fixed row cap. All reported counts are lower bounds; equal repeated bounds do not prove a flat or falling population."
+			f.context += " Exact size and trend are unavailable above the scan cap. Published age buckets are conservative lower bounds in capped mode; a zero age-bucket lower bound is not a recovery measurement. The first later exact count restarts trend warmup instead of comparing against a stale pre-cap count."
+			f.action += " Do not run an unbounded count to replace this censored observation while PostgreSQL is hot; use bounded closer outcomes and vacuum/progress evidence until an exact below-cap scan is available."
+			f.verify += " Require exact below-cap observations before claiming the count or age buckets are falling; repeated cap hits cannot resolve this warning."
+		}
+		return []finding{f}, nil
 	}
 	return []finding{healthyFinding("pg/open-set-size", tierWarn, "open-set-size", target)}, nil
 }
@@ -291,7 +323,11 @@ func (self *pgConnectRateProbe) check(ctx context.Context, env *probeEnv) ([]fin
 	if err != nil {
 		return nil, err
 	}
-	count := int64(atoiRow(rows[0], 0))
+	row, err := pgAggregateRow(rows, 1)
+	if err != nil {
+		return nil, err
+	}
+	count := int64(atoiRow(row, 0))
 	rate, rateReady := self.observe(count, time.Now())
 	if !rateReady {
 		return []finding{
@@ -428,7 +464,11 @@ func (self pgSelectionFreshnessProbe) check(ctx context.Context, env *probeEnv) 
 	if err != nil {
 		return nil, err
 	}
-	gapS := atoiRow(rows[0], 0)
+	row, err := pgAggregateRow(rows, 1)
+	if err != nil {
+		return nil, err
+	}
+	gapS := atoiRow(row, 0)
 
 	if gapS < 0 || gapS > 90*60 {
 		activeLog, activeLogSource, activeLogErr := readTaskLifecycleLog(
@@ -565,7 +605,7 @@ esac
 			observed:  "listener_tcp=closed connect_deadline_s=3",
 			evidence:  "Validated probe tools and the owned start/outcome contract distinguish connect refusal or timeout from command execution failure; no socket tuple is retained.",
 			context:   "An open tcp listener is not proof of working authentication, PgBouncer shard queues, nginx forwarding, or direct 5432. Service write-timeout observations are separate inputs.",
-			action:    "Split the configured nginx/PgBouncer frontend, every PgBouncer shard listener and queue, and direct 5432; correlate PostgreSQL activity and affected application routes before selecting a repair. Do not restart or raise timeouts solely on this tcp observation.",
+			action:    "Split the configured nginx/PgBouncer frontend, every PgBouncer shard listener and queue, and direct 5432. Use native SHOW POOLS/SERVERS to distinguish busy established servers from backend-startup nonprogress; require a bounded authenticated direct control matching the effective backend endpoint, role, database and TLS mode. Correlate affected application routes before selecting a repair. Do not restart or raise timeouts solely on this tcp observation.",
 			verify:    "The same local frontend accepts the next two bounded tcp observations and complete service log windows show no recurring client-write timeout while the affected routes are exercised; verify authentication and backend queues independently.",
 			playbook:  "SIGNALS.md §2.11",
 		})
@@ -619,7 +659,7 @@ esac
 				baseline:  fmt.Sprintf("Zero pgproto3 write i/o timeouts to the configured frontend :%d in a complete two-minute service log window.", port),
 				observed:  fmt.Sprintf("service=%s count_2m=%d", service, count),
 				evidence:  "A successful, below-limit log pull matched pgproto3.writeError plus a write-tcp destination at the configured frontend port and i/o timeout; raw lines and socket tuples are not retained.",
-				action:    "Split the configured nginx frontend, all PgBouncer shard queues/listeners, and direct 5432; group timeouts by application route.",
+				action:    "Split the configured nginx frontend, all PgBouncer shard queues/listeners, and direct 5432; group timeouts by application route. Native SHOW POOLS/SERVERS must distinguish busy established servers from backend-startup nonprogress. Require a bounded authenticated direct control matching the effective backend endpoint, role, database and TLS mode; a healthy listener or low PostgreSQL load does not clear the pool path.",
 				verify:    "The next two complete two-minute service log windows contain no configured-frontend client-write timeout while the affected route is exercised; a failed or truncated window is not recovery.",
 				playbook:  "SIGNALS.md §2.11",
 			})
@@ -791,10 +831,10 @@ func (self pgVacuumProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 		action := "Remove or bound the identified write fan-out first. Only address a horizon holder after confirming its owner and safety; do not cancel a progressing autovacuum merely because its index phase is long."
 		verify := "The high-row writer is bounded, the active vacuum completes, and " + recoveryTarget + " on consecutive five-minute samples."
 		if strings.Contains(strings.ToLower(r.str(20)), "client_reliability_running") {
-			mechanism += " The selected horizon is UpdateReliabilities performing a full running-window re-anchor; the pre-fix threshold was shorter than the task cadence, so this multi-billion-row transaction recurred every cycle and restricted each vacuum to rows removable before that old horizon. It can reduce, rather than completely prevent, reclamation."
-			context += " The task-overdue signal is the authoritative task diagnosis; this vacuum signal describes its MVCC consequence."
-			action = "Allow a progressing bounded re-anchor to finish, and roll out the four-hour reliability re-anchor cadence while retaining the 30-minute incremental cadence. Do not cancel the transaction, raise its deadline, or retune autovacuum to hide the shared root cause."
-			verify = "Most reliability cycles take the incremental path below their historical p95; " + recoveryTarget + " on consecutive five-minute samples, and after the bounded re-anchor completes the waiting maintenance proceeds and later vacuums can see the full removable cohort."
+			mechanism += " The selected horizon sample references reliability running-state data. Full re-anchor and rolling-enter statements share this truncated prefix, so the sample does not establish the maintenance phase or deployed cadence. An old snapshot can restrict the removable cohort without preventing all reclamation."
+			context += " The task-canary/task-overdue diagnostic and running-window markers supply the current phase and progress discriminator. Establish task ownership, complete SQL phase and current drained-target distance; this truncated query alone does not prove a full anchor or legacy artifact."
+			action = "Let independently verified, bounded progressing work finish. Establish reliability task ownership, SQL phase, current drained-target/window markers and deployed source before changing maintenance policy. Do not cancel the transaction, raise its deadline, or retune autovacuum from a truncated query sample alone."
+			verify = "The attributed reliability attempt reaches its bounded outcome and durable window markers advance; the active vacuum completes and " + recoveryTarget + " on consecutive five-minute samples. One released horizon or partial reclamation is not full recovery."
 		} else if lowerQuery := strings.ToLower(r.str(20)); strings.Contains(lowerQuery, "update transfer_contract") &&
 			strings.Contains(lowerQuery, "reap_time") {
 			mechanism += " The selected horizon is the legacy CompletePayment retention fan-out: one indexed payment lookup is updating millions of transfer_contract reap_time values inside one transaction, generating the dead rows and holding their old snapshot while autovacuum works."
@@ -805,7 +845,7 @@ func (self pgVacuumProbe) check(ctx context.Context, env *probeEnv) ([]finding, 
 			strings.Contains(lowerQuery, "set outcome") && strings.Contains(lowerQuery, "close_time") {
 			mechanism += " The selected horizon is one bounded per-contract CloseExpiredContracts transaction. During backlog recovery, many short committed closes legitimately create a new dead-row cohort; a seconds-old closer is workload evidence, not an old MVCC pin or the legacy multi-million-row retention fan-out."
 			context += " The open-contract signal is authoritative for whether the closer is draining. Compare its five- and 30-minute age buckets and the active close-task duration before attributing this dead-row wave to a stuck writer."
-			action = "Let the bounded close cohort and progressing autovacuum run, and roll out the 25,000-contract task checkpoint. Do not cancel the closer, raise its concurrency, or revive a draining backlog merely to reduce the current dead-tuple estimate."
+			action = "Let the bounded close cohort and progressing autovacuum run. Retain the independent 25,000-row open and disputed scan caps; roll out that existing checkpoint only where executor provenance proves the older limit. A merged count above 25,000 alone does not prove an old artifact. Do not cancel the closer, raise its concurrency, or revive a draining backlog merely to reduce the current dead-tuple estimate."
 			verify = "Older open-contract buckets fall, each close cohort checkpoints before its deadline, autovacuum completes, and " + recoveryTarget + " on consecutive five-minute samples after the backlog drains."
 		} else if isPaymentPlannerVacuumHorizon(r.str(20)) {
 			mechanism += " The selected horizon is the Payout payment planner building its bounded temp_account_payment working set. This statement reads transfer_contract and can retain an MVCC snapshot while the plan runs, but it is not the unbounded transfer_contract retention writer that produced the dead-row wave."

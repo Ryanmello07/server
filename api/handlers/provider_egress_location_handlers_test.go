@@ -14,6 +14,7 @@ import (
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/qualityprobe/egresshealth"
 )
 
 func TestProviderEgressLocationSubmitRejectsMissingSecret(t *testing.T) {
@@ -83,11 +84,9 @@ func TestProviderEgressLocationSubmitAcceptsCorrectSecret(t *testing.T) {
 		// surfaced by the handler as 400. That 400 is proof the request
 		// reached the controller, i.e. proof auth passed.
 		args := controller.SubmitProviderEgressLocationArgs{
-			ClientId:         server.NewId(),
-			CountryCode:      "US",
-			Country:          "United States",
-			CountryConfident: true,
-			ObservedAt:       server.NowUtc(),
+			ClientId:   server.NewId(),
+			ExitIp:     "192.0.2.1",
+			ObservedAt: server.NowUtc(),
 		}
 		body, err := json.Marshal(args)
 		if err != nil {
@@ -161,6 +160,23 @@ func TestProviderEgressLocationDueRejectsMissingSecret(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 when the operator secret header is absent", w.Code)
+	}
+}
+
+// Main's full shard selects 1000 providers and may request a bounded 5000-row
+// lookahead after it has already selected a batch. The API fallback of 500
+// silently clipped both phases; exercise the actual uncached startup reader.
+func TestProviderEgressDueConfiguredCapAdmitsFullLookup(t *testing.T) {
+	pop := server.Config.PushSimpleResource("provider_egress_due.yml", []byte("max_due_limit: 5000\n"))
+	defer pop()
+	if got := readMaxProviderEgressDueLimit(); got != 5000 {
+		t.Fatalf("configured due ceiling = %d, want 5000", got)
+	}
+	if got := min(1000, readMaxProviderEgressDueLimit()); got != 1000 {
+		t.Fatalf("full shard clipped to %d providers, want 1000", got)
+	}
+	if got := min(5000, readMaxProviderEgressDueLimit()); got != 5000 {
+		t.Fatalf("bounded successor lookahead clipped to %d providers, want 5000", got)
 	}
 }
 
@@ -269,12 +285,17 @@ func TestProviderEgressLocationDueAcceptsCorrectSecret(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 			t.Fatalf("decode body %q: %s", w.Body.String(), err)
 		}
-		if !slices.Contains(result.ClientIds, due) {
-			t.Fatalf("client_ids = %v, want it to contain the never-probed provider %s", result.ClientIds, due)
+		if !slices.Contains(testDueClientIds(result), due) {
+			t.Fatalf("providers = %+v, want it to contain the never-probed provider %s", result.Providers, due)
 		}
-		// the wire name the prober reads
-		if !strings.Contains(w.Body.String(), `"client_ids"`) {
-			t.Fatalf("body = %s, want a client_ids field", w.Body.String())
+		// the wire names the prober reads, and the place its sample is drawn for
+		if !strings.Contains(w.Body.String(), `"providers"`) || !strings.Contains(w.Body.String(), `"client_id"`) {
+			t.Fatalf("body = %s, want providers with client ids", w.Body.String())
+		}
+		for _, provider := range result.Providers {
+			if provider.ClientId == due && (provider.CountryCode != "us" || provider.Region != "California") {
+				t.Fatalf("due provider = %+v, want it placed at us/California", provider)
+			}
 		}
 	})
 }
@@ -314,18 +335,16 @@ func TestProviderEgressLocationDueHonoursLimit(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 			t.Fatalf("decode body %q: %s", w.Body.String(), err)
 		}
-		if len(result.ClientIds) != 1 {
-			t.Fatalf("len(client_ids) = %d, want 1 for limit=1; body = %s", len(result.ClientIds), w.Body.String())
+		if len(result.Providers) != 1 {
+			t.Fatalf("len(providers) = %d, want 1 for limit=1; body = %s", len(result.Providers), w.Body.String())
 		}
 	})
 }
 
-// Every other due test in this file stands up never-probed providers, which
-// come back regardless of what cutoff the handler computes -- so nothing here
-// actually exercised providerEgressDueAge. This one does: a provider probed
-// just now must be held back, and one probed past the cutoff must come through.
-// Defeating the cutoff (dropping it, computing it in the wrong direction,
-// comparing against sql now() through the session timezone) fails this.
+// The retained route now claims URL work, not stale location observations.
+// Fresh legacy-only evidence cannot defer a provider; ten current URL successes
+// can. A success older than four hours still counts in eight-hour ranking but
+// cannot satisfy the rolling quota, even when the location is fresh.
 func TestProviderEgressLocationDueHonoursStalenessCutoff(t *testing.T) {
 	t.Setenv("WARP_ENV", "local")
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
@@ -343,28 +362,67 @@ func TestProviderEgressLocationDueHonoursStalenessCutoff(t *testing.T) {
 		}
 		model.CreateLocation(ctx, city)
 
-		fresh := server.NewId()
-		stale := server.NewId()
-		testing_connectDueProvider(t, ctx, fresh, city.LocationId, "192.0.2.1:0")
-		testing_connectDueProvider(t, ctx, stale, city.LocationId, "192.0.2.2:0")
+		legacyFresh, complete, expired := server.NewId(), server.NewId(), server.NewId()
+		testing_connectDueProvider(t, ctx, legacyFresh, city.LocationId, "192.0.2.1:0")
+		testing_connectDueProvider(t, ctx, complete, city.LocationId, "192.0.2.2:0")
+		testing_connectDueProvider(t, ctx, expired, city.LocationId, "192.0.2.3:0")
 		model.UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
 
-		now := server.NowUtc()
-		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
-			ClientId: fresh, LocationId: city.LocationId,
-			CountryCode: "us", ObservedAt: now,
-		})
-		// comfortably past providerEgressDueAge, which is half
-		// model.ProviderEgressLocationMaxAge
-		model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
-			ClientId: stale, LocationId: city.LocationId,
-			CountryCode: "us", ObservedAt: now.Add(-providerEgressDueAge - time.Hour),
-		})
-		for _, clientId := range []server.Id{fresh, stale} {
-			model.SetProviderEgressHealth(ctx, &model.ProviderEgressHealth{
-				ClientId: clientId, MeasuredAt: now,
-				OKCount: 1, Total: 1,
+		now := server.NowUtc().Truncate(time.Microsecond)
+		for clientId, observedAt := range map[server.Id]time.Time{
+			legacyFresh: now,
+			complete:    now.Add(-providerEgressDueAge - time.Hour),
+			expired:     now,
+		} {
+			model.SetProviderEgressLocation(ctx, &model.ProviderEgressLocation{
+				ClientId: clientId, LocationId: city.LocationId,
+				CountryCode: "us", ObservedAt: observedAt,
 			})
+		}
+		model.SetProviderEgressHealth(ctx, &model.ProviderEgressHealth{
+			ClientId: legacyFresh, MeasuredAt: now,
+			OKCount: 1, Total: 1,
+		})
+
+		// These providers were admitted before the synthetic measurement window.
+		// Keep the stable token and independently paced deadline explicit.
+		token := now.Add(-6 * time.Hour)
+		server.Tx(ctx, func(tx server.PgTx) {
+			result, err := tx.Exec(ctx, `UPDATE provider_egress_probe_cycle
+				SET cycle_started_at=$1,next_attempt_at=$2 WHERE client_id IN ($3,$4,$5)`,
+				token, now.Add(-time.Hour), legacyFresh, complete, expired)
+			server.Raise(err)
+			if result.RowsAffected() != 3 {
+				t.Fatal("fixture did not initialize every URL admission row")
+			}
+		})
+		destination := egresshealth.Destination{Name: "synthetic-document", Class: egresshealth.ClassSite, Url: "https://document.example.invalid/"}
+		for _, clientId := range []server.Id{complete, expired} {
+			for index := range 10 {
+				measuredAt := now.Add(-time.Hour + time.Duration(index)*time.Minute)
+				if clientId == expired && index == 0 {
+					measuredAt = now.Add(-model.ProviderEgressProbeRefreshAge - time.Minute)
+				}
+				evidence := &egresshealth.UrlProbeEvidence{
+					PolicyVersion: egresshealth.UrlProbePolicyVersion, Policy: egresshealth.DefaultUrlProbePolicy(),
+					Destination: destination, MeasuredAt: measuredAt, ContentMatcherVersion: 1,
+					Security:   []egresshealth.UrlProbeSecurityEvent{{Destination: destination, MeasuredAt: measuredAt, TlsAuthenticated: true}},
+					StatusCode: 200, ByteCount: 32, WireByteCount: 32, WireSampleByteCount: 31, BodyComplete: true,
+					RequestWritten: true, FirstByteReceived: true, TtfbMillis: 10, BodyMillis: 1, BodyBitsPerSecond: 248000,
+					ContentClassification: "content", PerformanceClassification: "insufficient_sample",
+				}
+				w := postEgressHealth(t, secret, map[string]any{
+					"client_id": clientId, "run_id": server.NewId(), "cycle_started_at": token,
+					"url_probe_evidence": evidence, "ok_count": 1, "total_count": 1,
+					"class_results": map[string]any{"site": map[string]int{"ok": 1, "total": 1}},
+				})
+				if w.Code != http.StatusOK {
+					t.Fatalf("synthetic URL success rejected: status=%d body=%s", w.Code, w.Body.String())
+				}
+			}
+		}
+		if counts := model.GetAllProviderEgressHealthCounts(ctx)[expired]; counts.OKCount != 10 || counts.Total != 10 {
+			t.Fatal("the expired quota success must still be valid eight-hour ranking evidence")
 		}
 
 		req := httptest.NewRequest(http.MethodGet, "/network/provider-egress-due?limit=100", nil)
@@ -376,15 +434,33 @@ func TestProviderEgressLocationDueHonoursStalenessCutoff(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
 		}
-		var result ProviderEgressLocationDueResult
+		var result struct {
+			Providers []model.ProviderUrlProbeDue `json:"providers"`
+		}
 		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 			t.Fatalf("decode body %q: %s", w.Body.String(), err)
 		}
-		if slices.Contains(result.ClientIds, fresh) {
-			t.Fatalf("client_ids = %v, must not contain the just-probed provider %s", result.ClientIds, fresh)
+		byId := map[server.Id]model.ProviderUrlProbeDue{}
+		for _, provider := range result.Providers {
+			byId[provider.ClientId] = provider
+			if !provider.CycleStartedAt.Equal(token) || provider.CountryCode != "us" || provider.Region != "California" {
+				t.Fatal("URL due response lost its durable admission token or provider place")
+			}
 		}
-		if !slices.Contains(result.ClientIds, stale) {
-			t.Fatalf("client_ids = %v, must contain the provider probed past the cutoff %s", result.ClientIds, stale)
+		if len(result.Providers) != 2 || len(byId) != 2 {
+			t.Fatalf("URL due response count=%d want=2 distinct incomplete providers", len(result.Providers))
+		}
+		if _, included := byId[complete]; included {
+			t.Fatal("ten current URL successes must defer a provider despite its stale location")
+		}
+		if provider, included := byId[legacyFresh]; !included || provider.RunsNeeded != 10 || provider.OutcomeCount != 0 {
+			t.Fatal("fresh legacy-only evidence must remain due for ten URL successes")
+		}
+		if provider, included := byId[expired]; !included || provider.RunsNeeded != 1 || provider.OutcomeCount != 10 {
+			t.Fatal("nine current URL successes plus one expired success must remain due for one")
+		}
+		if got := due(t, secret); len(got) != 0 {
+			t.Fatal("an immediate repeated poll must not duplicate active URL claims")
 		}
 	})
 }
@@ -500,7 +576,16 @@ func due(t testing.TB, secret string) []server.Id {
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatalf("due: decode body %q: %s", w.Body.String(), err)
 	}
-	return result.ClientIds
+	return testDueClientIds(result)
+}
+
+// The client ids of a due result, in order.
+func testDueClientIds(result ProviderEgressLocationDueResult) []server.Id {
+	clientIds := []server.Id{}
+	for _, provider := range result.Providers {
+		clientIds = append(clientIds, provider.ClientId)
+	}
+	return clientIds
 }
 
 // An unknown client id must be rejected rather than writing an attempt row

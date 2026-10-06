@@ -1,7 +1,9 @@
 package work
 
 import (
+	"context"
 	"fmt"
+	"math"
 	mathrand "math/rand"
 	"time"
 
@@ -24,9 +26,10 @@ const (
 	// Checkpoint task success before the 30-minute task deadline. A 100,003-row
 	// production cohort hit that deadline exactly while transfer_contract was
 	// paying down retention/autovacuum write debt; its per-contract commits
-	// survived, but the task retried with a Timeout and had to rescan. A 25k
-	// cohort keeps the same worker parallelism while committing scheduler
-	// progress four times as often.
+	// survived, but the task retried with a Timeout and had to rescan. Retain
+	// the 25k per-stream total cap and worker parallelism; the model now
+	// checkpoints smaller raw subpages inside its own elapsed-time budget.
+	// Open and disputed rows remain independent, with a union up to 50k.
 	closeExpiredContractsMaxCount = 25_000
 	closeExpiredContractsParallel = 92
 )
@@ -35,16 +38,32 @@ func closeExpiredContractsFull(closeCount int64) bool {
 	return int64(closeExpiredContractsMaxCount/(4*DefaultCloseExpiredContractsBlockSize)) <= closeCount
 }
 
+// A rejected dispute does not count as progress. Keep the existing full/idle
+// cadence bands without accelerating an empty or only-rejected batch.
+func closeExpiredContractsRetryDelay(verifiedCloseCount int64, randomUnit float64) time.Duration {
+	randomUnit = max(0, min(randomUnit, math.Nextafter(1, 0)))
+	if closeExpiredContractsFull(verifiedCloseCount) {
+		return 2*time.Second + time.Duration(randomUnit*float64(2*time.Second))
+	}
+	return time.Minute + time.Duration(randomUnit*float64(4*time.Minute))
+}
+
 type CloseExpiredContractsArgs struct {
-	BlockSize  int `json:"block_size"`
-	BlockIndex int `json:"block_index"`
+	BlockSize  int                         `json:"block_size"`
+	BlockIndex int                         `json:"block_index"`
+	Cursor     *model.ContractExpiryCursor `json:"cursor,omitempty"`
 }
 
 type CloseExpiredContractsResult struct {
-	Full bool `json:"full"`
+	Full   bool                        `json:"full"`
+	Cursor *model.ContractExpiryCursor `json:"cursor,omitempty"`
 }
 
 func ScheduleCloseExpiredContracts(clientSession *session.ClientSession, tx server.PgTx, blockIndex int, delay bool) {
+	scheduleCloseExpiredContractsPage(clientSession, tx, blockIndex, delay, nil)
+}
+
+func scheduleCloseExpiredContractsPage(clientSession *session.ClientSession, tx server.PgTx, blockIndex int, delay bool, cursor *model.ContractExpiryCursor) {
 	// runAt := func() time.Time {
 	// 	now := server.NowUtc()
 	// 	year, month, day := now.Date()
@@ -67,6 +86,7 @@ func ScheduleCloseExpiredContracts(clientSession *session.ClientSession, tx serv
 		&CloseExpiredContractsArgs{
 			BlockSize:  blockSize,
 			BlockIndex: blockIndex,
+			Cursor:     cursor,
 		},
 		clientSession,
 		// legacy key
@@ -77,26 +97,61 @@ func ScheduleCloseExpiredContracts(clientSession *session.ClientSession, tx serv
 	)
 }
 
+// Allow two default receive-owner lifetimes before synthesizing an absent report.
+// The bounded cursor and accounting/intent gates remain authoritative.
+func closeExpiredContractsCutoff(now time.Time) time.Time {
+	return now.Add(-12 * time.Minute)
+}
+
 func CloseExpiredContracts(
 	closeExpiredContracts *CloseExpiredContractsArgs,
 	clientSession *session.ClientSession,
 ) (*CloseExpiredContractsResult, error) {
 	if closeExpiredContracts.BlockSize == DefaultCloseExpiredContractsBlockSize {
-		minTime := server.NowUtc().Add(-5 * time.Minute)
-		c, err := model.ForceCloseOpenContractIds(
+		minTime := closeExpiredContractsCutoff(server.NowUtc())
+		c, next, err := model.ForceCloseOpenContractIdsBudgetedPage(
 			clientSession.Ctx,
 			minTime,
 			closeExpiredContractsMaxCount,
 			closeExpiredContractsParallel,
 			closeExpiredContracts.BlockSize,
 			closeExpiredContracts.BlockIndex,
+			closeExpiredContracts.Cursor,
 		)
-		return &CloseExpiredContractsResult{
-			Full: closeExpiredContractsFull(c),
-		}, err
+		return closeExpiredContractsPageResult(clientSession.Ctx, closeExpiredContracts, c, next, err)
 	}
 	// else ignore lingering tasks with older block size
 	return &CloseExpiredContractsResult{}, nil
+}
+
+// Only a completed, fully classified accounting-error page may checkpoint its
+// raw scan position. End of pass resets the cursor so protected rows return on
+// the next pass; ambiguous/operational failures keep the original task args.
+func closeExpiredContractsPageResult(ctx context.Context, args *CloseExpiredContractsArgs, c int64, next *model.ContractExpiryCursor, err error) (*CloseExpiredContractsResult, error) {
+	// The model alone can attest that every selected row completed and
+	// every failure is a verified still-reserved dispute or completed
+	// no-payout quarantine. Never infer authority from a mixed error join.
+	// Scanning past an owned or recently active head is page progress,
+	// not a verified close. Continue the bounded pass without parking it
+	// at the idle cadence; completion resets to the oldest head next pass.
+	full := closeExpiredContractsFull(c) || next != nil
+	if accounting, ok := err.(*model.ForceCloseAccountingError); ok && ctx.Err() == nil &&
+		0 <= accounting.VerifiedCloseCount() && 0 <= accounting.AccountingRejectionCount() &&
+		0 <= accounting.QuarantinedAccountingRejectionCount() && accounting.QuarantinedAccountingRejectionCount() <= accounting.VerifiedCloseCount() &&
+		0 < accounting.AccountingRejectionCount()+accounting.QuarantinedAccountingRejectionCount() &&
+		accounting.VerifiedCloseCount()+accounting.AccountingRejectionCount() == c {
+		full = closeExpiredContractsFull(accounting.VerifiedCloseCount())
+		delay := closeExpiredContractsRetryDelay(accounting.VerifiedCloseCount(), mathrand.Float64())
+		err = task.WithRetryDelayAndArgs(err, delay, &CloseExpiredContractsArgs{
+			BlockSize: args.BlockSize, BlockIndex: args.BlockIndex, Cursor: next,
+		})
+		glog.Infof("[close-expired]completed batch terminal_verified=%d unresolved_accounting=%d quarantined_accounting=%d retry_delay_ms=%d\n",
+			accounting.VerifiedCloseCount(), accounting.AccountingRejectionCount(), accounting.QuarantinedAccountingRejectionCount(), delay.Milliseconds())
+	}
+	return &CloseExpiredContractsResult{
+		Full:   full,
+		Cursor: next,
+	}, err
 }
 
 func CloseExpiredContractsPost(
@@ -105,7 +160,7 @@ func CloseExpiredContractsPost(
 	clientSession *session.ClientSession,
 	tx server.PgTx,
 ) error {
-	ScheduleCloseExpiredContracts(clientSession, tx, closeExpiredContracts.BlockIndex, !closeExpiredContractsResult.Full)
+	scheduleCloseExpiredContractsPage(clientSession, tx, closeExpiredContracts.BlockIndex, !closeExpiredContractsResult.Full, closeExpiredContractsResult.Cursor)
 	return nil
 }
 

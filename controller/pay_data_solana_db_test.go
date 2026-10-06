@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/gagliardetto/solana-go"
 	"github.com/mr-tron/base58"
 
 	"github.com/urnetwork/connect"
@@ -87,6 +90,7 @@ func TestSolanaWebhookAppliesDataPackToNamedNetwork(t *testing.T) {
 		defer SetMessageSender(prevSender)
 
 		reference := "7Gk3sQx9pLmN2vB4cD6eF8hJ1kM5nP7rS9tU2wY4zA6B"
+		solanaTestAmountSuffixes(t, 202)
 		intentResult, err := PayDataSolanaIntent(&PayDataSolanaIntentArgs{
 			ItemId:      StripeItemData1Tib,
 			NetworkName: "BuyDataSolana",
@@ -96,7 +100,8 @@ func TestSolanaWebhookAppliesDataPackToNamedNetwork(t *testing.T) {
 		connect.AssertEqual(t, intentResult.Error, nil)
 		priceUsd, ok := dataPackPriceUsd(StripeItemData1Tib)
 		connect.AssertEqual(t, ok, true)
-		connect.AssertEqual(t, intentResult.AmountUsd, priceUsd)
+		// the price plus the reserved sub-cent suffix
+		connect.AssertEqual(t, intentResult.AmountUsd, model.SolanaMicroToUsd(model.SolanaUsdToMicro(priceUsd)+202))
 		connect.AssertEqual(t, intentResult.Memo, reference)
 		connect.AssertEqual(t, intentResult.NetworkName, "buydatasolana")
 		connect.AssertEqual(t, *intentResult.NetworkId, networkId)
@@ -116,7 +121,7 @@ func TestSolanaWebhookAppliesDataPackToNamedNetwork(t *testing.T) {
 		connect.AssertEqual(t, status.Status, PayDataSolanaStatusPending)
 		connect.AssertEqual(t, status.ItemId, StripeItemData1Tib)
 		connect.AssertEqual(t, status.NetworkName, "buydatasolana")
-		connect.AssertEqual(t, status.AmountUsd, priceUsd)
+		connect.AssertEqual(t, status.AmountUsd, intentResult.AmountUsd)
 
 		// underpaying buys nothing and keeps the intent open
 		result, err := HeliusWebhook(
@@ -171,5 +176,60 @@ func TestSolanaWebhookAppliesDataPackToNamedNetwork(t *testing.T) {
 		unknown, err := PayDataSolanaStatus(&PayDataSolanaStatusArgs{Reference: "never-quoted-reference"}, pageSession)
 		connect.AssertEqual(t, err, nil)
 		connect.AssertEqual(t, unknown.Status, PayDataSolanaStatusUnknown)
+	})
+}
+
+// The data pack intent names where to pay, the receiver every intent quotes
+// and the USDC mint, so the buy-data page builds the payment from the quote
+// instead of an address of its own; and the transfer a browser wallet of the
+// named network signs for that intent pays the same receiver. The receiver is
+// rotated to a fixture key first, as a treasury change would rotate it.
+func TestPayDataSolanaIntentNamesWhereToPay(t *testing.T) {
+	skipWithoutProYml(t)
+
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		solanaTestReceivers(t, solanaTestRotatedReceiver, solanaTestMerchant)
+
+		networkId := server.NewId()
+		model.Testing_CreateNetwork(ctx, networkId, "buydatarecipient", server.NewId())
+		// the buy-data page is not signed in: a session with no jwt
+		pageSession := session.Testing_CreateClientSession(ctx, nil)
+
+		solanaTestAmountSuffixes(t, 203)
+		intentResult, err := PayDataSolanaIntent(&PayDataSolanaIntentArgs{
+			ItemId:      StripeItemData1Tib,
+			NetworkName: "BuyDataRecipient",
+			Reference:   solanaTestReference,
+		}, pageSession)
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, intentResult.Error, (*PayDataCheckoutError)(nil))
+
+		// as the page reads it, off the wire
+		intentJson, err := json.Marshal(intentResult)
+		connect.AssertEqual(t, err, nil)
+		fields := map[string]any{}
+		connect.AssertEqual(t, json.Unmarshal(intentJson, &fields), nil)
+		connect.AssertEqual(t, fields["recipient"], solanaTestRotatedReceiver)
+		connect.AssertEqual(t, fields["spl_token_mint"], solanaUsdcMint)
+
+		// the transfer for this intent, with the rpc as a seam
+		latestBlockhash := solanaLatestBlockhash
+		t.Cleanup(func() {
+			solanaLatestBlockhash = latestBlockhash
+		})
+		solanaLatestBlockhash = func(_ context.Context) (solana.Hash, error) {
+			return solana.MustHashFromBase58(solanaTestBlockhash), nil
+		}
+		transactionResult, err := CreateSolanaPaymentTransaction(&SolanaPaymentTransactionArgs{
+			Reference: solanaTestReference,
+			Payer:     solanaTestPayer,
+		}, solanaTestPaymentSession(networkId))
+		connect.AssertEqual(t, err, nil)
+		connect.AssertEqual(t, transactionResult.Error, (*SolanaPaymentTransactionError)(nil))
+		transactionBytes, err := base64.StdEncoding.DecodeString(transactionResult.Transaction)
+		connect.AssertEqual(t, err, nil)
+		// TransferChecked's destination
+		connect.AssertEqual(t, solanaDecodeTransfer(t, transactionBytes).accounts[1][2], solanaTestRotatedReceiverUsdcAccount)
 	})
 }

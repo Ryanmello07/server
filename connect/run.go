@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	connectcore "github.com/urnetwork/connect"
 	"github.com/urnetwork/glog"
 
@@ -22,6 +23,14 @@ type RunOptions struct {
 	Port                 int
 	TLSDefaultHostName   string
 	DirectH3LoopbackMode bool
+	// Startup-only, opt-in accounting for resident SDK transfer owners.
+	MemoryOwnerLedger bool
+	// Optional exact host/block diagnostic scope. Empty reads the optional
+	// startup Config resource; "disabled" explicitly installs no socket.
+	PrivateHeapProfileTarget string
+	// Optional owners for a process composing multiple service runners.
+	WarpStatus       *router.WarpStatusState
+	StartStatsPusher func(context.Context) func()
 }
 
 func connectWarmupTargets() []server.WarmupTarget {
@@ -48,6 +57,13 @@ func (self RunOptions) Validate() error {
 
 func exchangeSettingsForRun(options RunOptions) *ExchangeSettings {
 	settings := DefaultExchangeSettings()
+	if options.MemoryOwnerLedger {
+		settings.MemoryOwnerLedger = &connectcore.TransferMemoryOwnerLedger{}
+		settings.payloadOwnerLedger = &residentPayloadLedger{}
+	}
+	if privateHeapProfileTargetsThisInstance(options.PrivateHeapProfileTarget) {
+		settings.SDKPayloadOwnerLedger = &connectcore.TransferPayloadOwnerLedger{}
+	}
 	settings.ConnectHandlerSettings.TransportTlsSettings.DefaultHostName = options.TLSDefaultHostName
 	if options.DirectH3LoopbackMode {
 		// Production ingress supplies Proxy Protocol on every new UDP flow. The
@@ -74,7 +90,20 @@ func validateRunListenIPv4(options RunOptions, listenIPv4 string) error {
 // Run serves the production connect module until ctx is canceled. The CLI and
 // simulator use the same exchange, router, readiness latch, and drain path.
 func Run(ctx context.Context, options RunOptions) error {
-	return runWithDependencies(ctx, options, router.StartupReadiness, server.StartStatsPusher, server.HttpListenAndServeWithReusePort)
+	startStatsPusher := options.StartStatsPusher
+	if startStatsPusher == nil {
+		startStatsPusher = server.StartStatsPusher
+	}
+	readiness := func(ctx context.Context) error {
+		err := router.CheckStartupReadiness(ctx)
+		if err != nil {
+			options.WarpStatus.SetNotReady(err)
+		} else {
+			options.WarpStatus.SetReady()
+		}
+		return err
+	}
+	return runWithDependencies(ctx, options, readiness, startStatsPusher, server.HttpListenAndServeWithReusePort)
 }
 
 func runWithDependencies(
@@ -90,39 +119,75 @@ func runWithDependencies(
 	if err := options.Validate(); err != nil {
 		return err
 	}
+	privateHeapTarget, privateHeapTargetErr := privateHeapProfileStartupTarget(options.PrivateHeapProfileTarget)
+	if privateHeapTargetErr != nil {
+		// A missing or invalid optional diagnostic must not gate serving.
+		glog.Errorf("[connect]optional private heap configuration unavailable; continuing primary startup\n")
+	}
+	options.PrivateHeapProfileTarget = privateHeapTarget
 	listenIPv4, _, listenPort := server.RequireListenIpPort(options.Port)
 	if err := validateRunListenIPv4(options, listenIPv4); err != nil {
 		return err
 	}
-	connectcore.ResizeMessagePools(connectcore.Gib(16))
+	ConfigureMessagePools()
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Startup has no established sessions to drain. Cancel dependency reads
+	// and construction immediately if the caller or a sibling has stopped.
+	stopStartup := context.AfterFunc(ctx, cancel)
+	defer stopStartup()
 	routes := []*router.Route{}
-	statusHandler := router.WarpStatus
+	statusHandler := options.WarpStatus.Handler
 	var exchange *Exchange
 	if err := readiness(runCtx); err != nil {
 		glog.Infof("[connect]not ready (%s)\n", err)
 	} else {
-		exchange = NewExchangeFromEnv(runCtx, exchangeSettingsForRun(options))
+		settings := exchangeSettingsForRun(options)
+		unregisterOwnerMetrics, err := registerTransferMemoryOwnerMetrics(prometheus.DefaultRegisterer, settings.MemoryOwnerLedger)
+		if err != nil {
+			return fmt.Errorf("register Connect transfer owner metrics: %w", err)
+		}
+		defer unregisterOwnerMetrics()
+		unregisterPayloadMetrics, err := registerResidentPayloadMetrics(prometheus.DefaultRegisterer, settings.payloadOwnerLedger)
+		if err != nil {
+			return fmt.Errorf("register Connect resident payload metrics: %w", err)
+		}
+		defer unregisterPayloadMetrics()
+		exchange = NewExchangeFromEnv(runCtx, settings)
 		defer exchange.Close()
 		connectRouter, err := newConnectRouterFromExchange(runCtx, cancel, exchange)
 		if err != nil {
 			return fmt.Errorf("initialize Connect ingress: %w", err)
 		}
-		statusHandler = connectRouter.Status
+		statusHandler = func(w http.ResponseWriter, r *http.Request) {
+			connectRouter.statusWithWarpStatus(w, r, options.WarpStatus)
+		}
 		routes = append(routes, router.NewRoute("GET", "/", connectRouter.Connect))
+		privateProfile, privateProfileErr := startPrivateHeapProfile(runCtx, options.PrivateHeapProfileTarget, exchange, connectRouter.connectHandler)
+		if privateProfileErr != nil {
+			// Optional diagnostics must not gate serving or expose private paths.
+			glog.Errorf("[connect]optional private heap diagnostics unavailable; continuing primary startup\n")
+		}
+		defer privateProfile.Close()
 		server.Warmup(connectWarmupTargets()...)
+		capture, captureErr := startArinShadowCaptureRuntime(runCtx)
+		if captureErr != nil {
+			// Optional diagnostic authority must not gate primary serving.
+			glog.Errorf("[arin-shadow]optional capture unavailable; continuing primary service startup\n")
+		}
+		defer capture.Close()
 		// Only admitted candidates publish a process-identity metrics cohort.
 		startStatsPusher(runCtx)
 	}
 	routes = append([]*router.Route{router.NewRoute("GET", "/status", statusHandler)}, routes...)
+	stopStartup()
 
 	draining := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			router.SetWarpStatusDrainingIfReady()
+			options.WarpStatus.SetDrainingIfReady()
 			if exchange != nil {
 				exchange.Drain()
 			}

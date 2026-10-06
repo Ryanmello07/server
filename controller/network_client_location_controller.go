@@ -28,36 +28,66 @@ func GetLocationForIp(ctx context.Context, clientIp string) (*model.Location, *m
 	}
 
 	location := &model.Location{
-		LocationType:  model.LocationTypeCity,
-		City:          ipInfo.City,
-		Region:        ipInfo.Region,
-		Country:       ipInfo.Country,
-		CountryCode:   ipInfo.CountryCode,
-		Continent:     ipInfo.Continent,
-		ContinentCode: ipInfo.ContinentCode,
-		Latitude:      ipInfo.Latitude,
-		Longitude:     ipInfo.Longitude,
-		Timezone:      ipInfo.Timezone,
+		LocationType:     model.LocationTypeCity,
+		City:             ipInfo.City,
+		Region:           ipInfo.Region,
+		Country:          ipInfo.Country,
+		CountryCode:      ipInfo.CountryCode,
+		Continent:        ipInfo.Continent,
+		ContinentCode:    ipInfo.ContinentCode,
+		Latitude:         ipInfo.Latitude,
+		Longitude:        ipInfo.Longitude,
+		Timezone:         ipInfo.Timezone,
+		CityGeonameId:    ipInfo.CityGeonameId,
+		RegionGeonameId:  ipInfo.RegionGeonameId,
+		CountryGeonameId: ipInfo.CountryGeonameId,
 	}
 	location.LocationType, err = location.GuessLocationType()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	connectionLocationScores := &model.ConnectionLocationScores{}
-	if ipInfo.Hosting {
-		connectionLocationScores.NetTypeHosting = 1
+	// Legacy net-type columns stay neutral. Reviewed hosting and geographic
+	// exceptions come from the actual connected address's ARIN lookup below;
+	// a location probe cannot substitute its country or vendor flags.
+	arinInfo, err := server.GetArinInfo(addr)
+	if err != nil {
+		return nil, nil, err
 	}
-	if ipInfo.Privacy {
-		connectionLocationScores.NetTypePrivacy = 1
+	connectionLocationScores := &model.ConnectionLocationScores{
+		NetTypeForeign: arinForeignScore(addr, ipInfo.CountryCode),
+		AccuracyKm:     genesisAccuracyKm(ipInfo),
 	}
-	if ipInfo.Virtual {
-		connectionLocationScores.NetTypeVirtual = 1
-	}
-
-	connectionLocationScores.NetTypeForeign = arinForeignScore(addr, ipInfo.CountryCode)
+	setArinConnectionFacts(connectionLocationScores, arinInfo)
 
 	return location, connectionLocationScores, nil
+}
+
+// Successful no-record lookups are explicitly evaluated unknowns. Overrides
+// that never queried the database cannot attest a generation or lookup time.
+func setArinConnectionFacts(scores *model.ConnectionLocationScores, info *server.ArinInfo) {
+	scores.ArinRisk = info.Risk
+	scores.ArinQualityVerified = info.QualityVerified()
+	scores.ArinNonQuality = info.NonQuality
+	scores.ArinDatabaseBuildEpoch = info.DatabaseBuildEpoch
+	scores.ArinLookupAt = nil
+	if info.DatabaseBuildEpoch > 0 {
+		now := server.NowUtc()
+		scores.ArinLookupAt = &now
+	}
+}
+
+// The lookup's accuracy radius as the location rows store it
+// (connect/GEOMAP.md §5.1): GeoLite2's radius in km around the coordinates, or
+// an override's when it names one. Nil when the lookup has none -- an override
+// without a radius, or a record GeoLite2 gives no radius -- since a zero would
+// read as a perfectly placed address rather than an unknown one.
+func genesisAccuracyKm(ipInfo *server.IpInfo) *float32 {
+	if ipInfo == nil || ipInfo.AccuracyRadiusKm <= 0 {
+		return nil
+	}
+	accuracyKm := float32(ipInfo.AccuracyRadiusKm)
+	return &accuracyKm
 }
 
 // arinForeignScore cross-checks the ARIN org registration country for addr

@@ -27,21 +27,30 @@ do not consume another noise draw. One score job has a three-hour hard execution
 limit; the adapter must therefore be asynchronous and tolerate an unbounded
 post-close grading window.
 A continuously available host supplies 56 full worst-case three-hour slots
-during a seven-day admission window. The first complete 18-replicate staging
-pass reached scoring in about 2 hours 33 minutes, or roughly 65 theoretical
-slots before scoring and operational overhead. These are planning capacities,
-not admission caps; excess accepted work remains queued through post-close
-grading.
+during a seven-day admission window. The first job also establishes the one
+nine-run epoch control; every later job runs only nine candidate replicates.
+At the observed staging rate, later jobs are projected around 1 hour 16 minutes,
+or roughly 130 theoretical slots before build, scoring, transition, and
+recovery overhead. These are planning capacities, not admission caps; excess
+accepted work remains queued through post-close grading.
 
 Before production epoch 1, the API can expose a staging era with sequential
 `staging_round` epochs beginning at zero. Its submissions are fee-free and use
 the real retention, cache, FIFO, evaluator, scoring, embargo, and polling paths
-against frozen source epoch zero. A staging round automatically finalizes with
-no winner after close and drain, then publishes each score or typed failure at
-the immutable job status URL. Its finalized result is also available through
+against frozen source epoch zero. After admission closes and the FIFO drains,
+a staging round automatically names its highest-ranked placeable candidate
+passing every gate, regardless of significance or takeover margin, or no winner
+if none qualifies, then
+publishes each score or typed failure at the immutable job status URL. Its
+finalized result is also available through
 the opt-in `GET /competition/leaderboard?include_staging=true` view with
-`staging: true` and a null winner. It never enters production ranking, honesty
-review, promotion, or the default production leaderboard. The first production-round commit
+`staging: true`, the same `winner_job_id`, and a matching winning entry. All
+staging entries start `honesty_review: not_reviewed`, including the winner.
+After a manual review of that exact finalized patch, the winner may change to
+`approved` through an append-only staging approval; this enables the adapter's
+approved-winner path but never promotes source or changes production ranking.
+New staging rounds freeze a zero takeover margin; historical rounds keep their
+original value. The first production-round commit
 ends the era and atomically cancels queued staging work; it refuses to race a
 running evaluation. The adapter must prefer `active_round` once present and
 persist the returned `staging` boolean.
@@ -93,19 +102,54 @@ only. Production rows identify
 approved, rejected, and unreviewed honesty status without exposing the private
 review report.
 
-Staging epoch 4 is open, verified on 2026-09-15 at 14:56 UTC:
+Staging epoch 5 is open, verified at `2026-09-19T09:57:30Z`:
+`round_id=01a0b913-c344-27f3-cb64-338dbddc8b07`,
+`opens_at=2026-09-19T09:57:00Z`, `closes_at=2026-09-21T09:57:00Z`.
+API version `2026.9.18+1049819730` repeatedly advertises source
+`807b473c927d1ae09a03276bb9758afb715fac9e` and evaluator
+`sha256:b0c07cf45c30adb483ee5c215b7426b2e098c0b35c7cf4c4abcb0166cb43a87e`.
+The migration audit reaches 683 with the shared-control and historical-ranking
+guards present. The singleton worker started after successful staging
+preflight and remains active with zero restarts; authenticated staging host
+refreshes continued through `2026-09-19T09:57:19Z`.
+Repeated API checks at `2026-09-19T09:59:31Z` matched this state, and an
+authenticated public-TLS metrics query verified a fresh worker heartbeat.
+This is a fee-free 48-hour staging round using source epoch zero, not a
+production epoch. Follow the [release record](STAGING-5-RELEASE.md) for worker
+identities and verification; no successful shared-control result is claimed yet.
+The worker installed at this September 19 opening still enforced the historical
+null-winner policy. The automatic named-staging-winner control-plane follow-up
+described above is not yet deployed; it requires a reviewed API/migration/worker
+rollout, not an evaluator rebuild or source promotion. No live named winner is
+claimed by this opening record.
+
+Staging epoch 4 remains finalized:
 `round_id=01a0a58b-9a3e-2e43-f612-0034ff7296ff`,
 `opens_at=2026-09-15T14:56:00Z`, `closes_at=2026-09-17T14:56:00Z`.
-The singleton evaluator is running, and this round freezes the corrected
-significance-capable evaluator. Macrocosmos can submit using its existing
-staging token. Accepted live scoring and finalized entries still need to be
-observed; this is not a claim that the downstream path has already passed.
+Its staging-inclusive leaderboard has four entries; Macrocosmos reported that
+its downstream path worked end to end. This closed round no longer accepts
+submissions, and its worker has exited. Its immutable release policy and
+published results are preserved alongside the new epoch-5 deployment.
+
+Update, 2026-09-16: a comment-only job completed all 18 replicates but failed
+G5 on a startup database recovery. Its frozen source omitted a wrapped-error
+fix already present on `main`; see the
+[G5 incident record](STAGING-4-G5-INCIDENT.md). The runtime repair and exact-source
+regression gate passed independent tests, including three full sim-latency
+suite runs. The [epoch-5 release](STAGING-5-RELEASE.md) also switches to one
+immutable shared baseline and absolute-latency ranking. Its API/config rollout
+is verified; successful live shared-control scoring remains pending.
+Epoch 4's image and historical results remain unchanged. Exact-image production
+qualification and the production launch approvals are still pending.
 
 A winner must be placeable,
-`takeover_eligible`, and pass every G1-G6 gate. Ordering is normalized score
-descending, raw score ascending, submission time, then job id. Statistical
-eligibility only enters the review queue; it does not establish that a patch is
-honest. Public rows use
+`takeover_eligible`, and pass every G1-G6 gate. Ordering is absolute raw score
+ascending, submission time, then job id; normalized score is display-only.
+Historical per-job-control epochs, including staging epoch 4, keep their
+original normalized-score-first ranking. Rollout does not retroactively reorder
+those published results.
+In production, statistical eligibility only enters the review queue; it does
+not establish that a patch is honest. Public rows use
 job and patch identities rather than bearer-token principal names; the adapter
 may associate those job ids with Apex identities in its own publication layer.
 
@@ -120,7 +164,7 @@ external-evaluator field; Macrocosmos has approved this deliberate exception.
 Candidate patches are structurally validated and built offline into one
 content-addressed image per canonical patch. Runtime has default-deny external
 networking, ten evaluation CPUs, bounded memory/PIDs/logs, fresh PostgreSQL and
-Redis, and only direct read-only `config/local` and `vault/local` mounts. Two
+Redis, and direct read-only `config/local` and `vault/local` configuration mounts. Two
 management CPUs and reserved memory remain outside candidate limits so the
 trusted runner can terminate CPU or memory bombs and remove exact labeled
 containers and networks.

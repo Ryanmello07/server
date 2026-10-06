@@ -1,8 +1,11 @@
 GOBUILD=go build -trimpath
 
-.PHONY: all clean build init warp_build warp_build_image
+# A release records this input; it never follows the wall clock.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct)
 
-all: init clean build
+.PHONY: all clean build warp_build warp_build_image
+
+all: clean build
 
 clean:
 	rm -rf build
@@ -18,13 +21,12 @@ warp_build:
 	@false
 
 warp_build_image:
+	@case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) echo "SOURCE_DATE_EPOCH must be a nonnegative Unix timestamp" >&2; exit 1;; esac
 	docker buildx build --progress=plain \
 		--build-arg warp_env=${WARP_ENV} \
-		--platform linux/arm64/v8,linux/amd64 \
-		-t ${WARP_DOCKER_NAMESPACE}/${WARP_DOCKER_IMAGE}:${WARP_DOCKER_VERSION} \
-		--push \
-		.
-
-init:
-	go clean -cache
-	go clean -modcache
+		--build-arg SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+	--platform linux/arm64/v8,linux/amd64 \
+	-t ${WARP_DOCKER_NAMESPACE}/${WARP_DOCKER_IMAGE}:${WARP_DOCKER_VERSION} \
+	--no-cache \
+	--output type=image,push=true,rewrite-timestamp=true,unpack=false \
+	.

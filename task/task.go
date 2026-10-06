@@ -30,17 +30,9 @@ import (
 	"github.com/urnetwork/server/session"
 )
 
-// taskPanicError converts a recovered task panic into the task's error.
-//
-// `server.IsDoneError` already classifies torn-down-connection pg panics
-// ("context canceled", "failed to deallocate cached statement(s)") as an
-// expected shutdown pattern, and `server.HandleError` drops them silently.
-// The task layer saw the same class and did the opposite — a multi-KB
-// "Unhandled:" blob with a full stack on every occurrence — because the
-// recover here runs BEFORE HandleError ever sees the panic, so that
-// classification never applied. Keep the failure itself loud (the task still
-// errors, reschedules, and names its cause) and drop only the stack for the
-// already-benign class; V(1) restores it when someone is debugging.
+// Explicit shutdown signals fail and reschedule the task without an unexpected
+// stack report. Database failures and cancellation-like diagnostic text retain
+// their full report; only typed cancellation is benign.
 func taskPanicError(r any) error {
 	if server.IsDoneError(r) {
 		if glog.V(1) {
@@ -136,8 +128,9 @@ func taskAdvisoryLockKey(taskId server.Id) int64 {
 }
 
 type taskClaimGuard struct {
-	conn        server.PgConn
-	releaseOnce sync.Once
+	conn         server.PgConn
+	releaseOnce  sync.Once
+	admissionKVs map[server.Id]*taskClaimReservation
 }
 
 func (self *taskClaimGuard) ping(ctx context.Context) error {
@@ -152,6 +145,11 @@ func (self *taskClaimGuard) release() {
 		return
 	}
 	self.releaseOnce.Do(func() {
+		defer func() {
+			for _, reservation := range self.admissionKVs {
+				reservation.release()
+			}
+		}()
 		if self.conn == nil {
 			return
 		}
@@ -255,6 +253,16 @@ var DefaultPriority = (TaskPriorityFastest + TaskPrioritySlowest) / 2
 type TaskFunction[T any, R any] func(T, *session.ClientSession) (R, error)
 
 type TaskPostFunction[T any, R any] func(T, R, *session.ClientSession, server.PgTx) error
+
+// A post that also returns work for after the finishing transaction commits.
+// External side effects (account messages, outbound calls) belong in that
+// work, not in the transaction: the transaction can roll back or rerun its
+// callback, and it holds its connection and row locks until the commit. The
+// worker runs the work once per committed finish, after `server.Tx` returns,
+// and waits for it; a post that returns an error, or a finish that rolls back,
+// drops it, and a crash between the commit and the work loses it. The post's
+// client session is canceled by then, so the work must not use its context.
+type TaskCommitPostFunction[T any, R any] func(T, R, *session.ClientSession, server.PgTx) ([]server.PostFunction, error)
 
 // type ScheduleTaskFunction[T any, R any] func(TaskFunction[T, R], T, *session.ClientSession, ...any)
 
@@ -1093,20 +1101,24 @@ func (self *FinishedTask) ClientSession(ctx context.Context) (*session.ClientSes
 	return clientSession, nil
 }
 
+// The post hooks run in the caller's transaction and return the work to run
+// after it commits (see `TaskCommitPostFunction`).
 type Target interface {
 	TargetFunctionName() string
 	// TargetFunction() TaskFunction[T, R]
 	// PostFunction() TaskPostFunction[T, R]
 	AlternateFunctionNames() []string
-	Run(context.Context, *Task) (any, func(server.PgTx) error, error)
-	RunPost(context.Context, *FinishedTask, server.PgTx) error
+	Run(context.Context, *Task) (any, func(server.PgTx) ([]server.PostFunction, error), error)
+	RunPost(context.Context, *FinishedTask, server.PgTx) ([]server.PostFunction, error)
 }
 
 type TaskTarget[T any, R any] struct {
 	targetFunctionName     string
 	targetFunction         TaskFunction[T, R]
-	postFunction           TaskPostFunction[T, R]
+	postFunction           TaskCommitPostFunction[T, R]
 	alternateFunctionNames []string
+	// An instance-local timer boundary permits deterministic max-time controls.
+	runAfter func(time.Duration) <-chan time.Time
 }
 
 func NewTaskTarget[T any, R any](
@@ -1120,9 +1132,25 @@ func NewTaskTarget[T any, R any](
 	}
 }
 
+// The post has no work for after the commit.
 func NewTaskTargetWithPost[T any, R any](
 	targetFunction TaskFunction[T, R],
 	postFunction TaskPostFunction[T, R],
+	alternateFunctionNames ...string,
+) *TaskTarget[T, R] {
+	var commitPostFunction TaskCommitPostFunction[T, R]
+	if postFunction != nil {
+		commitPostFunction = func(args T, result R, clientSession *session.ClientSession, tx server.PgTx) ([]server.PostFunction, error) {
+			return nil, postFunction(args, result, clientSession, tx)
+		}
+	}
+	return NewTaskTargetWithCommitPost(targetFunction, commitPostFunction, alternateFunctionNames...)
+}
+
+// The post can return work for after the finishing transaction commits.
+func NewTaskTargetWithCommitPost[T any, R any](
+	targetFunction TaskFunction[T, R],
+	postFunction TaskCommitPostFunction[T, R],
 	alternateFunctionNames ...string,
 ) *TaskTarget[T, R] {
 	return &TaskTarget[T, R]{
@@ -1161,7 +1189,7 @@ func (self *TaskTarget[T, R]) AlternateFunctionNames() []string {
 
 func (self *TaskTarget[T, R]) Run(ctx context.Context, task *Task) (
 	result any,
-	runPost func(server.PgTx) error,
+	runPost func(server.PgTx) ([]server.PostFunction, error),
 	returnErr error,
 ) {
 	return self.RunSpecific(ctx, task)
@@ -1169,9 +1197,10 @@ func (self *TaskTarget[T, R]) Run(ctx context.Context, task *Task) (
 
 func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 	result R,
-	runPost func(server.PgTx) error,
+	runPost func(server.PgTx) ([]server.PostFunction, error),
 	returnErr error,
 ) {
+	ctx = withExecutionIdentity(ctx, task.TaskId)
 	var args T
 	err := json.Unmarshal([]byte(task.ArgsJson), &args)
 	if err != nil {
@@ -1187,12 +1216,18 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 	defer clientSession.Cancel()
 
 	timeout := false
+	timerDone := make(chan struct{})
+	after := self.runAfter
+	if after == nil {
+		after = time.After
+	}
 
 	go server.HandleError(func() {
+		defer close(timerDone)
 		defer clientSession.Cancel()
 		select {
 		case <-clientSession.Ctx.Done():
-		case <-time.After(max(
+		case <-after(max(
 			time.Duration(task.RunMaxTimeSeconds)*time.Second,
 			DefaultMaxTime,
 		)):
@@ -1204,21 +1239,25 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 		if r := recover(); r != nil {
 			returnErr = taskPanicError(r)
 		}
+		// Join before reading the timer's result, including recovered panics.
+		// A canceled max-time context must not lose its timeout attribution.
+		clientSession.Cancel()
+		<-timerDone
+		if timeout {
+			returnErr = errors.Join(errors.New("Timeout"), returnErr)
+			runPost = nil
+		}
 	}()
 
 	result, returnErr = self.targetFunction(args, clientSession)
 	if returnErr != nil {
-		if timeout {
-			returnErr = errors.Join(errors.New("Timeout"), returnErr)
+		if clientSession.Ctx.Err() != nil {
+			returnErr = withoutTaskRetryArgs(returnErr)
 		}
 		return
 	}
-	if timeout {
-		returnErr = errors.New("Timeout")
-		return
-	}
 
-	runPost = func(tx server.PgTx) error {
+	runPost = func(tx server.PgTx) ([]server.PostFunction, error) {
 		// the post runs in the finalize tx AFTER the function completed. It
 		// must not be severed by the function's max-time/drain cancel (a
 		// completed task's chain re-arm would strand into the RunPost retry
@@ -1231,11 +1270,11 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 		defer postCancel()
 		clientSession, err := task.ClientSession(postCtx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer clientSession.Cancel()
 		if self.postFunction == nil {
-			return nil
+			return nil, nil
 		} else {
 			return self.postFunction(args, result, clientSession, tx)
 		}
@@ -1248,7 +1287,7 @@ func (self *TaskTarget[T, R]) RunPost(
 	ctx context.Context,
 	finishedTask *FinishedTask,
 	tx server.PgTx,
-) (returnErr error) {
+) (commitPosts []server.PostFunction, returnErr error) {
 	if self.postFunction == nil {
 		returnErr = errors.New("No post")
 		return
@@ -1276,12 +1315,18 @@ func (self *TaskTarget[T, R]) RunPost(
 	defer clientSession.Cancel()
 
 	timeout := false
+	timerDone := make(chan struct{})
+	after := self.runAfter
+	if after == nil {
+		after = time.After
+	}
 
 	go server.HandleError(func() {
+		defer close(timerDone)
 		defer clientSession.Cancel()
 		select {
 		case <-clientSession.Ctx.Done():
-		case <-time.After(max(
+		case <-after(max(
 			time.Duration(finishedTask.RunMaxTimeSeconds)*time.Second,
 			DefaultMaxTime,
 		)):
@@ -1293,19 +1338,18 @@ func (self *TaskTarget[T, R]) RunPost(
 		if r := recover(); r != nil {
 			returnErr = taskPanicError(r)
 		}
-	}()
-
-	returnErr = self.postFunction(args, result, clientSession, tx)
-	if returnErr != nil {
+		clientSession.Cancel()
+		<-timerDone
 		if timeout {
 			returnErr = errors.Join(errors.New("Timeout"), returnErr)
 		}
-		return
-	}
-	if timeout {
-		returnErr = errors.New("Timeout")
-		return
-	}
+		if returnErr != nil {
+			// a failed post is retried whole, with its work
+			commitPosts = nil
+		}
+	}()
+
+	commitPosts, returnErr = self.postFunction(args, result, clientSession, tx)
 
 	return
 }
@@ -1334,6 +1378,14 @@ type TaskWorkerSettings struct {
 	BatchSize              int
 	RetryTimeoutAfterError time.Duration
 	PollTimeout            time.Duration
+	// ClaimRegisteredTargetsOnly leaves other workloads' pending rows untouched.
+	// Filtering precedes the candidate limit, including the owner of a RunPost
+	// retry, so an unrelated backlog cannot starve registered work.
+	ClaimRegisteredTargetsOnly bool
+	// Opt-in per-instance limits, keyed by canonical target function name.
+	// Aliases share their target's limit; RunPost wrappers do not borrow it.
+	// Nil leaves every target unlimited. Construction snapshots this map.
+	TargetClaimLimits map[string]int
 	// how long `Drain` waits for in-flight tasks to finish naturally before
 	// canceling their contexts
 	DrainFinishTimeout time.Duration
@@ -1366,9 +1418,16 @@ type TaskWorker struct {
 	// constructed through NewTaskWorker receives the real clock and DB write.
 	heartbeatAfter             func(time.Duration) <-chan time.Time
 	refreshTaskTimestampLeases func(context.Context, map[server.Id]*Task)
+	// Drain logs are best effort: a full stdout pipe must not hold shutdown.
+	drainLogf func(string, ...any)
+	// Test barriers sit at real claim boundaries, without changing production
+	// ownership: nil leaves the direct PostgreSQL path untouched.
+	claimCandidatesReady func()
+	claimBeforeCommit    func(*taskClaimGuard) error
 
-	stateLock sync.Mutex
-	draining  bool
+	stateLock         sync.Mutex
+	draining          bool
+	claimTargetCounts map[string]int
 
 	inflightCount      atomic.Int64
 	drainCanceledCount atomic.Int64
@@ -1379,6 +1438,7 @@ func NewTaskWorkerWithDefaults(ctx context.Context) *TaskWorker {
 }
 
 func NewTaskWorker(ctx context.Context, settings *TaskWorkerSettings) *TaskWorker {
+	settings = snapshotTaskWorkerSettings(settings)
 	cancelCtx, cancel := context.WithCancel(ctx)
 	runCtx, runCancel := context.WithCancel(cancelCtx)
 	drainCtx, drainCancel := context.WithCancel(cancelCtx)
@@ -1395,6 +1455,8 @@ func NewTaskWorker(ctx context.Context, settings *TaskWorkerSettings) *TaskWorke
 		settings:                   settings,
 		heartbeatAfter:             time.After,
 		refreshTaskTimestampLeases: refreshTaskTimestampLeases,
+		drainLogf:                  glog.Infof,
+		claimTargetCounts:          map[string]int{},
 	}
 
 	taskWorker.AddTargets(
@@ -1506,18 +1568,18 @@ func (self *TaskWorker) Drain() {
 	}
 
 	if self.waitRunDone(self.settings.DrainFinishTimeout) {
-		glog.Infof("[taskworker]drain finished cleanly in %.1fs\n", elapsedSeconds())
+		self.logDrainAsync("[taskworker]drain finished cleanly in %.1fs\n", elapsedSeconds())
 		return
 	}
 
-	glog.Infof(
+	self.logDrainAsync(
 		"[taskworker]drain canceling %d in-flight tasks after %.1fs\n",
 		self.InflightCount(),
 		elapsedSeconds(),
 	)
 	self.drainCancel()
 	if self.waitRunDone(self.settings.DrainCancelTimeout) {
-		glog.Infof(
+		self.logDrainAsync(
 			"[taskworker]drain finished after cancel in %.1fs (%d canceled and rescheduled)\n",
 			elapsedSeconds(),
 			self.DrainCanceledCount(),
@@ -1525,11 +1587,19 @@ func (self *TaskWorker) Drain() {
 		return
 	}
 
-	glog.Infof(
+	self.logDrainAsync(
 		"[taskworker]drain gave up after %.1fs with %d tasks still running (claims release per task max time)\n",
 		elapsedSeconds(),
 		self.InflightCount(),
 	)
+}
+
+// Logging is not a shutdown gate. A stalled stdout/journal consumer can block
+// glog indefinitely; the drain deadlines and task cancellation must still run.
+func (self *TaskWorker) logDrainAsync(format string, args ...any) {
+	if self.drainLogf != nil {
+		go self.drainLogf(format, args...)
+	}
 }
 
 // WaitFinalHandback keeps the process alive for one bounded finalization
@@ -1622,7 +1692,7 @@ func (self *TaskWorker) RunPost(
 	// class visible to the reschedule write, e.g. ErrTargetNotFound)
 	defer func() {
 		if returnErr != nil {
-			returnErr = fmt.Errorf("%s(%s) = %w", finishedTask.FunctionName, finishedTask.ArgsJson, returnErr)
+			returnErr = fmt.Errorf("%s(%s) = %w", finishedTask.FunctionName, ArgumentsForLog(finishedTask.ArgsJson), returnErr)
 		}
 	}()
 
@@ -1630,8 +1700,15 @@ func (self *TaskWorker) RunPost(
 	finishedTask.FunctionName = updateFunctionName(finishedTask.FunctionName)
 
 	if target, ok := self.targets[finishedTask.FunctionName]; ok {
+		var commitPosts []server.PostFunction
 		server.Tx(clientSession.Ctx, func(tx server.PgTx) {
-			if err := target.RunPost(clientSession.Ctx, finishedTask, tx); err == nil {
+			// a rerun callback starts over: neither the outcome nor the work
+			// of a rolled-back attempt may outlive it
+			commitPosts = nil
+			runPostResult = nil
+			returnErr = nil
+			if posts, err := target.RunPost(clientSession.Ctx, finishedTask, tx); err == nil {
+				commitPosts = posts
 				runPostResult = &RunPostResult{}
 				return
 			} else {
@@ -1639,6 +1716,8 @@ func (self *TaskWorker) RunPost(
 				return
 			}
 		})
+		// the post's transaction committed
+		server.RunPosts(clientSession.Ctx, commitPosts...)
 		return
 	} else {
 		returnErr = fmt.Errorf("%w (%s).", ErrTargetNotFound, finishedTask.FunctionName)
@@ -1652,7 +1731,9 @@ func (self *TaskWorker) RunPostPost(
 	clientSession *session.ClientSession,
 	tx server.PgTx,
 ) error {
-	_, err := tx.Exec(
+	// a failed update raises: a returned error would leave the finalize
+	// transaction to commit a rollback
+	server.RaisePgResult(tx.Exec(
 		clientSession.Ctx,
 		`
 			UPDATE finished_task
@@ -1661,8 +1742,8 @@ func (self *TaskWorker) RunPostPost(
 			WHERE task_id = $1
 		`,
 		runPost.TaskId,
-	)
-	return err
+	))
+	return nil
 }
 
 // takes the n next available tasks, makes an initial timestamp claim, and
@@ -1682,7 +1763,7 @@ func (self *TaskWorker) takeTasks(n int) (
 	if err != nil {
 		return nil, nil, err
 	}
-	guard := &taskClaimGuard{conn: conn}
+	guard := &taskClaimGuard{conn: conn, admissionKVs: map[server.Id]*taskClaimReservation{}}
 	retainGuard := false
 	defer func() {
 		if !retainGuard {
@@ -1709,27 +1790,63 @@ func (self *TaskWorker) takeTasks(n int) (
 		maxTimeSeconds int
 	}
 	type taskCandidate struct {
-		taskId   server.Id
-		priority taskPriority
+		taskId       server.Id
+		functionName string
+		priority     taskPriority
 	}
 
 	nowBlock := server.NowUtc().Unix() / BlockSizeSeconds
 	candidateLimit := n + 64
+	claimPredicate := ""
+	queryArgs := []any{nowBlock, candidateLimit}
+	if self.settings.ClaimRegisteredTargetsOnly {
+		functionNames := make([]string, 0, len(self.targets))
+		for functionName := range self.targets {
+			functionNames = append(functionNames, functionName)
+		}
+		// Match the same version-normalized aliases as dispatch. RunPost is a
+		// wrapper: admitting its name alone would execute excluded post hooks.
+		// Invalid or orphaned wrappers stay available to the ordinary worker;
+		// they cannot poison this profile's queue or consume its candidate limit.
+		claimPredicate = `
+			AND CASE WHEN regexp_replace(function_name, '/v[0-9]+', '', 'g') = $4 THEN
+				EXISTS (
+					SELECT 1 FROM finished_task
+					WHERE finished_task.task_id = CASE
+						WHEN pg_input_is_valid(pending_task.args_json, 'jsonb')
+						THEN CASE WHEN (pending_task.args_json::jsonb ->> 'task_id') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+							THEN (pending_task.args_json::jsonb ->> 'task_id')::uuid
+						END
+					END
+					AND regexp_replace(finished_task.function_name, '/v[0-9]+', '', 'g') = ANY($3)
+				)
+			ELSE regexp_replace(function_name, '/v[0-9]+', '', 'g') = ANY($3)
+			END
+		`
+		queryArgs = append(queryArgs, functionNames, functionName(self.RunPost))
+	}
+	if excluded := self.saturatedClaimFunctionNames(); len(excluded) != 0 {
+		claimPredicate += fmt.Sprintf(`
+			AND NOT (regexp_replace(function_name, '/v[0-9]+', '', 'g') = ANY($%d))
+		`, len(queryArgs)+1)
+		queryArgs = append(queryArgs, excluded)
+	}
 	result, err := tx.Query(
 		self.ctx,
 		`
 			SELECT
 				task_id,
+				function_name,
 				run_priority,
 				run_max_time_seconds
 			FROM pending_task
 			WHERE available_block <= $1
+		`+claimPredicate+`
 			ORDER BY available_block, run_priority DESC, run_max_time_seconds DESC
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		`,
-		nowBlock,
-		candidateLimit,
+		queryArgs...,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -1739,6 +1856,7 @@ func (self *TaskWorker) takeTasks(n int) (
 		candidate := taskCandidate{}
 		if err := result.Scan(
 			&candidate.taskId,
+			&candidate.functionName,
 			&candidate.priority.priority,
 			&candidate.priority.maxTimeSeconds,
 		); err != nil {
@@ -1752,10 +1870,20 @@ func (self *TaskWorker) takeTasks(n int) (
 		return nil, nil, err
 	}
 	result.Close()
+	if self.claimCandidatesReady != nil {
+		self.claimCandidatesReady()
+	}
 
 	taskIds := []server.Id{}
 	taskIdPriorities := map[server.Id]taskPriority{}
 	for _, candidate := range candidates {
+		reservation, admitted := self.reserveTaskClaim(candidate.functionName)
+		if !admitted {
+			continue
+		}
+		if reservation != nil {
+			guard.admissionKVs[candidate.taskId] = reservation
+		}
 		lockKey := taskAdvisoryLockKey(candidate.taskId)
 		var acquired bool
 		if err := tx.QueryRow(
@@ -1766,6 +1894,7 @@ func (self *TaskWorker) takeTasks(n int) (
 			return nil, nil, err
 		}
 		if !acquired {
+			guard.releaseAdmission(candidate.taskId)
 			continue
 		}
 		taskIds = append(taskIds, candidate.taskId)
@@ -1817,6 +1946,7 @@ func (self *TaskWorker) takeTasks(n int) (
 		if !unlocked {
 			return nil, nil, fmt.Errorf("task advisory lock was not held for %s", taskId)
 		}
+		guard.releaseAdmission(taskId)
 	}
 	taskIds = taskIds[:selectedCount]
 
@@ -1842,6 +1972,11 @@ func (self *TaskWorker) takeTasks(n int) (
 		}
 	}
 
+	if self.claimBeforeCommit != nil {
+		if err := self.claimBeforeCommit(guard); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := tx.Commit(self.ctx); err != nil {
 		return nil, nil, err
 	}
@@ -1929,6 +2064,10 @@ func (self *TaskWorker) EvalTasks(n int) (
 	if len(tasks) == 0 {
 		return
 	}
+	if claimGuard == nil {
+		returnErr = errors.New("nonempty task claim has no advisory ownership guard")
+		return
+	}
 
 	// Once tasks are claimed, their result collection and final handback must
 	// survive cancellation of the process-serving context. Task functions
@@ -1946,7 +2085,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 		runStartTime time.Time
 		runEndTime   time.Time
 		resultJson   string
-		runPost      func(server.PgTx) error
+		runPost      func(server.PgTx) ([]server.PostFunction, error)
 	}
 
 	type result struct {
@@ -1957,8 +2096,10 @@ func (self *TaskWorker) EvalTasks(n int) (
 
 	taskCtx, taskCancel := context.WithCancel(evalCtx)
 	results := make(chan *result)
+	executionAdmissions := claimGuard.retainExecutionAdmissions(tasks)
 
 	go server.HandleError(func() {
+		defer executionAdmissions.releaseUnlaunched()
 		defer func() {
 			taskCancel()
 			close(results)
@@ -1968,8 +2109,12 @@ func (self *TaskWorker) EvalTasks(n int) (
 
 		for _, task := range tasks {
 			wg.Add(1)
+			reservation := executionAdmissions.take(task.TaskId)
 			go server.HandleError(func() {
 				defer wg.Done()
+				if reservation != nil {
+					defer reservation.release()
+				}
 				metricName := self.metricName(task.FunctionName)
 				attribution := taskMetricAttribution(task)
 				taskExecutionInflight.WithLabelValues(metricName, attribution).Inc()
@@ -1982,7 +2127,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 					},
 				}
 				if target, ok := self.targets[task.FunctionName]; ok {
-					glog.V(1).Infof("[%s]eval start %s(%s)\n", task.TaskId, task.FunctionName, task.ArgsJson)
+					glog.V(1).Infof("[%s]eval start %s(%s)\n", task.TaskId, task.FunctionName, ArgumentsForLog(task.ArgsJson))
 					r.runStartTime = server.NowUtc()
 					var result any
 					var err error
@@ -2073,10 +2218,10 @@ func (self *TaskWorker) EvalTasks(n int) (
 				}
 				elapsedSeconds := float32(r.runEndTime.Sub(r.runStartTime)/time.Millisecond) / 1000
 				if r.err == nil {
-					glog.V(1).Infof("[%s]eval done(%.2fs) %s(%s) = %s\n", r.task.TaskId, elapsedSeconds, r.task.FunctionName, r.task.ArgsJson, string(r.resultJson))
+					glog.V(1).Infof("[%s]eval done(%.2fs) %s(%s) = %s\n", r.task.TaskId, elapsedSeconds, r.task.FunctionName, ArgumentsForLog(r.task.ArgsJson), string(r.resultJson))
 					finishedTasks[r.task.TaskId] = &r.finished
 				} else {
-					glog.Infof("[%s]eval error(%.2fs) (reschedule) %s(%s) = %s\n", r.task.TaskId, elapsedSeconds, r.task.FunctionName, r.task.ArgsJson, r.err)
+					glog.Infof("[%s]eval error(%.2fs) (reschedule) %s(%s) = %s\n", r.task.TaskId, elapsedSeconds, r.task.FunctionName, ArgumentsForLog(r.task.ArgsJson), r.err)
 					rescheduledTasks[r.task.TaskId] = r.err
 				}
 
@@ -2084,7 +2229,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 				elapsedSeconds := float32(time.Now().Sub(startTime)/time.Millisecond) / 1000
 				if 10 <= elapsedSeconds {
 					for _, task := range tasks {
-						glog.Infof("[%s]eval active(%.2fs) %s(%s)\n", task.TaskId, elapsedSeconds, task.FunctionName, task.ArgsJson)
+						glog.Infof("[%s]eval active(%.2fs) %s(%s)\n", task.TaskId, elapsedSeconds, task.FunctionName, ArgumentsForLog(task.ArgsJson))
 					}
 				}
 
@@ -2144,7 +2289,13 @@ func (self *TaskWorker) EvalTasks(n int) (
 	)
 	defer finalizeCancel()
 
+	var commitPosts []server.PostFunction
 	server.Tx(finalizeCtx, func(tx server.PgTx) {
+		// a rerun callback starts over: the post errors and the work of a
+		// rolled-back attempt must not outlive it
+		commitPosts = nil
+		clear(postRescheduledTasks)
+
 		server.BatchInTx(finalizeCtx, tx, func(batch server.PgBatch) {
 			for taskId, finished := range finishedTasks {
 				batch.Queue(
@@ -2219,27 +2370,26 @@ func (self *TaskWorker) EvalTasks(n int) (
 				// - target not found (deploy version skew): the count still
 				//   advances (visibility) but the exponent clamps low, so the
 				//   retry converges to ~16s instead of the backoff cap
-				errorCountDelta := 1
-				backoffMaxExponent := rescheduleBackoffMaxExponent
-				if errors.Is(err, ErrDrained) {
-					errorCountDelta = 0
-					backoffMaxExponent = 0
-				} else if errors.Is(err, ErrTargetNotFound) {
-					backoffMaxExponent = targetNotFoundBackoffMaxExponent
-				}
-				rescheduleTime := now.Add(errorRescheduleDelay(
-					RescheduleTimeout,
-					RescheduleBackoffMaxTimeout,
+				// A classified failure hint or registered target cap can retain
+				// its cadence while preserving this same failing task and count.
+				delay, errorCountDelta := taskTargetErrorRetryDelay(
+					self.targets[tasks[taskId].FunctionName],
+					err,
 					tasks[taskId].RescheduleErrorCount,
-					backoffMaxExponent,
 					mathrand.Float64(),
-				))
+				)
+				rescheduleTime := now.Add(delay)
+				var retryArgsJson *string
+				if self.ctx.Err() == nil && self.drainCtx.Err() == nil {
+					retryArgsJson = taskRetryArgsJson(err)
+				}
 				batch.Queue(
 					`
 						UPDATE pending_task
 						SET
 							reschedule_error = $2,
 							reschedule_error_count = pending_task.reschedule_error_count + $5,
+							args_json = COALESCE($6, pending_task.args_json),
 							run_at = $3,
 							release_time = $4
 						WHERE task_id = $1
@@ -2249,17 +2399,21 @@ func (self *TaskWorker) EvalTasks(n int) (
 					rescheduleTime,
 					now,
 					errorCountDelta,
+					retryArgsJson,
 				)
 			}
 		})
 
 		for taskId, finished := range finishedTasks {
-			if err := finished.runPost(tx); err != nil {
+			if posts, err := finished.runPost(tx); err == nil {
+				commitPosts = append(commitPosts, posts...)
+			} else {
 				// record the post error
 
 				postRescheduledTasks[taskId] = err
 
-				tx.Exec(
+				// a failed update raises: going on would commit a rollback
+				server.RaisePgResult(tx.Exec(
 					finalizeCtx,
 					`
 						UPDATE finished_task
@@ -2270,7 +2424,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 					`,
 					taskId,
 					err.Error(),
-				)
+				))
 
 				// re-run the post
 				func() {
@@ -2293,6 +2447,8 @@ func (self *TaskWorker) EvalTasks(n int) (
 			}
 		}
 	})
+	// the finish committed
+	server.RunPosts(evalCtx, commitPosts...)
 
 	for taskId, _ := range finishedTasks {
 		if _, postRescheduled := postRescheduledTasks[taskId]; !postRescheduled {

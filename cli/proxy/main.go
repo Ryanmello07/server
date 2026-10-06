@@ -60,6 +60,12 @@ func newProxyDeviceManagerSettings(settings *proxy.ProxySettings) *proxy.ProxyDe
 }
 
 func main() {
+	// Address scrubbing for everything this process writes to stdout and
+	// stderr, installed before anything can log. A failure here is not fatal:
+	// it degrades to the previous unscrubbed behavior rather than losing
+	// logging entirely. See server.ScrubProcessLogs.
+	server.ScrubProcessLogs()
+
 	usage := `BringYour proxy server.
 
 Usage:
@@ -114,7 +120,13 @@ Options:
 		}
 	})
 
-	proxyDeviceManager := proxy.NewProxyDeviceManager(ctx, newProxyDeviceManagerSettings(settings))
+	// hosted devices discover providers in this process (localclient), and
+	// each answer counts toward the providers' appearance histograms. Closed
+	// after the device manager, so the final write sees every device's answers.
+	providerAppearances := model.NewProviderAppearances(ctx, model.DefaultProviderAppearanceSettings())
+	defer providerAppearances.Close()
+
+	proxyDeviceManager := proxy.NewProxyDeviceManager(model.WithProviderAppearances(ctx, providerAppearances), newProxyDeviceManagerSettings(settings))
 	defer func() {
 		_ = proxyDeviceManager.CloseAndWait(context.Background())
 	}()

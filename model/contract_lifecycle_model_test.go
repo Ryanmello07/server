@@ -83,22 +83,43 @@ func TestContractLifecycleWritesUsePrimaryDatabaseClockAfterLocks(t *testing.T) 
 	}{
 		{filename: "subscription_model.go", functionName: "createTransferEscrowInTx", lockMarker: "if err := lockActiveContractClientsInTx(", writeMarker: "INSERT INTO transfer_contract"},
 		{filename: "subscription_model.go", functionName: "createContractNoEscrowInTx", lockMarker: "if err := lockActiveContractClientsInTx(", writeMarker: "INSERT INTO transfer_contract"},
+		{filename: "subscription_redis_admission.go", functionName: "createRedisTransferEscrowInTx", lockMarker: "if err := lockActiveContractClientsInTx(", writeMarker: "INSERT INTO transfer_contract"},
 		{filename: "network_client_model.go", functionName: "deactivateNetworkClientsInTx", lockMarker: "/* network_client_deactivation_write_boundary */", writeMarker: "WITH lifecycle_clock AS MATERIALIZED"},
 		{filename: "network_client_model.go", functionName: "RemoveDisconnectedNetworkClients", lockMarker: "FOR UPDATE OF network_client", writeMarker: "WITH lifecycle_clock AS MATERIALIZED"},
 	}
 
 	for _, boundary := range boundaries {
 		source := functionSource(boundary.filename, boundary.functionName)
+		if boundary.functionName == "createRedisTransferEscrowInTx" {
+			if err := contractLifecycleRedisWriterOrder(source); err != nil {
+				t.Errorf("Redis writer: %v", err)
+			}
+		}
+		lockCount := 1
+		if boundary.functionName == "createTransferEscrowInTx" {
+			// Zero-byte anchors and positive-byte reservations deliberately take
+			// the same endpoint locks on opposite sides of the financial wait.
+			// Prove both branches, including negative-input rejection, rather
+			// than mistaking their two call sites for two locks on one path.
+			if err := contractLifecycleEscrowBranchLockOrder(source); err != nil {
+				t.Errorf("%s: %v", boundary.functionName, err)
+			}
+			lockCount = 2
+		}
 		for markerName, marker := range map[string]string{
 			"lock":  boundary.lockMarker,
 			"write": boundary.writeMarker,
 			"clock": "clock_timestamp() AT TIME ZONE 'UTC'",
 		} {
-			if count := strings.Count(source, marker); count != 1 {
-				t.Errorf("%s: %s marker count = %d, want 1", boundary.functionName, markerName, count)
+			want := 1
+			if markerName == "lock" {
+				want = lockCount
+			}
+			if count := strings.Count(source, marker); count != want {
+				t.Errorf("%s: %s marker count = %d, want %d", boundary.functionName, markerName, count, want)
 			}
 		}
-		lockIndex := strings.Index(source, boundary.lockMarker)
+		lockIndex := strings.LastIndex(source, boundary.lockMarker)
 		writeIndex := strings.Index(source, boundary.writeMarker)
 		clockIndex := strings.Index(source, "clock_timestamp() AT TIME ZONE 'UTC'")
 		if lockIndex < 0 || writeIndex <= lockIndex || clockIndex <= writeIndex {
@@ -134,8 +155,8 @@ func TestContractLifecycleWritesUsePrimaryDatabaseClockAfterLocks(t *testing.T) 
 			return true
 		})
 	}
-	if len(contractWriters) != 2 {
-		t.Fatalf("production transfer_contract INSERT writers = %d, want exactly 2 reviewed writers", len(contractWriters))
+	if len(contractWriters) != 3 {
+		t.Fatalf("production transfer_contract INSERT writers = %d, want exactly 3 reviewed writers", len(contractWriters))
 	}
 	for writerIndex, writer := range contractWriters {
 		if !strings.Contains(writer, "CLOCK_TIMESTAMP() AT TIME ZONE 'UTC'") {

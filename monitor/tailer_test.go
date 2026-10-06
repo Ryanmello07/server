@@ -230,6 +230,86 @@ func TestParseTailTransportMonitorRouteEvidenceDoesNotInferExpiryFromExplicitZer
 	}
 }
 
+// Both configd prefixes carry detach evidence, not the cause of router expiry.
+func TestTailTransportRouteLossRetainsRtadvDetachEvidence(t *testing.T) {
+	lines := []string{
+		"2026-01-02 03:04:05.000 Df configd[1:2] RTADV observer0: router lifetime became zero",
+		"2026-01-02 03:04:05.030 Df configd[1:2] network changed: v4(observer0:192.0.2.10)",
+		"2026-01-02 03:04:05.100 Df configd[1:2] RTADV other0: all autoconf addresses detached/deprecated",
+		"2026-01-02 03:04:05.200 Df configd[1:2] AUTOMATIC-V6 other0: all autoconf addresses detached/deprecated",
+		"2026-01-02 03:04:05.300 Df configd[1:2] OTHER observer0: all autoconf addresses detached/deprecated",
+		"2026-01-02 03:04:05.900 Df configd[1:2] RTADV observer0: all autoconf addresses detached/deprecated",
+		"2026-01-02 03:04:12.100 Df configd[1:2] RTADV observer0: all autoconf addresses detached/deprecated",
+		"2026-01-02 03:04:12.130 Df configd[1:2] network changed: v4(observer0:192.0.2.10) v6(observer0:2001:db8:1::10)",
+	}
+	evidence := parseTailTransportMonitorRouteEvidence(strings.Join(lines, "\n"))
+	if evidence.interfaceName != "observer0" || evidence.routerLifetimeExpiredCount != 1 || evidence.autoconfDetachCount != 2 {
+		t.Fatalf("RTADV evidence: interface=%q expirations=%d detaches=%d; want observer0, 1, 2", evidence.interfaceName, evidence.routerLifetimeExpiredCount, evidence.autoconfDetachCount)
+	}
+	event := &tailTransportRouteAggregate{
+		address:  "2001:db8:2::44",
+		count:    2,
+		first:    "2026/01/02 03:04:10",
+		last:     "2026/01/02 03:04:11",
+		services: map[string]struct{}{"synthetic-service": {}},
+	}
+	if !evidence.matches(event) || evidence.ipv6RestoredAt.Sub(evidence.ipv6AbsentAt) != 7100*time.Millisecond {
+		t.Fatalf("RTADV interval: matches=%t duration=%s; want true, 7.1s", evidence.matches(event), evidence.ipv6RestoredAt.Sub(evidence.ipv6AbsentAt))
+	}
+	loss := findingByClass(t, tailTransportRouteFindings(nil, map[string]*tailTransportRouteAggregate{event.address: event}, evidence), "tailer-ipv6-route-loss")
+	if loss.healthy || !strings.Contains(loss.observed, "monitor_autoconf_detach=2") {
+		t.Fatalf("RTADV finding: healthy=%t observed=%q; want unhealthy with detach count 2", loss.healthy, loss.observed)
+	}
+	for _, want := range []string{
+		"separately recorded 2 autoconfiguration detach/deprecate transition(s)",
+		"does not distinguish an explicit zero-lifetime Router Advertisement from missed or late refresh advertisements",
+		"or local RA-state invalidation",
+		"IPv6 network state returned at 2026-01-02 03:04:12.130",
+	} {
+		if !strings.Contains(loss.mechanism, want) {
+			t.Fatalf("RTADV mechanism %q omitted %q", loss.mechanism, want)
+		}
+	}
+	if !strings.Contains(loss.action, "Do not change the named production edge") || !strings.Contains(loss.verify, "For at least 30 minutes") {
+		t.Fatalf("RTADV action=%q verify=%q omitted the edge exclusion or 30-minute gate", loss.action, loss.verify)
+	}
+	alert := alertFromFinding(syntheticSettings(nil), "1.5", "log-errors", "Log error-class rates", loss)
+	for _, want := range []string{
+		"With explicit operator authorization",
+		"Correlate complete packet coverage with local state",
+		"local RA-state invalidation",
+		"An absent packet in incomplete capture is not proof of missed delivery",
+		"Select a router, delivery-path, or local-client repair only after that discriminator",
+	} {
+		if !strings.Contains(alert.Markdown(), want) {
+			t.Fatalf("route-loss Markdown omitted causal or authorization limit %q: %s", want, alert.Markdown())
+		}
+	}
+	for _, unsupported := range []string{"Independent warpctl tails lost their common local route", "repair the identified RA source or delivery path"} {
+		if strings.Contains(alert.Markdown(), unsupported) {
+			t.Fatalf("single-tail route-loss Markdown retained unsupported scope or repair claim %q: %s", unsupported, alert.Markdown())
+		}
+	}
+	for _, raw := range []string{"configd[", "network changed:", "192.0.2.10", "2001:db8:1::10", "other0", "RTADV observer0:"} {
+		if strings.Contains(alert.Markdown(), raw) {
+			t.Fatalf("route-loss Markdown retained synthetic local log fragment %q", raw)
+		}
+	}
+}
+
+// Detach records alone must not create a stored-router-expiration interval.
+func TestParseTailTransportMonitorRouteEvidenceRequiresExpiryForEitherDetachPrefix(t *testing.T) {
+	for _, prefix := range []string{"AUTOMATIC-V6", "RTADV"} {
+		evidence := parseTailTransportMonitorRouteEvidence(
+			"2026-01-02 03:04:05.000 Df configd[1:2] " + prefix + " observer0: all autoconf addresses detached/deprecated\n" +
+				"2026-01-02 03:04:05.030 Df configd[1:2] network changed: v4(observer0:192.0.2.10)\n",
+		)
+		if evidence.interfaceName != "" || evidence.autoconfDetachCount != 0 || !evidence.routerLifetimeExpiredAt.IsZero() || !evidence.ipv6AbsentAt.IsZero() {
+			t.Fatalf("%s detach-only records invented local router expiry: %+v", prefix, evidence)
+		}
+	}
+}
+
 func TestTailTransportRouteLossUsesMonitorRouterLifetimeExpirationDiscriminator(t *testing.T) {
 	tailer := newLogTailer("api", nil)
 	tailer.recordTransportDiagnostic("2026/09/01 06:59:49 client.go:473: Tail read error (read tcp [2001:db8:1::10]:62001->[2001:db8:2::44]:443: read: no route to host). Reconnecting.")
@@ -283,7 +363,9 @@ func TestTailTransportRouteLossUsesMonitorRouterLifetimeExpirationDiscriminator(
 		"monitor_interface=en0",
 		"monitor_router_lifetime_expired=1",
 		"monitor_autoconf_detach=2",
+		"The bounded window separately recorded 2 autoconfiguration detach/deprecate transition(s).",
 		"monitor_ipv6_absent=2026-09-01 06:59:49.500",
+		"IPv6 network state returned at 2026-09-01 06:59:55.750.",
 		"supersedes edge attribution",
 		"not evidence that the named production edge",
 		"Do not change the named production edge",
@@ -297,6 +379,67 @@ func TestTailTransportRouteLossUsesMonitorRouterLifetimeExpirationDiscriminator(
 	}
 	if strings.HasPrefix(routeLoss.action, "Immediately run the §18.1 exact-address battery") {
 		t.Fatalf("locally proven router expiry still starts with edge diagnosis: %s", routeLoss.action)
+	}
+}
+
+func TestTailTransportRouteLossWithoutDetachDoesNotInventTransition(t *testing.T) {
+	for _, restored := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restored=%t", restored), func(t *testing.T) {
+			lines := []string{
+				"2026-09-15 19:41:12.924 Df configd[1:2] RTADV en0: router lifetime became zero",
+				"2026-09-15 19:41:12.961 Df configd[1:2] network changed: v4(en0:192.0.2.10) DNS! Proxy!",
+			}
+			if restored {
+				lines = append(lines, "2026-09-15 19:41:21.562 Df configd[1:2] network changed: v4(en0:192.0.2.10) v6(en0:2001:db8:1::10) DNS! Proxy!")
+			}
+			tailer := newLogTailer("api", nil)
+			tailer.recordTransportDiagnostic("2026/09/15 19:41:20 client.go:473: Tail read error (read tcp [2001:db8:1::10]:62001->[2001:db8:2::44]:443: read: no route to host). Reconnecting.")
+			probe := &logTailProbe{
+				tailers: []*logTailer{tailer},
+				monitorRouteEvidence: func(context.Context, *probeEnv, map[string]*tailTransportRouteAggregate) tailTransportMonitorRouteEvidence {
+					return parseTailTransportMonitorRouteEvidence(strings.Join(lines, "\n"))
+				},
+			}
+			env := &probeEnv{cfg: &monitorConfig{hosts: []*host{{
+				name:     "synthetic-edge",
+				edgeIPv6: []EdgeIPv6InterfaceSettings{{Interface: "public0", Address: "2001:db8:2::44"}},
+			}}}}
+			findings, err := probe.check(context.Background(), env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			loss := findingByClass(t, findings, "tailer-ipv6-route-loss")
+			if loss.healthy || loss.target != "synthetic-edge" || loss.frame != "public0/2001:db8:2::44" || loss.sustain != 1 {
+				t.Fatal("zero-detach evidence changed route-loss identity or visibility")
+			}
+			for _, want := range []string{
+				"default-router lifetime on en0 reached zero at 2026-09-15 19:41:12.924",
+				"loss of that interface's IPv6 network state at 2026-09-15 19:41:12.961",
+				"does not distinguish an explicit zero-lifetime Router Advertisement from missed or late refresh advertisements",
+			} {
+				if !strings.Contains(loss.mechanism, want) {
+					t.Fatalf("zero-detach mechanism omitted proved boundary %q", want)
+				}
+			}
+			if strings.Contains(loss.mechanism, "detach") || strings.Contains(loss.mechanism, "deprecat") {
+				t.Fatal("zero-detach evidence asserted an unobserved detach/deprecate transition")
+			}
+			if strings.Contains(loss.mechanism, "IPv6 network state returned at") != restored {
+				t.Fatal("restoration claim does not match the bounded evidence")
+			}
+			if !strings.Contains(loss.observed, "monitor_autoconf_detach=0") ||
+				!strings.Contains(loss.evidence, "0 autoconfiguration detach/deprecate transition(s)") ||
+				!strings.Contains(loss.action, "Do not change the named production edge") ||
+				!strings.Contains(loss.verify, "For at least 30 minutes") {
+				t.Fatal("zero-detach correction lost the measured count, owner or verification gate")
+			}
+			alert := alertFromFinding(syntheticSettings(nil), "1.5", "log-errors", "Log error-class rates", loss)
+			for _, raw := range []string{"configd[", "network changed:", "then detached/deprecated"} {
+				if strings.Contains(alert.Markdown(), raw) {
+					t.Fatal("route-loss Markdown retained raw source text or the old unsupported claim")
+				}
+			}
+		})
 	}
 }
 
@@ -340,6 +483,24 @@ func TestTailTransportMonitorRouteEvidenceRequiresSameWindowIPv6Loss(t *testing.
 	)
 	if restoredOutsideDeliveryGrace.matches(event) {
 		t.Fatal("route loss restored outside the bounded delivery grace was treated as causal")
+	}
+	first, _, ok := tailTransportRouteEventBounds(map[string]*tailTransportRouteAggregate{"synthetic": event})
+	if !ok {
+		t.Fatal("synthetic route event has no valid bounds")
+	}
+	for _, test := range []struct {
+		delay time.Duration
+		want  bool
+	}{
+		{delay: monitorIPv6RestorationDiagnosticGracePeriod - time.Millisecond, want: true},
+		{delay: monitorIPv6RestorationDiagnosticGracePeriod, want: true},
+		{delay: monitorIPv6RestorationDiagnosticGracePeriod + time.Millisecond, want: false},
+	} {
+		boundary := activeInterval
+		boundary.ipv6RestoredAt = first.Add(-test.delay)
+		if got := boundary.matches(event); got != test.want {
+			t.Fatalf("restoration delay=%s matches=%t; want %t", test.delay, got, test.want)
+		}
 	}
 	withoutLoss := base
 	withoutLoss.ipv6AbsentAt = time.Time{}
@@ -479,6 +640,8 @@ func TestCollectTailTransportMonitorRouteEvidenceCoversProvenDiagnosticLag(t *te
 		"--start 2026-09-01 06:49:49",
 		"--end 2026-09-01 07:00:05",
 		`process == "configd"`,
+		`eventMessage CONTAINS "RTADV "`,
+		`eventMessage CONTAINS "AUTOMATIC-V6 "`,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("bounded configd command missing %q: %s", want, joined)
@@ -887,6 +1050,10 @@ func TestStandingTailPreCursorReductionIsDocumented(t *testing.T) {
 		"Distinct records at the cursor timestamp",
 		"remain visible",
 		"never replay suppressed contents",
+		"resolved Warpctl executable",
+		"d857872c4cae8e4768ed2314fdb53fc96b4fdbdb",
+		"false-positive qualifier",
+		"false-negative qualifier",
 	} {
 		if !strings.Contains(catalog, required) {
 			t.Errorf("pre-cursor catalog guidance omits %q", required)
@@ -1666,6 +1833,82 @@ func TestStandingTailAttributesDirectDroppedEntriesToAffectedService(t *testing.
 	}
 }
 
+func TestStandingTailCountsIdenticalDroppedEntryResponsesAcrossWindows(t *testing.T) {
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	tailer := newLogTailer("fixture-service", nil)
+	tailer.clock = func() time.Time { return now }
+	line := `[warpctl][loki-tail-dropped-entries] service=fixture-service count=2`
+
+	for window := 1; window <= 2; window++ {
+		tailer.ingestStanding(line, true, true)
+		finding := findingByClass(t, tailer.drainWindow(), "loki-tail-dropped-entries")
+		if finding.healthy || !strings.Contains(finding.observed, "rate=1/min") {
+			t.Fatalf("window %d lost a distinct identical response: %+v", window, finding)
+		}
+		now = now.Add(time.Minute)
+	}
+}
+
+func TestStandingTailReconciliationDeduplicatesDroppedEntryReplay(t *testing.T) {
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	tailer := newLogTailer("fixture-service", nil)
+	tailer.clock = func() time.Time { return now }
+	line := `[warpctl][loki-tail-dropped-entries] service=fixture-service count=2`
+
+	tailer.ingestStanding(line, false, true)
+	if finding := findingByClass(t, tailer.drainWindow(), "loki-tail-dropped-entries"); finding.healthy {
+		t.Fatalf("first reconciliation occurrence was lost: %+v", finding)
+	}
+	now = now.Add(time.Minute)
+	tailer.ingestStanding(line, false, true)
+	if finding := findingByClass(t, tailer.drainWindow(), "loki-tail-dropped-entries"); !finding.healthy {
+		t.Fatalf("reconciliation replay was counted twice: %+v", finding)
+	}
+}
+
+func TestStandingTailDroppedEntrySummaryRequiresExactPrivateSchema(t *testing.T) {
+	for _, line := range []string{
+		`[warpctl][loki-tail-dropped-entries] service=fixture-service count=0`,
+		`[warpctl][loki-tail-dropped-entries] service=fixture-service count=2 error=fixture-sensitive-suffix`,
+		`[warpctl][loki-tail-dropped-entries] service=fixture-service count=fixture-sensitive-suffix`,
+		`[warpctl][loki-tail-dropped-entries]error=fixture-sensitive-suffix`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			tailer := newLogTailer("fixture-service", nil)
+			tailer.ingestStanding(line, true, true)
+			if count := tailer.classCounts["loki-tail-dropped-entries"]; count != 0 {
+				t.Fatalf("invalid summary count = %d, want 0", count)
+			}
+			if _, retained := tailer.classSamples["loki-tail-dropped-entries"]; retained {
+				t.Fatal("invalid summary retained a typed sample")
+			}
+			if sample := tailer.classSamples["loki-tail-dropped-entries-unobservable"]; sample != "[warpctl][loki-tail-dropped-entries] invalid_schema" {
+				t.Fatalf("invalid summary visibility sample = %q", sample)
+			}
+			for _, sample := range tailer.novelSamples {
+				if strings.Contains(sample, "fixture-sensitive-suffix") {
+					t.Fatalf("invalid summary suffix reached novel sample %q", sample)
+				}
+			}
+			findings := tailer.drainWindow()
+			for _, finding := range findings {
+				if finding.class == "loki-tail-dropped-entries" {
+					t.Fatalf("invalid summary emitted a loss or false-healthy sibling: %+v", finding)
+				}
+			}
+			if finding := findingByClass(t, findings, "loki-tail-dropped-entries-unobservable"); finding.healthy {
+				t.Fatalf("invalid summary did not produce visibility finding: %+v", finding)
+			}
+			for _, finding := range findings {
+				rendered := finding.symptom + finding.baseline + finding.observed + finding.mechanism + finding.evidence + finding.context + finding.action + finding.verify
+				if strings.Contains(rendered, "fixture-sensitive-suffix") {
+					t.Fatalf("invalid summary suffix reached finding: %+v", finding)
+				}
+			}
+		})
+	}
+}
+
 // Minute volume is the liquidity/retry-amplification signal, but admissions
 // spread across distinct seconds do not violate the short-window invariant.
 // The subsequent empty window must also resolve a prior burst identity.
@@ -1898,6 +2141,11 @@ func TestTailerHealthFindings(t *testing.T) {
 	}
 	if f.probeId != "monitor/visibility" || f.target != "logs/api" {
 		t.Fatalf("wrong identity: probeId=%s target=%s", f.probeId, f.target)
+	}
+	if !strings.Contains(f.baseline, "idle service may emit none") ||
+		!strings.Contains(f.context, "unknown visibility") ||
+		!strings.Contains(f.action, "Do not restart") {
+		t.Fatalf("silence was misclassified as a proven outage or broken stream: %+v", f)
 	}
 	if f := findingByClass(t, silent, "tailer-restarting"); !f.healthy {
 		t.Fatalf("silent-only case reported restarting: %+v", f)

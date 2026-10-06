@@ -35,6 +35,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/urnetwork/server/qualityprobe/egresshealth"
+
 	"github.com/urnetwork/server/controller"
 	"github.com/urnetwork/server/model"
 )
@@ -96,8 +98,15 @@ func registry() []specEndpoint {
 		{"POST", "/network/unblock-location", rt(controller.NetworkUnblockLocationArgs{}), rt(controller.NetworkUnblockLocationResult{})},
 		{"GET", "/network/blocked-locations", nil, rt(controller.GetNetworkBlockedLocationsResult{})},
 		{"GET", "/network/reliability", nil, rt(controller.GetNetworkReliabilityResult{})},
+		{method: "GET", path: "/network/provider-status", argType: nil, resultType: rt(controller.GetProviderStatusResult{})},
 		{"GET", "/network/user", nil, rt(controller.GetNetworkUserResult{})},
 		{"POST", "/network/user/update", rt(controller.UpdateNetworkNameArgs{}), rt(controller.UpdateNetworkNameResult{})},
+		{method: "POST", path: "/network/extender-activate", argType: rt(controller.ExtenderActivateArgs{}), resultType: rt(controller.ExtenderActivateResult{})},
+		{method: "GET", path: "/network/extender-hint", argType: nil, resultType: rt(controller.ExtenderHintResult{})},
+		{method: "POST", path: "/network/extender-latency", argType: rt(controller.ExtenderLatencyReportArgs{}), resultType: rt(controller.ExtenderLatencyReportResult{})},
+		{method: "POST", path: "/network/ping-report", argType: rt(controller.ExtenderPingReportArgs{}), resultType: rt(controller.ExtenderPingReportResult{})},
+		// the prober module's own pool type is the response (connect/GEOMAP.md §11.4)
+		{method: "GET", path: "/network/provider-egress-destinations", argType: nil, resultType: rt(egresshealth.Pool{})},
 
 		{"POST", "/preferences/set-preferences", rt(model.AccountPreferencesSetArgs{}), rt(model.AccountPreferencesSetResult{})},
 		{"GET", "/preferences", nil, rt(model.AccountPreferencesGetResult{})},
@@ -134,7 +143,9 @@ func registry() []specEndpoint {
 		// Response is a polymorphic interface{}, so it stays unchecked (nil).
 		{"POST", "/verify", rt(controller.VerifyArgs{}), nil},
 		{"GET", "/key/{clientId}", nil, rt(controller.GetClientKeyResult{})},
+		{"GET", "/key/{clientId}/history", nil, rt(controller.GetClientKeyHistoryResult{})},
 		{"GET", "/hello", nil, rt(controller.HelloResult{})},
+		{method: "GET", path: "/my-ip-info", argType: nil, resultType: rt(controller.MyIpInfoResult{})},
 
 		{"POST", "/account/api-key", rt(model.CreateApiKeyArgs{}), rt(model.CreateApiKeyResult{})},
 		{"POST", "/account/api-key/remove", rt(controller.DeleteApiKeyArgs{}), rt(controller.DeleteApiKeyResult{})},
@@ -158,10 +169,13 @@ func registry() []specEndpoint {
 
 		{"GET", "/transfer/stats", nil, rt(model.TransferStats{})},
 		{"POST", "/solana/payment-intent", rt(controller.SolanaPaymentIntentArgs{}), rt(controller.SolanaPaymentIntentResult{})},
+		{method: "POST", path: "/solana/payment-transaction", argType: rt(controller.SolanaPaymentTransactionArgs{}), resultType: rt(controller.SolanaPaymentTransactionResult{})},
 		{"POST", "/stripe/payment-intent", rt(controller.StripeCreatePaymentIntentArgs{}), rt(controller.StripeCreatePaymentIntentResult{})},
 		{"POST", "/stripe/customer-portal", rt(controller.StripeCreateCustomerPortalArgs{}), rt(controller.StripeCreateCustomerPortalResult{})},
 		{"POST", "/pay/data/checkout", rt(controller.PayDataCheckoutArgs{}), rt(controller.PayDataCheckoutResult{})},
 		{"POST", "/pay/data/network-lookup", rt(controller.PayDataNetworkLookupArgs{}), rt(controller.PayDataNetworkLookupResult{})},
+		{method: "POST", path: "/pay/data/solana-intent", argType: rt(controller.PayDataSolanaIntentArgs{}), resultType: rt(controller.PayDataSolanaIntentResult{})},
+		{method: "POST", path: "/pay/data/solana-status", argType: rt(controller.PayDataSolanaStatusArgs{}), resultType: rt(controller.PayDataSolanaStatusResult{})},
 
 		{"GET", "/verify/keys", nil, rt(controller.GetVerifyKeysResult{})},
 		{"POST", "/sn/wallet", rt(controller.SnSetWalletArgs{}), rt(controller.SnSetWalletResult{})},
@@ -180,7 +194,6 @@ func registry() []specEndpoint {
 // present as routes; TestSpecRoutesImplemented covers that.)
 func skips() map[string]string {
 	return map[string]string{
-		"GET /my-ip-info":                      "spec MyIPInfoResult includes landmarks[], served by whereami rather than this api",
 		"GET /device/share-code/{code}/qr.png": "image/png response, no JSON schema",
 		"GET /device/adopt-code/{code}/qr.png": "image/png response, no JSON schema",
 	}
@@ -295,6 +308,22 @@ func (s *specDoc) kind(sch map[string]any) string {
 	}
 	if t, ok := sch["type"].(string); ok {
 		return t
+	}
+	// 3.1 nullable: type: [array, "null"]
+	if ts, ok := sch["type"].([]any); ok {
+		for _, t := range ts {
+			if t, ok := t.(string); ok && t != "null" {
+				return t
+			}
+		}
+	}
+	// nullable ref: oneOf: [{$ref}, {type: "null"}]
+	if alts, ok := sch["oneOf"].([]any); ok && len(alts) == 2 {
+		for _, alt := range alts {
+			if alt, ok := alt.(map[string]any); ok && alt["type"] != "null" {
+				return s.kind(alt)
+			}
+		}
 	}
 	if _, ok := sch["allOf"]; ok {
 		return "object"
@@ -628,6 +657,18 @@ func implRouteKeys() map[string]bool {
 		out[method+" "+normalizePath(pattern)] = true
 	}
 	return out
+}
+
+// A removed route must leave the implemented-schema registry even if its Go
+// types survive for another consumer or its planned schema remains published.
+func TestSpecRegistryRoutesImplemented(t *testing.T) {
+	implKeys := implRouteKeys()
+	for _, endpoint := range registry() {
+		key := endpoint.method + " " + normalizePath(endpoint.path)
+		if !implKeys[key] {
+			t.Errorf("registry endpoint %q has no matching implemented route", key)
+		}
+	}
 }
 
 func TestSpecRoutesImplemented(t *testing.T) {

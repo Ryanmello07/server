@@ -325,11 +325,13 @@ downstream system's specialization.
 type AlertHandler func(ctx context.Context, signal Signal, alerts Alerts) error
 ```
 
-The current CLI supplies this handler to `RunLoop`, skips empty batches, and
+The current CLI supplies this handler to `RunLoopWithOptions`, skips empty batches, and
 writes the selected Markdown or JSONL format to stdout. Stderr is diagnostic
 output, not a second machine-readable ticket-event channel. The legacy console
 emitter's lifecycle JSON and the historical webhook/PR proposals are not
-current CLI capabilities; additional sinks remain deferred.
+current CLI capabilities; additional sinks remain deferred. The fixed-schema
+`monitor-log-reconcile ` diagnostic receipt described below is bounded
+collector evidence, not an Alert, ticket event, or all-probes heartbeat.
 
 Self-health: the monitor distinguishes three states per target — *healthy
 observation*, *broken observation* (ticket about the target), and *cannot
@@ -361,7 +363,37 @@ misses). Tailer self-health: a tailer that exits or goes silent while its
 service is running restarts with backoff and raises `monitor/visibility`
 if it cannot stay up. Failed, stale, or truncated reconciliation raises the
 independent `tailer-reconcile` visibility class, because a connected process
-does not prove complete contents. The separate `loki-tail-backend-eof` class
+does not prove complete contents. Producer-declared timestamp skipping also
+fails every aggregate, block, or continuation page, even when the query exits
+zero below the requested cap; the fixed diagnostic resets completion proof
+without retaining the producer's timestamp, count, or block selector.
+
+Every standing-log cadence also writes one line to retained stderr: the exact
+prefix `monitor-log-reconcile ` followed by a schema-1 JSON object. It contains
+`schema`, `observed_at`, integer `collectors`, `enabled`, `fresh`, and
+`consecutive_two`, plus five `{oldest,newest}` UTC timestamp ranges:
+`collector_started_at`, `previous_window_start`, `latest_window_start`,
+`previous_completed_at`, and `latest_completed_at`. Missing range endpoints
+are JSON null. No service, block, host, label, content, or raw error is emitted.
+Only two successful query receipts per collector remain in memory; failures,
+incomplete queries, and cancellation clear the pair. Both query lower bounds
+and completions must advance, with less than 90 seconds between completions;
+latest completions must be no more than the current observation time and less
+than 90 seconds old. Repeated snapshots cannot create another success.
+
+For two-window closure, bind the receipt to the current watcher generation's
+immutable binary/session/stderr artifact and intended collector inventory.
+Require `collectors=enabled=fresh=consecutive_two > 0`, valid ordered ranges,
+and starts/completions meeting the incident's post-boundary window. Collector
+start ranges bind the process-local history; never combine predecessor and
+candidate receipts. These are query lower bounds and local completions, not
+source-record timestamps or proof that live tails are connected. Require
+independent fresh-source controls and the signal's no-loss observation window
+as well. Missing, malformed, stale, partial-scope, or unwritten receipts leave
+completion unknown; alert absence alone is insufficient. Diagnostic sink
+failure is nonfatal and never changes findings or manufactures an Alert.
+
+The separate `loki-tail-backend-eof` class
 matches only the internal tail-querier's unquoted EOF; client-driven
 `context canceled` during deliberate watcher retirement is excluded.
 Escalation batteries pull incident windows non-interactively with
@@ -374,6 +406,15 @@ Escalation batteries pull incident windows non-interactively with
   handler complete. Time spent queued or running therefore cannot create a
   buffered or wall-aligned back-to-back catch-up query against an already-slow
   dependency.
+- `RunLoopWithOptions` accepts a per-watcher `MinimumProbeCadence`; the CLI
+  exposes `-min-probe-cadence=15m` for an explicitly requested 15-minute active
+  observation floor. Zero/default preserves immediate active startup and native
+  cadences. A positive floor delays the **first active probe** by that floor,
+  then waits `max(native cadence, floor)` after each observation and handler.
+  Slower native probes remain slower. This is not a process-global throttle.
+  Standing log streams start immediately; their native drains and independent
+  overlap reconciliation are unchanged. Sustain/PageSustain still count actual
+  consecutive observations, so active-probe alert maturation takes longer.
 - One runtime-shared semaphore per destination host, capped at two actual SSH
   commands across every probe and probe-local battery. A limiter created per
   probe is not sufficient: four admitted signals can each fan out internally
@@ -467,7 +508,7 @@ hosts:                # only monitor-specific facts; lan ips come
       expected_chain: Bittensor
       expected_genesis_hash: "0x..."
       expected_spec_name: node-subtensor
-      expected_spec_version: 455  # current verified upstream pin; update with Xops
+      expected_spec_version: 468  # current verified upstream pin; update with Xops
       expected_transaction_version: 1
       expected_evm_chain_id: "0x3b1"
       warp_max_lag: 4096
@@ -513,6 +554,61 @@ block alerts before any DNS observation. Its managed domains and expected
 A/AAAA sets are public configuration, remain distinct from `services.yml` LB
 addresses, and are compared in memory without rendering addresses in alerts.
 
+### 7.1 Explicit read-only router enrollment
+
+Router observations (§§18.4–18.6) use a separate optional `routers` list. The
+following values are synthetic documentation examples, not an enrollment:
+
+```yaml
+routers:
+  - name: router-test
+    lan_ip: 192.0.2.9
+    overlay_ip: 198.51.100.9
+    ssh_user: synthetic-reader
+    ssh_identity_files: ["/synthetic/router-observer-key"]
+    disabled: true
+```
+
+An operator must explicitly enable an approved exact router and provide a
+current numeric address for the selected `address_mode`. No router is added
+to `hosts`, assigned Linux roles, inferred from an alert, or selected through
+the legacy first-host LAN-route map. Per-router SSH identity overrides the
+environment identity; keys are normal existing local SSH identity files.
+Disabled/excluded router names and known shared endpoints remain denied. The
+same guard includes disabled Linux hosts' known public/alias endpoints while
+leaving enabled generic-host denominators unchanged. Exclusion selectors can
+name either inventory and reject unknown/ambiguous identities.
+
+The local Warp tool must support read-only `vyos create-config` and the
+versioned `vyos compare-config` summary. Server does not import Warp. Each
+probe renders ONE desired config into a mode-0700 ephemeral directory;
+config captures are private files there and are removed after comparison.
+The comparison command never generates/applies a migration, and topology-only
+calls may leave running/saved captures absent without treating them as equal.
+Desired input changes are checked in memory before/after the observation;
+they require controlled monitor promotion, not hot-reload. No secret-derived
+fingerprint or raw output is published.
+
+SSH is batch/strict-host-key and unprivileged. The remote command gates on
+`hostname -s`, then brackets reads with the boot identity and an end marker.
+Config uses `/opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration` and
+`/config/config.boot`; neighbors use `ip -s neigh show nud all`; conntrack
+uses read-only `/proc` count/max/stats and module hashsize. No Python, `ip -j`,
+sudo, pings, historical RPC, cache flush or router restart is attempted.
+Missing tools/permissions, truncation, nonzero exit, concealed values or
+unsupported formats stay unknown. Compatible firmware/CLI and actual hardware
+behavior require separate acceptance; a boot bracket is not atomic config.
+
+Each probe has a 45-second whole-run budget, two concurrent target tasks,
+20-second command deadlines, and locally enforced output caps (1 MiB per
+config, 256 KiB telemetry/summary, 64 KiB stderr). Cancellation also stops
+queued targets. The existing per-endpoint SSH semaphore remains authoritative.
+Injected sources must honor context cancellation; there is no native network
+fallback when a synthetic/alternate source lacks local capability. Empty
+inventory is explicitly unconfigured, cold neighbor state is unknown, and
+conntrack counter health needs a bounded same-boot pair. These are not fleet
+coverage or client-request success claims.
+
 ## 8. Development plan
 
 Phase 0 (now): local run from the workstation against main —
@@ -526,7 +622,14 @@ Run it locally:
 WARP_HOME=/Users/brien/urnetwork WARP_ENV=main WARP_VERSION=0.0.0 \
   go run ./cli/monitor --once        # one pass, render a Markdown alert file
 WARP_HOME=... WARP_ENV=main ... go run ./cli/monitor   # cadence loop
+WARP_HOME=... WARP_ENV=main ... go run ./cli/monitor -min-probe-cadence=15m
 ```
+
+The optional cadence floor is continuous-mode only; negative, malformed, or
+nonzero `-once`/`-list-signals` combinations fail before settings or probes.
+It neither schedules one-shots nor replaces stateful monitoring with repeated
+snapshots. Coordinate any watcher overlap separately under RUN-MAIN.md; a
+per-watcher option does not coordinate active work across two processes.
 
 During an explicit per-host routing maintenance window, add
 `-exclude-edge-ipv6-host <configured-host-name>`. This removes only that
