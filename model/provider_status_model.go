@@ -205,6 +205,10 @@ func newProviderCountFilterForClients(ctx context.Context, clientIds []server.Id
 		countryCodes:            getProviderEgressCountryCodes(ctx, clientIds),
 	}
 	f.healthCounts, f.healthWindowEnd = getProviderEgressHealthCountsSnapshot(ctx, clientIds)
+	// the fleet's honored set restricted, since the floor is a fleet property
+	urlDark, err := loadProviderUrlDarkHonored(ctx, clientIds)
+	server.Raise(err)
+	f.urlDark = urlDark
 	server.Db(ctx, func(conn server.PgConn) {
 		rows, err := conn.Query(ctx, providerCountFilterClientSql(), clientIds)
 		server.WithPgResult(rows, err, func() {

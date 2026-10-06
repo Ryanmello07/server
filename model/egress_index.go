@@ -331,12 +331,15 @@ const (
 	ProviderExcludedArinRisk       = "arin_risk"
 	ProviderExcludedArinNonQuality = "arin_non_quality"
 	ProviderExcludedReliability    = "reliability"
+	// The latest counted URL turns carried nothing back (provider_url_dark.go).
+	ProviderExcludedUrlDark = "url_dark"
 )
 
 // The reasons in the order the rules apply.
 var ProviderExcludedReasons = []string{
 	ProviderExcludedBlackhole,
 	ProviderExcludedTls,
+	ProviderExcludedUrlDark,
 	ProviderExcludedCountry,
 	ProviderExcludedHealth,
 	ProviderExcludedUnprobed,
@@ -352,6 +355,8 @@ type providerEgressFacts struct {
 	reliabilityFailed       bool
 	blackholed              bool
 	tlsAuthenticationFailed bool
+	// an honored URL-dark verdict (provider_url_dark.go)
+	urlDark bool
 	// a fresh probe observed the exit in a country other than the published one
 	countryMismatch bool
 	// The rollup index is a ranking diagnostic; the verdict uses current history.
@@ -397,6 +402,7 @@ func (self providerCountFilter) egressFacts(
 		reliabilityFailed:       self.reliabilityFailed[clientId],
 		blackholed:              self.isBlackholed(clientId),
 		tlsAuthenticationFailed: self.tlsAuthenticationFailed[clientId],
+		urlDark:                 self.urlDark[clientId],
 		// a provider nobody has located, or whose own country is unknown,
 		// cannot contradict itself
 		countryMismatch: settings.CountryGate &&
@@ -425,6 +431,13 @@ func decideProviderEgress(facts *providerEgressFacts, egressTestEnabled bool) pr
 	case facts.tlsAuthenticationFailed:
 		return providerEgressDecision{
 			reason:       ProviderExcludedTls,
+			hardExcluded: true,
+		}
+	case facts.urlDark:
+		// A failing ratio stays online as backfill; an exit that returns
+		// nothing at all serves no one.
+		return providerEgressDecision{
+			reason:       ProviderExcludedUrlDark,
 			hardExcluded: true,
 		}
 	}
@@ -574,6 +587,8 @@ func getProviderHardExclusions(ctx context.Context, clientIds []server.Id) (excl
 // Read-through uses the exporter's reliability, ARIN-risk and security rules without loading
 // the fleet. Each query has at most 256 distinct candidates and result rows;
 // it observes the caller's context and never publishes a partial global set.
+// URL-dark is the exception: its serving floor is a fleet property, so the
+// exporter's own honored set is read, and only when a candidate is dark.
 func readProviderHardExclusions(ctx context.Context, clientIds []server.Id) (map[server.Id]bool, error) {
 	const chunkSize = 256
 	uniqueClientIds := make([]server.Id, 0, len(clientIds))
@@ -631,6 +646,13 @@ func readProviderHardExclusions(ctx context.Context, clientIds []server.Id) (map
 	}, server.OptReadOnly(), server.OptNoRetry())
 	if returnErr != nil {
 		return nil, returnErr
+	}
+	urlDark, err := loadProviderUrlDarkHonored(ctx, uniqueClientIds)
+	if err != nil {
+		return nil, err
+	}
+	for clientId := range urlDark {
+		excludedClientIds[clientId] = true
 	}
 	return excludedClientIds, nil
 }
@@ -789,6 +811,7 @@ type ProviderEgressInspection struct {
 	ObservedCountryCode     string
 	Blackholed              bool
 	TlsAuthenticationFailed bool
+	UrlDark                 bool
 	ArinRisk                bool
 	ArinNonQuality          bool
 	ReliabilityFailed       bool
@@ -868,6 +891,7 @@ func InspectProviderEgress(ctx context.Context, clientId server.Id) *ProviderEgr
 	inspection.ObservedCountryCode = countFilter.countryCodes[clientId]
 	inspection.Blackholed = facts.blackholed
 	inspection.TlsAuthenticationFailed = facts.tlsAuthenticationFailed
+	inspection.UrlDark = facts.urlDark
 	inspection.ArinRisk = facts.arinRisk
 	inspection.ArinNonQuality = facts.arinNonQuality
 	inspection.ReliabilityFailed = facts.reliabilityFailed

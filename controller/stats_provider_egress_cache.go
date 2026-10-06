@@ -41,9 +41,11 @@ type statsProviderEgressSnapshot struct {
 type statsProviderEgressCacheKeys struct{ value, fill string }
 
 // Both keys share a slot; policy text and ownership tokens never become labels.
+// v2 added the url_dark reason: a mixed rollout must not read the other
+// side's snapshot, whose reason set fails validation as an error, not a miss.
 func statsProviderEgressKeys(policyKey string) statsProviderEgressCacheKeys {
 	sum := sha256.Sum256([]byte(policyKey))
-	prefix := "stats_provider_egress:v1:{" + hex.EncodeToString(sum[:]) + "}"
+	prefix := "stats_provider_egress:v2:{" + hex.EncodeToString(sum[:]) + "}"
 	return statsProviderEgressCacheKeys{prefix + ":value", prefix + ":fill"}
 }
 
@@ -130,7 +132,7 @@ type statsProviderEgressWire struct {
 }
 
 func validStatsProviderEgressCounts(counts *model.ProviderEgressCounts) bool {
-	if counts == nil || counts.MaxIndex < 0 || counts.MaxIndex > statsProviderEgressMaxIndex || len(counts.BucketIndexCounts) != 3 || len(counts.ReasonCounts) != 8 {
+	if counts == nil || counts.MaxIndex < 0 || counts.MaxIndex > statsProviderEgressMaxIndex || len(counts.BucketIndexCounts) != 3 || len(counts.ReasonCounts) != len(model.ProviderExcludedReasons) {
 		return false
 	}
 	for _, bucket := range []string{model.RankModeQuality, model.RankModeSpeed, model.ProviderEgressBucketOnline} {
@@ -150,7 +152,7 @@ func validStatsProviderEgressCounts(counts *model.ProviderEgressCounts) bool {
 			}
 		}
 	}
-	for _, reason := range []string{model.ProviderExcludedBlackhole, model.ProviderExcludedTls, model.ProviderExcludedCountry, model.ProviderExcludedHealth, model.ProviderExcludedUnprobed, model.ProviderExcludedArinRisk, model.ProviderExcludedArinNonQuality, model.ProviderExcludedReliability} {
+	for _, reason := range model.ProviderExcludedReasons {
 		if count, ok := counts.ReasonCounts[reason]; !ok || count < 0 {
 			return false
 		}

@@ -1,0 +1,363 @@
+package model
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"testing"
+	"time"
+
+	"github.com/urnetwork/connect"
+
+	"github.com/urnetwork/server"
+	"github.com/urnetwork/server/qualityprobe/egresshealth"
+)
+
+// URL-dark against the database: history rows are written as accepted ingest
+// stores a counted URL turn, and every verdict is read back through the paths
+// the server publishes and serves from.
+
+// Writes one counted URL turn: cycle-admitted, one URL, the selected policy.
+// A nil evidence document stores SQL NULL.
+func urlDarkTestRow(ctx context.Context, clientId server.Id, at time.Time, ok int, evidence any) {
+	var encoded *string
+	if evidence != nil {
+		var raw string
+		if s, isString := evidence.(string); isString {
+			raw = s
+		} else {
+			b, err := json.Marshal(evidence)
+			server.Raise(err)
+			raw = string(b)
+		}
+		encoded = &raw
+	}
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(ctx, `INSERT INTO provider_egress_health_history
+			(run_id, client_id, measured_at, ok_count, total_count, class_results, tls_authentication_failure,
+			 cycle_started_at, url_probe, url_probe_evidence, url_probe_policy_version)
+			VALUES ($1, $2, $3, $4, 1, '{}', false, $3, true, $5::jsonb, $6)`,
+			server.NewId(), clientId, at.UTC(), ok, encoded, SelectedProviderUrlProbePolicyVersion()))
+	})
+}
+
+func urlDarkTestTurn(ctx context.Context, clientId server.Id, at time.Time, turn providerUrlDarkTurn) {
+	switch turn {
+	case providerUrlDarkSuccess:
+		urlDarkTestRow(ctx, clientId, at, 1, fp2TestUrlProbeEvidence(at, true))
+	case providerUrlDarkForwarded:
+		// a captcha page: status, first byte and authenticated TLS came back
+		urlDarkTestRow(ctx, clientId, at, 0, fp2TestUrlProbeEvidence(at, false))
+	default:
+		urlDarkTestRow(ctx, clientId, at, 0, urlDarkTestNoResponseEvidence(at))
+	}
+}
+
+// Successes from `count` other, unconnected providers just before `at`: the
+// positive control that lets a no-response turn at `at` count.
+func urlDarkTestControls(ctx context.Context, at time.Time, count int, before time.Duration) {
+	for range count {
+		urlDarkTestTurn(ctx, server.NewId(), at.Add(-before), providerUrlDarkSuccess)
+	}
+}
+
+// No-response turns at each time, each with `controls` control successes a
+// minute before it.
+func urlDarkTestDark(ctx context.Context, clientId server.Id, controls int, times ...time.Time) {
+	for _, at := range times {
+		urlDarkTestControls(ctx, at, controls, time.Minute)
+		urlDarkTestTurn(ctx, clientId, at, providerUrlDarkNoResponse)
+	}
+}
+
+// Connected public providers with no URL history, so the published population
+// is large enough that the serving floor does not hide a verdict.
+func urlDarkTestFleet(ctx context.Context, t testing.TB, city *Location, count int) []*egressTestProvider {
+	providers := []*egressTestProvider{}
+	for range count {
+		providers = append(providers, egressTestConnect(ctx, t, city, egressTestFast, nil, nil))
+	}
+	return providers
+}
+
+// Publishes, then requires the same excluded set through the warm Redis
+// snapshot, the cold read-through, the dashboard reasons, the public location
+// count and a request naming each excluded provider.
+func urlDarkTestAssert(ctx context.Context, t testing.TB, city *Location, population int, candidates []*egressTestProvider, want ...*egressTestProvider) {
+	t.Helper()
+	egressTestPasses(ctx, t)
+	candidateIds := []server.Id{}
+	for _, provider := range candidates {
+		candidateIds = append(candidateIds, provider.clientId)
+	}
+	wantIds := map[server.Id]bool{}
+	for _, provider := range want {
+		wantIds[provider.clientId] = true
+	}
+
+	warm, err := getProviderHardExclusions(ctx, candidateIds)
+	connect.AssertEqual(t, err, nil)
+	if !maps.Equal(warm, wantIds) {
+		t.Fatalf("published snapshot excluded %v, want %v", warm, wantIds)
+	}
+	connect.AssertEqual(t, CountProviderEgress(ctx).ReasonCounts[ProviderExcludedUrlDark], int64(len(want)))
+	connect.AssertEqual(t, egressTestLocationCount(ctx, t, city), population-len(want))
+	for _, provider := range want {
+		providers := egressTestFind(ctx, t, []*ProviderSpec{{ClientId: &provider.clientId}}, RankModeQuality, 1, true, server.NewId())
+		connect.AssertEqual(t, len(providers), 0)
+		inspection := InspectProviderEgress(ctx, provider.clientId)
+		connect.AssertEqual(t, inspection.UrlDark, true)
+		connect.AssertEqual(t, inspection.Reason, ProviderExcludedUrlDark)
+	}
+
+	hardExclusionTestClear(ctx, t)
+	cold, err := getProviderHardExclusions(ctx, candidateIds)
+	connect.AssertEqual(t, err, nil)
+	if !maps.Equal(cold, wantIds) {
+		t.Fatalf("read-through excluded %v, want %v", cold, wantIds)
+	}
+}
+
+// The SQL that serves classifies exactly as the Go statement of the rule, and
+// anything that cannot prove no-response is not no-response.
+func TestProviderUrlDarkSqlClassifierMatchesGo(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		now := server.NowUtc()
+		status := urlDarkTestNoResponseEvidence(now)
+		status.StatusCode = 502
+		firstByte := urlDarkTestNoResponseEvidence(now)
+		firstByte.FirstByteReceived = true
+		tlsEvent := urlDarkTestNoResponseEvidence(now)
+		tlsEvent.Security = []egresshealth.UrlProbeSecurityEvent{{MeasuredAt: now, TlsFailure: true}}
+		emptySecurity := urlDarkTestNoResponseEvidence(now)
+		emptySecurity.Security = []egresshealth.UrlProbeSecurityEvent{}
+		typed := []struct {
+			ok       int
+			evidence *egresshealth.UrlProbeEvidence
+		}{
+			{1, fp2TestUrlProbeEvidence(now, true)},
+			{0, fp2TestUrlProbeEvidence(now, false)},
+			{0, nil},
+			{0, status},
+			{0, firstByte},
+			{0, tlsEvent},
+			{0, urlDarkTestNoResponseEvidence(now)},
+			{0, emptySecurity},
+			// a passing turn is never no-response whatever its document says
+			{1, urlDarkTestNoResponseEvidence(now)},
+		}
+		raw := []struct {
+			name     string
+			evidence string
+			want     bool
+		}{
+			{"json null", `null`, false},
+			{"missing first byte", `{"status_code":0,"security":null}`, false},
+			{"missing status", `{"first_byte_received":false,"security":null}`, false},
+			{"null first byte", `{"first_byte_received":null,"status_code":0}`, false},
+			{"missing security", `{"first_byte_received":false,"status_code":0}`, true},
+			{"object security", `{"first_byte_received":false,"status_code":0,"security":{}}`, false},
+		}
+		query := `SELECT ` + providerUrlDarkNoResponseSql("turn") + ` FROM provider_egress_health_history AS turn WHERE client_id = $1`
+		read := func(clientId server.Id) bool {
+			var noResponse bool
+			server.Db(ctx, func(conn server.PgConn) {
+				server.Raise(conn.QueryRow(ctx, query, clientId).Scan(&noResponse))
+			})
+			return noResponse
+		}
+		for i, c := range typed {
+			clientId := server.NewId()
+			if c.evidence == nil {
+				urlDarkTestRow(ctx, clientId, now, c.ok, nil)
+			} else {
+				urlDarkTestRow(ctx, clientId, now, c.ok, c.evidence)
+			}
+			want := classifyProviderUrlDarkTurn(c.ok, c.evidence) == providerUrlDarkNoResponse
+			if got := read(clientId); got != want {
+				t.Errorf("typed case %d: sql %t, go %t", i, got, want)
+			}
+		}
+		for _, c := range raw {
+			clientId := server.NewId()
+			urlDarkTestRow(ctx, clientId, now, 0, c.evidence)
+			if got := read(clientId); got != c.want {
+				t.Errorf("%s: sql %t, want %t", c.name, got, c.want)
+			}
+		}
+	})
+}
+
+// (a) Three no-response turns, each with the fleet answering around it: the
+// provider is hard-excluded everywhere with reason url_dark, and its status is
+// not eligible.
+func TestUrlDarkExcludedEverywhere(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
+
+		urlDarkTestAssert(ctx, t, city, 11, append(fleet, dark), dark)
+		status := GetClientProviderStatus(ctx, dark.networkId, dark.clientId)
+		connect.AssertEqual(t, status.Reason, ProviderStatusReasonNotEligible)
+	})
+}
+
+// (b) A forwarded turn as the newest breaks the run, and so does a turn whose
+// evidence is missing: neither can prove the exit is dark.
+func TestUrlDarkForwardedTurnBreaksTheRun(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		forwarded := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		unknown := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		for _, provider := range []*egressTestProvider{forwarded, unknown} {
+			urlDarkTestDark(ctx, provider.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute))
+		}
+		urlDarkTestControls(ctx, now.Add(-30*time.Minute), 3, time.Minute)
+		urlDarkTestTurn(ctx, forwarded.clientId, now.Add(-30*time.Minute), providerUrlDarkForwarded)
+		urlDarkTestRow(ctx, unknown.clientId, now.Add(-30*time.Minute), 0, nil)
+
+		urlDarkTestAssert(ctx, t, city, 12, append(fleet, forwarded, unknown))
+	})
+}
+
+// (c) A passing turn after the verdict readmits at the next publication.
+func TestUrlDarkPassingTurnReadmits(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
+		urlDarkTestAssert(ctx, t, city, 11, append(fleet, dark), dark)
+
+		urlDarkTestTurn(ctx, dark.clientId, now.Add(-10*time.Minute), providerUrlDarkSuccess)
+		urlDarkTestAssert(ctx, t, city, 11, append(fleet, dark))
+		status := GetClientProviderStatus(ctx, dark.networkId, dark.clientId)
+		if status.Reason == ProviderStatusReasonNotEligible {
+			t.Fatal("a readmitted provider is still not eligible")
+		}
+	})
+}
+
+// (d) Breaker layer 1: with fewer than three other providers succeeding in the
+// half hour before a no-response turn, the turn is excused (a fleet outage).
+// An excused turn is ignored entirely: it neither counts nor breaks a run.
+func TestUrlDarkFleetOutageIsExcused(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+
+		// Each provider's turns are an hour apart and hours from the others,
+		// so no control window reaches another turn's controls.
+
+		// two controls only
+		thin := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, thin.clientId, 2, now.Add(-12*time.Hour), now.Add(-11*time.Hour), now.Add(-10*time.Hour))
+
+		// three controls, but 31 minutes before each turn: outside the window
+		stale := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		for _, at := range []time.Time{now.Add(-9 * time.Hour), now.Add(-8 * time.Hour), now.Add(-7 * time.Hour)} {
+			urlDarkTestControls(ctx, at, 3, 31*time.Minute)
+			urlDarkTestTurn(ctx, stale.clientId, at, providerUrlDarkNoResponse)
+		}
+
+		// an excused turn in the middle of a counted run neither counts nor
+		// breaks it: the three counted turns still make a verdict
+		excusedInside := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, excusedInside.clientId, 3, now.Add(-5*time.Hour), now.Add(-4*time.Hour))
+		urlDarkTestTurn(ctx, excusedInside.clientId, now.Add(-150*time.Minute), providerUrlDarkNoResponse)
+		urlDarkTestDark(ctx, excusedInside.clientId, 3, now.Add(-60*time.Minute))
+
+		urlDarkTestAssert(ctx, t, city, 13, append(fleet, thin, stale, excusedInside), excusedInside)
+	})
+}
+
+// (e) A success within eight hours of the newest failure keeps a provider out
+// of darkness; one older than eight hours does not.
+func TestUrlDarkRecentSuccessWithinEightHours(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		newest := now.Add(-30 * time.Minute)
+		times := []time.Time{now.Add(-50 * time.Minute), now.Add(-40 * time.Minute), newest}
+		recent := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestTurn(ctx, recent.clientId, newest.Add(-7*time.Hour), providerUrlDarkSuccess)
+		old := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestTurn(ctx, old.clientId, newest.Add(-9*time.Hour), providerUrlDarkSuccess)
+		for _, at := range times {
+			urlDarkTestControls(ctx, at, 3, time.Minute)
+			urlDarkTestTurn(ctx, recent.clientId, at, providerUrlDarkNoResponse)
+			urlDarkTestTurn(ctx, old.clientId, at, providerUrlDarkNoResponse)
+		}
+
+		urlDarkTestAssert(ctx, t, city, 12, append(fleet, recent, old), old)
+	})
+}
+
+// (f) Breaker layer 2: when nearly everyone is dark, the oldest verdicts are
+// honored and at least max(10, 10%) of the published population still serves.
+func TestUrlDarkServingFloorHonorsOldest(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 3)
+		dark := []*egressTestProvider{}
+		for i := range 12 {
+			provider := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+			first := now.Add(-3*time.Hour + time.Duration(i)*5*time.Minute)
+			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
+			dark = append(dark, provider)
+		}
+		// population 15, floor 10: the five oldest first failures stand
+		connect.AssertEqual(t, providerUrlDarkServingFloor(15), 10)
+		urlDarkTestAssert(ctx, t, city, 15, append(fleet, dark...), dark[:5]...)
+	})
+}
+
+// (g) A partially failing provider is never URL-dark: a success inside eight
+// hours, or successes interleaved with failures, keep it online.
+func TestUrlDarkPartialFailureStaysOnline(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		earlierSuccess := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		interleaved := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestTurn(ctx, earlierSuccess.clientId, now.Add(-3*time.Hour), providerUrlDarkSuccess)
+		urlDarkTestDark(ctx, earlierSuccess.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
+		pattern := []providerUrlDarkTurn{
+			providerUrlDarkNoResponse, providerUrlDarkNoResponse, providerUrlDarkSuccess,
+			providerUrlDarkNoResponse, providerUrlDarkNoResponse, providerUrlDarkSuccess,
+			providerUrlDarkNoResponse, providerUrlDarkNoResponse,
+		}
+		for i, turn := range pattern {
+			at := now.Add(-4*time.Hour + time.Duration(i)*20*time.Minute)
+			urlDarkTestControls(ctx, at, 3, time.Minute)
+			urlDarkTestTurn(ctx, interleaved.clientId, at, turn)
+		}
+
+		urlDarkTestAssert(ctx, t, city, 12, append(fleet, earlierSuccess, interleaved))
+		for _, provider := range []*egressTestProvider{earlierSuccess, interleaved} {
+			inspection := InspectProviderEgress(ctx, provider.clientId)
+			if inspection.UrlDark || inspection.HardExcluded || !inspection.Online {
+				t.Errorf("%s: partial failure left online: %s", provider.clientId, fmt.Sprintf("%+v", inspection.Reason))
+			}
+		}
+	})
+}

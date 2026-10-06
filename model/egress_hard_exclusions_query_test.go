@@ -245,6 +245,16 @@ func TestProviderHardExclusionsCacheFallbackChunks(t *testing.T) {
 		outside := server.NewId()
 		server.Tx(ctx, func(tx server.PgTx) {
 			testingHardExclusionQueryTables(t, tx, false)
+			// The fallback also reads the URL-dark population and history
+			// (provider_url_dark.go); none of these providers is dark.
+			for _, query := range []string{
+				`ALTER TABLE network_client_location_reliability ADD COLUMN connected bool NOT NULL DEFAULT true, ADD COLUMN valid bool NOT NULL DEFAULT true`,
+				`CREATE TABLE network_client(client_id uuid PRIMARY KEY, active bool NOT NULL, source_client_id uuid)`,
+				`CREATE TABLE provide_key(client_id uuid, provide_mode int NOT NULL, PRIMARY KEY(client_id,provide_mode))`,
+				`CREATE TABLE provider_egress_health_history(run_id uuid PRIMARY KEY, client_id uuid NOT NULL, measured_at timestamp NOT NULL, ok_count int NOT NULL, total_count int NOT NULL, url_probe bool NOT NULL, url_probe_evidence jsonb, url_probe_policy_version int NOT NULL)`,
+			} {
+				server.RaisePgResult(tx.Exec(ctx, query))
+			}
 			for _, id := range []server.Id{ids[0], ids[len(ids)-1], outside} {
 				server.RaisePgResult(tx.Exec(ctx, `INSERT INTO network_client_location_reliability VALUES($1,true)`, id))
 			}

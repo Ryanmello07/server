@@ -3862,6 +3862,8 @@ type providerCountFilter struct {
 	blackholed map[server.Id]bool
 	// Security exceptions persist until later authenticated TLS from the same URL.
 	tlsAuthenticationFailed map[server.Id]bool
+	// Honored URL-dark verdicts, after the serving floor (provider_url_dark.go).
+	urlDark map[server.Id]bool
 }
 
 // Complete means disconnected history too. The partial covering index supplies
@@ -3915,6 +3917,9 @@ func newProviderCountFilter(ctx context.Context, loadEgressEvidence bool) provid
 		countryCodes:            GetAllProviderEgressCountryCodes(ctx),
 	}
 	f.healthCounts, f.healthWindowEnd = getAllProviderEgressHealthCountsSnapshot(ctx)
+	urlDark, err := loadProviderUrlDarkHonored(ctx, nil)
+	server.Raise(err)
+	f.urlDark = urlDark
 	server.Db(ctx, func(conn server.PgConn) {
 		rows, err := conn.Query(ctx, providerCountFilterCommonSql())
 		server.WithPgResult(rows, err, func() {
@@ -3942,7 +3947,7 @@ func (self providerCountFilter) isBlackholed(clientId server.Id) bool {
 }
 
 func (self providerCountFilter) hasHardEgressFailure(clientId server.Id) bool {
-	return self.arinRisk[clientId] || self.reliabilityFailed[clientId] || self.tlsAuthenticationFailed[clientId]
+	return self.arinRisk[clientId] || self.reliabilityFailed[clientId] || self.tlsAuthenticationFailed[clientId] || self.urlDark[clientId]
 }
 
 // Reports the indexer's accepted URL ratio after the common safety gates.
@@ -3997,7 +4002,7 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 	// a versioned marker for an authoritative empty set. Missing snapshots use SQL.
 	hardExcludedMembers := []any{providerHardExclusionsReadyMember}
 	seenHardExcludedClientIds := map[server.Id]bool{}
-	for _, exclusions := range []map[server.Id]bool{countFilter.arinRisk, countFilter.reliabilityFailed, countFilter.tlsAuthenticationFailed} {
+	for _, exclusions := range []map[server.Id]bool{countFilter.arinRisk, countFilter.reliabilityFailed, countFilter.tlsAuthenticationFailed, countFilter.urlDark} {
 		for clientId, failed := range exclusions {
 			if failed && !seenHardExcludedClientIds[clientId] {
 				hardExcludedMembers = append(hardExcludedMembers, clientId.String())

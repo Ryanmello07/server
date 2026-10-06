@@ -185,6 +185,7 @@ func TestProviderStatusScopedFilterParity(t *testing.T) {
 				"arin_non_quality":   {scoped.arinNonQuality, fleetFilter.arinNonQuality},
 				"reliability_failed": {scoped.reliabilityFailed, fleetFilter.reliabilityFailed},
 				"tls":                {scoped.tlsAuthenticationFailed, fleetFilter.tlsAuthenticationFailed},
+				"url_dark":           {scoped.urlDark, fleetFilter.urlDark},
 				"country_codes":      {scoped.countryCodes, fleetFilter.countryCodes},
 				"health_counts":      {scoped.healthCounts, fleetFilter.healthCounts},
 			} {
