@@ -121,12 +121,22 @@ if [ ! -f "$EC_DIR/jwt-ec.pem" ]; then
     openssl ec -in "$EC_DIR/jwt-ec.pem" -pubout -out "$EC_DIR/jwt-ec.pub.pem"
 fi
 
-# Download or generate MMDBs if missing.
-if [ ! -f "$MMDB_DIR/ip-ipinfo.mmdb" ] || [ ! -f "$ARIN_DIR/arin.mmdb" ]; then
-    echo "Generating beta MMDBs..."
-    go run ./scripts/gen-beta-mmdb.go
+# Geolocation inputs the server requires at startup (api and connect panic
+# without them). Always run the generator: it is idempotent and offline when
+# the files exist, and it also replaces the legacy all-"us" ARIN stub, which
+# the server would otherwise turn into an ARIN-risk exclusion of every
+# provider located outside the US.
+echo "Preparing beta MMDBs..."
+go run ./scripts/gen-beta-mmdb.go
+
+# The place list the server seeds locations from (mmdb/places.yml), derived
+# from the GeoLite2-City database beside it. Regenerate when it is missing or
+# older than the database.
+if [ ! -f "$MMDB_DIR/places.yml" ] || [ "$MMDB_DIR/geolite2.mmdb" -nt "$MMDB_DIR/places.yml" ]; then
+    echo "Generating places.yml from geolite2.mmdb..."
+    go run ./cli/geolite2export -mmdb "$MMDB_DIR/geolite2.mmdb" -out "$MMDB_DIR/places.yml"
 else
-    echo "Beta MMDBs already present."
+    echo "places.yml already current."
 fi
 
 # Build and start the Docker Compose stack.

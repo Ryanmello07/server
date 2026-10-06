@@ -1,5 +1,7 @@
 # Beta environment generated secrets and databases
 beta-vault/config/**/*.mmdb
+# derived from the GeoLite2 database beside it (cli/geolite2export); regenerate, never commit
+beta-vault/config/mmdb/places.yml
 beta-vault/vault/tls/**/*.pem
 beta-vault/vault/tls/**/*.pub.pem
 # caddy writes .crt/.key, not .pem. Without these two lines the proxy's
