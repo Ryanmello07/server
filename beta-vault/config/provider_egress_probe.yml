@@ -1,0 +1,11 @@
+# Provider URL-probe scheduler tuning for THIS deployment (beta). Read by
+# taskworker/work loadProviderEgressProbeSettings, which starts from the
+# built-in defaults and overlays this file, so only the keys below change.
+#
+# idle_delay_seconds: how long a shard waits before its next run when the last
+# run found less than a full batch. A full batch reschedules immediately, so
+# this never slows probing while a backlog exists. It matters because every
+# run mints a disposable prober shard account (model.BeginProberShard) BEFORE
+# it asks for due work: at the 5s default, 4 idle shards create and clean up
+# ~48 accounts a minute with nothing to probe. 120s keeps that to ~2 a minute.
+idle_delay_seconds: 120
