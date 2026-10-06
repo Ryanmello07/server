@@ -27,6 +27,15 @@
 	# address, the whole deployment shared one signup budget, and real users
 	# got 429/503 on their first account.
 	header_up X-UR-Forwarded-For "{http.request.remote}"
+
+	# Since the 2026-10-06 upstream merge the router trusts X-UR-Request-Buffering
+	# to mean "this body streams at the client's pace", and swaps the server's
+	# read/write timeouts for its more lenient streaming policy
+	# (router/streaming_body.go). The upstream contract is that the load balancer
+	# strips any client-supplied value; without this a client could claim a
+	# streamed body to buy itself longer timeouts. Stripping keeps the timeouts
+	# beta has always applied.
+	header_up -X-UR-Request-Buffering
 }
 
 api.beta-test.net {

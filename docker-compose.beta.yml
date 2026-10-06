@@ -117,11 +117,16 @@ services:
       BRINGYOUR_REDIS_HOSTNAME: redis
       WARP_HOME: /srv/warp
     command: ["taskworker", "--count=2", "--batch_size=2"]
+    # Waits for migrate like api and connect. Since the 2026-10-06 merge a
+    # taskworker that starts against an older schema latches "not ready", and
+    # migration 744's settlement guard fails any writer older than the schema.
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./beta-vault:/srv/warp:ro
 
@@ -290,6 +295,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   egress-prober:
     logging:

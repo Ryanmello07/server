@@ -15,20 +15,19 @@ COPY ./userwireguard /workspace/userwireguard
 COPY ./sn /workspace/sn
 # required since the upstream merge: go.mod replaces goidenticons with ../goidenticons
 COPY ./goidenticons /workspace/goidenticons
-# required since the 2026-09-10 upstream merge: the egress prober moved into the
-# server taskworker (taskworker/work/provider_egress_probe_work.go imports
-# operator-proxy directly), so it is now a build dependency, not just a
-# separately-deployed service.
-COPY ./operator-proxy /workspace/operator-proxy
-# required since the 2026-09-15 upstream merge: alt/ imports
-# github.com/urnetwork/warp/services, so warp is a build dependency now.
-COPY ./warp /workspace/warp
+# required since the 2026-10-06 upstream merge: go.mod replaces gvisor.dev/gvisor
+# with ../gvisor (the urnetwork fork, pinned in .github/workflows/test.yml). The
+# merge also dropped the operator-proxy and warp replaces -- nothing imports
+# either any more -- so they are no longer copied.
+COPY ./gvisor /workspace/gvisor
 
 WORKDIR /workspace/server
 # Build only the binaries the beta stack runs, not ./... . Beta ships these
 # four; building the rest (connect/sim-latency, monitor, scripts) only makes
 # the image larger and lets breakage in a tool beta never runs block a deploy.
-RUN go mod tidy && CGO_ENABLED=0 go build -o /out/ \
+# -mod=readonly, not `go mod tidy`: build exactly the go.mod/go.sum upstream
+# tested, so the image cannot silently resolve a different dependency set.
+RUN CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -o /out/ \
     ./bringyourctl ./cli/api ./cli/connect ./cli/taskworker ./cli/proxy
 
 FROM debian:bookworm-slim
