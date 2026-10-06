@@ -543,7 +543,8 @@ func providerHardExclusionsSql() string {
 
 // Which candidates the complete cached set excludes. A missing, expired or
 // legacy snapshot has unknown coverage, so read only these candidates from
-// the primary database. Backend errors never become an empty exclusion set.
+// the primary database. Backend errors never become an empty exclusion set,
+// except URL-dark's, which fail open (loadProviderUrlDarkHonored).
 func getProviderHardExclusions(ctx context.Context, clientIds []server.Id) (excludedClientIds map[server.Id]bool, returnErr error) {
 	excludedClientIds = map[server.Id]bool{}
 	if len(clientIds) == 0 {
