@@ -43,7 +43,7 @@ var providerUrlDarkScopedTimeout = 5 * time.Second
 var providerUrlDarkRetryAfter = time.Minute
 
 // Breaker layer 2, serving floor: verdicts are released, newest first, until
-// at least max(10, ceil(10%)) of the published population remains.
+// at least max(10, ceil(10%)) of the population remains.
 const providerUrlDarkMinimumServing = 10
 const providerUrlDarkMinimumServingPercent = 10
 
@@ -100,7 +100,7 @@ func providerUrlDarkCountedSql(alias string, version int) string {
 }
 
 // One row per call: the population's size, then each dark member (NULL when
-// none) with the oldest of its K failures.
+// none) with its last answer within the horizon (NULL when none).
 //
 // A member's walk starts after its newest counted turn within the horizon
 // that is not no-response (answered: a success or a forwarded turn, never
@@ -161,7 +161,7 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 		)
 		%[5]s
 	), recent AS MATERIALIZED (
-		SELECT member.client_id, turn.measured_at
+		SELECT member.client_id, member.answered_at, turn.measured_at
 		FROM member
 		CROSS JOIN LATERAL (
 			SELECT turn.measured_at, turn.run_id
@@ -174,9 +174,9 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 			LIMIT $2
 		) AS turn
 	), dark AS (
-		SELECT recent.client_id, min(recent.measured_at) AS oldest_failure_at
+		SELECT recent.client_id, recent.answered_at
 		FROM recent
-		GROUP BY recent.client_id
+		GROUP BY recent.client_id, recent.answered_at
 		HAVING count(*) = $2
 		AND NOT EXISTS (
 			SELECT 1 FROM provider_egress_health_history AS success
@@ -184,7 +184,7 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 			AND success.measured_at > max(recent.measured_at) - make_interval(secs => $4)
 		)
 	)
-	SELECT population_count.count, dark.client_id, dark.oldest_failure_at
+	SELECT population_count.count, dark.client_id, dark.answered_at
 	FROM (SELECT count(*) AS count FROM population) AS population_count
 	LEFT JOIN dark ON true
 	`,
@@ -225,10 +225,11 @@ func providerUrlDarkControlSql(version int) string {
 	return "EXISTS (\n\t\t\tSELECT 1 FROM (SELECT) AS start\n\t\t\t" + strings.Join(probes, "\n\t\t\t") + "\n\t\t)"
 }
 
-// A dark member of the published population.
+// A dark member of the population, with its last answer (a success or a
+// forwarded turn) within the horizon, or nil when there is none.
 type providerUrlDarkVerdict struct {
-	clientId        server.Id
-	oldestFailureAt time.Time
+	clientId   server.Id
+	answeredAt *time.Time
 }
 
 // The fewest providers URL-dark may leave serving: max(10, ceil(10%)).
@@ -237,17 +238,24 @@ func providerUrlDarkServingFloor(populationCount int) int {
 }
 
 // Breaker layer 2. Honors every verdict while the floor holds; otherwise only
-// the oldest (by first failure, then client id), as many as keep the floor. A
-// wave the positive control missed then cannot empty the list, while verdicts
-// that predate it stand. A population at or below the floor honors none.
+// the longest standing, as many as keep the floor: by last answer within the
+// horizon (none first), then client id. That key holds still while a provider
+// stays dark, where the oldest of its K most recent failures moves with each
+// paced burst, so the honored set does not churn between passes, and a wave
+// of providers that answered just before it is released first. A population
+// at or below the floor honors none.
 func honorProviderUrlDarkVerdicts(populationCount int, verdicts []providerUrlDarkVerdict) map[server.Id]bool {
 	honored := map[server.Id]bool{}
 	allowed := max(0, populationCount-providerUrlDarkServingFloor(populationCount))
 	if len(verdicts) > allowed {
 		verdicts = append([]providerUrlDarkVerdict(nil), verdicts...)
 		sort.Slice(verdicts, func(i, j int) bool {
-			if !verdicts[i].oldestFailureAt.Equal(verdicts[j].oldestFailureAt) {
-				return verdicts[i].oldestFailureAt.Before(verdicts[j].oldestFailureAt)
+			a, b := verdicts[i].answeredAt, verdicts[j].answeredAt
+			if (a == nil) != (b == nil) {
+				return a == nil
+			}
+			if a != nil && !a.Equal(*b) {
+				return a.Before(*b)
 			}
 			return bytes.Compare(verdicts[i].clientId[:], verdicts[j].clientId[:]) < 0
 		})
@@ -292,14 +300,14 @@ func loadProviderUrlDarkVerdicts(ctx context.Context, clientIds []server.Id) (po
 			for rows.Next() {
 				var count int64
 				var clientId *server.Id
-				var oldestFailureAt *time.Time
-				if err := rows.Scan(&count, &clientId, &oldestFailureAt); err != nil {
+				var answeredAt *time.Time
+				if err := rows.Scan(&count, &clientId, &answeredAt); err != nil {
 					returnErr = err
 					return
 				}
 				populationCount = int(count)
-				if clientId != nil && oldestFailureAt != nil {
-					verdicts = append(verdicts, providerUrlDarkVerdict{clientId: *clientId, oldestFailureAt: *oldestFailureAt})
+				if clientId != nil {
+					verdicts = append(verdicts, providerUrlDarkVerdict{clientId: *clientId, answeredAt: answeredAt})
 				}
 			}
 			returnErr = rows.Err()

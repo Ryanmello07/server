@@ -88,8 +88,9 @@ func TestProviderUrlDarkDecision(t *testing.T) {
 	connect.AssertEqual(t, filter.egressFacts(clientId, nil, nil, nil, DefaultEgressIndexSettings()).urlDark, true)
 }
 
-// The floor is a no-op while plenty remain, releases the newest verdicts
-// first when it binds, and never leaves fewer than max(10, ceil(10%)).
+// The floor is a no-op while plenty remain, releases the verdicts whose last
+// answer is newest first when it binds, and never leaves fewer than
+// max(10, ceil(10%)).
 func TestProviderUrlDarkServingFloor(t *testing.T) {
 	connect.AssertEqual(t, providerUrlDarkServingFloor(0), 10)
 	connect.AssertEqual(t, providerUrlDarkServingFloor(100), 10)
@@ -100,8 +101,9 @@ func TestProviderUrlDarkServingFloor(t *testing.T) {
 	verdicts := func(n int) []providerUrlDarkVerdict {
 		out := []providerUrlDarkVerdict{}
 		for i := range n {
-			// listed newest first, so the floor must sort
-			out = append(out, providerUrlDarkVerdict{clientId: server.NewId(), oldestFailureAt: now.Add(-time.Duration(i) * time.Minute)})
+			// listed newest answer first, so the floor must sort
+			answeredAt := now.Add(-time.Duration(i) * time.Minute)
+			out = append(out, providerUrlDarkVerdict{clientId: server.NewId(), answeredAt: &answeredAt})
 		}
 		return out
 	}
@@ -123,8 +125,13 @@ func TestProviderUrlDarkServingFloor(t *testing.T) {
 		}
 	}
 
-	// equal first failures order by client id
-	a := providerUrlDarkVerdict{clientId: server.Id{1}, oldestFailureAt: now}
-	b := providerUrlDarkVerdict{clientId: server.Id{2}, oldestFailureAt: now}
+	// equal answers order by client id
+	a := providerUrlDarkVerdict{clientId: server.Id{1}, answeredAt: &now}
+	b := providerUrlDarkVerdict{clientId: server.Id{2}, answeredAt: &now}
 	connect.AssertEqual(t, honorProviderUrlDarkVerdicts(11, []providerUrlDarkVerdict{b, a}), map[server.Id]bool{a.clientId: true})
+	// no answer within the horizon stands longest, whatever its id
+	never := providerUrlDarkVerdict{clientId: server.Id{9}}
+	connect.AssertEqual(t, honorProviderUrlDarkVerdicts(11, []providerUrlDarkVerdict{a, never}), map[server.Id]bool{never.clientId: true})
+	never2 := providerUrlDarkVerdict{clientId: server.Id{3}}
+	connect.AssertEqual(t, honorProviderUrlDarkVerdicts(11, []providerUrlDarkVerdict{never, never2}), map[server.Id]bool{never2.clientId: true})
 }

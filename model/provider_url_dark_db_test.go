@@ -313,8 +313,9 @@ func TestUrlDarkRecentSuccessWithinEightHours(t *testing.T) {
 	})
 }
 
-// (f) Breaker layer 2: when nearly everyone is dark, the oldest verdicts are
-// honored and at least max(10, 10%) of the published population still serves.
+// (f) Breaker layer 2: when nearly everyone is dark, the longest-standing
+// verdicts are honored and at least max(10, 10%) of the population still
+// serves.
 func TestUrlDarkServingFloorHonorsOldest(t *testing.T) {
 	server.DefaultTestEnv().Run(t, func(t testing.TB) {
 		ctx := context.Background()
@@ -325,10 +326,12 @@ func TestUrlDarkServingFloorHonorsOldest(t *testing.T) {
 		for i := range 12 {
 			provider := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 			first := now.Add(-3*time.Hour + time.Duration(i)*5*time.Minute)
+			// it last answered more than eight hours before its failures
+			urlDarkTestTurn(ctx, provider.clientId, first.Add(-9*time.Hour), providerUrlDarkSuccess)
 			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
 			dark = append(dark, provider)
 		}
-		// population 15, floor 10: the five oldest first failures stand
+		// population 15, floor 10: the five that answered longest ago stand
 		connect.AssertEqual(t, providerUrlDarkServingFloor(15), 10)
 		urlDarkTestAssert(ctx, t, city, 15, append(fleet, dark...), dark[:5]...)
 
@@ -565,5 +568,29 @@ func TestUrlDarkReadFailsOpen(t *testing.T) {
 		providerUrlDarkLast.failedAt = time.Time{}
 		providerUrlDarkLast.Unlock()
 		published(dark)
+	})
+}
+
+// The floor honors the longest-standing verdicts by last answer, a key a
+// dark provider's paced bursts do not move: a provider dark for the whole
+// horizon that just had a fresh burst outranks one that answered half a day
+// ago and went dark two hours ago.
+func TestUrlDarkServingFloorKeyIsStable(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 9)
+		// created first so a tie on the key would favor it by client id
+		recent := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestTurn(ctx, recent.clientId, now.Add(-12*time.Hour), providerUrlDarkSuccess)
+		urlDarkTestDark(ctx, recent.clientId, 3, now.Add(-2*time.Hour), now.Add(-119*time.Minute), now.Add(-118*time.Minute))
+		longDark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		first := now.Add(-20 * time.Hour)
+		urlDarkTestDark(ctx, longDark.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
+		urlDarkTestDark(ctx, longDark.clientId, 3, now.Add(-20*time.Minute), now.Add(-19*time.Minute), now.Add(-18*time.Minute))
+
+		// population 11, floor 10: one verdict stands
+		urlDarkTestAssert(ctx, t, city, 11, append(fleet, recent, longDark), longDark)
 	})
 }
