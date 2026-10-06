@@ -372,8 +372,9 @@ func readProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) (map
 // never stop publication or a request: if a read errs or outlasts its budget,
 // the last set this process computed stands while younger than
 // ProviderEgressHealthMaxAge, else none. Both breaker layers already lean
-// toward serving; holding the last set keeps a seeded proxy out through the
-// prober outage that makes the walk slow, which no successes could readmit.
+// toward serving; holding the last set keeps a seeded proxy out through a
+// prober outage that makes the walk slow, which no successes could readmit,
+// for up to that age. A longer outage, or a fresh process, serves them.
 func loadProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) map[server.Id]bool {
 	if clientIds != nil && len(clientIds) == 0 {
 		return map[server.Id]bool{}
