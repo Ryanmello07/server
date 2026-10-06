@@ -1,0 +1,179 @@
+# URL-probe destination catalog for THIS deployment (beta).
+#
+# Resource model.ProviderEgressSitesResourceName ("qualityprobe.yml"), read by
+# controller.LoadProviderEgressSites from the config tree (WARP_HOME=/srv/warp
+# -> /srv/warp/config/qualityprobe.yml). The api serves it to the taskworker's
+# URL probes as GET /network/provider-egress-destinations. Upstream ships no
+# catalog and there is no compiled-in fallback: without this file nothing is
+# probed and every provider stays "unprobed".
+#
+# Rules every entry was checked against. Keep them when editing:
+#
+# 1. Never list a pinned host. The probe pin-checks every host the server
+#    serves a certificate pin for: model.GeolocationSourceHosts = api.i.pn,
+#    free.freeipapi.com, ipinfo.io (observed into geolocation_source_pin and
+#    served to the taskworker). Redirect hops are checked against the FULL
+#    served set (fleetprobe/full.go RedirectPins), so no entry may redirect to
+#    them either. A pin mismatch is a TLS authentication failure, one of the
+#    three HARD exclusions in model/egress_index.go decideProviderEgress, for
+#    every provider that loads the URL.
+# 2. Every chain must verify under the taskworker image's root store, not a
+#    workstation's: Dockerfile.beta is debian:bookworm-slim with
+#    ca-certificates 20230311+deb12u1. Go does not fetch missing
+#    intermediates. A chain that fails there fails for every provider, which is
+#    the same fleet-wide hard exclusion as rule 1.
+# 3. Never declare `expect: status` with 204 or 205. The loader accepts it, but
+#    egresshealth.checkUrlProbe then refuses the whole catalog on every probe.
+# 4. A URL probe judges the final response only: 2xx with real content
+#    (CAPTCHA, challenge and portal pages fail), final-request TTFB within
+#    max_ttfb_ms, and either a complete body or the throughput floor. expect,
+#    status and max_bytes are legacy batch-path fields that the URL judge does
+#    not read (except rule 3). Every entry here answers 2xx with a body directly,
+#    with no redirect, so the default `expect: body` holds on both paths.
+#
+# url_probe_policy is omitted on purpose, so egresshealth.DefaultUrlProbePolicy()
+# applies: version 1, max_redirects 5, max_body_bytes 1048576, max_ttfb_ms
+# 2000, min_throughput_bps 100000, min_throughput_bytes 16384.
+#
+# Ported from the old prober's built-in table (operator-proxy
+# egresshealth/egresshealth.go `destinations`), names and URLs unchanged.
+# Measured 2026-10-06 from the beta host through egresshealth.Check in
+# URL-probe mode, over IPv4 with the provider tunnel's TLS settings
+# (PinnedTlsConfigForHost: no ALPN, HTTP/1.1, no keep-alive) and the bookworm
+# root store. Every entry below passed 6 of 6 loads with no redirect. The
+# slowest final TTFB was 554 ms (atlassian, then target), against the 2 s limit.
+#
+# Left out of the old table:
+#   - generate_204 x5 (www.google.com, connectivitycheck.gstatic.com,
+#     www.gstatic.com, connectivity-check.ubuntu.com, cp.cloudflare.com):
+#     rule 3.
+#   - Declared 3xx / 202 / reachable contracts (fastly, microsoft-azure-cdn,
+#     fedora-downloads, hulu, microsoft, gitlab, mdn, the-guardian, france-24,
+#     imdb, jd-com, vk, line, zoom, notion, playstation, xbox, nintendo,
+#     riot-games, stack-overflow): the URL judge ignores the declared status
+#     and would judge an unmeasured redirect target instead.
+#   - cloudflare-trace (https://1.1.1.1) and cloudflare-one-one-one-one
+#     (one.one.one.one -> 1.1.1.1/1.0.0.1): some consumer gateways and
+#     enterprise controllers answer 1.1.1.1 locally. A local certificate there
+#     would hard-exclude a healthy provider.
+#   - example-com-https: under the bookworm roots it verifies only through a
+#     cross-sign to the 2004 Comodo "AAA Certificate Services" root.
+#   - github-api: per-IP unauthenticated rate limit.
+#   - Failed the URL judge from the beta host: amazon (202 WAF captcha);
+#     ap-news, ecosia, canva, epic-games (captcha/challenge); ebay, etsy (403);
+#     reuters (401); aliexpress (redirect loop); mail-ru (redirects through
+#     login.vk.ru); tiktok (TTFB 2.06 s against the 2 s limit).
+#   - ipinfo: already absent from the old table, and pinned (rule 1).
+schema_version: 1
+destinations:
+  # DNS-over-HTTPS, JSON GET form. Each answer is verified as a resolved name.
+  - {name: cloudflare-doh, class: dns, category: doh, url: "https://cloudflare-dns.com/dns-query?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+  - {name: google-doh, class: dns, category: doh, url: "https://dns.google/resolve?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+  - {name: adguard-doh, class: dns, category: doh, url: "https://dns.adguard-dns.com/resolve?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+  - {name: dnssb-doh, class: dns, category: doh, url: "https://doh.dns.sb/dns-query?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+  - {name: nextdns-doh, class: dns, category: doh, url: "https://dns.nextdns.io/dns-query?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+  - {name: alidns-doh, class: dns, category: doh, url: "https://dns.alidns.com/resolve?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+  - {name: dnspod-doh, class: dns, category: doh, url: "https://doh.pub/dns-query?name=example.com&type=A", headers: {Accept: application/dns-json}, max_bytes: 768, verify: {kind: dns_json}}
+
+  # Connectivity: OS portal-detection endpoints with a fixed-text check, and the
+  # plain-text echo services whose ip_text answer is the provider's exit
+  # address (egresshealth samples it as optional exit evidence).
+  - {name: apple-captive-portal, class: connectivity, category: portal-check, url: "https://captive.apple.com/hotspot-detect.html", max_bytes: 256, verify: {kind: contains, text: "Success"}}
+  - {name: firefox-detectportal, class: connectivity, category: portal-check, url: "https://detectportal.firefox.com/success.txt", max_bytes: 256, verify: {kind: contains, text: "success"}}
+  - {name: gnome-nm-check, class: connectivity, category: portal-check, url: "https://nmcheck.gnome.org/check_network_status.txt", max_bytes: 256, verify: {kind: contains, text: "online"}}
+  - {name: aws-checkip, class: connectivity, category: ip-echo, url: "https://checkip.amazonaws.com", max_bytes: 256, verify: {kind: ip_text}}
+  - {name: ifconfig-me, class: connectivity, category: ip-echo, url: "https://ifconfig.me/ip", max_bytes: 256, verify: {kind: ip_text}}
+  - {name: icanhazip, class: connectivity, category: ip-echo, url: "https://icanhazip.com", max_bytes: 256, verify: {kind: ip_text}}
+  - {name: ipify, class: connectivity, category: ip-echo, url: "https://api.ipify.org", max_bytes: 256, verify: {kind: ip_text}}
+
+  # CDN edges, static assets and distribution mirrors. The large assets are
+  # where the URL judge measures throughput: it samples about 64 KiB, then
+  # closes the connection.
+  - {name: cloudflare-cdn, class: cdn, category: static-asset, url: "https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css"}
+  - {name: cloudflare-sized-1kb, class: cdn, category: static-asset, url: "https://speed.cloudflare.com/__down?bytes=1024"}
+  - {name: jsdelivr-fastly-mirror, class: cdn, category: static-asset, url: "https://fastly.jsdelivr.net/npm/normalize.css@8.0.1/normalize.min.css"}
+  - {name: unpkg, class: cdn, category: static-asset, url: "https://unpkg.com"}
+  - {name: google-hosted-libraries, class: cdn, category: static-asset, url: "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"}
+  - {name: amazon-cloudfront, class: cdn, category: static-asset, url: "https://sdk.amazonaws.com/js/aws-sdk-2.1691.0.min.js"}
+  - {name: keycdn, class: cdn, category: cdn-vendor, url: "https://www.keycdn.com"}
+  - {name: cdn77, class: cdn, category: cdn-vendor, url: "https://www.cdn77.com"}
+  - {name: sucuri-cdn, class: cdn, category: cdn-vendor, url: "https://www.sucuri.net/robots.txt"}
+  - {name: cachefly, class: cdn, category: static-asset, url: "https://cachefly.cachefly.net/10mb.test"}
+  - {name: ovh-proof-eu, class: cdn, category: mirror, url: "https://proof.ovh.net"}
+  - {name: kernel-org-mirrors, class: cdn, category: mirror, url: "https://mirrors.kernel.org"}
+  - {name: debian-cdn, class: cdn, category: mirror, url: "https://deb.debian.org"}
+  - {name: ubuntu-archive-plain-http, class: cdn, category: mirror, url: "https://archive.ubuntu.com"}
+  - {name: alpine-cdn, class: cdn, category: mirror, url: "https://dl-cdn.alpinelinux.org"}
+
+  # Ordinary web properties, regional ones included (see egresshealth
+  # ClassSite for why those are not a class of their own).
+  - {name: cloudflare-speed-test, class: site, category: infrastructure, url: "https://speed.cloudflare.com"}
+  - {name: google, class: site, category: search, url: "https://www.google.com"}
+  - {name: bing, class: site, category: search, url: "https://www.bing.com"}
+  - {name: yahoo, class: site, category: search, url: "https://www.yahoo.com"}
+  - {name: duckduckgo, class: site, category: search, url: "https://duckduckgo.com"}
+  - {name: baidu, class: site, category: search, url: "https://www.baidu.com"}
+  - {name: yandex, class: site, category: search, url: "https://yandex.com"}
+  - {name: facebook, class: site, category: social, url: "https://www.facebook.com"}
+  - {name: instagram, class: site, category: social, url: "https://www.instagram.com"}
+  - {name: twitter-x, class: site, category: social, url: "https://x.com"}
+  - {name: linkedin, class: site, category: social, url: "https://www.linkedin.com"}
+  - {name: pinterest, class: site, category: social, url: "https://www.pinterest.com"}
+  - {name: snapchat, class: site, category: social, url: "https://www.snapchat.com"}
+  - {name: discord, class: site, category: social, url: "https://discord.com"}
+  - {name: telegram, class: site, category: social, url: "https://telegram.org"}
+  - {name: whatsapp, class: site, category: social, url: "https://www.whatsapp.com"}
+  - {name: mastodon, class: site, category: social, url: "https://mastodon.social"}
+  - {name: bluesky, class: site, category: social, url: "https://bsky.app"}
+  - {name: reddit, class: site, category: social, url: "https://www.reddit.com"}
+  - {name: youtube, class: site, category: video, url: "https://www.youtube.com"}
+  - {name: netflix, class: site, category: video, url: "https://www.netflix.com/robots.txt"}
+  - {name: twitch, class: site, category: video, url: "https://www.twitch.tv"}
+  - {name: vimeo, class: site, category: video, url: "https://vimeo.com"}
+  - {name: disney, class: site, category: video, url: "https://www.disneyplus.com"}
+  - {name: dailymotion, class: site, category: video, url: "https://www.dailymotion.com"}
+  - {name: spotify, class: site, category: audio, url: "https://open.spotify.com"}
+  - {name: soundcloud, class: site, category: audio, url: "https://soundcloud.com"}
+  - {name: walmart, class: site, category: commerce, url: "https://www.walmart.com"}
+  - {name: alibaba, class: site, category: commerce, url: "https://www.alibaba.com"}
+  - {name: target, class: site, category: commerce, url: "https://www.target.com"}
+  - {name: shopify, class: site, category: commerce, url: "https://www.shopify.com"}
+  - {name: mercadolibre, class: site, category: commerce, url: "https://www.mercadolibre.com"}
+  - {name: apple, class: site, category: technology, url: "https://www.apple.com/robots.txt"}
+  - {name: akamai, class: site, category: technology, url: "https://www.akamai.com"}
+  - {name: github, class: site, category: developer, url: "https://github.com/robots.txt"}
+  - {name: cloudflare, class: site, category: developer, url: "https://www.cloudflare.com/robots.txt"}
+  - {name: aws, class: site, category: developer, url: "https://aws.amazon.com"}
+  - {name: google-cloud, class: site, category: developer, url: "https://cloud.google.com"}
+  - {name: digitalocean, class: site, category: developer, url: "https://www.digitalocean.com"}
+  - {name: docker-hub, class: site, category: developer, url: "https://hub.docker.com"}
+  - {name: npm-registry, class: site, category: developer, url: "https://registry.npmjs.org"}
+  - {name: pypi, class: site, category: developer, url: "https://pypi.org"}
+  - {name: rubygems, class: site, category: developer, url: "https://rubygems.org"}
+  - {name: python-org, class: site, category: developer, url: "https://www.python.org"}
+  - {name: go-dev, class: site, category: developer, url: "https://go.dev"}
+  - {name: kernel-org, class: site, category: developer, url: "https://www.kernel.org"}
+  - {name: cnn, class: site, category: news, url: "https://www.cnn.com/robots.txt"}
+  - {name: bbc, class: site, category: news, url: "https://www.bbc.com"}
+  - {name: new-york-times, class: site, category: news, url: "https://www.nytimes.com"}
+  - {name: al-jazeera, class: site, category: news, url: "https://www.aljazeera.com"}
+  - {name: deutsche-welle, class: site, category: news, url: "https://www.dw.com"}
+  - {name: times-of-india, class: site, category: news, url: "https://timesofindia.indiatimes.com/robots.txt"}
+  - {name: abc-australia, class: site, category: news, url: "https://www.abc.net.au"}
+  - {name: news24, class: site, category: news, url: "https://www.news24.com"}
+  - {name: wikipedia, class: site, category: reference, url: "https://www.wikipedia.org/static/favicon/wikipedia.ico"}
+  - {name: internet-archive, class: site, category: reference, url: "https://archive.org"}
+  - {name: noaa-weather, class: site, category: reference, url: "https://www.weather.gov"}
+  - {name: wordpress, class: site, category: publishing, url: "https://wordpress.com"}
+  - {name: qq, class: site, category: regional, url: "https://www.qq.com"}
+  - {name: sina, class: site, category: regional, url: "https://www.sina.com.cn"}
+  - {name: taobao, class: site, category: regional, url: "https://www.taobao.com"}
+  - {name: naver, class: site, category: regional, url: "https://www.naver.com"}
+  - {name: globo, class: site, category: regional, url: "https://www.globo.com"}
+  - {name: slack, class: site, category: productivity, url: "https://slack.com"}
+  - {name: dropbox, class: site, category: productivity, url: "https://www.dropbox.com"}
+  - {name: trello, class: site, category: productivity, url: "https://trello.com"}
+  - {name: atlassian, class: site, category: productivity, url: "https://www.atlassian.com"}
+  - {name: figma, class: site, category: productivity, url: "https://www.figma.com"}
+  - {name: steam, class: site, category: gaming, url: "https://store.steampowered.com"}
+  - {name: roblox, class: site, category: gaming, url: "https://www.roblox.com"}
