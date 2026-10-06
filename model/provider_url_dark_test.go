@@ -39,6 +39,8 @@ func TestProviderUrlDarkClassify(t *testing.T) {
 	tlsEvent.Security = []egresshealth.UrlProbeSecurityEvent{{MeasuredAt: now, TlsFailure: true}}
 	emptySecurity := urlDarkTestNoResponseEvidence(now)
 	emptySecurity.Security = []egresshealth.UrlProbeSecurityEvent{}
+	runEnded := urlDarkTestNoResponseEvidence(now)
+	runEnded.FailureStage = "run_ended"
 
 	for _, c := range []struct {
 		name     string
@@ -53,6 +55,8 @@ func TestProviderUrlDarkClassify(t *testing.T) {
 		{"status code", 0, status, providerUrlDarkForwarded},
 		{"first byte", 0, firstByte, providerUrlDarkForwarded},
 		{"tls event", 0, tlsEvent, providerUrlDarkForwarded},
+		// the prober ran out of budget before the first attempt
+		{"run ended", 0, runEnded, providerUrlDarkForwarded},
 		{"no response", 0, noResponse, providerUrlDarkNoResponse},
 		{"no response, empty security", 0, emptySecurity, providerUrlDarkNoResponse},
 	} {

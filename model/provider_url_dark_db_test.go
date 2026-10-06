@@ -133,6 +133,8 @@ func TestProviderUrlDarkSqlClassifierMatchesGo(t *testing.T) {
 		tlsEvent.Security = []egresshealth.UrlProbeSecurityEvent{{MeasuredAt: now, TlsFailure: true}}
 		emptySecurity := urlDarkTestNoResponseEvidence(now)
 		emptySecurity.Security = []egresshealth.UrlProbeSecurityEvent{}
+		runEnded := urlDarkTestNoResponseEvidence(now)
+		runEnded.FailureStage = "run_ended"
 		typed := []struct {
 			ok       int
 			evidence *egresshealth.UrlProbeEvidence
@@ -145,6 +147,7 @@ func TestProviderUrlDarkSqlClassifierMatchesGo(t *testing.T) {
 			{0, tlsEvent},
 			{0, urlDarkTestNoResponseEvidence(now)},
 			{0, emptySecurity},
+			{0, runEnded},
 			// a passing turn is never no-response whatever its document says
 			{1, urlDarkTestNoResponseEvidence(now)},
 		}
@@ -159,6 +162,8 @@ func TestProviderUrlDarkSqlClassifierMatchesGo(t *testing.T) {
 			{"null first byte", `{"first_byte_received":null,"status_code":0}`, false},
 			{"missing security", `{"first_byte_received":false,"status_code":0}`, true},
 			{"object security", `{"first_byte_received":false,"status_code":0,"security":{}}`, false},
+			{"run ended", `{"first_byte_received":false,"status_code":0,"security":null,"failure_stage":"run_ended"}`, false},
+			{"null failure stage", `{"first_byte_received":false,"status_code":0,"security":null,"failure_stage":null}`, true},
 		}
 		query := `SELECT ` + providerUrlDarkNoResponseSql("turn") + ` FROM provider_egress_health_history AS turn WHERE client_id = $1`
 		read := func(clientId server.Id) bool {

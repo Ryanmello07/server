@@ -40,6 +40,10 @@ const (
 	providerUrlDarkNoResponse
 )
 
+// The prober's own budget ended before the load's first attempt (retry.go): a
+// failure on the run, but not a provider that answered nothing.
+const providerUrlDarkRunEndedStage = "run_ended"
+
 // The Go statement of providerUrlDarkNoResponseSql, which is what serves. Nil
 // evidence is forwarded on purpose: it cannot prove no-response, so it must
 // never push a provider toward darkness.
@@ -47,7 +51,8 @@ func classifyProviderUrlDarkTurn(okCount int, evidence *egresshealth.UrlProbeEvi
 	switch {
 	case okCount == 1:
 		return providerUrlDarkSuccess
-	case evidence == nil || evidence.FirstByteReceived || evidence.StatusCode != 0 || len(evidence.Security) > 0:
+	case evidence == nil || evidence.FirstByteReceived || evidence.StatusCode != 0 || len(evidence.Security) > 0 ||
+		evidence.FailureStage == providerUrlDarkRunEndedStage:
 		return providerUrlDarkForwarded
 	default:
 		return providerUrlDarkNoResponse
@@ -56,13 +61,15 @@ func classifyProviderUrlDarkTurn(okCount int, evidence *egresshealth.UrlProbeEvi
 
 // A counted turn at alias that provably received nothing. Each key must be
 // present with its exact empty value; a missing key or NULL/JSON-null
-// evidence is forwarded. COALESCE keeps it a strict boolean, because a NULL
-// would be skipped by bool_and and could not break a streak.
+// evidence is forwarded, and so is a run_ended load. COALESCE keeps it a
+// strict boolean, because a NULL would be skipped by bool_and and could not
+// break a streak.
 func providerUrlDarkNoResponseSql(alias string) string {
 	return fmt.Sprintf(`COALESCE(%[1]s.ok_count = 0
 		AND %[1]s.url_probe_evidence->'first_byte_received' = 'false'::jsonb
 		AND %[1]s.url_probe_evidence->'status_code' = '0'::jsonb
-		AND COALESCE(%[1]s.url_probe_evidence->'security', 'null'::jsonb) IN ('null'::jsonb, '[]'::jsonb), false)`, alias)
+		AND COALESCE(%[1]s.url_probe_evidence->'security', 'null'::jsonb) IN ('null'::jsonb, '[]'::jsonb)
+		AND COALESCE(%[1]s.url_probe_evidence->>'failure_stage', '') <> '%[2]s', false)`, alias, providerUrlDarkRunEndedStage)
 }
 
 // Counted URL turns: accepted cycle-admitted single-URL receipts of the
