@@ -440,3 +440,34 @@ func TestUrlDarkNeedsKTurns(t *testing.T) {
 		urlDarkTestAssert(ctx, t, city, 11, append(fleet, short))
 	})
 }
+
+// Breaker layer 2 counts only providers no other hard exclusion removes: a
+// TLS-quarantined provider serves no one, so it neither raises the floor's
+// budget nor takes a verdict's place.
+func TestUrlDarkServingFloorIgnoresOtherExclusions(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 3)
+		for range 5 {
+			quarantined := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+			server.Tx(ctx, func(tx server.PgTx) {
+				server.RaisePgResult(tx.Exec(ctx, `INSERT INTO provider_egress_url_security(client_id,url_key,destination,measured_at,tls_failure)
+					VALUES($1,'synthetic','{}',$2,true)`, quarantined.clientId, now))
+			})
+		}
+		dark := []*egressTestProvider{}
+		for i := range 12 {
+			provider := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+			first := now.Add(-3*time.Hour + time.Duration(i)*5*time.Minute)
+			// it last answered more than eight hours before its failures
+			urlDarkTestTurn(ctx, provider.clientId, first.Add(-9*time.Hour), providerUrlDarkSuccess)
+			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
+			dark = append(dark, provider)
+		}
+		// 20 connected public providers, but only 15 not otherwise excluded:
+		// floor 10 allows 5 verdicts, not the 10 a count of 20 would
+		urlDarkTestAssert(ctx, t, city, 15, append(fleet, dark...), dark[:5]...)
+	})
+}

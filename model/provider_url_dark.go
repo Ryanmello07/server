@@ -80,10 +80,14 @@ func providerUrlDarkCountedSql(alias string, version int) string {
 		AND (%[1]s.ok_count = 0 OR %[1]s.ok_count = 1)`, alias, version)
 }
 
-// One row per call: the published population's size, then each dark member
-// (NULL when none) with the oldest of its K failures. The population is the
-// public count's (CountProviderEgress), so the floor and the verdicts share
-// it. With clientScoped only members in $6 are walked; the count stays fleet.
+// One row per call: the population's size, then each dark member (NULL when
+// none) with the oldest of its K failures. The population is the public
+// count's (CountProviderEgress) less providers another hard exclusion already
+// removes (providerEgressEligibilitySql, the rules providerHardExclusionsSql
+// negates): they serve no one either way, so they must not count toward the
+// floor or spend its budget, and their verdicts return statelessly once that
+// exclusion clears. With clientScoped only members in $6 are walked; the
+// count stays fleet.
 //
 // A member is dark when its K most recent non-excused counted turns are all
 // no-response and it has no counted success within ProviderEgressHealthMaxAge
@@ -107,6 +111,7 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 			SELECT 1 FROM provide_key
 			WHERE provide_key.client_id = provider_location.client_id AND provide_key.provide_mode = $1
 		)
+		AND %[7]s
 	), recent AS MATERIALIZED (
 		SELECT population.client_id, turn.measured_at, turn.no_response
 		FROM population
@@ -147,6 +152,7 @@ func providerUrlDarkSql(version int, clientScoped bool) string {
 		providerUrlDarkCountedSql("control", version),
 		scope,
 		providerUrlDarkCountedSql("success", version),
+		providerEgressEligibilitySql("provider_location"),
 	)
 }
 
