@@ -135,3 +135,13 @@ func TestProviderUrlDarkServingFloor(t *testing.T) {
 	never2 := providerUrlDarkVerdict{clientId: server.Id{3}}
 	connect.AssertEqual(t, honorProviderUrlDarkVerdicts(11, []providerUrlDarkVerdict{never, never2}), map[server.Id]bool{never2.clientId: true})
 }
+
+// The verdict span never drops below the control window, whatever the rules
+// say: that floor is what closes the outage onset.
+func TestProviderUrlDarkMinimumSpanFloor(t *testing.T) {
+	rules := DefaultProviderEgressRules()
+	rules.DarkMinimumSpanSeconds = 0
+	connect.AssertEqual(t, providerUrlDarkMinimumSpan(rules), providerUrlDarkControlWindow)
+	rules.DarkMinimumSpanSeconds = 2 * 60 * 60
+	connect.AssertEqual(t, providerUrlDarkMinimumSpan(rules), 2*time.Hour)
+}
