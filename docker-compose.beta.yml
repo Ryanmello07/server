@@ -158,13 +158,6 @@ services:
       BRINGYOUR_REDIS_HOSTNAME: redis
       WARP_HOME: /srv/warp
     command: ["api", "--port=8080"]
-    # `default` must stay listed: naming any network at all stops compose from
-    # attaching the default one implicitly, and postgres, redis and caddy are
-    # all on it. `prober` is the internal-only network the egress-prober lives
-    # on -- see that service for why it cannot be on `default`.
-    networks:
-      - default
-      - prober
     # No published port. Caddy terminates tls for api.beta-test.net and is the
     # only ingress; publishing 8080 would let a client reach the api over plain
     # http and bypass the forwarded-address headers connect and the api rely on
@@ -202,10 +195,6 @@ services:
       WARP_HOME: /srv/warp
       WARP_PORTS: "80:5080,15080:15080"
     command: ["connect", "--port=80"]
-    # see the api service above for why `default` has to be repeated here
-    networks:
-      - default
-      - prober
     # No published ports. Caddy terminates tls for connect.beta-test.net and is
     # the only ingress. This is load-bearing beyond transport security: connect
     # only trusts a forwarded client address when it receives BOTH
@@ -224,27 +213,6 @@ services:
     volumes:
       - ./beta-vault:/srv/warp:ro
 
-  # Operator-run prober. For each provider it opens a tunnel THROUGH that
-  # provider and asks public geolocation APIs what address they see, so the
-  # server learns the provider's real egress location.
-  #
-  # It must never be able to reach those APIs directly. A direct lookup would
-  # record THIS host's location for the provider and hand the operator's own
-  # address to third-party APIs. That is what the `prober` network below is
-  # for: it is `internal: true`, so the container has no default route, no NAT
-  # and no path off the docker bridge. It reaches `api` and `connect` and
-  # nothing else.
-  #
-  # The confinement IS the network attachment. Do not add this service to
-  # `default`, do not publish ports from it, and never pass
-  # --skip-confinement-check: a check disabled in a config file is not a check.
-  # The prober verifies its own confinement at startup and exits non-zero if it
-  # can reach a geolocation address, so a wrong network stops the prober
-  # instead of silently leaking.
-  #
-  # Not started by default (profile `prober`), because it needs a network
-  # client jwt that only an operator can mint. Start it explicitly:
-  #   docker compose -f docker-compose.beta.yml up -d --no-deps egress-prober
   # The proxy server: socks/http/https/api/wg endpoints that proxy clients are
   # pointed at by CreateProxyClient. It is NOT behind caddy -- it terminates its
   # own TLS, reading the cert for proxy.beta-test.net from the vault at
@@ -298,187 +266,6 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  egress-prober:
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    profiles:
-      - prober
-    build:
-      # The prober lives in its own repo. Clone it next to this one (the same
-      # urnetwork parent directory Dockerfile.beta builds from), or point
-      # PROBER_CONTEXT at the checkout:
-      #   git clone https://github.com/Ryanmello07/urnetwork-operator-proxy.git operator-proxy
-      context: ${PROBER_CONTEXT:-../operator-proxy}
-      # Its go.mod replaces github.com/urnetwork/connect and .../glog with
-      # ../connect and ../glog, so those two checkouts have to be in the build
-      # as well. Named contexts keep each one small -- a single context over
-      # the whole urnetwork parent directory is ~1.6G to transfer.
-      additional_contexts:
-        connect: ${CONNECT_CONTEXT:-../connect}
-        glog: ${GLOG_CONTEXT:-../glog}
-      dockerfile_inline: |
-        FROM golang:1.26.5-alpine AS build
-        # layout mirrors the local urnetwork monorepo so the ../ replaces resolve
-        WORKDIR /src/operator-proxy
-        COPY . .
-        COPY --from=connect / /src/connect
-        COPY --from=glog / /src/glog
-        RUN CGO_ENABLED=0 go build -trimpath -o /out/egress-prober ./cmd/egress-prober
-        FROM alpine:3
-        RUN apk add --no-cache ca-certificates
-        COPY --from=build /out/egress-prober /usr/local/bin/egress-prober
-        # the prober needs no privileges: the provider tunnel is a userspace
-        # gvisor netstack, not a kernel tun device
-        USER 65534:65534
-        ENTRYPOINT ["egress-prober"]
-    restart: unless-stopped
-    networks:
-      - prober
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    # UR_PROBER_BY_JWT and UR_OPERATOR_SECRET. Kept out of the command line so
-    # they never appear in `docker inspect` args or in ps inside the container.
-    # required:false so the whole compose project still loads before an
-    # operator has created the file.
-    env_file:
-      - path: ./beta-vault/prober.env
-        required: false
-    command:
-      - --api-url=http://api:8080
-      # The far-side address: the bandwidth target is fetched through the
-      # provider tunnel, so it egresses to the public internet and comes back
-      # to the api by its public name. --api-url above is the control plane
-      # (prober -> api, internal) and is NOT interchangeable with this.
-      - --public-api-url=https://api.beta-test.net
-      - --platform-url=ws://connect:80/
-      # --interval is a sleep AFTER a pass finishes, not a fixed period, so the
-      # cycle is pass_duration + interval and throughput is
-      # due-limit / (pass_duration + interval). At 1h that measured 500 probes
-      # per ~90 minute cycle -- ~390/hour, with the prober idle for roughly two
-      # thirds of every cycle while the due queue held tens of thousands of
-      # unprobed providers. 1m effectively runs passes back to back (~1000/hour)
-      # without removing the gap entirely: at 0 a pass that returns an empty
-      # queue would spin.
-      #
-      # --due-limit is already at the server's ceiling: the api clamps a batch to
-      # provider_egress_due.yml's max_due_limit, and with that file absent it
-      # falls back to 500. Raising this past 500 does nothing until that config
-      # exists AND api restarts, because the value is memoised with sync.OnceValue.
-      - --interval=1m
-      # 24 simultaneous tunnels. Probes are network bound, not cpu bound: each
-      # tests 131 destinations and a dead provider burns the full
-      # --probe-timeout on every one, so a single probe takes ~3 minutes wall
-      # clock. Throughput is therefore concurrency / probe-duration, and the box
-      # sits idle waiting on timeouts -- measured at concurrency 8 it managed
-      # ~135 probes/hour with load 2.6 across 8 cores and the prober using
-      # 121MB. At 24 it measured ~490/hour on the same box.
-      #
-      # Raising --due-limit alone did nothing: queue depth was never the
-      # constraint. This was 2 for the old 7.9G/4-core box, below the binary's
-      # own default of 4.
-      - --concurrency=24
-      # The blackhole sweep is a SEPARATE loop from the full pass above, and the
-      # reason it exists is that the full pass is too slow to notice a provider
-      # going dark: it spends minutes per provider, so the fleet takes hours to
-      # days, and until it comes back round the provider keeps its last passing
-      # measurement and stays in the public list. Measured here: 98.6% of
-      # advertised providers were judged on evidence over six hours old, and 12
-      # sampled from the stalest cohort answered ok=0/131 while still being
-      # handed to clients.
-      #
-      # Hourly over ~2,700 eligible providers is ~0.75/sec, which one round trip
-      # through an already-required tunnel comfortably sustains at concurrency
-      # 32. The limit is the server's per-request ceiling, not the sweep size --
-      # a pass keeps asking until the queue is empty.
-      - --blackhole-interval=1h
-      - --blackhole-limit=500
-      - --blackhole-concurrency=32
-      # NOT --probe-timeout's 2m20s: a dark provider must fail fast or the sweep
-      # costs the full timeout on every one, and on a mostly-dark fleet the cheap
-      # loop runs as slowly as the full pass it complements.
-      - --blackhole-timeout=15s
-      # Ask for the server's maximum batch (maxProviderEgressDueLimit=500)
-      # rather than the 100 default. With a 6h re-probe backoff and ~2400
-      # providers, 100 per pass can never cover the fleet: it capped coverage
-      # at ~100/hour against a need of ~400/hour, which is why most providers
-      # stayed untested and therefore hidden by the health gate.
-      - --due-limit=500
-      # Beta runs ONE prober, so shard 0 of 1 -- which sends no shard
-      # parameters at all and is byte-identical to the unsharded request.
-      # Set here explicitly so the deployed value is visible rather than
-      # implied: mainnet runs one prober per edge server and sets
-      # --shard-count to the number of them, each with its own index.
-      - --shard-count=1
-      - --shard-index=0
-      # 2m20s, not 60s: with --egress-health-all the whole health run must
-      # fit inside one probe timeout, and 60s left 4.286s per request --
-      # below the 10s cold-tunnel floor, so every request risked timing out
-      # and being recorded as a PROVIDER failure. The prober refuses to
-      # start rather than charge honest providers for that, and names this
-      # value. Raising the timeout keeps full-table coverage; dropping
-      # --egress-health-all would sample instead and lose the concurrency
-      # exercise that only the full table provides.
-      - --probe-timeout=2m20s
-      - --confinement-timeout=3s
-      # DNS vs -confinement-address, for this environment: an `internal: true`
-      # docker network cannot resolve external names at all -- docker's
-      # embedded resolver answers SERVFAIL because it has no route to forward
-      # the query. The startup self-check would then resolve none of the
-      # geolocation hosts, obtain no evidence either way, and REFUSE TO START
-      # (ErrNoEvidence): being unable to verify is not evidence of confinement.
-      # So we hand it the addresses to dial instead of asking it to resolve
-      # them, which keeps the check real inside a jail where dns is blocked.
-      #
-      # These are a second copy of the endpoint list and can go stale. Keep
-      # them in step with the hosts the prober prints on every start
-      # ("geolocation hosts: ..."); re-resolve with
-      #   for h in ip.pn free.freeipapi.com ipinfo.io; do getent ahostsv4 $h; done
-      # A stale address weakens the check (it tests an IP nobody serves any
-      # more) but can never produce a false "not confined".
-      # Full-table diagnostic run: every destination, no sampling. This is
-      # deliberately NOT how a scheduled pass should run -- it costs ~4.5x and
-      # forfeits the anti-gaming property that random sampling provides -- but
-      # it is what answers "show me the complete health of every provider".
-      - --egress-health-all
-      - --confinement-address=188.40.247.138:443  # api.i.pn (ip.pn json endpoint moved hosts 2026-08-02)
-      - --confinement-address=104.21.94.136:443    # free.freeipapi.com (cloudflare)
-      - --confinement-address=172.67.168.79:443    # free.freeipapi.com (cloudflare)
-      - --confinement-address=34.117.59.81:443     # ipinfo.io
-      # egress-health destinations (egresshealth.DestinationHosts). These belong
-      # here for a sharper reason than the geolocation hosts: a direct
-      # geolocation lookup merely records the OPERATOR's location for a
-      # provider, but a direct egress-health check would PASS -- this host can
-      # obviously reach Cloudflare and Amazon -- and so would certify a
-      # blackholing provider as healthy. That is the exact inversion of the
-      # signal the check exists to produce.
-      #
-      # One representative address per host is enough, and after the table grew
-      # to ~140 destinations that is now the ONLY workable approach: enumerating
-      # every destination here is not hand-maintainable, and it would not buy
-      # anything. The prober's network is `internal: true` -- no gateway, no NAT
-      # -- so connectivity is all-or-nothing. If these addresses are unreachable
-      # the route does not exist, and no destination is reachable either. The
-      # check is proving the ABSENCE OF A ROUTE, not enumerating a destination
-      # list; treating it as the latter is what would make it unmaintainable.
-      #
-      # Spread across distinct networks (cloudflare, google, amazon, wikimedia,
-      # fastly) so a partial-connectivity misconfiguration -- a second network
-      # attached to the prober that reaches some ASNs -- still trips it.
-      - --confinement-address=104.17.24.14:443     # cdnjs.cloudflare.com
-      - --confinement-address=104.16.248.249:443   # cloudflare-dns.com
-      - --confinement-address=151.101.193.155:443  # code.jquery.com
-      - --confinement-address=94.140.14.14:443     # dns.adguard-dns.com
-      - --confinement-address=8.8.8.8:443          # dns.google
-      - --confinement-address=3.170.73.93:443      # sdk.amazonaws.com
-      - --confinement-address=3.171.166.195:443    # www.amazon.com
-      - --confinement-address=151.101.129.140:443  # www.reddit.com
-      - --confinement-address=208.80.154.224:443   # www.wikipedia.org
-
   caddy:
     logging:
       driver: json-file
@@ -499,15 +286,6 @@ services:
     depends_on:
       - api
       - connect
-
-networks:
-  # The egress-prober's confinement. `internal: true` gives containers on this
-  # network no gateway and no NAT, so nothing attached to it can reach the
-  # internet -- only the other containers that are also on it (api, connect).
-  # Removing `internal: true`, or adding another network to the prober, undoes
-  # the confinement; the prober's startup self-check is what catches that.
-  prober:
-    internal: true
 
 volumes:
   # ⚠️ Named volume that persists Postgres data across container restarts.
