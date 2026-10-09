@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"slices"
 	"testing"
 	"time"
@@ -134,6 +135,37 @@ func TestProviderUrlDarkServingFloor(t *testing.T) {
 	connect.AssertEqual(t, honorProviderUrlDarkVerdicts(11, []providerUrlDarkVerdict{a, never}), map[server.Id]bool{never.clientId: true})
 	never2 := providerUrlDarkVerdict{clientId: server.Id{3}}
 	connect.AssertEqual(t, honorProviderUrlDarkVerdicts(11, []providerUrlDarkVerdict{never, never2}), map[server.Id]bool{never2.clientId: true})
+}
+
+// A fleet-cohort pass reads the fleet set whatever cohort its filter names, and
+// every other call reads what it names; the cohort still restricts the result.
+// No database: the retry delay after a failed read serves the last set.
+func TestProviderUrlDarkFleetCohortReadsFleet(t *testing.T) {
+	ctx := context.Background()
+	fleetCohort := withProviderUrlDarkFleetCohort(ctx)
+	dark, other, served := server.NewId(), server.NewId(), server.NewId()
+	cohort := []server.Id{dark, served}
+
+	connect.AssertEqual(t, providerUrlDarkReadClientIds(ctx, cohort), cohort)
+	connect.AssertEqual(t, providerUrlDarkReadClientIds(ctx, nil) == nil, true)
+	connect.AssertEqual(t, providerUrlDarkReadClientIds(fleetCohort, cohort) == nil, true)
+	connect.AssertEqual(t, providerUrlDarkReadClientIds(fleetCohort, nil) == nil, true)
+
+	providerUrlDarkLast.Lock()
+	honored, computedAt, failedAt := providerUrlDarkLast.honored, providerUrlDarkLast.computedAt, providerUrlDarkLast.failedAt
+	providerUrlDarkLast.honored = map[server.Id]bool{dark: true, other: true}
+	providerUrlDarkLast.computedAt, providerUrlDarkLast.failedAt = time.Now(), time.Now()
+	providerUrlDarkLast.Unlock()
+	defer func() {
+		providerUrlDarkLast.Lock()
+		providerUrlDarkLast.honored, providerUrlDarkLast.computedAt, providerUrlDarkLast.failedAt = honored, computedAt, failedAt
+		providerUrlDarkLast.Unlock()
+	}()
+	for _, readCtx := range []context.Context{ctx, fleetCohort} {
+		connect.AssertEqual(t, loadProviderUrlDarkHonored(readCtx, cohort), map[server.Id]bool{dark: true})
+		connect.AssertEqual(t, loadProviderUrlDarkHonored(readCtx, []server.Id{}), map[server.Id]bool{})
+	}
+	connect.AssertEqual(t, loadProviderUrlDarkHonored(fleetCohort, nil), map[server.Id]bool{dark: true, other: true})
 }
 
 // The verdict span never drops below the control window, whatever the rules

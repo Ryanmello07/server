@@ -376,10 +376,33 @@ func readProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) (map
 	return honored, nil
 }
 
+// Marks the context of a pass whose cohort is the whole serving population:
+// the publication passes (UpdateClientLocations, UpdateClientScores) and the
+// dashboard count (CountProviderEgress). They load their evidence for the
+// cohort they captured, and their URL-dark read stays the one fleet read on
+// the fleet budget, restricted to that cohort. The scoped read would walk the
+// cohort and then the fleet again inside the request budget, and would renew
+// the fail-open set only while a cohort member is dark.
+type providerUrlDarkFleetCohortKey struct{}
+
+func withProviderUrlDarkFleetCohort(ctx context.Context) context.Context {
+	return context.WithValue(ctx, providerUrlDarkFleetCohortKey{}, true)
+}
+
+// The clients whose verdicts one call reads: nil, the fleet, for a fleet call
+// and for any call of a fleet-cohort pass.
+func providerUrlDarkReadClientIds(ctx context.Context, clientIds []server.Id) []server.Id {
+	if ctx.Value(providerUrlDarkFleetCohortKey{}) != nil {
+		return nil
+	}
+	return clientIds
+}
+
 // The honored URL-dark set: the single source every consumer reads. With
 // clientIds it is the fleet set restricted to them. Honored verdicts are a
 // subset of dark ones, so the fleet read runs only when a requested client is
-// dark at all.
+// dark at all. A fleet-cohort pass reads the fleet set whatever cohort it
+// names (withProviderUrlDarkFleetCohort).
 //
 // Unlike the other hard exclusions it fails open, so a slow fleet walk can
 // never stop publication or a request: if a read errs or outlasts its budget,
@@ -392,7 +415,7 @@ func loadProviderUrlDarkHonored(ctx context.Context, clientIds []server.Id) map[
 	if clientIds != nil && len(clientIds) == 0 {
 		return map[server.Id]bool{}
 	}
-	honored, err := readProviderUrlDarkHonored(ctx, clientIds)
+	honored, err := readProviderUrlDarkHonored(ctx, providerUrlDarkReadClientIds(ctx, clientIds))
 	if err != nil {
 		providerUrlDarkLast.Lock()
 		// a caller giving up is not a failed read

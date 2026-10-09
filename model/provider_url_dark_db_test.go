@@ -79,6 +79,13 @@ func urlDarkTestDark(ctx context.Context, clientId server.Id, controls int, time
 // Connected public providers with no URL history, so the published population
 // is large enough that the serving floor does not hide a verdict.
 func urlDarkTestFleet(ctx context.Context, t testing.TB, city *Location, count int) []*egressTestProvider {
+	// A read that failed open in an earlier test of this process must not
+	// leave this one inside the retry delay. Fixtures that build their own
+	// provider_egress_health_history without the URL columns fail it
+	// (provider_count_cohort_query_test.go), and every cohort filter reads it.
+	providerUrlDarkLast.Lock()
+	providerUrlDarkLast.failedAt = time.Time{}
+	providerUrlDarkLast.Unlock()
 	providers := []*egressTestProvider{}
 	for range count {
 		providers = append(providers, egressTestConnect(ctx, t, city, egressTestFast, nil, nil))
@@ -573,6 +580,52 @@ func TestUrlDarkReadFailsOpen(t *testing.T) {
 		providerUrlDarkLast.failedAt = time.Time{}
 		providerUrlDarkLast.Unlock()
 		published(dark)
+	})
+}
+
+// The passes whose cohort is the fleet (the publication passes and the
+// dashboard count) load their filter for the cohort they captured, and still
+// read URL-dark as one fleet read on the fleet budget: with the request
+// budget spent, they compute, publish and count the verdict, and no read fails.
+func TestUrlDarkFleetCohortPassesReadOnTheFleetBudget(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		scopedTimeout := providerUrlDarkScopedTimeout
+		resetLast := func() {
+			providerUrlDarkLast.Lock()
+			providerUrlDarkLast.honored, providerUrlDarkLast.computedAt, providerUrlDarkLast.failedAt = nil, time.Time{}, time.Time{}
+			providerUrlDarkLast.Unlock()
+		}
+		resetLast()
+		defer func() {
+			providerUrlDarkScopedTimeout = scopedTimeout
+			resetLast()
+		}()
+
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-70*time.Minute), now.Add(-50*time.Minute), now.Add(-30*time.Minute))
+		candidateIds := []server.Id{dark.clientId}
+		for _, provider := range fleet {
+			candidateIds = append(candidateIds, provider.clientId)
+		}
+
+		// a scoped read would now outlast its budget and fail open to no set
+		providerUrlDarkScopedTimeout = time.Nanosecond
+		egressTestPasses(ctx, t)
+		connect.AssertEqual(t, CountProviderEgress(ctx).ReasonCounts[ProviderExcludedUrlDark], int64(1))
+		providerUrlDarkLast.Lock()
+		computed, failed := !providerUrlDarkLast.computedAt.IsZero(), !providerUrlDarkLast.failedAt.IsZero()
+		providerUrlDarkLast.Unlock()
+		connect.AssertEqual(t, computed, true)
+		connect.AssertEqual(t, failed, false)
+		warm, err := getProviderHardExclusions(ctx, candidateIds)
+		connect.AssertEqual(t, err, nil)
+		if want := map[server.Id]bool{dark.clientId: true}; !maps.Equal(warm, want) {
+			t.Fatalf("published snapshot excluded %v, want %v", warm, want)
+		}
 	})
 }
 

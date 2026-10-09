@@ -803,7 +803,8 @@ func CountProviderEgress(ctx context.Context) *ProviderEgressCounts {
 		})
 	})
 	// Capture the exact dashboard population before loading its evidence.
-	countFilter := newProviderCountFilterForClients(ctx, clientIds)
+	// beta: this cohort is the fleet, so URL-dark is one fleet read (provider_url_dark.go)
+	countFilter := newProviderCountFilterForClients(withProviderUrlDarkFleetCohort(ctx), clientIds)
 	for _, row := range rows {
 		decision := decideProviderEgress(
 			countFilter.egressFacts(row.clientId, row.claimedCountryCode, row.egressIndex, row.egressQuality, settings),

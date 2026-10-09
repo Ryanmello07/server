@@ -4123,7 +4123,8 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 			}
 		})
 	})
-	countFilter := newProviderCountFilterForClients(ctx, clientIds)
+	// beta: this cohort is the fleet, so URL-dark is one fleet read (provider_url_dark.go)
+	countFilter := newProviderCountFilterForClients(withProviderUrlDarkFleetCohort(ctx), clientIds)
 	if err := publishProviderHardExclusions(ctx, clientIds, countFilter, ttl); err != nil {
 		return fmt.Errorf("publish provider hard exclusions: %w", err)
 	}
@@ -5487,7 +5488,8 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		})
 	})
 
-	countFilter := newProviderCommonFilterForClients(ctx, slices.Collect(maps.Keys(cohort)))
+	// beta: this cohort is the fleet, so URL-dark is one fleet read (provider_url_dark.go)
+	countFilter := newProviderCommonFilterForClients(withProviderUrlDarkFleetCohort(ctx), slices.Collect(maps.Keys(cohort)))
 	// SourceMap in the native census has always covered the full accepted
 	// health map, including providers outside this serving cohort. Keep that
 	// diagnostic population and its exact evidence window unchanged.
