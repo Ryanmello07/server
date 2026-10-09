@@ -85,6 +85,8 @@ func BeginProberShard(ctx context.Context, key ProberShardKey, credit ByteCount,
 			if previous != nil {
 				server.Raise(drainProberShardInTx(ctx, tx, previous))
 			}
+			// The replacement grant id is fresh and unpublished until commit;
+			// only the previous owner's existing grant needs shared ownership.
 			owner = &ProberShardOwner{Key: key, NetworkId: server.NewId(), UserId: server.NewId(), ClientId: server.NewId(), DeviceId: server.NewId(), BalanceId: server.NewId(), State: "active", Deadline: now.Add(lifetime)}
 			name := "probe-" + owner.NetworkId.String()
 			// Machine accounts use the normal seedphrase hash, not a retained root
@@ -100,7 +102,7 @@ func BeginProberShard(ctx context.Context, key ProberShardKey, credit ByteCount,
 			server.RaisePgResult(tx.Exec(ctx, `INSERT INTO network_client(client_id,network_id,device_id,description,create_time,auth_time) VALUES($1,$2,$3,$4,$5,$5)`, owner.ClientId, owner.NetworkId, owner.DeviceId, ProberClientDescription, now))
 			server.RaisePgResult(tx.Exec(ctx, `INSERT INTO transfer_balance(balance_id,network_id,start_time,end_time,start_balance_byte_count,balance_byte_count,net_revenue_nano_cents,subsidy_net_revenue_nano_cents,pro) VALUES($1,$2,$3,$4,$5,$5,0,0,false)`, owner.BalanceId, owner.NetworkId, now, owner.Deadline.Add(24*time.Hour), credit))
 			server.RaisePgResult(tx.Exec(ctx, `INSERT INTO prober_shard_run(task_id,epoch,shard_index,shard_count,network_id,user_id,client_id,device_id,balance_id,state,create_time,deadline,next_cleanup_time) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11,$11)`, key.TaskId, key.Epoch, key.ShardIndex, key.ShardCount, owner.NetworkId, owner.UserId, owner.ClientId, owner.DeviceId, owner.BalanceId, now, owner.Deadline))
-		}, server.TxReadCommitted)
+		}, server.TxReadCommitted, server.OptNoRetry())
 		if returnErr != nil {
 			return nil, returnErr
 		}
@@ -133,9 +135,18 @@ func ProberShardIdentity(ctx context.Context, owner *ProberShardOwner) (*ProberI
 // Draining takes the exclusive lock before enumerating/deactivating clients,
 // so a late derived-client callback cannot escape the teardown cohort.
 func lockProberShardClientAdmissionInTx(ctx context.Context, tx server.PgTx, networkId server.Id) error {
+	_, err := lockProberShardClientAdmissionDeadlineInTx(ctx, tx, networkId)
+	return err
+}
+
+// Keep the registry lock first, but carry its immutable deadline across later
+// endpoint waits. Projecting a clock inside a locking SELECT can precede the
+// lock wait, so even this first check reads the clock after acquiring the row.
+func lockProberShardClientAdmissionDeadlineInTx(ctx context.Context, tx server.PgTx, networkId server.Id) (*time.Time, error) {
 	var state string
-	var live bool
-	rows, err := tx.Query(ctx, `SELECT state, clock_timestamp() AT TIME ZONE 'UTC' < deadline FROM prober_shard_run WHERE network_id=$1 FOR SHARE`, networkId)
+	var deadline time.Time
+	var admissionDeadline *time.Time
+	rows, err := tx.Query(ctx, `SELECT state, deadline FROM prober_shard_run WHERE network_id=$1 FOR SHARE`, networkId)
 	// Only the retired-shard policy refusal returns normally. Operational
 	// failures must unwind the enclosing void Tx callback: otherwise it reaches
 	// COMMIT after a failed admission read and can mask cancellation with a
@@ -143,13 +154,15 @@ func lockProberShardClientAdmissionInTx(ctx context.Context, tx server.PgTx, net
 	server.Raise(err)
 	defer rows.Close()
 	if rows.Next() {
-		server.Raise(rows.Scan(&state, &live))
-		if state != "active" || !live {
-			return ErrProberShardRetired
+		server.Raise(rows.Scan(&state, &deadline))
+		if state != "active" {
+			return nil, ErrProberShardRetired
 		}
+		admissionDeadline = &deadline
 	}
+	rows.Close()
 	server.Raise(rows.Err())
-	return nil
+	return admissionDeadline, validateProberShardAdmissionDeadlineInTx(ctx, tx, admissionDeadline)
 }
 
 // A private probe account may fund only contracts in which it is an endpoint;
@@ -207,8 +220,19 @@ func drainProberShardInTx(ctx context.Context, tx server.PgTx, owner *ProberShar
 	if owner.State != "active" {
 		return nil
 	}
+	admitted, err := tryTransferBalanceOwnershipInTx(ctx, tx, []server.Id{owner.BalanceId})
+	if err != nil {
+		return err
+	}
+	if !admitted {
+		return errTransferBalanceOwnershipBusy
+	}
 	var clients []server.Id
-	rows, err := tx.Query(ctx, `SELECT client_id FROM network_client WHERE network_id=$1 ORDER BY client_id`, owner.NetworkId)
+	// The registry fence prevents new shard admissions. Already retired clients
+	// need no second timestamp or index rewrite; lock the remaining live set in
+	// the same order as ordinary deactivation before reading its common clock.
+	rows, err := tx.Query(ctx, `SELECT client_id FROM network_client
+		WHERE network_id=$1 AND active=true ORDER BY client_id FOR UPDATE`, owner.NetworkId)
 	if err != nil {
 		return err
 	}
@@ -225,7 +249,7 @@ func drainProberShardInTx(ctx context.Context, tx server.PgTx, owner *ProberShar
 	if err != nil {
 		return err
 	}
-	if _, err = deactivateNetworkClientsInTx(ctx, tx, clients, owner.NetworkId); err != nil {
+	if _, err = deactivateLockedNetworkClientsInTx(ctx, tx, clients, owner.NetworkId); err != nil {
 		return err
 	}
 	// active is a generated amount predicate. Expire admission without changing
@@ -246,7 +270,7 @@ func DrainProberShard(ctx context.Context, key ProberShardKey) error {
 				server.Raise(fmt.Errorf("probe shard owner mismatch"))
 			}
 			server.Raise(drainProberShardInTx(ctx, tx, owner))
-		}, server.TxReadCommitted)
+		}, server.TxReadCommitted, server.OptNoRetry())
 		return struct{}{}, nil
 	}, func(err error) (struct{}, error) { return struct{}{}, err })
 	return err
@@ -338,7 +362,7 @@ func ReapProberShard(ctx context.Context, key ProberShardKey) (deleted bool, ret
 			server.RaisePgResult(tx.Exec(ctx, `UPDATE prober_shard_run
 				SET next_cleanup_time=(clock_timestamp() AT TIME ZONE 'UTC')+interval '1 minute'
 				WHERE task_id=$1 AND epoch=$2 AND state IN ('draining','deleted')`, key.TaskId, key.Epoch))
-		}, server.TxReadCommitted)
+		}, server.TxReadCommitted, server.OptNoRetry())
 		if err := settleReportedProberShardContracts(ctx, key); err != nil {
 			return false, err
 		}
@@ -362,12 +386,14 @@ func ReapProberShard(ctx context.Context, key ProberShardKey) (deleted bool, ret
 			if owner.State != "draining" {
 				return
 			}
+			admitted, ownershipErr := tryTransferBalanceOwnershipInTx(ctx, tx, []server.Id{owner.BalanceId})
+			server.Raise(ownershipErr)
+			if !admitted {
+				server.Raise(errTransferBalanceOwnershipBusy)
+			}
 			// Registry precedes the compatibility bridge; grants and client
 			// teardown follow it, matching normal authenticated admission.
-			providerWorkOptionalSchemaInTx(ctx, tx, func(optional server.PgTx) error {
-				_, err := optional.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(-776::bigint)`)
-				return err
-			})
+			server.RaisePgResult(tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(-776::bigint)`))
 			// Settlement takes a contract lock before the balance lock. This read
 			// never locks contracts while holding a balance: its post-lock snapshot
 			// either sees a completed debit or retains the open/unsettled debt.
@@ -427,7 +453,7 @@ func ReapProberShard(ctx context.Context, key ProberShardKey) (deleted bool, ret
 			})
 			slices.SortFunc(clients, func(a, b server.Id) int { return a.Cmp(b) })
 			clients = slices.Compact(clients)
-			providerWorkLockSessionMutationInTx(ctx, tx, clients...)
+			providerWorkLockCurrentSessionMutationInTx(ctx, tx, clients...)
 			server.Raise(tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM network_client_connection WHERE client_id=ANY($1) AND connected)`, clients).Scan(&blocked))
 			if blocked {
 				return
@@ -456,7 +482,7 @@ func ReapProberShard(ctx context.Context, key ProberShardKey) (deleted bool, ret
 			server.RaisePgResult(tx.Exec(ctx, `DELETE FROM network_user WHERE user_id=$1`, owner.UserId))
 			server.RaisePgResult(tx.Exec(ctx, `UPDATE prober_shard_run SET state='deleted',retired_client_ids=$3,close_time=clock_timestamp() AT TIME ZONE 'UTC' WHERE task_id=$1 AND epoch=$2`, key.TaskId, key.Epoch, clients))
 			cacheOwner = owner
-		}, server.TxReadCommitted)
+		}, server.TxReadCommitted, server.OptNoRetry())
 		if cacheOwner != nil {
 			// Ordinary model cleanup uses bounded cross-slot pipelines. Keep all
 			// Redis I/O outside the transaction and repeat safely after a crash.
@@ -479,7 +505,7 @@ func ReapProberShard(ctx context.Context, key ProberShardKey) (deleted bool, ret
 			refreshNetEscrow(ctx, []server.Id{cacheOwner.BalanceId})
 			server.Tx(ctx, func(tx server.PgTx) {
 				server.RaisePgResult(tx.Exec(ctx, `UPDATE prober_shard_run SET state='closed',retired_client_ids='{}' WHERE task_id=$1 AND epoch=$2 AND state='deleted'`, key.TaskId, key.Epoch))
-			}, server.TxReadCommitted)
+			}, server.TxReadCommitted, server.OptNoRetry())
 			deleted = true
 		}
 		return deleted, nil
@@ -509,7 +535,7 @@ func ReapDueProberShards(ctx context.Context, limit int) (int, error) {
 					batch.Queue(`UPDATE prober_shard_run SET next_cleanup_time=(clock_timestamp() AT TIME ZONE 'UTC')+interval '1 minute' WHERE task_id=$1 AND epoch=$2`, owner.Key.TaskId, owner.Key.Epoch)
 				}
 			})
-		}, server.TxReadCommitted)
+		}, server.TxReadCommitted, server.OptNoRetry())
 		removed := 0
 		var cleanupErr error
 		for _, owner := range owners {

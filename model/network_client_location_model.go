@@ -2024,8 +2024,12 @@ func createLocation(ctx context.Context, location *Location, options createLocat
 		}
 	}
 	var resolved *Location
+	// the location search's in-memory index changes, in the transaction's order
+	var posts []server.PostFunction
 	server.Tx(ctx, func(tx server.PgTx) {
+		// a rerun starts over
 		resolved = nil
+		posts = nil
 
 		if !options.seed && input.LocationType == LocationTypeCity && input.CityGeonameId != 0 {
 			if cityLocation := cityLocationByGeonameIdInTx(ctx, tx, &input); cityLocation != nil {
@@ -2034,20 +2038,26 @@ func createLocation(ctx context.Context, location *Location, options createLocat
 			}
 		}
 
-		countryLocation := countryLocationInTx(ctx, tx, &input, countryCode, options.seed)
+		countryLocation, countryPosts := countryLocationInTx(ctx, tx, &input, countryCode, options.seed)
+		posts = append(posts, countryPosts...)
 		if input.LocationType == LocationTypeCountry {
 			resolved = countryLocation
 			return
 		}
 
-		regionLocation := regionLocationInTx(ctx, tx, &input, countryCode, countryLocation, names, options.seed)
+		regionLocation, regionPosts := regionLocationInTx(ctx, tx, &input, countryCode, countryLocation, names, options.seed)
+		posts = append(posts, regionPosts...)
 		if input.LocationType == LocationTypeRegion {
 			resolved = regionLocation
 			return
 		}
 
-		resolved = cityLocationInTx(ctx, tx, &input, countryCode, countryLocation, regionLocation, names, options)
+		cityLocation, cityPosts := cityLocationInTx(ctx, tx, &input, countryCode, countryLocation, regionLocation, names, options)
+		posts = append(posts, cityPosts...)
+		resolved = cityLocation
 	})
+	// the transaction committed
+	server.RunPosts(ctx, server.SequencePosts(posts...))
 	if resolved == nil {
 		return false
 	}
@@ -2187,7 +2197,8 @@ func newRowNameInTx(
 // search strings with it, and reports whether it did. It leaves the row as it
 // is when another row already holds the full name the new name composes: that
 // is a row of the same place from before geoname ids, and both stay
-// resolvable.
+// resolvable. Returns the posts that move the location search's in-memory
+// index, for the caller to run, in order, once the transaction commits.
 func renameLocationInTx(
 	ctx context.Context,
 	tx server.PgTx,
@@ -2195,7 +2206,7 @@ func renameLocationInTx(
 	name string,
 	fullName string,
 	searchLocation *Location,
-) bool {
+) (bool, []server.PostFunction) {
 	tag, err := tx.Exec(
 		ctx,
 		`
@@ -2220,13 +2231,15 @@ func renameLocationInTx(
 	)
 	server.Raise(err)
 	if tag.RowsAffected() == 0 {
-		return false
+		return false, nil
 	}
-	locationSearch().RemoveInTx(ctx, locationId, tx)
+	posts := []server.PostFunction{
+		locationSearch().RemoveInTxPost(ctx, locationId, tx),
+	}
 	for i, searchStr := range searchLocation.SearchStrings() {
-		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+		posts = append(posts, locationSearch().AddInTxPost(ctx, searchStr, locationId, i, tx))
 	}
-	return true
+	return true, posts
 }
 
 // Finds or creates the country row. A country code names one country, so a
@@ -2240,7 +2253,8 @@ func countryLocationInTx(
 	location *Location,
 	countryCode string,
 	seed bool,
-) *Location {
+) (*Location, []server.PostFunction) {
+	var posts []server.PostFunction
 	var countryLocation *Location
 	result, err := tx.Query(
 		ctx,
@@ -2304,11 +2318,13 @@ func countryLocationInTx(
 				CountryCode:  countryLocation.CountryCode,
 			}
 			// a country row's full name is its code
-			if renameLocationInTx(ctx, tx, countryLocation.LocationId, location.Country, countryLocation.CountryCode, renamed) {
+			nameChanged, renamePosts := renameLocationInTx(ctx, tx, countryLocation.LocationId, location.Country, countryLocation.CountryCode, renamed)
+			posts = append(posts, renamePosts...)
+			if nameChanged {
 				countryLocation.Country = location.Country
 			}
 		}
-		return countryLocation
+		return countryLocation, posts
 	}
 
 	if location.Country == "" {
@@ -2350,9 +2366,9 @@ func countryLocationInTx(
 
 	// add to the search
 	for i, searchStr := range countryLocation.SearchStrings() {
-		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+		posts = append(posts, locationSearch().AddInTxPost(ctx, searchStr, locationId, i, tx))
 	}
-	return countryLocation
+	return countryLocation, posts
 }
 
 // Finds or creates the region row under the country row: by the subdivision's
@@ -2366,7 +2382,8 @@ func regionLocationInTx(
 	countryLocation *Location,
 	names *locationPlaceNames,
 	seed bool,
-) *Location {
+) (*Location, []server.PostFunction) {
+	var posts []server.PostFunction
 	var regionLocation *Location
 	scanRegion := func(result server.PgResult) {
 		if result.Next() {
@@ -2482,11 +2499,13 @@ func regionLocationInTx(
 				CountryCode:  countryCode,
 			}
 			fullName := fmt.Sprintf("%s, %s", location.Region, countryCode)
-			if renameLocationInTx(ctx, tx, regionLocation.LocationId, location.Region, fullName, renamed) {
+			nameChanged, renamePosts := renameLocationInTx(ctx, tx, regionLocation.LocationId, location.Region, fullName, renamed)
+			posts = append(posts, renamePosts...)
+			if nameChanged {
 				regionLocation.Region = location.Region
 			}
 		}
-		return regionLocation
+		return regionLocation, posts
 	}
 
 	// create a new location
@@ -2535,9 +2554,9 @@ func regionLocationInTx(
 
 	// add to the search
 	for i, searchStr := range regionLocation.SearchStrings() {
-		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+		posts = append(posts, locationSearch().AddInTxPost(ctx, searchStr, locationId, i, tx))
 	}
-	return regionLocation
+	return regionLocation, posts
 }
 
 // The list's region a lookup names, or nil: the region of its subdivision's
@@ -2976,7 +2995,8 @@ func cityLocationInTx(
 	regionLocation *Location,
 	names *locationPlaceNames,
 	options createLocationOptions,
-) *Location {
+) (*Location, []server.PostFunction) {
+	var posts []server.PostFunction
 	seed := options.seed
 	var row *storedCityRow
 	if location.CityGeonameId != 0 {
@@ -3037,7 +3057,7 @@ func cityLocationInTx(
 	}
 
 	if row == nil && options.exactCity {
-		return nil
+		return nil, posts
 	}
 
 	if row != nil {
@@ -3079,14 +3099,16 @@ func cityLocationInTx(
 					Country:      row.countryName,
 					CountryCode:  row.countryCode,
 				}
-				if renameLocationInTx(ctx, tx, row.locationId, location.City, fullName, renamed) {
+				nameChanged, renamePosts := renameLocationInTx(ctx, tx, row.locationId, location.City, fullName, renamed)
+				posts = append(posts, renamePosts...)
+				if nameChanged {
 					row.name = location.City
 				}
 			}
 		} else {
 			healCityCoordinatesInTx(ctx, tx, row, location)
 		}
-		return row.location()
+		return row.location(), posts
 	}
 
 	// create a new location
@@ -3150,9 +3172,9 @@ func cityLocationInTx(
 
 	// add to the search
 	for i, searchStr := range cityLocation.SearchStrings() {
-		locationSearch().AddInTx(ctx, searchStr, locationId, i, tx)
+		posts = append(posts, locationSearch().AddInTxPost(ctx, searchStr, locationId, i, tx))
 	}
-	return cityLocation
+	return cityLocation, posts
 }
 
 // Reads a location row with the city, region and
@@ -3310,7 +3332,11 @@ func CreateLocationGroup(ctx context.Context, locationGroup *LocationGroup) {
 		}
 		uniqueMemberLocationIds[memberLocationId] = true
 	}
+	// the location group search's in-memory index changes, in order
+	var posts []server.PostFunction
 	server.Tx(ctx, func(tx server.PgTx) {
+		// a rerun starts over
+		posts = nil
 		ok := false
 		var locationGroupId server.Id
 
@@ -3393,9 +3419,11 @@ func CreateLocationGroup(ctx context.Context, locationGroup *LocationGroup) {
 		locationGroup.LocationGroupId = locationGroupId
 
 		for i, searchStr := range locationGroup.SearchStrings() {
-			locationGroupSearch().AddInTx(ctx, searchStr, locationGroupId, i, tx)
+			posts = append(posts, locationGroupSearch().AddInTxPost(ctx, searchStr, locationGroupId, i, tx))
 		}
 	})
+	// the transaction committed
+	server.RunPosts(ctx, server.SequencePosts(posts...))
 }
 
 func UpdateLocationGroup(ctx context.Context, locationGroup *LocationGroup) bool {
@@ -3848,8 +3876,8 @@ func providerEgressTestEnabledFromResource(resource *server.SimpleResource, err 
 	return len(enabled) == 1 && enabled[0]
 }
 
-// Bulk evidence for the shared provider decision. Database lookups are once per
-// publication pass; request paths use its complete hard-exclusion snapshot.
+// Bulk evidence for the shared provider decision. Publications load their own
+// cohort; request paths read through for candidates outside the cached cohort.
 type providerCountFilter struct {
 	now               time.Time
 	arinRisk          map[server.Id]bool
@@ -3991,41 +4019,13 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 
 	initialClientLocations := &InitialClientLocations{}
 
-	// Counts and score export use one bulk snapshot of the common gates.
+	// Counts and score export use the same common gates for their captured clients.
 	egressTestEnabled := providerEgressTestEnabled()
 	egressSettings := egressIndexSettings()
-	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
-
-	// Publish the complete common-gate exclusion snapshot atomically, including
-	// a versioned marker for an authoritative empty set. Missing snapshots use SQL.
-	hardExcludedMembers := []any{providerHardExclusionsReadyMember}
-	seenHardExcludedClientIds := map[server.Id]bool{}
-	for _, exclusions := range []map[server.Id]bool{countFilter.arinRisk, countFilter.reliabilityFailed, countFilter.tlsAuthenticationFailed, countFilter.urlDark} {
-		for clientId, failed := range exclusions {
-			if failed && !seenHardExcludedClientIds[clientId] {
-				hardExcludedMembers = append(hardExcludedMembers, clientId.String())
-				seenHardExcludedClientIds[clientId] = true
-			}
-		}
-	}
-	var hardExclusionsErr error
-	server.Redis(ctx, func(r server.RedisClient) {
-		_, hardExclusionsErr = r.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.Del(ctx, providerHardExclusionsKey)
-			pipe.SAdd(ctx, providerHardExclusionsKey, hardExcludedMembers...)
-			pipe.Expire(ctx, providerHardExclusionsKey, ttl)
-			return nil
-		})
-	})
-	if hardExclusionsErr != nil {
-		return fmt.Errorf("publish provider hard exclusions: %w", hardExclusionsErr)
-	}
-
-	server.Tx(ctx, func(tx server.PgTx) {
-
-		providerCountRows := []providerCountRow{}
-
-		result, err := tx.Query(
+	providerCountRows := []providerCountRow{}
+	clientIds := []server.Id{}
+	server.Db(ctx, func(conn server.PgConn) {
+		result, err := conn.Query(
 			ctx,
 			`
 	        SELECT
@@ -4119,8 +4119,16 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 					&row.egressQuality,
 				))
 				providerCountRows = append(providerCountRows, row)
+				clientIds = append(clientIds, row.clientId)
 			}
 		})
+	})
+	countFilter := newProviderCountFilterForClients(ctx, clientIds)
+	if err := publishProviderHardExclusions(ctx, clientIds, countFilter, ttl); err != nil {
+		return fmt.Errorf("publish provider hard exclusions: %w", err)
+	}
+
+	server.Tx(ctx, func(tx server.PgTx) {
 
 		// Count the same common-gate passes exposed as online supply.
 		countProviderRows := func() map[server.Id]int {
@@ -4180,7 +4188,7 @@ func UpdateClientLocations(ctx context.Context, ttl time.Duration) (returnErr er
 			slices.Collect(maps.Keys(locationClientCounts))...,
 		)
 
-		result, err = tx.Query(
+		result, err := tx.Query(
 			ctx,
 			`
                 SELECT
@@ -4379,6 +4387,11 @@ func loadClientLocations(
 	ctx context.Context,
 	locationIds map[server.Id]bool,
 ) (clientLocations map[server.Id]*ClientLocation, returnErr error) {
+	defer func() {
+		if returnErr != nil {
+			clientLocations = nil
+		}
+	}()
 	server.Redis(ctx, func(r server.RedisClient) {
 		load := func(locationIds map[server.Id]bool, clientLocations map[server.Id]*ClientLocation) error {
 			clientLocationCmds := map[server.Id]*redis.StringCmd{}
@@ -5250,11 +5263,19 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 		return
 	}
 
-	// Load common gates and accepted URL history once before assembling any
-	// location or group pool. Every advertised count uses this same decision.
+	// Capture both actual source populations before loading their common gates.
+	// A client added between the two queries must receive evidence as well.
 	egressTestEnabled := providerEgressTestEnabled()
 	egressSettings := egressIndexSettings()
-	countFilter := newProviderCountFilter(ctx, egressTestEnabled)
+	type pendingClientScore struct {
+		score                       *ClientScore
+		cityId, regionId, countryId *server.Id
+		reputationFailedNames       string
+		egress                      *clientScoreEgress
+		locationGroup               bool
+	}
+	pendingScores := []pendingClientScore{}
+	cohort := map[server.Id]bool{}
 	clientIdEgresses := map[server.Id]*clientScoreEgress{}
 	hardExcludedClientIds := map[server.Id]bool{}
 	shadowScoreCapture := beginArinShadowScoreCapture()
@@ -5360,41 +5381,11 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			for result.Next() {
 				sourceRows++
 				lookbackClientScore, cityLocationId, regionLocationId, countryLocationId, reputationFailedNames, egress := loadClientScore(result)
-				if shadowScoreCapture != nil {
-					shadowScoreCapture.observe(lookbackClientScore, egress.publishedCountryCode, countFilter.egressFacts(lookbackClientScore.ClientId, egress.publishedCountryCode, egress.egressIndex, egress.egressQuality, egressSettings), egressTestEnabled)
-				}
-				if countFilter.hasHardEgressFailure(lookbackClientScore.ClientId) {
-					hardExcludedClientIds[lookbackClientScore.ClientId] = true
-					continue
-				}
-				clientIdEgresses[lookbackClientScore.ClientId] = egress
-
-				// top-level only; the lookback copies stay nil (see `ClientScore`)
-				setLocationIds := func(clientScore *ClientScore) {
-					clientScore.CityLocationId = cityLocationId
-					clientScore.RegionLocationId = regionLocationId
-					clientScore.CountryLocationId = countryLocationId
-				}
-
-				// once per distinct location id: a country-only client stores
-				// its country id in all three columns (see
-				// SetConnectionLocation), and a client belongs in a location's
-				// pool once. The per-location map is keyed by client id so a
-				// repeat is already absorbed, but going through the set makes
-				// the intent explicit and keeps this loop in step with the
-				// counting loop in UpdateClientLocations.
-				for _, locationId := range distinctIds(
-					cityLocationId,
-					regionLocationId,
-					countryLocationId,
-				) {
-					clientScores, ok := locationClientScores[locationId]
-					if !ok {
-						clientScores = map[server.Id]*ClientScore{}
-						locationClientScores[locationId] = clientScores
-					}
-					setLocationIds(addClientScore(lookbackClientScore, reputationFailedNames, clientScores))
-				}
+				pendingScores = append(pendingScores, pendingClientScore{
+					score: lookbackClientScore, cityId: cityLocationId, regionId: regionLocationId,
+					countryId: countryLocationId, reputationFailedNames: reputationFailedNames, egress: egress,
+				})
+				cohort[lookbackClientScore.ClientId] = true
 			}
 		})
 
@@ -5486,33 +5477,84 @@ func UpdateClientScores(ctx context.Context, ttl time.Duration, parallel int) (r
 			for result.Next() {
 				sourceRows++
 				lookbackClientScore, cityLocationGroupId, regionLocationGroupId, countryLocationGroupId, reputationFailedNames, egress := loadClientScore(result)
-				if shadowScoreCapture != nil {
-					shadowScoreCapture.observe(lookbackClientScore, egress.publishedCountryCode, countFilter.egressFacts(lookbackClientScore.ClientId, egress.publishedCountryCode, egress.egressIndex, egress.egressQuality, egressSettings), egressTestEnabled)
-				}
-				if countFilter.hasHardEgressFailure(lookbackClientScore.ClientId) {
-					hardExcludedClientIds[lookbackClientScore.ClientId] = true
-					continue
-				}
-				clientIdEgresses[lookbackClientScore.ClientId] = egress
-
-				// once per distinct group id. The three location columns can
-				// be the same id (a country-only client), in which case all
-				// three group joins resolve to the same membership rows.
-				for _, locationGroupId := range distinctIds(
-					cityLocationGroupId,
-					regionLocationGroupId,
-					countryLocationGroupId,
-				) {
-					clientScores, ok := locationGroupClientScores[locationGroupId]
-					if !ok {
-						clientScores = map[server.Id]*ClientScore{}
-						locationGroupClientScores[locationGroupId] = clientScores
-					}
-					addClientScore(lookbackClientScore, reputationFailedNames, clientScores)
-				}
+				pendingScores = append(pendingScores, pendingClientScore{
+					score: lookbackClientScore, cityId: cityLocationGroupId, regionId: regionLocationGroupId,
+					countryId: countryLocationGroupId, reputationFailedNames: reputationFailedNames, egress: egress,
+					locationGroup: true,
+				})
+				cohort[lookbackClientScore.ClientId] = true
 			}
 		})
 	})
+
+	countFilter := newProviderCommonFilterForClients(ctx, slices.Collect(maps.Keys(cohort)))
+	// SourceMap in the native census has always covered the full accepted
+	// health map, including providers outside this serving cohort. Keep that
+	// diagnostic population and its exact evidence window unchanged.
+	countFilter.healthCounts, countFilter.healthWindowEnd = getAllProviderEgressHealthCountsSnapshot(ctx)
+	for i, row := range pendingScores {
+		// Release staging references as each row is moved into its target maps.
+		pendingScores[i] = pendingClientScore{}
+		lookbackClientScore, reputationFailedNames, egress := row.score, row.reputationFailedNames, row.egress
+		if shadowScoreCapture != nil {
+			shadowScoreCapture.observe(lookbackClientScore, egress.publishedCountryCode, countFilter.egressFacts(lookbackClientScore.ClientId, egress.publishedCountryCode, egress.egressIndex, egress.egressQuality, egressSettings), egressTestEnabled)
+		}
+		if countFilter.hasHardEgressFailure(lookbackClientScore.ClientId) {
+			hardExcludedClientIds[lookbackClientScore.ClientId] = true
+			continue
+		}
+		clientIdEgresses[lookbackClientScore.ClientId] = egress
+		if !row.locationGroup {
+			cityLocationId, regionLocationId, countryLocationId := row.cityId, row.regionId, row.countryId
+
+			// top-level only; the lookback copies stay nil (see `ClientScore`)
+			setLocationIds := func(clientScore *ClientScore) {
+				clientScore.CityLocationId = cityLocationId
+				clientScore.RegionLocationId = regionLocationId
+				clientScore.CountryLocationId = countryLocationId
+			}
+
+			// once per distinct location id: a country-only client stores
+			// its country id in all three columns (see
+			// SetConnectionLocation), and a client belongs in a location's
+			// pool once. The per-location map is keyed by client id so a
+			// repeat is already absorbed, but going through the set makes
+			// the intent explicit and keeps this loop in step with the
+			// counting loop in UpdateClientLocations.
+			for _, locationId := range distinctIds(
+				cityLocationId,
+				regionLocationId,
+				countryLocationId,
+			) {
+				clientScores, ok := locationClientScores[locationId]
+				if !ok {
+					clientScores = map[server.Id]*ClientScore{}
+					locationClientScores[locationId] = clientScores
+				}
+				setLocationIds(addClientScore(lookbackClientScore, reputationFailedNames, clientScores))
+			}
+		} else {
+			cityLocationGroupId, regionLocationGroupId, countryLocationGroupId := row.cityId, row.regionId, row.countryId
+
+			// once per distinct group id. The three location columns can
+			// be the same id (a country-only client), in which case all
+			// three group joins resolve to the same membership rows.
+			for _, locationGroupId := range distinctIds(
+				cityLocationGroupId,
+				regionLocationGroupId,
+				countryLocationGroupId,
+			) {
+				clientScores, ok := locationGroupClientScores[locationGroupId]
+				if !ok {
+					clientScores = map[server.Id]*ClientScore{}
+					locationGroupClientScores[locationGroupId] = clientScores
+				}
+				addClientScore(lookbackClientScore, reputationFailedNames, clientScores)
+			}
+		}
+	}
+	pendingScores = nil
+	cohort = nil
 
 	// keyed by lookback index (see ClientLookbacks): 1 = the hour, 2 = 12h.
 	// The hour threshold is the gate that decides whether a provider is in the
@@ -6044,6 +6086,7 @@ func loadClientScoresWithCursor(
 
 		addTarget := func(
 			read targetRead,
+			groupId *server.Id,
 			facetSampleKey func(effectiveClientLocationId server.Id, facet ipFamilyFacet, index int) string,
 			sampleKey func(effectiveClientLocationId server.Id, index int) string,
 		) {
@@ -6074,7 +6117,7 @@ func loadClientScoresWithCursor(
 			if returnErr != nil || !ok {
 				sourceIncomplete = true
 				if returnErr == nil && observation != nil {
-					observation.missingTargets++
+					observation.missingTarget(groupId, clientLocationId, rankMode)
 				}
 				return
 			}
@@ -6086,6 +6129,7 @@ func loadClientScoresWithCursor(
 		for locationId, read := range locationReads {
 			addTarget(
 				read,
+				nil,
 				func(effectiveClientLocationId server.Id, facet ipFamilyFacet, index int) string {
 					return clientScoreLocationFacetSampleKey(forceMinimum, rankMode, locationId, effectiveClientLocationId, facet, index)
 				},
@@ -6100,6 +6144,7 @@ func loadClientScoresWithCursor(
 		for locationGroupId, read := range locationGroupReads {
 			addTarget(
 				read,
+				&locationGroupId,
 				func(effectiveClientLocationId server.Id, facet ipFamilyFacet, index int) string {
 					return clientScoreLocationGroupFacetSampleKey(forceMinimum, rankMode, locationGroupId, effectiveClientLocationId, facet, index)
 				},
@@ -6208,6 +6253,7 @@ func FindProviders2(
 	session *session.ClientSession,
 ) (*FindProviders2Result, error) {
 	observation := newFindProviders2SelectionObservation(findProviders2)
+	observation.beginPrivateCapture(session.Ctx)
 	defer observation.finish(session.Ctx)
 	providers := []*FindProvidersProvider{}
 	rankMode := RankModeQuality
@@ -6281,6 +6327,7 @@ func FindProviders2(
 
 	if 0 < len(locationIds) || 0 < len(locationGroupIds) {
 		observation.discovery = true
+		observation.privateGroupCount = len(locationGroupIds)
 		requestSettings := requestEgressIndexSettings()
 		// use a min block size to reduce db activity
 		var count int
@@ -6319,6 +6366,7 @@ func FindProviders2(
 		observation.targetKind = findProviders2TargetKind(findProviders2, countryLocations, targetDirectory)
 
 		observation.enter("load_primary")
+		observation.load.privateSource = "primary_legacy"
 		loadStartTime := time.Now()
 		clientScores, primaryCursor, err := loadPreferredClientScoresWithCursor(
 			requestSettings.NativeReaderEnabled,
@@ -6843,6 +6891,7 @@ func FindProviders2(
 				backfillTierOffset := requestSettings.BackfillTierOffset
 
 				observation.enter("load_backfill")
+				observation.load.privateSource = "alternate_legacy"
 				otherClientScores, otherCursor, err := loadPreferredClientScoresWithCursor(
 					requestSettings.NativeReaderEnabled,
 					false,
@@ -6921,6 +6970,7 @@ func FindProviders2(
 						pool, cursor := source.scores, source.cursor
 						if cursor == nil || cursor.nativeOnly {
 							observation.enter("load_backfill")
+							observation.load.privateSource = "online_legacy"
 							var err error
 							pool, cursor, err = loadClientScoresWithCursor(false, source.mode, session.Ctx, locationIds, locationGroupIds, clientLocationId, loadCount, facets, &observation.load)
 							if err != nil {

@@ -26,6 +26,10 @@ type contractExpiryState struct {
 	destinationId server.Id
 	dispute       bool
 
+	// Only write preparation may retain this witness. Callers must commit
+	// that transaction before continuing; the durable flag never resets.
+	usageUnverifiedRetained bool
+
 	sourceCloseTime             *time.Time
 	sourceUsedTransferByteCount *ByteCount
 	sourceCheckpoint            *bool
@@ -73,7 +77,8 @@ func retainedContractExpiryUsage(data []byte) (*contractUsageSnapshot, error) {
 
 // A successful preparation commits the original proof before billing can
 // synthesize or finalize a close. Restarts reuse that exact proof. A recent
-// real report withdraws a stale scan candidate without closing its stream.
+// real report withdraws a stale quiet-period candidate until its absolute
+// deadline. Once due, checkpoints retain usage without extending the lifetime.
 func prepareContractExpiryInTx(ctx context.Context, tx server.PgTx, contractId server.Id, cutoff time.Time) (*contractExpiryState, error) {
 	return inspectContractExpiryInTx(ctx, tx, contractId, cutoff, true)
 }
@@ -87,16 +92,17 @@ func inspectContractExpiryInTx(ctx context.Context, tx server.PgTx, contractId s
 	state := &contractExpiryState{contractId: contractId}
 	var outcome *ContractOutcome
 	var created time.Time
+	var expirationTime *time.Time
 	var originIsSource *bool
 	var unverified bool
 	var retained []byte
 	proof := &contractUsageExpiry{Reports: map[ContractParty]contractUsageClose{}}
 	if err := tx.QueryRow(ctx, `
 		SELECT source_id, destination_id, dispute, outcome, create_time,
-			usage_origin_is_source, usage_unverified, provider_usage, transfer_byte_count
+			usage_origin_is_source, usage_unverified, provider_usage, transfer_byte_count, expiration_time
 		FROM transfer_contract WHERE contract_id=$1
 	`+lock, contractId).Scan(&state.sourceId, &state.destinationId, &state.dispute, &outcome, &created,
-		&originIsSource, &unverified, &retained, &proof.Capacity); err != nil {
+		&originIsSource, &unverified, &retained, &proof.Capacity, &expirationTime); err != nil {
 		return nil, fmt.Errorf("lock expiring contract: %w", err)
 	}
 	if outcome != nil {
@@ -138,9 +144,10 @@ func inspectContractExpiryInTx(ctx context.Context, tx server.PgTx, contractId s
 		// The earlier expiry already owned retirement. Synthetic close times
 		// cannot postpone its durable continuation by another quiet period.
 		_, err := retainedContractExpiryUsage(retained)
+		state.usageUnverifiedRetained = writeProof && err == nil
 		return state, err
 	}
-	if lastReport.After(cutoff) {
+	if !contractExpirationDue(expirationTime, created, lastReport, cutoff, server.NowUtc()) {
 		return nil, nil
 	}
 	byteCount, err := contractExpiryCompletedUsage(proof)
@@ -163,9 +170,11 @@ func inspectContractExpiryInTx(ctx context.Context, tx server.PgTx, contractId s
 		}
 	}
 	if writeProof {
-		if _, err := tx.Exec(ctx, `UPDATE transfer_contract SET usage_unverified=true,provider_usage=$2 WHERE contract_id=$1 AND outcome IS NULL`, contractId, snapshot); err != nil {
+		result, err := tx.Exec(ctx, `UPDATE transfer_contract SET usage_unverified=true,provider_usage=$2 WHERE contract_id=$1 AND outcome IS NULL`, contractId, snapshot)
+		if err != nil {
 			return nil, fmt.Errorf("retain original expiry proof: %w", err)
 		}
+		state.usageUnverifiedRetained = result.RowsAffected() == 1
 	}
 	return state, nil
 }

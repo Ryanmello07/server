@@ -97,6 +97,7 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("POST", "/auth/verify", handlers.AuthVerify),
 		router.NewRoute("POST", "/auth/wallet-challenge", handlers.AuthWalletChallenge),
 		router.NewRoute("GET", "/auth/refresh", handlers.AuthRefreshToken),
+		router.NewRoute("POST", "/auth/network-refresh", handlers.AuthNetworkRefreshToken),
 		router.NewRoute("POST", "/auth/verify-send", handlers.AuthVerifySend),
 		router.NewRoute("POST", "/auth/password-reset", handlers.AuthPasswordReset),
 		router.NewRoute("POST", "/auth/password-set", handlers.AuthPasswordSet),
@@ -125,6 +126,11 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		// supersedes it (connect/GEOMAP.md D14)
 		router.NewRoute("GET", "/network/extender-hint", handlers.ExtenderHint),
 		router.NewRoute("POST", "/network/extender-latency", handlers.ExtenderLatencyReport),
+		// the gated tier of the directory: a release to the calling identity,
+		// and a client's report of an extender it could not reach
+		// (connect/EXTENDER.md R3, R4)
+		router.NewRoute("POST", "/network/extender-release", handlers.ExtenderRelease),
+		router.NewRoute("POST", "/network/extender-block-report", handlers.ExtenderBlockReport),
 		// the pings a provider or an extender measured, reported by the pinger
 		// with the target's co-signature (connect/GEOMAP.md §2.5)
 		router.NewRoute("POST", "/network/ping-report", handlers.ExtenderPingReport),
@@ -198,6 +204,27 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 
 		// reliability
 		router.NewRoute("GET", "/network/reliability", handlers.GetNetworkReliability),
+
+		// per-client data caps for embedded clients (EMBED1.md): set and list
+		// with the network's root token or an API key; read one with either, or
+		// with the client's own token
+		router.NewRoute("POST", "/network/client-data-cap", handlers.NetworkClientDataCapSet),
+		router.NewRoute("GET", "/network/client-data-cap", handlers.NetworkClientDataCapGet),
+		router.NewRoute("GET", "/network/client-data-caps", handlers.NetworkClientDataCapsList),
+
+		// per-client ACL groups (EMBED1.md): "isolated" keeps a client out of the
+		// network's peer list. Set with the network's root token or an API key;
+		// read with either, or with the client's own token
+		router.NewRoute("POST", "/network/client-acl-group", handlers.NetworkClientAclGroupSet),
+		router.NewRoute("GET", "/network/client-acl-group", handlers.NetworkClientAclGroupGet),
+
+		// whether the network is Embed-enabled, its client allowance and its
+		// counted clients (EMBED1.md); the data-cap and ACL-group routes above
+		// refuse a network that is not. Read with the root token or an API key
+		router.NewRoute("GET", "/network/embed", handlers.NetworkEmbedGet),
+
+		// the public Services contact form (EMBED1.md)
+		router.NewRoute("POST", "/services/contact-sales", handlers.ServicesContactSales),
 
 		router.NewRoute("POST", "/preferences/set-preferences", handlers.AccountPreferencesSet),
 		router.NewRoute("GET", "/preferences", handlers.AccountPreferencesGet),
@@ -290,6 +317,12 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("POST", "/sn/wallet", handlers.SnSetWallet),
 		router.NewRoute("POST", "/sn/wallet/consent", handlers.SnWalletMappingChallenge),
 		router.NewRoute("POST", "/sn/wallet/consent/history", handlers.SnWalletMappingHistory),
+		router.NewRoute("POST", "/sn/wallet/network-consent", handlers.SnNetworkWalletMappingChallenge),
+		router.NewRoute("POST", "/sn/wallet/network-consent/history", handlers.SnNetworkWalletMappingHistory),
+		router.NewRoute("POST", "/sn/wallet/hotkey-consent", handlers.SnHotkeyWalletMappingConsent),
+		router.NewRoute("POST", "/sn/wallet/hotkey-consent/history", handlers.SnHotkeyWalletMappingHistory),
+		router.NewRoute("POST", "/sn/wallet/hotkey-delegation", handlers.SnHotkeyNetworkDelegationChallenge),
+		router.NewRoute("POST", "/sn/wallet/hotkey-delegation/history", handlers.SnHotkeyNetworkDelegationHistory),
 		router.NewRoute("GET", "/sn/wallet", handlers.SnGetWallet),
 		router.NewRoute("POST", "/sn/wallet/validate", handlers.SnValidateWallet),
 		router.NewRoute("GET", "/sn/head", handlers.SnHead),
@@ -334,5 +367,6 @@ func routesWithReservedAttemptUpload(reserved *controller.StReservedAttemptUploa
 		router.NewRoute("POST", "/log/([^/]+)/upload", handlers.LogUpload),
 	}
 
-	return append(routes, oauth.Routes()...)
+	// every route is classified by credential (route_authz.go, AUTHZ1.md)
+	return applyRouteAccess(append(routes, oauth.Routes()...))
 }

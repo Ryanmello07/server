@@ -450,6 +450,19 @@ func PlanPaymentsWithMaxDurationLoop(
 	maxDuration time.Duration,
 	onSlice func(*PaymentPlan),
 ) ([]*PaymentPlan, error) {
+	return PlanPaymentsWithMaxDurationLoopInTx(ctx, maxDuration, nil, onSlice)
+}
+
+// The bounded drain of PlanPaymentsWithMaxDurationLoop, with writeInTx run in
+// each slice's transaction once the slice's plan is built: what it writes
+// commits with the slice or not at all (the payout run's held missing-wallet
+// notices).
+func PlanPaymentsWithMaxDurationLoopInTx(
+	ctx context.Context,
+	maxDuration time.Duration,
+	writeInTx func(server.PgTx, *PaymentPlan),
+	onSlice func(*PaymentPlan),
+) ([]*PaymentPlan, error) {
 	transition, err := server.LoadProviderPayoutEarningPolicy(ctx)
 	if err != nil {
 		return nil, err
@@ -459,7 +472,7 @@ func PlanPaymentsWithMaxDurationLoop(
 		end = server.MinTime(end, transition.Cutoff)
 	}
 	if maxDuration <= 0 {
-		plan, err := CreatePaymentPlan(ctx, EnvSubsidyConfig(), false, 0)
+		plan, err := createPaymentPlan(ctx, EnvSubsidyConfig(), false, 0, true, writeInTx)
 		if err != nil {
 			return nil, err
 		}
@@ -474,7 +487,7 @@ func PlanPaymentsWithMaxDurationLoop(
 	for i := 0; ; i += 1 {
 		// refresh the shared reliability inputs only on the first slice; the
 		// window is the same for every slice in this drain.
-		plan, err := createPaymentPlan(ctx, EnvSubsidyConfig(), false, maxDuration, i == 0)
+		plan, err := createPaymentPlan(ctx, EnvSubsidyConfig(), false, maxDuration, i == 0, writeInTx)
 		if err != nil {
 			return plans, err
 		}
@@ -673,13 +686,21 @@ func CompletePayment(
 	paymentReceipt string,
 	txHash string,
 ) (returnErr error) {
-	server.Tx(ctx, func(tx server.PgTx) {
-		returnErr = completePaymentInTx(ctx, tx, paymentId, paymentReceipt, txHash)
-	})
+	networkId, exists := readPaymentAccountNetwork(ctx, paymentId)
+	if !exists {
+		return fmt.Errorf("Invalid payment.")
+	}
+	keys := []server.PgOwnershipKey{server.NewPgOwnershipKey("account_payment", paymentId)}
+	if networkId != nil {
+		keys = append(keys, accountBalanceOwnershipKeys([]server.Id{*networkId})...)
+	}
+	server.OwnedTx(ctx, keys, func(tx server.PgTx) {
+		returnErr = completePaymentInTx(ctx, tx, paymentId, networkId, paymentReceipt, txHash)
+	}, server.TxReadCommitted)
 	return
 }
 
-func completePaymentInTx(ctx context.Context, tx server.PgTx, paymentId server.Id, paymentReceipt, txHash string) error {
+func completePaymentInTx(ctx context.Context, tx server.PgTx, paymentId server.Id, networkId *server.Id, paymentReceipt, txHash string) error {
 	tag := server.RaisePgResult(tx.Exec(
 		ctx,
 		`
@@ -692,13 +713,14 @@ func completePaymentInTx(ctx context.Context, tx server.PgTx, paymentId server.I
                     contract_retention_cursor = NULL,
                     contract_retention_pending = NOT attribution_review_required
                 WHERE
-                    payment_id = $1 AND
+                    payment_id = $1 AND network_id IS NOT DISTINCT FROM $5::uuid AND
                     NOT completed AND NOT canceled
             `,
 		paymentId,
 		paymentReceipt,
 		server.NowUtc(),
 		txHash,
+		networkId,
 	))
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("Invalid payment.")

@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"slices"
 	"sync"
@@ -25,11 +26,16 @@ func providerTotalsTestEnv(t *testing.T, run func(testing.TB, context.Context)) 
 }
 
 func providerTotalsTestTask(ctx context.Context, contractId, networkId server.Id) (id server.Id) {
-	server.Tx(ctx, func(tx server.PgTx) {
-		id = queueLegacyProviderTotalsInTx(ctx, tx, contractId, map[server.Id]*contractPayout{
-			networkId: {payoutByteCount: 17, payout: 29},
-		})
+	return providerTotalsTestPublish(ctx, contractId, map[server.Id]*contractPayout{
+		networkId: {payoutByteCount: 17, payout: 29},
 	})
+}
+
+// Fixtures enter through the same complete queue owner as financial publishers.
+func providerTotalsTestPublish(ctx context.Context, contractId server.Id, payouts map[server.Id]*contractPayout) (id server.Id) {
+	server.OwnedTx(ctx, []server.PgOwnershipKey{task.RunOnceOwnershipKey(task.RunOnce("legacy_provider_totals", contractId))}, func(tx server.PgTx) {
+		id = queueLegacyProviderTotalsInTx(ctx, tx, contractId, payouts)
+	}, server.TxReadCommitted)
 	return
 }
 
@@ -47,22 +53,81 @@ func requireProviderTotalsTestState(t testing.TB, ctx context.Context, id, netwo
 	})
 }
 
+// Provider projection must neither claim nor discard the independent mirror owner.
+func requireProviderTotalsTestMirrorUntouched(t testing.TB, ctx context.Context, before *task.Task) {
+	t.Helper()
+	after := task.GetTasks(ctx, before.TaskId)[before.TaskId]
+	if after == nil || after.FunctionName != before.FunctionName || after.ArgsJson != before.ArgsJson ||
+		!after.ClaimTime.Equal(before.ClaimTime) || !after.ReleaseTime.Equal(before.ReleaseTime) ||
+		after.RescheduleErrorCount != before.RescheduleErrorCount || after.RescheduleError != before.RescheduleError {
+		t.Fatal("provider projection changed the independent mirror owner")
+	}
+}
+
+// Cold mirror recovery uses its actual target, fenced Redis publisher and normal
+// delete/post finalizer. Merely projecting provider totals cannot acknowledge it.
+func finalizeProviderTotalsTestMirror(t testing.TB, ctx context.Context, owner *task.Task) {
+	t.Helper()
+	payload, err := decodeLegacyNetEscrowMirror([]byte(owner.ArgsJson))
+	server.Raise(err)
+	target := NewLegacyNetEscrowMirrorTaskTarget()
+	if owner.FunctionName != target.TargetFunctionName() {
+		t.Fatal("expected the exact durable mirror owner")
+	}
+	settings := task.DefaultTaskWorkerSettings()
+	settings.ClaimRegisteredTargetsOnly = true
+	worker := task.NewTaskWorker(ctx, settings)
+	defer worker.Close()
+	worker.AddTargets(target)
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(ctx, `UPDATE pending_task SET run_at=$2,release_time=$2 WHERE task_id=$1`, owner.TaskId, time.Time{}))
+	})
+	finished, retried, posts, err := worker.EvalTasks(1)
+	if err != nil || len(finished) != 1 || finished[0] != owner.TaskId || len(retried) != 0 || len(posts) != 0 {
+		t.Fatal("independent mirror owner did not complete and finalize", err)
+	}
+	completed := task.GetFinishedTasks(ctx, owner.TaskId)[owner.TaskId]
+	if completed == nil || !completed.PostCompleted || completed.ArgsJson != owner.ArgsJson {
+		t.Fatal("mirror finalization lost its exact scope or completion")
+	}
+	var result LegacyNetEscrowMirrorResult
+	server.Raise(json.Unmarshal([]byte(completed.ResultJson), &result))
+	server.Db(ctx, func(conn server.PgConn) {
+		var exact bool
+		server.Raise(conn.QueryRow(ctx, `SELECT
+            NOT EXISTS(SELECT 1 FROM pending_task WHERE run_once_key=$1) AND
+            COALESCE((SELECT revision FROM transfer_balance_net_escrow_revision WHERE balance_id=$2),0)=$3`,
+			task.RunOnce("legacy_net_escrow_mirror", payload.BalanceId).String(), payload.BalanceId, result.Revision).Scan(&exact))
+		if !exact {
+			t.Fatal("mirror finalization lost its acknowledged revision or left an owner pending")
+		}
+	})
+}
+
 // Each rollback and missing-reply boundary uses the actual PostgreSQL owner.
 func TestLegacyProviderTotalsAtomicEnqueueApplyAndReplay(t *testing.T) {
 	providerTotalsTestEnv(t, func(t testing.TB, ctx context.Context) {
 		networkId, contractId := server.NewId(), server.NewId()
-		conn := acquireContractLifecycleTestConnection(t, ctx)
-		defer conn.Release()
-		tx, err := conn.Begin(ctx)
-		server.Raise(err)
-		abortedId := queueLegacyProviderTotalsInTx(ctx, tx, contractId, map[server.Id]*contractPayout{networkId: {payoutByteCount: 17, payout: 29}})
-		server.Raise(tx.Rollback(ctx))
+		var abortedId server.Id
+		abort := errors.New("synthetic provider publication rollback")
+		var err error
+		server.HandleError(func() {
+			server.OwnedTx(ctx, []server.PgOwnershipKey{task.RunOnceOwnershipKey(task.RunOnce("legacy_provider_totals", contractId))}, func(tx server.PgTx) {
+				abortedId = queueLegacyProviderTotalsInTx(ctx, tx, contractId, map[server.Id]*contractPayout{networkId: {payoutByteCount: 17, payout: 29}})
+				panic(abort)
+			}, server.TxReadCommitted)
+		}, func(cause error) { err = cause })
+		if !errors.Is(err, abort) || abortedId == (server.Id{}) {
+			t.Fatal("provider publication did not reach its actual rollback", err)
+		}
 		if len(task.GetTasks(ctx, abortedId)) != 0 {
 			t.Fatal("rolled-back projection became visible")
 		}
 		id := providerTotalsTestTask(ctx, contractId, networkId)
 		stale := task.GetTasks(ctx, id)[id]
-		tx, err = conn.Begin(ctx)
+		conn := acquireContractLifecycleTestConnection(t, ctx)
+		defer conn.Release()
+		tx, err := conn.Begin(ctx)
 		server.Raise(err)
 		server.Raise(applyLegacyProviderTotalsInTx(ctx, tx, id))
 		server.Raise(tx.Rollback(ctx))
@@ -164,13 +229,17 @@ func TestLegacyProviderTotalsSecondNetworkFailureRollsBackFirst(t *testing.T) {
 	providerTotalsTestEnv(t, func(t testing.TB, ctx context.Context) {
 		networks := []server.Id{server.NewId(), server.NewId()}
 		slices.SortFunc(networks, server.Id.Cmp)
+		contractId := server.NewId()
 		var id server.Id
-		server.Tx(ctx, func(tx server.PgTx) {
+		server.OwnedTx(ctx, []server.PgOwnershipKey{
+			task.RunOnceOwnershipKey(task.RunOnce("legacy_provider_totals", contractId)),
+			server.NewPgOwnershipKey("account_balance", networks[1]),
+		}, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `INSERT INTO account_balance(network_id,provided_byte_count) VALUES($1,$2)`, networks[1], int64(math.MaxInt64)))
-			id = queueLegacyProviderTotalsInTx(ctx, tx, server.NewId(), map[server.Id]*contractPayout{
+			id = queueLegacyProviderTotalsInTx(ctx, tx, contractId, map[server.Id]*contractPayout{
 				networks[0]: {payoutByteCount: 17, payout: 29}, networks[1]: {payoutByteCount: 17, payout: 29},
 			})
-		})
+		}, server.TxReadCommitted)
 		queued := task.GetTasks(ctx, id)[id]
 		target := task.NewTaskTarget(ApplyLegacyProviderTotals)
 		if _, _, err := target.RunSpecific(ctx, queued); err == nil {

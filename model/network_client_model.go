@@ -55,6 +55,10 @@ const MaxClientPrincipalLength = 256
 // errors.Is to separate this terminal state from infrastructure failures.
 var ErrActiveClientNotFound = errors.New("Client does not exist.")
 
+// An owned child mint failed its live parent credential check. Database and
+// cancellation failures unwind separately and must not become an auth refusal.
+var ErrClientParentInactive = errors.New("Signed parent token is no longer active.")
+
 // Identifies a destination that cannot participate at the contract write
 // boundary. Controllers map this state to a route-specific reliability result.
 var ErrContractDestinationInactive = errors.New("Contract destination is inactive.")
@@ -194,6 +198,13 @@ type AuthNetworkClientArgs struct {
 
 	ProxyConfig *ProxyConfig `json:"proxy_config,omitempty"`
 
+	// a new top-level client that will provide publicly. Its creation is exempt
+	// from the top-level client cap and the concurrent connected client check:
+	// providers do not count toward the client limit, and the connection's
+	// provider intent check keeps the flag honest (provider_intent_model.go).
+	// Ignored for a re-auth and for an ancillary client.
+	ProvideIntent bool `json:"provide_intent,omitempty"`
+
 	// TimeZone is the device's IANA zone (e.g. "America/Los_Angeles"), used
 	// only to place the onboarding campaign's sends in the user's local day.
 	// Optional; never stored on the client.
@@ -302,10 +313,50 @@ func AuthNetworkClient(
 	return authNetworkClient(authClient, session, nil)
 }
 
+// A local owner supplies cryptographically verified parent claims. Their live
+// state is checked in every mint transaction before any client/device write;
+// the verified device replaces the otherwise separate source-device lookup.
+func AuthNetworkClientFromParent(authClient *AuthNetworkClientArgs, clientSession *session.ClientSession) (*AuthNetworkClientResult, error) {
+	if authClient == nil || authClient.ClientId != nil || authClient.SourceClientId == nil ||
+		clientSession == nil || clientSession.ByJwt == nil || clientSession.ByJwt.ClientId == nil ||
+		clientSession.ByJwt.DeviceId == nil || *authClient.SourceClientId != *clientSession.ByJwt.ClientId {
+		return nil, errors.New("Client mint requires its credential's parent.")
+	}
+	return authNetworkClientWithParentState(authClient, clientSession, nil, true)
+}
+
 // The optional registration owner is created only by the versioned endpoint.
 // Ordinary client creation retains its original request and response contract.
 func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.ClientSession, registration *networkClientRegistrationOwner) (authClientResult *AuthNetworkClientResult, authClientError error) {
+	return authNetworkClientWithParentState(authClient, session, registration, false)
+}
+
+// Parent validation belongs to the transaction that creates the child. Other
+// entry points keep their existing caller-owned authentication boundary.
+func authNetworkClientWithParentState(authClient *AuthNetworkClientArgs, session *session.ClientSession, registration *networkClientRegistrationOwner, validateParent bool) (authClientResult *AuthNetworkClientResult, authClientError error) {
 	if authClient.ClientId == nil {
+		// a client token creates only children of its own client (AUTHZ1.md).
+		// A top-level client needs the network credential, and another
+		// client's id answers as a client that does not exist
+		if callerClientId := session.ByJwt.ClientId; callerClientId != nil {
+			if authClient.SourceClientId == nil {
+				authClientResult = &AuthNetworkClientResult{
+					Error: &AuthNetworkClientError{
+						Message: "A client token cannot create a top-level client.",
+					},
+				}
+				return
+			}
+			if *authClient.SourceClientId != *callerClientId {
+				authClientResult = &AuthNetworkClientResult{
+					Error: &AuthNetworkClientError{
+						Message: "Client does not exist.",
+					},
+				}
+				return
+			}
+		}
+
 		roles, principal, message := validateClientIdentityArgs(authClient.Roles, authClient.Principal, session)
 		if message != "" {
 			authClientResult = &AuthNetworkClientResult{
@@ -420,13 +471,13 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 
 		// Client-creation gate for the plan's concurrent connected-client limit:
 		// Do not provision a new top-level client while the network is already at its
-		// connected limit. Only top-level clients count and public providers are
-		// exempt; Pro is read live rather than from the jwt's stale claim; and while
-		// the rollout is dark this does no redis/db work at all. See
-		// NetworkConcurrentClientsExceeded. Checked before the tx so the lookup does
-		// not hold it open. Connection activation applies the same limit; see
-		// CanConnectNetworkPeer.
-		concurrentLimitExceeded := authClient.SourceClientId == nil && NetworkConcurrentClientsExceeded(session.Ctx, session.ByJwt.NetworkId)
+		// connected limit. Only top-level clients count and a client created with
+		// provide intent is exempt, like an intent provider at connect; Pro is read
+		// live rather than from the jwt's stale claim; and while the rollout is dark
+		// this does no redis/db work at all. See NetworkConcurrentClientsExceeded.
+		// Checked before the tx so the lookup does not hold it open. Connection
+		// activation applies the same limit; see CanConnectNetworkPeer.
+		concurrentLimitExceeded := authClient.SourceClientId == nil && !authClient.ProvideIntent && NetworkConcurrentClientsExceeded(session.Ctx, session.ByJwt.NetworkId)
 		if concurrentLimitExceeded && registration == nil {
 			authClientResult = &AuthNetworkClientResult{
 				Error: &AuthNetworkClientError{
@@ -494,16 +545,26 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 		var proxyDeviceConfigJson []byte
 		var proxyClient *ProxyClient
 
-		// A client JWT is durable, so entitlement must come from the source of
-		// truth. Resolve it before opening the write transaction: IsProFresh
-		// performs its own PostgreSQL read and Redis cache refresh.
-		isPro := IsProFresh(session.Ctx, &session.ByJwt.NetworkId)
-
 		var registrationTxOptions []any
 		if registration != nil {
 			// The first statement waits for the network's allocation lock.
 			// Its following lookup must see the preceding owner's commit.
 			registrationTxOptions = []any{server.TxReadCommitted}
+		}
+		// Hosted mint needs a fresh entitlement before its later live-parent
+		// snapshot, but neither a separate pool borrower nor a TTL authority.
+		// Read on the transaction's owned connection before BEGIN, and keep
+		// cache publication outside the database connection's lifetime.
+		var isPro bool
+		var mintEntitlement proEntitlement
+		if validateParent {
+			registrationTxOptions = append(registrationTxOptions, server.TxReadBeforeBegin(func(conn server.PgCanQuery) {
+				mintEntitlement = loadProNetworkWithConn(session.Ctx, conn, session.ByJwt.NetworkId)
+				observeProNetworkLoaded(session.ByJwt.NetworkId)
+				isPro = mintEntitlement.pro
+			}))
+		} else {
+			isPro = IsProFresh(session.Ctx, &session.ByJwt.NetworkId)
 		}
 		server.Tx(session.Ctx, func(tx server.PgTx) {
 			// reset in case the tx is retried on a transient error: only the
@@ -513,6 +574,12 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 			proxyDeviceConfigJson = nil
 			proxyClient = nil
 
+			if validateParent {
+				if err := jwt.ValidateByJwtStateInTx(session.Ctx, tx, session.ByJwt, true); err != nil {
+					authClientError = ErrClientParentInactive
+					return
+				}
+			}
 			if err := lockProberShardClientAdmissionInTx(session.Ctx, tx, session.ByJwt.NetworkId); err != nil {
 				authClientError = err
 				return
@@ -541,33 +608,16 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 				// count is hard limited (see peer_model.go). Gated by
 				// enforce_concurrent_clients: while the concurrent-client rollout
 				// is dark, this cap is not enforced and no count runs at all (see
-				// pro.yml). Provisioning must never be refused while dark.
-				if Pro().EnforceConcurrentClients {
+				// pro.yml). Provisioning must never be refused while dark. A
+				// provider install (provide intent) is exempt and is not counted:
+				// it never becomes a peer (NetworkPeerCategoryProvider). The limit
+				// is per network: an Embed plan raises it (see
+				// network_client_limit_model.go); the peer valve keeps the constant.
+				if Pro().EnforceConcurrentClients && !authClient.ProvideIntent {
+					topLevelClientLimit := networkTopLevelClientLimitInTx(session.Ctx, tx, session.ByJwt.NetworkId)
 					// the scan is bounded at the limit since only the threshold matters
-					result, err := tx.Query(
-						session.Ctx,
-						`
-							SELECT COUNT(*) AS top_level_client_count
-							FROM (
-								SELECT 1
-								FROM network_client
-								WHERE
-									network_id = $1 AND
-									active = true AND
-									source_client_id IS NULL
-								LIMIT $2
-							) t
-						`,
-						session.ByJwt.NetworkId,
-						LimitTopLevelClientIdsPerNetwork+1,
-					)
-					topLevelClientCount := 0
-					server.WithPgResult(result, err, func() {
-						if result.Next() {
-							server.Raise(result.Scan(&topLevelClientCount))
-						}
-					})
-					if LimitTopLevelClientIdsPerNetwork <= topLevelClientCount {
+					topLevelClientCount := countNetworkActiveTopLevelClients(session.Ctx, tx, session.ByJwt.NetworkId, topLevelClientLimit+1)
+					if topLevelClientLimit <= topLevelClientCount {
 						authClientResult = &AuthNetworkClientResult{
 							Error: &AuthNetworkClientError{
 								ClientLimitExceeded: true,
@@ -598,6 +648,10 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 					authClient.DeviceSpec,
 					createTime,
 				))
+			} else if validateParent {
+				// The same snapshot just verified this exact active client and
+				// claimed device; no second source-client read is needed.
+				deviceId = *session.ByJwt.DeviceId
 			} else {
 				// copy the device id from the source
 				// important: validate the source client id is in the same network
@@ -694,6 +748,22 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 				principal,
 			))
 
+			if authClient.ProvideIntent && authClient.SourceClientId == nil {
+				// a provider install for its life (NetworkPeerCategoryProvider)
+				server.RaisePgResult(tx.Exec(
+					session.Ctx,
+					`
+						INSERT INTO network_client_provider_intent (
+							client_id,
+							create_time
+						)
+						VALUES ($1, $2)
+					`,
+					clientId,
+					createTime,
+				))
+			}
+
 			if 0 < len(roles) {
 				server.BatchInTx(session.Ctx, tx, func(batch server.PgBatch) {
 					for _, role := range roles {
@@ -769,6 +839,14 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 			}
 		}, registrationTxOptions...)
 
+		if validateParent && authClientError == nil && authClientResult != nil && authClientResult.Error == nil {
+			// Optional cache refresh cannot turn a committed identity into a
+			// failed mint. Version ordering still rejects older publications.
+			server.HandleError(func() {
+				storeProNetwork(session.Ctx, session.ByJwt.NetworkId, mintEntitlement)
+			})
+		}
+
 		// only redis is written after the commit. The identity cache, the proxy
 		// device config mirror and the proxy hosts' wakeup are caches and a
 		// wakeup over the committed rows (their readers fall back to postgres,
@@ -815,7 +893,9 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 			}
 			// the client and its device are checked before either is written,
 			// so a refusal writes nothing. The client row is still locked
-			// before the device row.
+			// before the device row. A client token reissues only its own
+			// token and its children's (AUTHZ1.md); any other client answers
+			// as a client that does not exist
 			clientFound := false
 			var deviceId *server.Id
 			result, err := tx.Query(
@@ -825,11 +905,17 @@ func authNetworkClient(authClient *AuthNetworkClientArgs, session *session.Clien
 					WHERE
 						client_id = $1 AND
 						network_id = $2 AND
-						active = true
+						active = true AND
+						(
+							$3::uuid IS NULL OR
+							client_id = $3 OR
+							source_client_id = $3
+						)
 					FOR NO KEY UPDATE
 				`,
 				authClient.ClientId,
 				session.ByJwt.NetworkId,
+				session.ByJwt.ClientId,
 			)
 			server.WithPgResult(result, err, func() {
 				if result.Next() {
@@ -983,12 +1069,26 @@ func RemoveNetworkClient(
 
 	// important: must check `network_id = session network_id`
 	server.Tx(session.Ctx, func(tx server.PgTx) {
-		rowCount, err := deactivateNetworkClientsInTx(
-			session.Ctx,
-			tx,
-			[]server.Id{removeClient.ClientId},
-			session.ByJwt.NetworkId,
-		)
+		var rowCount int64
+		var err error
+		if callerClientId := session.ByJwt.ClientId; callerClientId != nil {
+			// a client token removes only its own client and its children
+			// (AUTHZ1.md); any other client answers as one that does not exist
+			rowCount, err = deactivateOwnedNetworkClientInTx(
+				session.Ctx,
+				tx,
+				removeClient.ClientId,
+				session.ByJwt.NetworkId,
+				*callerClientId,
+			)
+		} else {
+			rowCount, err = deactivateNetworkClientsInTx(
+				session.Ctx,
+				tx,
+				[]server.Id{removeClient.ClientId},
+				session.ByJwt.NetworkId,
+			)
+		}
 		server.Raise(err)
 		if rowCount != 1 {
 			removeClientResult = &RemoveNetworkClientResult{
@@ -1003,6 +1103,43 @@ func RemoveNetworkClient(
 	})
 
 	return removeClientResult, removeClientErr
+}
+
+// RetireProberNetworkClient completes an internal prober cleanup operation.
+// A repeated cleanup of an owned inactive client succeeds without extending
+// its deactivation timestamp. Public removal retains its existing timestamp
+// refresh semantics. No in-memory minted set is required after reconstruction.
+func RetireProberNetworkClient(
+	removeClient *RemoveNetworkClientArgs,
+	clientSession *session.ClientSession,
+) (*RemoveNetworkClientResult, error) {
+	var result *RemoveNetworkClientResult
+	server.Tx(clientSession.Ctx, func(tx server.PgTx) {
+		matched, err := retireProberNetworkClientInTx(clientSession.Ctx, tx, removeClient.ClientId, clientSession.ByJwt.NetworkId)
+		server.Raise(err)
+		result = &RemoveNetworkClientResult{}
+		if !matched {
+			result.Error = &RemoveNetworkClientError{Message: "Client does not exist."}
+		}
+	}, server.TxReadCommitted)
+	return result, nil
+}
+
+func retireProberNetworkClientInTx(ctx context.Context, tx server.PgTx, clientId, networkId server.Id) (bool, error) {
+	var active bool
+	err := tx.QueryRow(ctx, `SELECT active FROM network_client
+		WHERE client_id=$1 AND network_id=$2 FOR UPDATE`, clientId, networkId).Scan(&active)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !active {
+		return true, nil
+	}
+	count, err := deactivateLockedNetworkClientsInTx(ctx, tx, []server.Id{clientId}, networkId)
+	return count == 1, err
 }
 
 // matches the batch size `RemoveDisconnectedNetworkClients` already uses for
@@ -1053,6 +1190,49 @@ func deactivateNetworkClientsInTx(
 	if err := result.Err(); err != nil {
 		return 0, err
 	}
+	if len(lockedClientIds) == 0 {
+		return 0, nil
+	}
+	return deactivateLockedNetworkClientsInTx(ctx, tx, lockedClientIds, networkId)
+}
+
+// deactivateOwnedNetworkClientInTx deactivates the client only when it is the
+// owner client itself or a child the owner created, and returns the rows
+// deactivated (0 when the client is not the owner's).
+func deactivateOwnedNetworkClientInTx(
+	ctx context.Context,
+	tx server.PgTx,
+	clientId server.Id,
+	networkId server.Id,
+	ownerClientId server.Id,
+) (int64, error) {
+	var lockedClientId server.Id
+	err := tx.QueryRow(
+		ctx,
+		`
+			SELECT client_id
+			FROM network_client
+			WHERE
+				client_id = $1 AND
+				network_id = $2 AND
+				(client_id = $3 OR source_client_id = $3)
+			FOR UPDATE
+		`,
+		clientId,
+		networkId,
+		ownerClientId,
+	).Scan(&lockedClientId)
+	if err == pgx.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return deactivateLockedNetworkClientsInTx(ctx, tx, []server.Id{lockedClientId}, networkId)
+}
+
+// The caller must hold FOR UPDATE on every client in this exact owned set.
+func deactivateLockedNetworkClientsInTx(ctx context.Context, tx server.PgTx, lockedClientIds []server.Id, networkId server.Id) (int64, error) {
 	if len(lockedClientIds) == 0 {
 		return 0, nil
 	}
@@ -2568,6 +2748,9 @@ func ConnectNetworkClient(
 // family the transport declared it intends to prove: 0 (legacy), 4 or 6. The
 // observed family is derived here from the client address and stored beside
 // the intent; see ConnectionProvenIpFamily for how the pair is judged.
+// The endpoint and shard locks retain the original session cut through commit.
+// Read committed observes the head after an endpoint wait instead of replaying
+// the whole admission because its pre-wait snapshot became stale.
 // Transport callers pass their authenticated network so a late handshake is
 // ordered with disposable probe-account teardown, even after client deletion.
 func ConnectNetworkClientWithIpFamily(
@@ -2623,13 +2806,24 @@ func ConnectNetworkClientWithIpFamily(
 	connectTime := server.NowUtc()
 	server.Tx(ctx, func(tx server.PgTx) {
 		err = nil
+		var admissionDeadline *time.Time
 		for _, networkId := range authenticatedNetworkIds {
-			if err = lockProberShardClientAdmissionInTx(ctx, tx, networkId); err != nil {
+			var deadline *time.Time
+			if deadline, err = lockProberShardClientAdmissionDeadlineInTx(ctx, tx, networkId); err != nil {
 				return
+			}
+			if deadline != nil && (admissionDeadline == nil || deadline.Before(*admissionDeadline)) {
+				admissionDeadline = deadline
 			}
 		}
 		connectionId = server.NewId()
-		providerWorkLockSessionMutationInTx(ctx, tx, clientId)
+		providerWorkLockCurrentSessionMutationInTx(ctx, tx, clientId)
+		// The registry fence prevents teardown, but its deadline can pass while
+		// an existing connection owner holds the endpoint. Refuse before any
+		// genesis, connection or original evidence write in this transaction.
+		if err = validateProberShardAdmissionDeadlineInTx(ctx, tx, admissionDeadline); err != nil {
+			return
+		}
 		providerWorkSessionGenesisInTx(ctx, tx, clientId)
 
 		host, _ := server.Host()
@@ -2714,7 +2908,7 @@ func ConnectNetworkClientWithIpFamily(
 			connectTime,
 			connectTime.Add(-clientAuthTimeRefreshMinInterval),
 		))
-	})
+	}, server.TxReadCommitted)
 
 	if err != nil {
 		return
@@ -2728,19 +2922,20 @@ func ConnectNetworkClientWithIpFamily(
 	return
 }
 
-// Endpoint conflicts retry within Tx's bound. If transport cancellation exhausts
-// that bound, handler expiry retires the remaining connection asynchronously.
+// The exclusive endpoint fence orders retirement; read committed observes its
+// current head after a wait. Conflicts still retry within Tx's existing bound.
+// Handler expiry retires any connection left after transport cancellation.
 func DisconnectNetworkClient(ctx context.Context, connectionId server.Id) error {
 	ctx = providerWorkSessionContext(ctx)
 	var disconnectErr error
 
 	server.Tx(ctx, func(tx server.PgTx) {
 		var originalClientId *server.Id
-		providerWorkOptionalSchemaInTx(ctx, tx, func(optional server.PgTx) error {
-			return optional.QueryRow(ctx, `SELECT client_id FROM network_client_connection WHERE connection_id=$1`, connectionId).Scan(&originalClientId)
-		})
+		if err := tx.QueryRow(ctx, `SELECT client_id FROM network_client_connection WHERE connection_id=$1`, connectionId).Scan(&originalClientId); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			server.Raise(err)
+		}
 		if originalClientId != nil {
-			providerWorkLockSessionMutationInTx(ctx, tx, *originalClientId)
+			providerWorkLockCurrentSessionMutationInTx(ctx, tx, *originalClientId)
 		}
 		disconnectTime := server.NowUtc()
 		tag, err := tx.Exec(
@@ -2764,7 +2959,7 @@ func DisconnectNetworkClient(ctx context.Context, connectionId server.Id) error 
 		if originalClientId != nil {
 			providerWorkRetainSessionEventsInTx(ctx, tx, *originalClientId)
 		}
-	})
+	}, server.TxReadCommitted)
 
 	return disconnectErr
 }
@@ -2942,18 +3137,21 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 	// references the device.
 	var reapedClientIds []server.Id
 	var reapedDeviceIds []server.Id
-	collectReaped := func(rows server.PgResult, err error) {
+	// Keep returned identities local to an attempt. MaintenanceTx may rerun
+	// after DELETE RETURNING was read but its transaction did not commit.
+	collectReaped := func(rows server.PgResult, err error) (clientIds []server.Id, deviceIds []server.Id) {
 		server.WithPgResult(rows, err, func() {
 			for rows.Next() {
 				var clientId server.Id
 				var deviceId *server.Id
 				server.Raise(rows.Scan(&clientId, &deviceId))
-				reapedClientIds = append(reapedClientIds, clientId)
+				clientIds = append(clientIds, clientId)
 				if deviceId != nil {
-					reapedDeviceIds = append(reapedDeviceIds, *deviceId)
+					deviceIds = append(deviceIds, *deviceId)
 				}
 			}
 		})
+		return
 	}
 
 	// inactive clients reap `NetworkClientReapAfterDeactivate` after their
@@ -2964,8 +3162,9 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 	// first) instead of a full scan of the active = false band
 	reapInactiveBatchCount := 10000
 	for {
-		before := len(reapedClientIds)
+		var batchClientIds, batchDeviceIds []server.Id
 		server.MaintenanceTx(ctx, func(tx server.PgTx) {
+			batchClientIds, batchDeviceIds = nil, nil
 			rows, err := tx.Query(
 				ctx,
 				`
@@ -2982,9 +3181,12 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 				minClientTime.UTC(),
 				reapInactiveBatchCount,
 			)
-			collectReaped(rows, err)
+			batchClientIds, batchDeviceIds = collectReaped(rows, err)
 		}, server.TxReadCommitted)
-		if len(reapedClientIds)-before < reapInactiveBatchCount {
+		// Only the successful attempt owns downstream cleanup.
+		reapedClientIds = append(reapedClientIds, batchClientIds...)
+		reapedDeviceIds = append(reapedDeviceIds, batchDeviceIds...)
+		if len(batchClientIds) < reapInactiveBatchCount {
 			break
 		}
 	}
@@ -3053,8 +3255,9 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 	// bounded batches (see the inactive reap above); driven by the
 	// network_client_child_reap_auth_time partial index, oldest auth_time first
 	for {
-		before := len(reapedClientIds)
+		var batchClientIds, batchDeviceIds []server.Id
 		server.MaintenanceTx(ctx, func(tx server.PgTx) {
+			batchClientIds, batchDeviceIds = nil, nil
 			rows, err := tx.Query(
 				ctx,
 				`
@@ -3076,9 +3279,11 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 				minClientTime.UTC(),
 				reapChildBatchCount,
 			)
-			collectReaped(rows, err)
+			batchClientIds, batchDeviceIds = collectReaped(rows, err)
 		}, server.TxReadCommitted)
-		if len(reapedClientIds)-before < reapChildBatchCount {
+		reapedClientIds = append(reapedClientIds, batchClientIds...)
+		reapedDeviceIds = append(reapedDeviceIds, batchDeviceIds...)
+		if len(batchClientIds) < reapChildBatchCount {
 			break
 		}
 	}
@@ -3106,6 +3311,15 @@ func RemoveDisconnectedNetworkClients(ctx context.Context, minConnectionTime tim
 				ctx,
 				`
 				DELETE FROM client_tls_certificate
+				WHERE client_id = ANY($1::uuid[])
+				`,
+				idStrings(chunk),
+			))
+			// (cascade) and their provider install category
+			server.RaisePgResult(tx.Exec(
+				ctx,
+				`
+				DELETE FROM network_client_provider_intent
 				WHERE client_id = ANY($1::uuid[])
 				`,
 				idStrings(chunk),
@@ -3355,9 +3569,9 @@ func removeProvideKeysForClientIds(ctx context.Context, clientIds []server.Id) {
 // tables whose parent row no longer exists. RemoveDisconnectedNetworkClients
 // cascades dependents together with the parent deletes, so this is a
 // low-cadence safety net for orphans left by other deletion paths or older
-// releases, not the primary cleanup mechanism. Each table is paged fully by its
-// primary key in bounded sliceSize slices (see sweepOrphanCursor), so a call
-// never full-scans a child table even when there are no orphans.
+// releases, not the primary cleanup mechanism. Each call intentionally traverses
+// every child table in primary-key order, with at most sliceSize selected keys
+// per page (see sweepOrphanCursor).
 func SweepOrphanNetworkClientData(ctx context.Context, sliceSize int) (removedCount int64) {
 	// per-connection tables whose connection is gone, keyed by connection_id
 	removedCount += sweepOrphanTable(
@@ -3644,107 +3858,8 @@ func SweepOrphanNetworkClientData(ctx context.Context, sliceSize int) (removedCo
 		func() []any { return []any{new(string), new(string), new(int64)} },
 	)
 
-	// provide keys whose client is gone, paged by (client_id, provide_mode).
-	// RETURNING feeds the redis mirror cleanup, so this is an inline cursor loop
-	// (like proxy_device_config above): a bound sentinel row carries pagination
-	// so slices with no deletions still advance the cursor.
-	{
-		var cursorClientId server.Id
-		var cursorProvideMode ProvideMode
-		firstSlice := true
-		for {
-			clientProvideModes := map[server.Id][]ProvideMode{}
-			var sliceCount int64
-			var maxClientId server.Id
-			var maxProvideMode ProvideMode
-			gotBound := false
-			server.MaintenanceTx(ctx, func(tx server.PgTx) {
-				// reset in case the tx is retried on a transient error
-				clientProvideModes = map[server.Id][]ProvideMode{}
-				sliceCount = 0
-				gotBound = false
-
-				result, err := tx.Query(
-					ctx,
-					`
-					WITH slice AS (
-						SELECT client_id, provide_mode
-						FROM provide_key
-						WHERE ($1 OR (client_id, provide_mode) > ($2, $3))
-						ORDER BY client_id, provide_mode
-						LIMIT $4
-					), del AS (
-						DELETE FROM provide_key
-						USING slice
-						WHERE
-							provide_key.client_id = slice.client_id AND
-							provide_key.provide_mode = slice.provide_mode AND
-							NOT EXISTS (
-								SELECT 1 FROM network_client
-								WHERE network_client.client_id = provide_key.client_id
-							)
-						RETURNING provide_key.client_id, provide_key.provide_mode
-					), bound AS (
-						SELECT client_id, provide_mode
-						FROM slice
-						ORDER BY client_id DESC, provide_mode DESC
-						LIMIT 1
-					)
-					SELECT true, (SELECT count(*) FROM slice), bound.client_id, bound.provide_mode
-					FROM bound
-					UNION ALL
-					SELECT false, NULL, del.client_id, del.provide_mode
-					FROM del
-					`,
-					firstSlice,
-					cursorClientId,
-					cursorProvideMode,
-					sliceSize,
-				)
-				server.WithPgResult(result, err, func() {
-					for result.Next() {
-						var isBound bool
-						var sc *int64
-						var clientId server.Id
-						var provideMode ProvideMode
-						server.Raise(result.Scan(&isBound, &sc, &clientId, &provideMode))
-						if isBound {
-							gotBound = true
-							if sc != nil {
-								sliceCount = *sc
-							}
-							maxClientId = clientId
-							maxProvideMode = provideMode
-						} else {
-							clientProvideModes[clientId] = append(clientProvideModes[clientId], provideMode)
-						}
-					}
-				})
-			}, server.TxReadCommitted)
-
-			server.Redis(ctx, func(r server.RedisClient) {
-				for clientId, provideModes := range clientProvideModes {
-					pipe := r.TxPipeline()
-					pipe.Del(ctx, provideModesKey(clientId))
-					for _, provideMode := range provideModes {
-						pipe.Del(ctx, provideModeSecretKeyKey(clientId, provideMode))
-					}
-					_, err := pipe.Exec(ctx)
-					server.Raise(err)
-				}
-			})
-
-			for _, provideModes := range clientProvideModes {
-				removedCount += int64(len(provideModes))
-			}
-			if !gotBound || sliceCount < int64(sliceSize) {
-				break
-			}
-			cursorClientId = maxClientId
-			cursorProvideMode = maxProvideMode
-			firstSlice = false
-		}
-	}
+	// Provide keys use a bounded full-key page and locked-tuple deletion.
+	removedCount += sweepOrphanProvideKeys(ctx, sliceSize)
 
 	// TLS certificates whose client is gone, keyed by client_id
 	removedCount += sweepOrphanTable(
@@ -3853,74 +3968,6 @@ func HeartbeatNetworkClientHandler(ctx context.Context, handlerId server.Id) (re
 	return
 }
 
-func CloseExpiredNetworkClientHandlers(ctx context.Context, minTime time.Time) {
-	ctx = providerWorkSessionContext(ctx)
-	disconnectTime := server.NowUtc()
-	server.MaintenanceTx(ctx, func(tx server.PgTx) {
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-				DELETE FROM network_client_handler
-				WHERE
-					heartbeat_time < $1
-			`,
-			minTime.UTC(),
-		))
-		var originalClientIds []server.Id
-		boundedRetirement := providerWorkOptionalSchemaInTx(ctx, tx, func(optional server.PgTx) error {
-			rows, err := optional.Query(ctx, `SELECT DISTINCT client_id FROM network_client_connection c
-			 WHERE c.connected AND NOT EXISTS(SELECT 1 FROM network_client_handler h WHERE h.handler_id=c.handler_id)
-			 ORDER BY client_id LIMIT 4096`)
-			if err != nil {
-				return err
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var clientId server.Id
-				if err := rows.Scan(&clientId); err != nil {
-					return err
-				}
-				originalClientIds = append(originalClientIds, clientId)
-			}
-			return rows.Err()
-		})
-		if boundedRetirement && len(originalClientIds) == 0 {
-			return
-		}
-		boundedRetirement = boundedRetirement && providerWorkLockSessionMutationInTx(ctx, tx, originalClientIds...)
-
-		// A handler row and its connections deliberately have no foreign key:
-		// handlers are ephemeral, while connection history is retained. That
-		// means a process loss, an old cleanup implementation, or a connect that
-		// races handler deletion can leave an open row whose handler is already
-		// gone. Selecting only expired handler ids can never discover that row.
-		// Sweep the durable invariant after the delete so every such connection
-		// is repaired, including orphans left by an earlier taskworker.
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-				UPDATE network_client_connection
-				SET
-					connected = false,
-					disconnect_time = $1
-				WHERE
-					network_client_connection.connected = true AND
-					(NOT $2::boolean OR network_client_connection.client_id=ANY($3::uuid[])) AND
-					NOT EXISTS (
-						SELECT 1
-						FROM network_client_handler
-						WHERE
-							network_client_handler.handler_id = network_client_connection.handler_id
-					)
-			`,
-			disconnectTime,
-			boundedRetirement,
-			originalClientIds,
-		))
-		providerWorkRetainSessionEventsInTx(ctx, tx, originalClientIds...)
-	})
-}
-
 type NetworkClientConnectionStatus struct {
 	Connected    bool
 	ClientExists bool
@@ -3984,6 +4031,8 @@ func DeviceSetName(
 	clientSession *session.ClientSession,
 ) (setNameResult *DeviceSetNameResult, returnErr error) {
 	server.Tx(clientSession.Ctx, func(tx server.PgTx) {
+		// a client token renames only its own client's device (AUTHZ1.md);
+		// any other device answers as one that does not exist
 		tag := server.RaisePgResult(tx.Exec(
 			clientSession.Ctx,
 			`
@@ -3991,11 +4040,22 @@ func DeviceSetName(
 					device_name = $2
 				WHERE
 					device_id = $1 AND
-					network_id = $3
+					network_id = $3 AND
+					(
+						$4::uuid IS NULL OR
+						device_id IN (
+							SELECT device_id
+							FROM network_client
+							WHERE
+								client_id = $4 AND
+								network_id = $3
+						)
+					)
 			`,
 			setName.DeviceId,
 			setName.DeviceName,
 			clientSession.ByJwt.NetworkId,
+			clientSession.ByJwt.ClientId,
 		))
 		if tag.RowsAffected() != 1 {
 			setNameResult = &DeviceSetNameResult{

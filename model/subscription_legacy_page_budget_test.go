@@ -10,7 +10,8 @@ import (
 )
 
 // Each statement stays below the worker's two-second limit, while a loaded
-// page cannot fit all 64 independent commits inside its fifteen-second budget.
+// page cannot fit all 64 independent commits inside its fifteen-second budget,
+// even when the row ceiling permits256. The ceiling cannot extend that budget.
 // A page timeout must checkpoint the committed prefix, preserve the interrupted
 // contract's full reservation, and resume without a task-wide error backoff.
 func TestLegacySettlementLoadedPageBudgetPreservesContinuation(t *testing.T) {
@@ -46,6 +47,9 @@ func TestLegacySettlementLoadedPageBudgetPreservesContinuation(t *testing.T) {
 				server.RaisePgResult(tx.Exec(ctx, `UPDATE legacy_settlement_intent SET next_attempt_time=$2 WHERE contract_id=$1`, id, oldest.Add(time.Duration(index)*time.Millisecond)))
 			})
 		}
+		// The setup-only ID rewrites must not add deferred cold repair to
+		// this financial page-budget control.
+		refreshNetEscrow(ctx, []server.Id{f.balanceId})
 
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `
@@ -60,7 +64,7 @@ func TestLegacySettlementLoadedPageBudgetPreservesContinuation(t *testing.T) {
                 EXECUTE FUNCTION synthetic_legacy_settlement_residence();`))
 		})
 		started := time.Now()
-		first, err := FlushLegacySettlements(ctx, 0, nil, count)
+		first, err := FlushLegacySettlements(ctx, 0, nil, 256)
 		elapsed := time.Since(started)
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `DROP TRIGGER synthetic_legacy_settlement_residence ON transfer_contract;
@@ -87,7 +91,7 @@ func TestLegacySettlementLoadedPageBudgetPreservesContinuation(t *testing.T) {
 		if err != nil || first.Completed != terminal || first.Failed != 0 || !first.More || first.Cursor == nil || first.Cursor.ContractId != ids[terminal-1] {
 			t.Fatalf("page budget discarded its completed prefix instead of continuing: %+v, %v", first, err)
 		}
-		second, err := FlushLegacySettlements(ctx, 0, first.Cursor, count)
+		second, err := FlushLegacySettlements(ctx, 0, first.Cursor, 256)
 		if err != nil || second.Failed != 0 || first.Completed+second.Completed != count || second.Cursor != nil {
 			t.Fatalf("continued page skipped the interrupted intent: %+v, %v", second, err)
 		}
@@ -134,6 +138,7 @@ func TestLegacySettlementParentCancellationKeepsPartialPageError(t *testing.T) {
 		})
 		server.Raise(CloseContract(ctx, secondID, f.sourceId, 11, false))
 		server.Raise(CloseContract(ctx, secondID, f.destinationId, 11, false))
+		refreshNetEscrow(ctx, []server.Id{f.balanceId})
 		oldest := server.NowUtc().Add(-time.Hour)
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `UPDATE legacy_settlement_intent SET next_attempt_time=$2 WHERE contract_id=$1`, firstID, oldest))
@@ -159,19 +164,33 @@ func TestLegacySettlementParentCancellationKeepsPartialPageError(t *testing.T) {
 		defer held.Rollback(context.Background())
 		server.RaisePgResult(held.Exec(ctx, `SELECT pg_advisory_xact_lock(731019)`))
 		blocker := contractLifecycleTestBackendPid(t, ctx, held)
+		// Resume before the first row so its existing individual forward
+		// turn commits before the second row enters the cancellation barrier.
+		after := &LegacySettlementCursor{ContractId: firstID, NextAttemptTime: oldest.Add(-time.Second), PassEndTime: server.NowUtc()}
 		parent, cancelParent := context.WithCancel(ctx)
 		defer cancelParent()
 		type outcome struct {
 			result LegacySettlementFlushResult
 			err    error
 		}
-		done := make(chan outcome, 1)
+		done, joined := make(chan outcome, 1), make(chan struct{})
+		defer func() { cancelParent(); held.Rollback(context.Background()); <-joined }()
 		shard := int(firstID[15]) % LegacySettlementShardCount
 		go func() {
-			result, err := FlushLegacySettlements(parent, shard, nil, 64)
-			done <- outcome{result, err}
+			defer close(joined)
+			result, err := FlushLegacySettlements(parent, shard, after, 256)
+			done <- outcome{result: result, err: err}
 		}()
 		requireContractLifecycleBlockedBy(t, ctx, held, blocker)
+		var firstCommitted, secondPending bool
+		server.Raise(held.QueryRow(ctx, `SELECT
+		 COALESCE((SELECT outcome='settled' FROM transfer_contract WHERE contract_id=$1),false)
+		  AND NOT EXISTS(SELECT 1 FROM legacy_settlement_intent WHERE contract_id=$1),
+		 COALESCE((SELECT outcome IS NULL FROM transfer_contract WHERE contract_id=$2),false)
+		  AND EXISTS(SELECT 1 FROM legacy_settlement_intent WHERE contract_id=$2)`, firstID, secondID).Scan(&firstCommitted, &secondPending))
+		if !firstCommitted || !secondPending {
+			t.Fatal("parent cancellation barrier did not follow a committed first owner", firstCommitted, secondPending)
+		}
 		cancelParent()
 		var canceled outcome
 		select {
@@ -189,7 +208,7 @@ func TestLegacySettlementParentCancellationKeepsPartialPageError(t *testing.T) {
 		}
 		requireLegacySettlementTestState(t, ctx, f, firstID, false, true, 989, 100)
 		requireLegacySettlementTestState(t, ctx, f, secondID, true, false, 989, 100)
-		resumed, err := FlushLegacySettlements(ctx, shard, nil, 64)
+		resumed, err := FlushLegacySettlements(ctx, shard, nil, 256)
 		if err != nil || resumed.Completed != 1 || resumed.Cursor != nil {
 			t.Fatalf("parent-canceled intent did not resume: %+v, %v", resumed, err)
 		}

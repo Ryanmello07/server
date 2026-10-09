@@ -1,6 +1,6 @@
 module github.com/urnetwork/server
 
-go 1.26.5
+go 1.27.2
 
 require (
 	github.com/ChainSafe/go-schnorrkel v1.1.0
@@ -47,11 +47,11 @@ require (
 	github.com/urnetwork/proxy v0.0.0
 	github.com/urnetwork/sdk v0.0.0
 	github.com/urnetwork/userwireguard v0.0.0
-	golang.org/x/crypto v0.54.0
-	golang.org/x/net v0.57.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sys v0.47.0
-	golang.org/x/text v0.40.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/text v0.42.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
@@ -176,6 +176,7 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/supranational/blst v0.3.16-0.20250831170142-f48500c1fdbe // indirect
 	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7 // indirect
+	github.com/theodorsm/covert-dtls v1.5.1 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
@@ -196,8 +197,8 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
 	golang.org/x/image v0.44.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/term v0.45.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	gopkg.in/ini.v1 v1.67.3 // indirect
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
@@ -228,6 +229,7 @@ replace github.com/urfoundation/sn => ../sn
 // native RPC transport and tracked upstream provenance in server binaries.
 replace github.com/centrifuge/go-substrate-rpc-client/v4 => ../sn/third_party/go-substrate-rpc-client
 
-// Share the fork's source with local builds and frozen PERF arms. CI locks this
-// sibling's full revision; the release builder converts it to an immutable pin.
+// Share the fork's source with local builds and frozen PERF arms. The source
+// lock (local/source-graph/lock.yml) pins this sibling's full revision; the
+// release builder converts it to an immutable pin.
 replace gvisor.dev/gvisor => ../gvisor

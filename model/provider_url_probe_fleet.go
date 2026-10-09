@@ -40,24 +40,38 @@ type ProviderUrlProbeFleet struct {
 // This aggregate belongs on the periodic metrics path, not on every claim.
 // Missing quota rows remain in the denominator and show their full deficit.
 func GetProviderUrlProbeFleet(ctx context.Context, now time.Time) ProviderUrlProbeFleet {
+	return GetProviderUrlProbeFleetObserved(ctx, now, nil)
+}
+
+// GetProviderUrlProbeFleetObserved retains the exact census query and deadline.
+// Query completion includes result iteration, decoding, and result cleanup;
+// rows count decoded aggregate rows, never eligible providers or quota credits.
+func GetProviderUrlProbeFleetObserved(ctx context.Context, now time.Time, observation *server.DbReadObservation) ProviderUrlProbeFleet {
 	fleet := ProviderUrlProbeFleet{}
 	policy := SelectedProviderUrlProbePolicyVersion()
 	server.Db(ctx, func(conn server.PgConn) {
-		var deficitJson []byte
-		rows, err := conn.Query(ctx, providerUrlProbeFleetSql(policy), now.UTC(), ProvideModePublic, ProviderUrlProbeRunTarget,
-			now.Add(-ProviderEgressProbeRefreshAge).UTC())
-		server.WithPgResult(rows, err, func() {
-			if rows.Next() {
-				server.Raise(rows.Scan(&fleet.Eligible, &fleet.Due, &fleet.Complete, &fleet.Overdue, &fleet.RunsNeeded, &fleet.OldestDueSeconds,
-					&fleet.SecurityExceptions, &fleet.SecurityUnknownTargets, &fleet.QuotaComplete,
-					&fleet.Warming, &fleet.MissingCycles, &fleet.CohortStartedAtSeconds,
-					&fleet.MatureEligible, &fleet.MatureQuotaComplete, &fleet.MatureRunsNeeded,
-					&fleet.WarmingEligible, &fleet.WarmingQuotaComplete, &fleet.WarmingRunsNeeded,
-					&fleet.EligibilityAgeUnknown, &fleet.AgeUnknownQuotaComplete, &fleet.AgeUnknownRunsNeeded, &deficitJson))
-				fleet.MatureDeficitDiagnostics = providerUrlProbeMatureDeficitDiagnostics(deficitJson, policy, fleet.MatureEligible-fleet.MatureQuotaComplete)
-			}
+		providerUrlProbeFleetRead(ctx, conn, func(tx server.PgTx) {
+			observation.BeginQuery()
+			querySucceeded := false
+			defer func() { observation.FinishQuery(querySucceeded) }()
+			var deficitJson []byte
+			rows, err := tx.Query(ctx, providerUrlProbeFleetSql(policy), now.UTC(), ProvideModePublic, ProviderUrlProbeRunTarget,
+				now.Add(-ProviderEgressProbeRefreshAge).UTC())
+			server.WithPgResult(rows, err, func() {
+				if rows.Next() {
+					server.Raise(rows.Scan(&fleet.Eligible, &fleet.Due, &fleet.Complete, &fleet.Overdue, &fleet.RunsNeeded, &fleet.OldestDueSeconds,
+						&fleet.SecurityExceptions, &fleet.SecurityUnknownTargets, &fleet.QuotaComplete,
+						&fleet.Warming, &fleet.MissingCycles, &fleet.CohortStartedAtSeconds,
+						&fleet.MatureEligible, &fleet.MatureQuotaComplete, &fleet.MatureRunsNeeded,
+						&fleet.WarmingEligible, &fleet.WarmingQuotaComplete, &fleet.WarmingRunsNeeded,
+						&fleet.EligibilityAgeUnknown, &fleet.AgeUnknownQuotaComplete, &fleet.AgeUnknownRunsNeeded, &deficitJson))
+					observation.Row()
+					fleet.MatureDeficitDiagnostics = providerUrlProbeMatureDeficitDiagnostics(deficitJson, policy, fleet.MatureEligible-fleet.MatureQuotaComplete)
+				}
+			})
+			querySucceeded = true
 		})
-	})
+	}, observation)
 	fleet.SuccessesNeeded = fleet.RunsNeeded
 	return fleet
 }
@@ -78,7 +92,7 @@ func providerUrlProbeFleetSql(policy int) string {
 			AND (provider.ipv4_proven OR NOT provider.ipv6_proven)
 			AND client.active AND client.source_client_id IS NULL
 			AND EXISTS (SELECT 1 FROM provide_key AS key WHERE key.client_id=provider.client_id AND key.provide_mode=$2)
-			AND ` + providerProbeEligibilitySql("provider") + `
+			AND ` + providerUrlProbeAdmissionSql("provider") + `
 			)` + providerUrlProbeMatureDeficitCtesSql(policy) + `
 			SELECT COUNT(*),
 				COUNT(*) FILTER (WHERE next_attempt_at <= $1 OR client_id IS NULL),

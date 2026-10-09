@@ -40,12 +40,33 @@ const snNanoPointsPerPoint = 1_000_000
 // Wallet: read + validate
 // -----------------------------------------------------------------------------
 
+// The consent kinds a wallet entry can come from. An entry without a scope
+// is an account projection of a wallet login proof or the network side copy,
+// which release settlement never pays.
+const (
+	SnWalletConsentScopeProvider = protocol.EarningWalletModeProvider
+	SnWalletConsentScopeNetwork  = protocol.EarningWalletModeNetwork
+	SnWalletConsentScopeHotkey   = protocol.EarningWalletModeHotkey
+)
+
 // SnWallet is one attached coldkey. ClientId is nil for the network-level
 // wallet and set for a provider client's wallet.
 type SnWallet struct {
 	ColdkeySs58 string     `json:"coldkey_ss58"`
 	ClientId    *server.Id `json:"client_id,omitempty"`
 	SetAtMillis int64      `json:"set_at_millis"`
+	// SnWalletConsentScope*, or absent when the entry is not a consent
+	ConsentScope string `json:"consent_scope,omitempty"`
+	// for a consent: its first and last earning epochs
+	FromEpoch    uint64 `json:"from_epoch,omitempty"`
+	ThroughEpoch uint64 `json:"through_epoch,omitempty"`
+	// hotkey scope only: the delegated hotkey, the global consent head the
+	// delegation pins and the delegation chain head, hashes as 0x hex
+	HotkeySs58        string `json:"hotkey_ss58,omitempty"`
+	ConsentHeadHash   string `json:"consent_head_hash,omitempty"`
+	ConsentGeneration uint64 `json:"consent_generation,omitempty"`
+	MappingHash       string `json:"mapping_hash,omitempty"`
+	MappingGeneration uint64 `json:"mapping_generation,omitempty"`
 }
 
 type SnGetWalletError struct {
@@ -53,8 +74,11 @@ type SnGetWalletError struct {
 }
 
 // SnGetWalletResult lists every wallet attached inside the network. `Wallet`
-// is the effective one for the session: the client-scoped wallet for a
-// client session when set, else the network wallet; nil when none.
+// is the effective one for the session, in settlement's precedence: a client
+// session's own provider consent, else the network consent, else the hotkey
+// delegation, else the client's own wallet without a consent, else the network
+// side copy. A network session: the network consent, else the hotkey
+// delegation, else the side copy. Nil when none.
 type SnGetWalletResult struct {
 	Wallet  *SnWallet         `json:"wallet,omitempty"`
 	Wallets []SnWallet        `json:"wallets"`
@@ -65,11 +89,39 @@ func SnGetWallet(clientSession *session.ClientSession) (*SnGetWalletResult, erro
 	ctx := clientSession.Ctx
 	networkId := clientSession.ByJwt.NetworkId
 	result := &SnGetWalletResult{Wallets: []SnWallet{}}
+	// the effective candidates in precedence order
+	var ownConsent, networkConsent, hotkeyDelegation, ownProjection, sideCopy *SnWallet
+	// the network consent and then the hotkey delegation are listed before the
+	// side copy, so a client that takes the first network-level entry follows
+	// settlement's order
+	if domain, ok := stClientKeyHistoryDomain(); ok {
+		consent, err := model.GetNetworkWalletMappingConsent(ctx, domain, networkId)
+		if err != nil {
+			return nil, err
+		}
+		if consent != nil {
+			wallet := SnWallet{
+				ColdkeySs58:  consent.ColdkeySs58,
+				SetAtMillis:  consent.AcceptedAt.UnixMilli(),
+				ConsentScope: SnWalletConsentScopeNetwork,
+				FromEpoch:    consent.FromEpoch,
+				ThroughEpoch: consent.ThroughEpoch,
+			}
+			result.Wallets = append(result.Wallets, wallet)
+			networkConsent = &wallet
+		}
+		hotkeyDelegation, err = snHotkeyWallet(ctx, domain, networkId)
+		if err != nil {
+			return nil, err
+		}
+		if hotkeyDelegation != nil {
+			result.Wallets = append(result.Wallets, *hotkeyDelegation)
+		}
+	}
 	if wallet := model.GetStWallet(ctx, networkId); wallet != nil {
 		networkWallet := SnWallet{ColdkeySs58: wallet.ColdkeySs58, SetAtMillis: wallet.SetTime.UnixMilli()}
 		result.Wallets = append(result.Wallets, networkWallet)
-		effective := networkWallet
-		result.Wallet = &effective
+		sideCopy = &networkWallet
 	}
 	for _, providerWallet := range model.GetStProviderWalletsForNetwork(ctx, networkId) {
 		clientId := providerWallet.ClientId
@@ -78,10 +130,26 @@ func SnGetWallet(clientSession *session.ClientSession) (*SnGetWalletResult, erro
 			ClientId:    &clientId,
 			SetAtMillis: providerWallet.SetTime.UnixMilli(),
 		}
+		if providerWallet.OriginalMessage != nil {
+			if statement, err := protocol.DecodeWalletMappingStatement(*providerWallet.OriginalMessage); err == nil && statement.ClientId == [16]byte(clientId) {
+				wallet.ConsentScope = SnWalletConsentScopeProvider
+				wallet.FromEpoch, wallet.ThroughEpoch = statement.FromEpoch, statement.ThroughEpoch
+			}
+		}
 		result.Wallets = append(result.Wallets, wallet)
 		if clientSession.ByJwt.ClientId != nil && *clientSession.ByJwt.ClientId == clientId {
-			effective := wallet
-			result.Wallet = &effective
+			if wallet.ConsentScope == SnWalletConsentScopeProvider {
+				ownConsent = &wallet
+			} else {
+				ownProjection = &wallet
+			}
+		}
+	}
+	for _, effective := range []*SnWallet{ownConsent, networkConsent, hotkeyDelegation, ownProjection, sideCopy} {
+		if effective != nil {
+			wallet := *effective
+			result.Wallet = &wallet
+			break
 		}
 	}
 	return result, nil
@@ -215,11 +283,24 @@ func snChainState(ctx context.Context) (*StConfig, StClient, *StEpochState) {
 
 // snEpochSummaryWithChainSettings overlays the release chain settings that
 // direct claims need onto the epoch summary: settlement vault, no_id
-// (decimal), netuid and the selected profile's public rpc url. Unset values
-// stay empty so the SDK/web defaults win.
+// (decimal), netuid and the selected profile's public rpc url. It also states
+// the genesis hash, which with chain_id and netuid names the subnet a miner's
+// hotkey wallet consent is signed for, so a miner learns the subnet without
+// requesting a challenge. Unset values stay empty so the SDK/web defaults win.
 func snEpochSummaryWithChainSettings(cfg *StConfig, summary *model.StEpochSummary) *model.StEpochSummary {
 	if cfg == nil || summary == nil {
 		return summary
+	}
+	// the epoch-row fallback carries no chain identity of its own; the cached
+	// summary already states the same configured values
+	if summary.ChainId == 0 {
+		summary.ChainId = cfg.ChainId
+	}
+	if summary.ContractAddress == "" && cfg.ContractAddress != (common.Address{}) {
+		summary.ContractAddress = cfg.ContractAddress.Hex()
+	}
+	if cfg.GenesisHash != ([32]byte{}) {
+		summary.GenesisHash = "0x" + hex.EncodeToString(cfg.GenesisHash[:])
 	}
 	if cfg.SettlementVault != (common.Address{}) {
 		summary.SettlementVaultAddress = cfg.SettlementVault.Hex()

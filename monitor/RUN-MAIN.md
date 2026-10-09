@@ -183,6 +183,15 @@ The normal workstation mode is `overlay`; use `lan` only from a host with the
 configured LAN routes. An explicit `-ssh-key` may be repeated when the SSH
 configuration does not already select the identities.
 
+For continuous URL-quota tracking, add `-url-probe-coverage-output` with a
+private JSONL path under the run evidence directory to the authoritative
+watcher. The same signal execution records healthy and unavailable samples
+alongside the unchanged alert stream; it starts no additional observer or
+query. Keep this append-only file across cadence samples and pin it with the
+watcher binary. Read the latest record's source clocks, nullable age partitions
+and gaps before reporting a mature percentage; an old numeric row is not a
+current observation. Source promotion is still subject to the gates below.
+
 ```sh
 test -n "$BRINGYOUR_HOME"
 test -n "$WARP_HOME"
@@ -631,6 +640,68 @@ SQL, process argv and credentials out of public evidence. See `SIGNALS.md`
 
 ## Safe watcher promotion
 
+### Shared SSH admission for bounded diagnostics
+
+When the qualified shared-admission profile is selected, the watcher receives
+`-ssh-admission-dir` naming a private mode-0700 directory separate from sampler
+cadence files. This Linux-only profile requires a dedicated user systemd service
+with `KillMode=control-group`. The directory persists across controlled watcher
+replacement. Do not erase it, lower its accounting, or reset sampler clocks to
+obtain a diagnostic slot. Registration refuses a second live watcher; follow
+the user's exact singleton promotion policy rather than bypassing registration.
+
+A qualified diagnostic wrapper invokes the same source-qualified binary as
+`monitor ssh-lease PRIVATE_REQUEST_JSON` within its separately owned finite
+systemd service. The shared binary initializes generic Config/Site resources
+before command dispatch, so the helper must receive a minimal environment:
+only the local user-bus variables are inherited, and all WARP resource roots
+point at newly created private mode-0700 empty Config/Site/Vault directories.
+This isolation applies only to the helper; the watcher keeps its complete
+effective settings. Remove the temporary resource directories after joining
+the helper. Account for startup stderr separately with an 8192-byte total
+limit, retaining only its count/hash. Exact stdout framing, zero exit status,
+and joined ownership establish completion; stderr alone establishes neither
+grant nor release.
+
+The mode-0600 request has exactly `directory`, `watcher`
+(`pid`, `start_ticks`, `boot_id`), `hosts` (one inventory name or the exact
+gateway and leaf), and `wait_seconds` (1–120). The helper executes no target
+command and emits only `{"granted":true}` on stdout after an atomic reservation.
+The caller must retain and join this local helper, preserve its
+full watcher/binary/inventory guards, perform both existing SSH audits after
+the grant, and start only its qualified finite read. Write `release\n` only
+after every transport descendant is joined or the owner proves none started.
+EOF, cancellation and timeout deliberately retain the active reservation until
+native dead-owner cleanup proves its exact original cgroup empty or removed.
+The helper defaults to a 240-second process budget, including admission and
+setup. A separately qualified long-operation wrapper can invoke
+`monitor ssh-lease PRIVATE_REQUEST_JSON --lifetime-seconds N`, where `N` is a
+canonical integer from 1 through 1900. Derive `N` from the remaining original
+owner-service budget before spawning the helper. Before starting the owned
+operation, require enough time in both the helper and owner budgets for its
+complete existing work limit and joined cleanup; include queue wait and setup
+in that accounting. Do not reset either deadline or renew a reservation to
+extend work. The option changes no read, SQL, owner-service or SSH capacity
+limit. Ordinary finite readers keep the default invocation. A failed grant is
+a local refusal, not Main contact.
+
+The long-operation helper may be a separately pinned compatible build while
+the watcher remains on its exact current binary. Keep the request's watcher
+identity and the caller's full live-watcher verification unchanged; bind the
+helper executable and its source qualification separately. Its queue protocol,
+native owner checks and retained-reservation behavior must match the watcher.
+
+Before this profile is used, qualify the coupled watcher and diagnostic source,
+normal/race/vet controls, rendered target, one direct/one atomic-hop admission,
+and real local process/cgroup ownership. Preserve standing tails and the
+15-minute floor, continuous PG, current resource fences and global-four/
+per-host-two limits. No watcher pause, second diagnostic, cap exception, or
+blind retry follows an admission failure. The private queue is scheduling
+evidence only; actual native results and original capture receipts remain the
+authority for production findings.
+
+### Watcher handoff
+
 Any monitor code, catalog, inventory-loading, tailer, alert-rendering, or
 effective Config/Vault settings-generation change requires a newly built
 watcher. A `settings-freshness` finding means this boundary has already been
@@ -867,6 +938,15 @@ production resources to make a fixture pass. Any derived metric in an evidence
 receipt must carry its unit and expression so rates per second and per minute
 cannot be silently exchanged.
 
+For a read-only diagnostic binder, exercise the unchanged invocation guard
+against the exact enabled artifact before reporting successful binding. The
+disabled source can fit a manifest byte bound while activation timestamps,
+watcher identity and added lineage pins push the enabled artifact past it.
+Serialize and check that bound before creating its one-use target; lossless
+compact JSON can preserve the existing cap. A local invocation refusal proves
+no runtime fact. Preserve the refused namespace and require a separately gated
+successor with a fresh authority window, without broadening remote limits.
+
 For every iOS/Apple issue, cross-validate the same failure mechanism on Android,
 Windows, Linux, macOS, `mmm/ur.io`, and `extension` before closing the finding.
 This applies to the initial cause, adjacent defects, and the proposed fix.
@@ -1003,6 +1083,13 @@ by an alert or ledger record; the sampler never overwrites or deletes receipt
 bodies. Global archival/retention needs an explicit policy. A source/queue
 failure consumes its admission reservation; no immediate manual retry or
 second watcher is allowed. Monitor tests are not a sampler runtime action.
+When a projected receipt references a private SQL companion, inspect it only
+within the private evidence boundary. The companion contains bounded SQL bytes
+and query-ID/token mappings; neither belongs in alerts, chat, logs, or fixtures.
+Keep both immutable files and their combined 256 KiB cap. Prefix, source-buffer,
+selection and storage omissions remain explicit; a complete family sample is
+not a full SQL or caller identity. Older receipts cannot recover discarded SQL.
+The private extension uses the existing SELECTs and cadence, not another reader.
 An unacquired shared slot has no database attempt to record; its first-cadence
 coverage alert must say so and preserve any older durable clocks. Test the real
 RunLoop with a startup bulk wave and a later saturated queue: the enabled

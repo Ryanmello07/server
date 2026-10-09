@@ -12,31 +12,44 @@ import (
 )
 
 type FlushLegacySettlementsArgs struct {
-	Shard  int                           `json:"shard"`
-	Cursor *model.LegacySettlementCursor `json:"cursor,omitempty"`
+	Shard       int                                `json:"shard"`
+	Cursor      *model.LegacySettlementCursor      `json:"cursor,omitempty"`
+	PayerCursor *model.LegacySettlementPayerCursor `json:"payer_cursor,omitempty"`
 }
 type FlushLegacySettlementsResult struct {
-	model.LegacySettlementFlushResult
+	model.LegacySettlementShardResult
+	Dispatch *model.LegacySettlementDispatchResult `json:"dispatch,omitempty"`
 }
 
-func scheduleFlushLegacySettlements(clientSession *session.ClientSession, tx server.PgTx, shard int, after *model.LegacySettlementCursor, more bool) {
+func scheduleFlushLegacySettlements(clientSession *session.ClientSession, tx server.PgTx, shard int, after *model.LegacySettlementCursor, payerAfter *model.LegacySettlementPayerCursor, more bool) {
 	next := server.NowUtc().Add(2 * time.Second)
 	if more {
 		next = server.NowUtc()
 	}
-	task.ScheduleTaskInTx(tx, FlushLegacySettlements, &FlushLegacySettlementsArgs{Shard: shard, Cursor: after}, clientSession,
-		task.RunOnce(fmt.Sprintf("flush_legacy_settlements_%d", shard)), task.RunAt(next), task.MaxTime(30*time.Second))
+	task.ScheduleTaskInTx(tx, FlushLegacySettlements, &FlushLegacySettlementsArgs{Shard: shard, Cursor: after, PayerCursor: payerAfter}, clientSession,
+		task.RunOnce(fmt.Sprintf("flush_legacy_settlements_%d", shard)), task.RunAt(next), task.MaxTime(30*time.Second), task.RequireQueueOwnership(tx))
 }
 func ScheduleFlushLegacySettlements(clientSession *session.ClientSession, tx server.PgTx) {
+	requireSettlementStartupOwnershipInTx(clientSession.Ctx, tx, legacySettlementStartupOwnershipKeys())
 	for shard := range model.LegacySettlementShardCount {
-		scheduleFlushLegacySettlements(clientSession, tx, shard, nil, false)
+		scheduleFlushLegacySettlements(clientSession, tx, shard, nil, nil, false)
 	}
 }
 func FlushLegacySettlements(args *FlushLegacySettlementsArgs, clientSession *session.ClientSession) (*FlushLegacySettlementsResult, error) {
-	result, err := model.FlushLegacySettlements(clientSession.Ctx, args.Shard, args.Cursor, 64)
-	return &FlushLegacySettlementsResult{LegacySettlementFlushResult: result}, err
+	result, err := model.DispatchLegacySettlementPayers(clientSession.Ctx, args.Shard, args.Cursor, args.PayerCursor)
+	return &FlushLegacySettlementsResult{Dispatch: &result}, err
 }
 func FlushLegacySettlementsPost(args *FlushLegacySettlementsArgs, result *FlushLegacySettlementsResult, clientSession *session.ClientSession, tx server.PgTx) error {
-	scheduleFlushLegacySettlements(clientSession, tx, args.Shard, result.Cursor, result.More && result.Failed == 0 && result.Completed > 0)
+	if result.Dispatch != nil {
+		for _, payerNetworkId := range result.Dispatch.PayerNetworkIds {
+			model.QueueLegacyPayerSettlementsInTx(clientSession, tx, payerNetworkId)
+		}
+		scheduleFlushLegacySettlements(clientSession, tx, args.Shard, result.Dispatch.Cursor,
+			result.Dispatch.PayerCursor, result.Dispatch.More)
+		return nil
+	}
+	// A persisted RunPost from the earlier financial target still owns its
+	// original continuation. The next invocation enters dispatch above.
+	scheduleFlushLegacySettlements(clientSession, tx, args.Shard, result.Cursor, result.PayerCursor, result.More && result.Failed == 0 && result.Completed > 0)
 	return nil
 }

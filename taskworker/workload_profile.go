@@ -61,12 +61,19 @@ func initTaskScheduleForProfile(ctx context.Context, profile WorkloadProfile) er
 	server.Tx(ctx, func(tx server.PgTx) {
 		clientSession := session.NewLocalClientSession(ctx, "0.0.0.0:0", nil)
 		defer clientSession.Cancel()
+		debitName := work.NewTransferDebitTaskTarget().TargetFunctionName()
+		dispatchName := work.NewLegacySettlementDispatcherTaskTarget().TargetFunctionName()
 		for _, definition := range subnetOperatorTasks() {
 			if definition.schedule != nil {
+				name := definition.target.TargetFunctionName()
+				if name == debitName || name == dispatchName {
+					continue
+				}
 				definition.schedule(clientSession, tx)
 			}
 		}
 	}, server.TxReadCommitted)
+	work.ScheduleSettlementAccountingTasks(ctx)
 	return nil
 }
 
@@ -127,8 +134,11 @@ func subnetOperatorTasks() []subnetOperatorTask {
 		{target: task.NewTaskTarget(work.RemoveDisconnectedNetworkClients), schedule: work.ScheduleRemoveDisconnectedNetworkClients},
 		{target: task.NewTaskTarget(work.SweepOrphanNetworkClientData), schedule: work.ScheduleSweepOrphanNetworkClientData},
 		{target: task.NewTaskTarget(model.RemoveNetworkClientsTask)},
-		{target: task.NewTaskTarget(model.ApplyLegacyProviderTotals)},
+		{target: model.NewLegacyProviderTotalsTaskTarget()},
+		{target: model.NewLegacyNetEscrowMirrorTaskTarget()},
 		{target: task.NewTaskTarget(work.SweepOrphanContractData), schedule: work.ScheduleSweepOrphanContractData},
+		// Drain a previously queued retired refresher; startup never seeds it.
+		{target: task.NewTaskTarget(work.RefreshContractHoles)},
 		{target: task.NewTaskTarget(task.TaskCleanup), schedule: task.ScheduleTaskCleanup},
 		{target: task.NewTaskTarget(work.BackfillInitialTransferBalance), schedule: work.ScheduleBackfillInitialTransferBalance},
 		{target: task.NewTaskTarget(work.IndexSearchLocations), schedule: work.ScheduleIndexSearchLocations},
@@ -136,8 +146,9 @@ func subnetOperatorTasks() []subnetOperatorTask {
 		{target: task.NewTaskTarget(controller.RebuildPointsLeaderboard), schedule: controller.ScheduleRebuildPointsLeaderboard},
 		{target: task.NewTaskTarget(work.RemoveCompletedContracts), schedule: work.ScheduleRemoveCompletedContracts},
 		{target: task.NewTaskTarget(work.ReconcileNetEscrow), schedule: work.ScheduleReconcileNetEscrow},
-		{target: task.NewTaskTarget(work.FlushTransferDebits), schedule: work.ScheduleFlushTransferDebits},
-		{target: task.NewTaskTarget(work.FlushLegacySettlements), schedule: work.ScheduleFlushLegacySettlements},
+		{target: work.NewTransferDebitTaskTarget(), schedule: work.ScheduleFlushTransferDebits},
+		{target: work.NewLegacySettlementDispatcherTaskTarget(), schedule: work.ScheduleFlushLegacySettlements},
+		{target: model.NewLegacyPayerSettlementTaskTarget()},
 		{target: task.NewTaskTarget(work.DbMaintenance), schedule: func(clientSession *session.ClientSession, tx server.PgTx) {
 			work.ScheduleDbMaintenance(clientSession, tx, 0)
 		}},
@@ -154,6 +165,7 @@ func subnetOperatorTasks() []subnetOperatorTask {
 		{target: task.NewTaskTarget(work.RollupTransferAuditEvents), schedule: work.ScheduleRollupTransferAuditEvents},
 		{target: task.NewTaskTarget(work.RemoveOldClientReliabilityStats), schedule: work.ScheduleRemoveOldClientReliabilityStats},
 		{target: task.NewTaskTarget(work.RollupClientReliabilityStats), schedule: work.ScheduleRollupClientReliabilityStats},
+		{target: task.NewTaskTarget(work.RollupClientDataUsage), schedule: work.ScheduleRollupClientDataUsage},
 		{target: task.NewTaskTarget(work.UpdateClientReliabilityScores), schedule: work.ScheduleUpdateClientReliabilityScores},
 		{target: task.NewTaskTarget(work.RemoveOldProvideKeyChanges), schedule: work.ScheduleRemoveOldProvideKeyChanges},
 		{target: task.NewTaskTarget(work.UpdateNetworkReliabilityWindow), schedule: work.ScheduleUpdateNetworkReliabilityWindow},

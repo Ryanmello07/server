@@ -12,6 +12,7 @@ import (
 	mathrand "math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -79,6 +80,13 @@ type PgCanQuery interface {
 	Query(ctx context.Context, sql string, args ...any) (PgResult, error)
 }
 
+// TxReadBeforeBegin performs an authoritative read on the transaction's owned
+// connection before the transaction takes its first snapshot. It runs for every
+// attempt, including a connection retry, and must not write or publish effects.
+// This avoids a second pool acquisition without carrying an earlier snapshot
+// into a transaction that must observe a later credential or ownership change.
+type TxReadBeforeBegin func(PgCanQuery)
+
 const TxSerializable = pgx.Serializable
 const TxRepeatableRead = pgx.RepeatableRead
 const TxReadCommitted = pgx.ReadCommitted
@@ -122,6 +130,9 @@ type safePgPool struct {
 	ctx                context.Context
 	mutex              sync.Mutex
 	pool               *pgxpool.Pool
+	lifecycleLock      sync.Mutex
+	lifecycle          *pgPoolWrapperLifecycle
+	lifecycleDropped   atomic.Uint64
 }
 
 // resolveResources returns the connection (vault) and pool-sizing (config)
@@ -234,6 +245,7 @@ func (self *safePgPool) open() *pgxpool.Pool {
 		if err != nil {
 			panic(fmt.Sprintf("Unable to parse url: %s", err))
 		}
+		glog.Infof("[db]statement_tag = %s\n", processPgStatementTag())
 		configurePgPoolLiveness(config)
 		configurePgPoolWriteTracking(config)
 		configurePgPoolStatementErrors(config)
@@ -505,6 +517,7 @@ func MaintenanceDb(ctx context.Context, callback func(PgConn), options ...any) {
 // PostgreSQL advisory lock guarding a task claim. The maintenance pool bypasses
 // transaction-pooled PgBouncer, where session locks would not be safe.
 func AcquireMaintenanceDbConn(ctx context.Context) (PgConn, error) {
+	checkPostgresAllowed(ctx)
 	conn, err := safeMaintenancePool.open().Acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -588,9 +601,13 @@ func discardPgConnection(ctx context.Context, conn PgConn) {
 }
 
 func dbWithPool(ctx context.Context, pool *safePgPool, callback func(PgConn), options ...any) {
+	checkPostgresAllowed(ctx)
 	retryOptions := OptRetryDefault()
 	rwOptions := OptReadOnly()
 	var timing *DbTiming
+	var readObservation *DbReadObservation
+	var ownedConnection *pgOwnedConnection
+	var readBeforeBegin TxReadBeforeBegin
 	// debugOptions := OptNoDebug()
 	for _, option := range options {
 		switch v := option.(type) {
@@ -600,9 +617,19 @@ func dbWithPool(ctx context.Context, pool *safePgPool, callback func(PgConn), op
 			rwOptions = v
 		case *DbTiming:
 			timing = v
+		case *DbReadObservation:
+			readObservation = v
+		case *pgOwnedConnection:
+			ownedConnection = v
+		case TxReadBeforeBegin:
+			readBeforeBegin = v
 			// case DbDebugOptions:
 			// 	debugOptions = v
 		}
+	}
+	if ownedConnection != nil {
+		ownedConnection.run(ctx, callback, rwOptions.readOnly)
+		return
 	}
 
 	retryEndTime := NowUtc().Add(retryOptions.endRetryTimeout)
@@ -616,7 +643,10 @@ func dbWithPool(ctx context.Context, pool *safePgPool, callback func(PgConn), op
 		callbackWrites := pgWriteSnapshot{}
 		connectionRetrySafe := false
 		acquireStarted := timing.start()
-		conn, connErr := pool.open().Acquire(ctx)
+		pgPool := pool.open()
+		readObservation.BeginAcquire()
+		conn, connErr := pgPool.Acquire(ctx)
+		readObservation.FinishAcquire(connErr == nil)
 		timing.finish(DbTimingAcquire, acquireStarted)
 		if connErr != nil {
 			if retryOptions.rerunOnConnectionError {
@@ -635,17 +665,23 @@ func dbWithPool(ctx context.Context, pool *safePgPool, callback func(PgConn), op
 			}
 			panic(connErr)
 		}
+		lifecycle := pool.observeBorrow(pgPool)
+		physical := conn.Conn().PgConn()
+		cleanup := physical.CleanupDone()
 
 		func() {
 			// Cleanup must observe the classification below. Register it first so
 			// the recovery defer runs before it during panic unwinding.
 			defer func() {
+				needsCleanup := connErr != nil || physical.IsClosed() || physical.IsBusy() || physical.TxStatus() != 'I'
+				lifecycle.beginRelease()
 				if connErr != nil {
 					discardPgConnection(ctx, conn)
 					conn = nil
 				} else {
 					conn.Release()
 				}
+				lifecycle.finishRelease(cleanup, needsCleanup)
 			}()
 			defer func() {
 				if err := recover(); err != nil {
@@ -669,6 +705,12 @@ func dbWithPool(ctx context.Context, pool *safePgPool, callback func(PgConn), op
 			if !rwOptions.readOnly {
 				// the default is read only, escalate to rw
 				RaisePgResult(conn.Exec(ctx, "SET default_transaction_read_only=off"))
+			}
+			if readBeforeBegin != nil {
+				// Only this explicitly read-only preparation precedes the
+				// callback's write/replay boundary. A failed BEGIN can still
+				// retry safely, and every new connection reloads the read.
+				readBeforeBegin(conn)
 			}
 			callbackWrites = snapshotPgWrites(conn.Conn().PgConn().Conn())
 			callbackStarted = true
@@ -808,16 +850,21 @@ func txWithPool(ctx context.Context, pool *safePgPool, callback func(PgTx), opti
 	for {
 		var pgErr error
 		var commitErr error
+		var commitPosts []PostFunction
+		var committedAt time.Time
 		dbWithPool(ctx, pool, func(conn PgConn) {
 			// an earlier use of the pooled connection is not evidence about
 			// this attempt
 			pgStatementErrorRecorderOf(conn.Conn().PgConn()).Reset()
 			beginStarted := timing.start()
-			tx, err := conn.BeginTx(ctx, txOptions)
+			rawTx, err := conn.BeginTx(ctx, txOptions)
 			timing.finish(DbTimingBegin, beginStarted)
 			if err != nil {
 				panic(err)
 			}
+			tx := &postCommitPgTx{PgTx: rawTx,
+				ownershipAllowed: txOptions.IsoLevel == pgx.ReadCommitted &&
+					!retryOptions.rerunOnCommitError && !retryOptions.rerunOnTransientError && !retryOptions.rerunOnConnectionError}
 			// if debugOptions.txCommitSeparately {
 			// 	tx = newDebugTx(tx, conn, txOptions)
 			// }
@@ -867,7 +914,12 @@ func txWithPool(ctx context.Context, pool *safePgPool, callback func(PgTx), opti
 					PgCommitTimeout,
 				)
 				commitStarted := timing.start()
-				commitErr = tx.Commit(commitCtx)
+				commitErr = commitObservedTx(commitCtx, tx)
+				if commitErr == nil {
+					committedAt = time.Now()
+					tx.committedAt = committedAt
+					commitPosts = tx.posts
+				}
 				timing.finish(DbTimingCommit, commitStarted)
 				commitCancel()
 				if errors.Is(commitErr, pgx.ErrTxCommitRollback) {
@@ -902,6 +954,7 @@ func txWithPool(ctx context.Context, pool *safePgPool, callback func(PgTx), opti
 				} else if glog.V(1) {
 					glog.Infof("[db]transient error, retry = %v\n", pgErr)
 				}
+				runTxRerunHook(ctx)
 				continue
 			}
 			panic(pgErr)
@@ -925,11 +978,21 @@ func txWithPool(ctx context.Context, pool *safePgPool, callback func(PgTx), opti
 				} else if glog.V(1) {
 					glog.Infof("[db]commit error, retry = %v\n", commitErr)
 				}
+				runTxRerunHook(ctx)
 				continue
 			}
 			panic(commitErr)
 		}
 
+		// A confirmed commit owns its bounded publications even if the request
+		// canceled. The commit timestamp includes post queueing in that budget.
+		if len(commitPosts) > 0 {
+			postCtx, postCancel := context.WithDeadline(context.WithoutCancel(ctx), committedAt.Add(TxPostCommitTimeout))
+			for offset := 0; offset < len(commitPosts) && postCtx.Err() == nil; offset += 8 {
+				RunPosts(postCtx, commitPosts[offset:min(offset+8, len(commitPosts))]...)
+			}
+			postCancel()
+		}
 		return
 	}
 }
@@ -986,9 +1049,22 @@ func (self *debugTx) Exec(ctx context.Context, sql string, arguments ...any) (co
 // }
 */
 
+// Preserve an existing failure while closing its rows. After a successful
+// callback, Close must finish before Err is checked: draining a final reply
+// can produce the first error after the callback has consumed its last row.
 func WithPgResult(r PgResult, err error, callback any) {
+	closed := false
+	defer func() {
+		if !closed && r != nil {
+			// This path unwinds an earlier error, callback panic or Goexit.
+			// Cleanup must not replace that primary outcome with its panic.
+			func() {
+				defer func() { _ = recover() }()
+				r.Close()
+			}()
+		}
+	}()
 	Raise(err)
-	defer r.Close()
 	switch v := callback.(type) {
 	case func():
 		v()
@@ -997,6 +1073,9 @@ func WithPgResult(r PgResult, err error, callback any) {
 	default:
 		panic(errors.New(fmt.Sprintf("Unknown callback: %s", callback)))
 	}
+	Raise(r.Err())
+	closed = true
+	r.Close()
 	Raise(r.Err())
 }
 

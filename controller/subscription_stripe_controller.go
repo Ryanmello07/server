@@ -1262,7 +1262,7 @@ func stripeHandleRefund(
 			// the ledger row and the clawback) so Stripe retries the whole thing
 			server.Raise(eventErr)
 		}
-	})
+	}, server.TxReadCommitted, server.OptNoRetry())
 
 	if handled {
 		for _, networkId := range endedNetworkIds {
@@ -1324,6 +1324,18 @@ func StripeCreatePaymentIntent(
 		}, nil
 	}
 
+	// a step that failed: the cause is logged, and the client gets the code and
+	// the plain message (the cause can carry Stripe's or the database's words)
+	startFailed := func(step string, err error) *StripeCreatePaymentIntentResult {
+		glog.Errorf("[stripe]payment intent for network %s: %s: %v\n", session.ByJwt.NetworkId, step, err)
+		return &StripeCreatePaymentIntentResult{
+			Error: &StripeCreatePaymentIntentArgsErr{
+				Code:    PurchaseErrorCodeStartFailed,
+				Message: purchaseStartFailedMessage,
+			},
+		}
+	}
+
 	// check if user has a stripe customer id
 	stripeCustomerId, _ := model.GetStripeCustomer(session)
 
@@ -1334,16 +1346,12 @@ func StripeCreatePaymentIntent(
 		params := &stripe.CustomerParams{}
 		result, err := customer.New(params)
 		if err != nil {
-			return &StripeCreatePaymentIntentResult{
-				Error: &StripeCreatePaymentIntentArgsErr{Message: fmt.Sprintf("Failed to create stripe customer: %v", err)},
-			}, nil
+			return startFailed("create the stripe customer", err), nil
 		}
 
 		err = model.CreateStripeCustomer(result.ID, session)
 		if err != nil {
-			return &StripeCreatePaymentIntentResult{
-				Error: &StripeCreatePaymentIntentArgsErr{Message: fmt.Sprintf("Failed to save stripe customer: %v", err)},
-			}, nil
+			return startFailed("save the stripe customer", err), nil
 		}
 
 		stripeCustomerId = &result.ID
@@ -1356,9 +1364,7 @@ func StripeCreatePaymentIntent(
 
 	ek, err := ephemeralkey.New(ekparams)
 	if err != nil {
-		return &StripeCreatePaymentIntentResult{
-			Error: &StripeCreatePaymentIntentArgsErr{Message: fmt.Sprintf("Failed to create stripe ephemeral key: %v", err)},
-		}, nil
+		return startFailed("create the stripe ephemeral key", err), nil
 	}
 
 	// prices := stripeSubscriptionPrices()
@@ -1405,15 +1411,11 @@ func StripeCreatePaymentIntent(
 
 		sub, err := subscription.New(params)
 		if err != nil {
-			return &StripeCreatePaymentIntentResult{
-				Error: &StripeCreatePaymentIntentArgsErr{Message: fmt.Sprintf("Failed to create stripe subscription: %v", err)},
-			}, nil
+			return startFailed("create the stripe subscription", err), nil
 		}
 
 		if sub.LatestInvoice == nil || sub.LatestInvoice.ID == "" {
-			return &StripeCreatePaymentIntentResult{
-				Error: &StripeCreatePaymentIntentArgsErr{Message: "No latest invoice found on the subscription"},
-			}, nil
+			return startFailed("read the subscription's latest invoice", errors.New("no latest invoice")), nil
 		}
 
 		// Define helper structs to unmarshal the invoice with PaymentIntent
@@ -1442,17 +1444,11 @@ func StripeCreatePaymentIntent(
 		)
 
 		if err != nil {
-			glog.Infof("Failed to fetch invoice details: %v", err)
-			return &StripeCreatePaymentIntentResult{
-				Error: &StripeCreatePaymentIntentArgsErr{Message: fmt.Sprintf("Failed to fetch invoice details: %v", err)},
-			}, nil
+			return startFailed("fetch the invoice details", err), nil
 		}
 
 		if invoice.PaymentIntent == nil || invoice.PaymentIntent.ClientSecret == "" {
-			glog.Infof("No payment intent found on the latest invoice")
-			return &StripeCreatePaymentIntentResult{
-				Error: &StripeCreatePaymentIntentArgsErr{Message: "No payment intent found on the latest invoice"},
-			}, nil
+			return startFailed("read the invoice's payment intent", errors.New("no payment intent on the latest invoice")), nil
 		}
 
 		intents = append(intents, StripePaymentIntent{
@@ -1472,6 +1468,9 @@ func StripeCreatePaymentIntent(
 }
 
 type StripeCreateCustomerPortalError struct {
+	// one of the `SubscriptionErrorCode*` values. Added after `Message`; older
+	// clients ignore it.
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -1493,7 +1492,10 @@ func StripeCreateCustomerPortal(
 	stripeCustomerId, err := model.GetStripeCustomer(session)
 	if err != nil || stripeCustomerId == nil {
 		return &StripeCreateCustomerPortalResult{
-			Error: &StripeCreateCustomerPortalError{Message: "No stripe customer found"},
+			Error: &StripeCreateCustomerPortalError{
+				Code:    SubscriptionErrorCodeNoCustomer,
+				Message: "No stripe customer found",
+			},
 		}, nil
 	}
 
@@ -1507,8 +1509,13 @@ func StripeCreateCustomerPortal(
 	result, err := stripesession.New(params)
 
 	if err != nil {
+		// Stripe's own words stay in the log
+		glog.Errorf("[stripe]could not create the customer portal session for network %s: %v\n", session.ByJwt.NetworkId, err)
 		return &StripeCreateCustomerPortalResult{
-			Error: &StripeCreateCustomerPortalError{Message: fmt.Sprintf("Failed to create stripe customer portal session: %v", err)},
+			Error: &StripeCreateCustomerPortalError{
+				Code:    SubscriptionErrorCodeStoreUnavailable,
+				Message: "Could not open the billing portal. Please try again.",
+			},
 		}, nil
 	}
 
@@ -1517,13 +1524,16 @@ func StripeCreateCustomerPortal(
 	}, nil
 }
 
+// Cancels the network's Stripe subscriptions and closes the local renewal of
+// each one Stripe confirms ended. A failed statement of the renewal query or
+// of a renewal's close raises, which ends its transaction at once with its own
+// error; keeping the error and returning normally from the transaction
+// callback went on to a commit that postgres rolled back.
 func UnsubscribeStripe(session *session.ClientSession) error {
 	invoiceIds := []string{}
-	var queryErr error
 
 	server.Tx(session.Ctx, func(tx server.PgTx) {
 		invoiceIds = nil
-		queryErr = nil
 
 		// query if network has active stripe subscriptions
 		result, err := tx.Query(
@@ -1541,30 +1551,14 @@ func UnsubscribeStripe(session *session.ClientSession) error {
 			model.SubscriptionMarketStripe,
 			server.NowUtc(),
 		)
-
-		if err != nil {
-			glog.Errorf("[unsubscribe] Failed to query subscription_renewal: %v", err)
-			queryErr = err
-			return
-		}
-
 		server.WithPgResult(result, err, func() {
 			for result.Next() {
 				var invoiceId string
-				err := result.Scan(&invoiceId)
-				if err != nil {
-					glog.Errorf("[unsubscribe] Failed to scan subscription renewal: %v", err)
-					queryErr = err
-					return
-				}
+				server.Raise(result.Scan(&invoiceId))
 				invoiceIds = append(invoiceIds, invoiceId)
 			}
 		})
 	})
-
-	if queryErr != nil {
-		return fmt.Errorf("[unsubscribe] failed to query subscription renewals: %w", queryErr)
-	}
 
 	customerId := ""
 	stripeCustomerId, err := model.GetStripeCustomer(session)
@@ -1584,10 +1578,11 @@ func UnsubscribeStripe(session *session.ClientSession) error {
 		return fmt.Errorf("[unsubscribe] failed to discover Stripe subscriptions: %w", err)
 	}
 
+	// a failed update raises (see the doc comment), so the error result is
+	// always nil
 	closeRenewal := func(invoiceId string) error {
-		var updateErr error
 		server.Tx(session.Ctx, func(tx server.PgTx) {
-			_, updateErr = tx.Exec(
+			server.RaisePgResult(tx.Exec(
 				session.Ctx,
 				`
 					UPDATE subscription_renewal
@@ -1600,12 +1595,8 @@ func UnsubscribeStripe(session *session.ClientSession) error {
 				session.ByJwt.NetworkId,
 				model.SubscriptionMarketStripe,
 				invoiceId,
-			)
+			))
 		})
-		if updateErr != nil {
-			glog.Errorf("[unsubscribe] Failed to close Stripe subscription renewal: %v", updateErr)
-			return fmt.Errorf("[unsubscribe] failed to close Stripe renewal: %w", updateErr)
-		}
 		return nil
 	}
 	if err := stripeCancelDeletionSubscriptions(session.Ctx, deletions, closeRenewal); err != nil {
@@ -1698,9 +1689,11 @@ type StripeCreateCheckoutSessionResult struct {
 	Error *StripeCreateCheckoutSessionError `json:"error,omitempty"`
 }
 
-func stripeCheckoutError(message string) *StripeCreateCheckoutSessionResult {
+// stripeCheckoutError is a refused checkout session: a `PurchaseErrorCode*`
+// and its message.
+func stripeCheckoutError(code string, message string) *StripeCreateCheckoutSessionResult {
 	return &StripeCreateCheckoutSessionResult{
-		Error: &StripeCreateCheckoutSessionError{Message: message},
+		Error: &StripeCreateCheckoutSessionError{Code: code, Message: message},
 	}
 }
 
@@ -1708,21 +1701,22 @@ func stripeCheckoutError(message string) *StripeCreateCheckoutSessionResult {
 // from pro.yml and attached to the EXISTING Stripe product -- so
 // checkout.session.completed can still look the sku up by product id and know how
 // much data to grant. Shared by the signed-in checkout and /pay/data/checkout so
-// both sell exactly the same thing. A non-empty errMessage is customer-facing.
-func stripeDataPackLineItems(itemId string) (lineItems []*stripe.CheckoutSessionLineItemParams, errMessage string) {
+// both sell exactly the same thing. A non-empty errMessage is customer-facing,
+// and errCode is its `PurchaseErrorCode*`.
+func stripeDataPackLineItems(itemId string) (lineItems []*stripe.CheckoutSessionLineItemParams, errCode string, errMessage string) {
 	byteCount, ok := stripeDataPackByteCount(itemId)
 	if !ok {
-		return nil, "Unknown item."
+		return nil, PurchaseErrorCodeInvalidRequest, "Unknown item."
 	}
 	productId, ok := stripeProductForByteCount(byteCount)
 	if !ok {
 		glog.Errorf("[stripe]no product configured for data pack %s\n", itemId)
-		return nil, "That data pack is not available."
+		return nil, PurchaseErrorCodeItemUnavailable, "That data pack is not available."
 	}
 	priceUsd, ok := stripeDataPackPriceUsd(byteCount)
 	if !ok || priceUsd <= 0 {
 		glog.Errorf("[stripe]no price in pro.yml for data pack %s\n", itemId)
-		return nil, "That data pack is not available."
+		return nil, PurchaseErrorCodeItemUnavailable, "That data pack is not available."
 	}
 	return []*stripe.CheckoutSessionLineItemParams{
 		{
@@ -1733,7 +1727,7 @@ func stripeDataPackLineItems(itemId string) (lineItems []*stripe.CheckoutSession
 			},
 			Quantity: stripe.Int64(1),
 		},
-	}, ""
+	}, "", ""
 }
 
 // stripeDataPackByteCount maps a data item id to the amount it grants, from pro.yml.
@@ -1870,16 +1864,15 @@ func StripeCreateCheckoutSession(
 
 	uiMode, ok := stripeCheckoutUiMode(args.UiMode)
 	if !ok {
-		return stripeCheckoutError("Unknown ui mode."), nil
+		return stripeCheckoutError(PurchaseErrorCodeInvalidRequest, "Unknown ui mode."), nil
 	}
 
 	redirectNever, redirectOk := stripeCheckoutRedirectNever(uiMode, args.RedirectOnCompletion)
 	if !redirectOk {
-		return &StripeCreateCheckoutSessionResult{
-			Error: &StripeCreateCheckoutSessionError{
-				Message: "redirect_on_completion \"never\" requires ui_mode \"embedded\".",
-			},
-		}, nil
+		return stripeCheckoutError(
+			PurchaseErrorCodeInvalidRequest,
+			"redirect_on_completion \"never\" requires ui_mode \"embedded\".",
+		), nil
 	}
 
 	networkId := clientSession.ByJwt.NetworkId
@@ -1895,7 +1888,7 @@ func StripeCreateCheckoutSession(
 	if !stripeCheckoutApplyUiMode(params, uiMode, redirectNever, stripeCheckoutUrls()) {
 		// refuse rather than hand a customer to Stripe with no way back
 		glog.Errorf("[stripe]checkout urls are not configured for ui mode %s\n", uiMode)
-		return stripeCheckoutError("Checkout is not configured."), nil
+		return stripeCheckoutError(PurchaseErrorCodeCheckoutUnavailable, "Checkout is not configured."), nil
 	}
 
 	stripe.Key = stripeApiToken()
@@ -1910,7 +1903,7 @@ func StripeCreateCheckoutSession(
 		}
 		if stripeNetworkHasActiveSubscription(clientSession, customerId) {
 			glog.Infof("[stripe]checkout: network %s already has an active subscription\n", networkId)
-			return stripeCheckoutError(stripeAlreadySubscribedMessage), nil
+			return stripeCheckoutError(PurchaseErrorCodeAlreadySubscribed, stripeAlreadySubscribedMessage), nil
 		}
 
 		// the caller's regional tier price, and the welcome-offer coupon when
@@ -1918,7 +1911,7 @@ func StripeCreateCheckoutSession(
 		priceId, discounts, onboardingMetadata, err := stripeCheckoutTierAndDiscount(args.ItemId, args.StorefrontCountry, clientSession)
 		if err != nil || priceId == "" {
 			glog.Errorf("[stripe]no subscription price configured for %s: %v\n", args.ItemId, err)
-			return stripeCheckoutError("That plan is not available."), nil
+			return stripeCheckoutError(PurchaseErrorCodePlanUnavailable, "That plan is not available."), nil
 		}
 		params.Discounts = discounts
 
@@ -1953,22 +1946,22 @@ func StripeCreateCheckoutSession(
 		}
 
 	case StripeItemData1Tib, StripeItemData10Tib:
-		lineItems, errMessage := stripeDataPackLineItems(args.ItemId)
+		lineItems, errCode, errMessage := stripeDataPackLineItems(args.ItemId)
 		if errMessage != "" {
-			return stripeCheckoutError(errMessage), nil
+			return stripeCheckoutError(errCode, errMessage), nil
 		}
 		// a one-time payment
 		params.Mode = stripe.String(string(stripe.CheckoutSessionModePayment))
 		params.LineItems = lineItems
 
 	default:
-		return stripeCheckoutError("Unknown item."), nil
+		return stripeCheckoutError(PurchaseErrorCodeInvalidRequest, "Unknown item."), nil
 	}
 
 	checkoutSession, err := stripecheckout.New(params)
 	if err != nil {
 		glog.Errorf("[stripe]could not create checkout session for %s: %s\n", args.ItemId, err)
-		return stripeCheckoutError("Could not start checkout. Please try again."), nil
+		return stripeCheckoutError(PurchaseErrorCodeStartFailed, "Could not start checkout. Please try again."), nil
 	}
 
 	glog.Infof(

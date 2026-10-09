@@ -87,13 +87,19 @@ type PaymentReconciliationEvent struct {
 
 // AddPaymentReconciliationEvent appends one audit row. The audit trail must
 // never turn a completed repair into a failed run, so callers log-and-continue
-// on error rather than aborting.
+// on error rather than aborting. A failed insert rolls back this audit-only
+// transaction and is returned as the error; it used to go on to a commit that
+// postgres rolled back, which raised past the callers instead.
 func AddPaymentReconciliationEvent(
 	ctx context.Context,
 	event *PaymentReconciliationEvent,
 ) (err error) {
-	server.Tx(ctx, func(tx server.PgTx) {
-		err = AddPaymentReconciliationEventInTx(tx, ctx, event)
+	server.HandleError(func() {
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.Raise(AddPaymentReconciliationEventInTx(tx, ctx, event))
+		})
+	}, func(handledErr error) {
+		err = handledErr
 	})
 	return
 }
@@ -101,7 +107,8 @@ func AddPaymentReconciliationEvent(
 // AddPaymentReconciliationEventInTx is AddPaymentReconciliationEvent inside a
 // caller-owned tx -- used by the refund/revocation webhook handlers so the
 // operator event commits (or rolls back) atomically with the clawback and its
-// idempotency-ledger row.
+// idempotency-ledger row. A failed insert raises, which ends the caller's
+// transaction at once with its own error, so the error result is always nil.
 func AddPaymentReconciliationEventInTx(
 	tx server.PgTx,
 	ctx context.Context,
@@ -122,7 +129,7 @@ func AddPaymentReconciliationEventInTx(
 	event.EventId = server.NewId()
 	event.EventTime = server.NowUtc()
 
-	_, err = tx.Exec(
+	server.RaisePgResult(tx.Exec(
 		ctx,
 		`
 		INSERT INTO payment_reconciliation_event
@@ -138,43 +145,51 @@ func AddPaymentReconciliationEventInTx(
 		detailsJson,
 		event.DryRun,
 		event.EventTime,
-	)
-	return
+	))
+	return nil
 }
 
 // AddPaymentReconciliationEventOnce appends the event unless a non-dry-run row
 // with the same store, action and evidence already exists. added is false when
 // one does. Webhook redeliveries use this so one store object is one support
 // row; two concurrent first deliveries can still both append, which is
-// harmless (readers count distinct evidence).
+// harmless (readers count distinct evidence). A failed statement rolls back
+// the transaction and is returned as the error, like
+// AddPaymentReconciliationEvent.
 func AddPaymentReconciliationEventOnce(
 	ctx context.Context,
 	event *PaymentReconciliationEvent,
 ) (added bool, err error) {
-	server.Tx(ctx, func(tx server.PgTx) {
-		result, queryErr := tx.Query(
-			ctx,
-			`
-			SELECT 1 FROM payment_reconciliation_event
-			WHERE store = $1
-			  AND action = $2
-			  AND evidence = $3
-			  AND NOT dry_run
-			LIMIT 1
-			`,
-			event.Store,
-			event.Action,
-			event.Evidence,
-		)
-		exists := false
-		server.WithPgResult(result, queryErr, func() {
-			exists = result.Next()
+	server.HandleError(func() {
+		server.Tx(ctx, func(tx server.PgTx) {
+			added = false
+			result, queryErr := tx.Query(
+				ctx,
+				`
+				SELECT 1 FROM payment_reconciliation_event
+				WHERE store = $1
+				  AND action = $2
+				  AND evidence = $3
+				  AND NOT dry_run
+				LIMIT 1
+				`,
+				event.Store,
+				event.Action,
+				event.Evidence,
+			)
+			exists := false
+			server.WithPgResult(result, queryErr, func() {
+				exists = result.Next()
+			})
+			if exists {
+				return
+			}
+			server.Raise(AddPaymentReconciliationEventInTx(tx, ctx, event))
+			added = true
 		})
-		if exists {
-			return
-		}
-		err = AddPaymentReconciliationEventInTx(tx, ctx, event)
-		added = err == nil
+	}, func(handledErr error) {
+		added = false
+		err = handledErr
 	})
 	return
 }
@@ -542,7 +557,7 @@ func EndReconciledEntitlement(
 ) (ended bool, err error) {
 	server.Tx(ctx, func(tx server.PgTx) {
 		ended = 0 < len(endReconciledEntitlementInTx(tx, ctx, &networkId, market, nil, "", now))
-	})
+	}, server.TxReadCommitted, server.OptNoRetry())
 
 	if ended {
 		// the entitlement changed under the network -- refresh the pro cache so
@@ -566,7 +581,7 @@ func EndReconciledEntitlementForTransactions(
 ) (endedNetworkIds []server.Id) {
 	server.Tx(ctx, func(tx server.PgTx) {
 		endedNetworkIds = EndReconciledEntitlementForTransactionsInTx(tx, ctx, market, transactionIds, now)
-	})
+	}, server.TxReadCommitted, server.OptNoRetry())
 	for _, networkId := range endedNetworkIds {
 		UpdateProNetwork(ctx, networkId)
 	}
@@ -577,7 +592,8 @@ func EndReconciledEntitlementForTransactions(
 // so a webhook handler can gate the clawback on its idempotency ledger inside
 // the SAME tx (the stripe_refund ledger, the apple_notification ledger). The
 // caller must refresh the pro cache (UpdateProNetwork) for each returned
-// network after commit.
+// network after commit. The outer transaction must use OptNoRetry; ownership
+// refusal aborts that transaction and its idempotency receipt together.
 func EndReconciledEntitlementForTransactionsInTx(
 	tx server.PgTx,
 	ctx context.Context,
@@ -609,7 +625,7 @@ func EndReconciledEntitlementForPurchaseToken(
 	}
 	server.Tx(ctx, func(tx server.PgTx) {
 		endedNetworkIds = endReconciledEntitlementInTx(tx, ctx, nil, market, nil, purchaseToken, now)
-	})
+	}, server.TxReadCommitted, server.OptNoRetry())
 	for _, networkId := range endedNetworkIds {
 		UpdateProNetwork(ctx, networkId)
 	}
@@ -634,8 +650,7 @@ func EndReconciledEntitlementForNetworkPurchaseToken(
 		return false, nil
 	}
 	server.Tx(ctx, func(tx server.PgTx) {
-		// Tx may retry after a transient serialization error; never retain an
-		// aborted attempt's outcome in the named return values.
+		// Ownership refusal must unwind this attempt, including caller receipts.
 		ended = false
 		err = nil
 		if err = LockPlaySubscriptionPurchaseInTx(
@@ -655,7 +670,7 @@ func EndReconciledEntitlementForNetworkPurchaseToken(
 			purchaseToken,
 			now,
 		))
-	}, server.TxReadCommitted)
+	}, server.TxReadCommitted, server.OptNoRetry())
 
 	if ended {
 		UpdateProNetwork(ctx, networkId)
@@ -680,17 +695,24 @@ func endReconciledEntitlementInTx(
 	purchaseToken string,
 	now time.Time,
 ) []server.Id {
-	networkEndTimes := map[server.Id][]time.Time{}
+	balanceIds := []server.Id{}
 	result, queryErr := tx.Query(
 		ctx,
 		`
-		SELECT network_id, end_time FROM subscription_renewal
-		WHERE subscription_type = $1
-		  AND market = $2
-		  AND end_time > $3
-		  AND ($4::uuid IS NULL OR network_id = $4)
-		  AND ($5::varchar[] IS NULL OR transaction_id = ANY($5))
-		  AND ($6::varchar = '' OR purchase_token = $6)
+		SELECT balance_id FROM transfer_balance AS balance
+		WHERE balance.pro AND balance.end_time > $3
+		  AND ($6::varchar = '' OR balance.purchase_token = $6)
+		  AND EXISTS (
+			SELECT 1 FROM subscription_renewal AS renewal
+			WHERE renewal.subscription_type = $1
+			  AND renewal.market = $2
+			  AND renewal.end_time > $3
+			  AND ($4::uuid IS NULL OR renewal.network_id = $4)
+			  AND ($5::varchar[] IS NULL OR renewal.transaction_id = ANY($5))
+			  AND ($6::varchar = '' OR renewal.purchase_token = $6)
+			  AND renewal.network_id = balance.network_id
+			  AND renewal.end_time = balance.end_time
+		  )
 		`,
 		SubscriptionTypeSupporter,
 		market,
@@ -701,27 +723,71 @@ func endReconciledEntitlementInTx(
 	)
 	server.WithPgResult(result, queryErr, func() {
 		for result.Next() {
-			var rowNetworkId server.Id
-			var endTime time.Time
-			server.Raise(result.Scan(&rowNetworkId, &endTime))
-			networkEndTimes[rowNetworkId] = append(networkEndTimes[rowNetworkId], endTime)
+			var balanceId server.Id
+			server.Raise(result.Scan(&balanceId))
+			balanceIds = append(balanceIds, balanceId)
 		}
 	})
-	if len(networkEndTimes) == 0 {
-		return nil
+	admitted, ownershipErr := tryTransferBalanceOwnershipInTx(ctx, tx, balanceIds)
+	server.Raise(ownershipErr)
+	if !admitted {
+		server.Raise(errTransferBalanceOwnershipBusy)
 	}
 
-	server.RaisePgResult(tx.Exec(
+	// Re-read scope in the mutation's snapshot. A grant that appeared during
+	// admission must roll back the receipt, never be silently left active.
+	endedNetworkIds := []server.Id{}
+	server.Raise(tx.QueryRow(
 		ctx,
 		`
-		UPDATE subscription_renewal
-		SET end_time = $3
-		WHERE subscription_type = $1
-		  AND market = $2
-		  AND end_time > $3
-		  AND ($4::uuid IS NULL OR network_id = $4)
-		  AND ($5::varchar[] IS NULL OR transaction_id = ANY($5))
-		  AND ($6::varchar = '' OR purchase_token = $6)
+		WITH renewals AS MATERIALIZED (
+			SELECT network_id, subscription_type, start_time, end_time, market
+			FROM subscription_renewal
+			WHERE subscription_type = $1
+			  AND market = $2
+			  AND end_time > $3
+			  AND ($4::uuid IS NULL OR network_id = $4)
+			  AND ($5::varchar[] IS NULL OR transaction_id = ANY($5))
+			  AND ($6::varchar = '' OR purchase_token = $6)
+		), grants AS MATERIALIZED (
+			SELECT balance_id, network_id, end_time
+			FROM transfer_balance AS balance
+			WHERE balance.pro AND balance.end_time > $3
+			  AND ($6::varchar = '' OR balance.purchase_token = $6)
+			  AND EXISTS (SELECT 1 FROM renewals
+				WHERE renewals.network_id = balance.network_id
+				  AND renewals.end_time = balance.end_time)
+		), ownership AS MATERIALIZED (
+			SELECT NOT EXISTS (
+				SELECT 1 FROM grants WHERE NOT (balance_id = ANY($7::uuid[]))
+			) AS admitted
+		), ended_renewals AS (
+			UPDATE subscription_renewal AS renewal SET end_time = $3
+			FROM renewals
+			WHERE renewal.network_id = renewals.network_id
+			  AND renewal.subscription_type = renewals.subscription_type
+			  AND renewal.start_time = renewals.start_time
+			  AND renewal.end_time = renewals.end_time
+			  AND renewal.market = renewals.market
+			  AND renewal.end_time > $3
+			  AND ($5::varchar[] IS NULL OR renewal.transaction_id = ANY($5))
+			  AND ($6::varchar = '' OR renewal.purchase_token = $6)
+			  AND (SELECT admitted FROM ownership)
+			RETURNING renewal.network_id
+		), ended_balances AS (
+			UPDATE transfer_balance AS balance SET end_time = $3
+			FROM grants
+			WHERE balance.balance_id = grants.balance_id
+			  AND balance.balance_id = ANY($7::uuid[])
+			  AND balance.network_id = grants.network_id
+			  AND balance.end_time = grants.end_time
+			  AND balance.pro AND balance.end_time > $3
+			  AND ($6::varchar = '' OR balance.purchase_token = $6)
+			  AND (SELECT admitted FROM ownership)
+			RETURNING balance.balance_id
+		)
+		SELECT admitted, ARRAY(SELECT DISTINCT network_id FROM ended_renewals)
+		FROM ownership
 		`,
 		SubscriptionTypeSupporter,
 		market,
@@ -729,27 +795,10 @@ func endReconciledEntitlementInTx(
 		networkId,
 		transactionIds,
 		purchaseToken,
-	))
-
-	endedNetworkIds := []server.Id{}
-	for endedNetworkId, endTimes := range networkEndTimes {
-		server.RaisePgResult(tx.Exec(
-			ctx,
-			`
-			UPDATE transfer_balance
-			SET end_time = $2
-			WHERE network_id = $1
-			  AND pro
-			  AND end_time = ANY($3::timestamp[])
-			  AND end_time > $2
-			  AND ($4::varchar = '' OR purchase_token = $4)
-			`,
-			endedNetworkId,
-			now,
-			endTimes,
-			purchaseToken,
-		))
-		endedNetworkIds = append(endedNetworkIds, endedNetworkId)
+		balanceIds,
+	).Scan(&admitted, &endedNetworkIds))
+	if !admitted {
+		server.Raise(errTransferBalanceOwnershipBusy)
 	}
 	return endedNetworkIds
 }

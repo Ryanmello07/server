@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/task"
@@ -42,6 +43,12 @@ func TestLegacyProviderTotalsHeldProviderDoesNotRetainGrant(t *testing.T) {
 			server.Raise(CloseContract(ctx, id, f.destinationId, 11, false))
 			ids = append(ids, id)
 		}
+		// Keep the cache explicitly cold so foreground financial posts cannot
+		// stand in for the independently queued historical mirror consumer.
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `DELETE FROM transfer_balance_net_escrow_snapshot WHERE balance_id=$1`, f.balanceId))
+		})
+		requireLegacyOwnedMetadataRedis(t, ctx, f.balanceId, 100*count)
 		holder := acquireContractLifecycleTestConnection(t, ctx)
 		defer holder.Release()
 		held, err := holder.Begin(ctx)
@@ -89,14 +96,17 @@ func TestLegacyProviderTotalsHeldProviderDoesNotRetainGrant(t *testing.T) {
 		var pid int
 		select {
 		case pid = <-projectionPid:
-		case <-projectionDone:
+		case failure := <-projectionDone:
 			joined = true
-			t.Fatal("projection ended before publishing its backend")
+			t.Fatal("projection ended before publishing its backend", failure)
 		case <-ctx.Done():
 			t.Fatal("projection did not publish its backend")
 		}
 		select {
 		case <-entered:
+		case failure := <-projectionDone:
+			joined = true
+			t.Fatal("projection ended before its provider write was observed", failure)
 		case <-ctx.Done():
 			t.Fatal("projection did not reach provider update")
 		}
@@ -113,6 +123,9 @@ func TestLegacyProviderTotalsHeldProviderDoesNotRetainGrant(t *testing.T) {
 			}
 			select {
 			case <-tick.C:
+			case failure := <-projectionDone:
+				joined = true
+				t.Fatal("projection ended before its exact provider blocking edge was observed", failure)
 			case <-ctx.Done():
 				t.Fatal("exact projection blocking edge was not observed")
 			}
@@ -202,7 +215,14 @@ func TestLegacyProviderTotalsHeldProviderDoesNotRetainGrant(t *testing.T) {
 			}
 		})
 		release()
-		worker := task.NewTaskWorkerWithDefaults(ctx)
+		mirrorOwner := legacyMirrorTestOwner(t, ctx, f.balanceId)
+		server.Tx(ctx, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `UPDATE pending_task SET run_at=$2,release_time=$2 WHERE task_id=$1`, mirrorOwner.TaskId, time.Time{}))
+		})
+		mirrorOwner = task.GetTasks(ctx, mirrorOwner.TaskId)[mirrorOwner.TaskId]
+		settings := task.DefaultTaskWorkerSettings()
+		settings.ClaimRegisteredTargetsOnly = true
+		worker := task.NewTaskWorker(ctx, settings)
 		defer worker.Close()
 		worker.AddTargets(task.NewTaskTarget(ApplyLegacyProviderTotals))
 		finished := 0
@@ -239,21 +259,42 @@ func TestLegacyProviderTotalsHeldProviderDoesNotRetainGrant(t *testing.T) {
 			}
 		})
 		assertFinancial(true)
+		requireProviderTotalsTestMirrorUntouched(t, ctx, mirrorOwner)
+		requireLegacyOwnedMetadataRedis(t, ctx, f.balanceId, 100*count)
+		finalizeProviderTotalsTestMirror(t, ctx, mirrorOwner)
 		requireLegacyOwnedMetadataRedis(t, ctx, f.balanceId, 0)
-		t.Log("exact provider blocking edge retained no financial grant; all 512 same-grant settlements completed while provider held; real task execution projected and finalized all allocations exactly")
+		assertFinancial(true)
+		t.Log("exact provider blocking edge retained no financial grant; all 512 same-grant settlements completed while provider held; provider and cold-mirror owners independently executed and finalized with exact accounting")
 	})
 }
 
+// The signal covers either transport but is only a submission observation.
+// The fixture separately requires the exact live PostgreSQL blocker edge.
 type providerTotalContentionTx struct {
 	server.PgTx
 	beforeProvider func()
 }
 
-func (self *providerTotalContentionTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+// Signal once for a matching provider statement before delegating unchanged.
+func (self *providerTotalContentionTx) observeProvider(sql string) {
 	if self.beforeProvider != nil && strings.Contains(sql, "INSERT INTO account_balance") {
 		before := self.beforeProvider
 		self.beforeProvider = nil
 		before()
 	}
+}
+
+// Ordinary controls retain the same observation before their direct write.
+func (self *providerTotalContentionTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	self.observeProvider(sql)
 	return self.PgTx.Exec(ctx, sql, args...)
+}
+
+// Pipelining keeps the provider write in the batch; an Exec-only wrapper cannot
+// see it. Inspect supplied statements without consuming or changing any reply.
+func (self *providerTotalContentionTx) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
+	for _, query := range batch.QueuedQueries {
+		self.observeProvider(query.SQL)
+	}
+	return self.PgTx.SendBatch(ctx, batch)
 }

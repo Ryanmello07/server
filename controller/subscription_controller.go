@@ -253,14 +253,46 @@ func isGuestNetwork(
 	return !hasAnyAuthMethod(session.Ctx, session.ByJwt.UserId)
 }
 
-// Stable machine codes for a refused checkout or payment intent. Clients pick
-// a localized message (or flow) from the code and fall back to `Message`.
+// Stable machine codes for a refused checkout or payment intent
+// (/stripe/create-checkout-session, /stripe/payment-intent,
+// /subscription/stripe/payment-sheet, /solana/payment-intent, /pay/data/checkout
+// and /pay/data/solana-intent). Clients pick a localized message (or flow) from
+// the code and fall back to `Message`, which every refusal still carries, so a
+// client older than a code reads the refusal as before.
 const (
 	// the network has no login method; add one (AddAuth) before buying
 	PurchaseErrorCodeGuestSignInRequired = "guest_sign_in_required"
+	// the network already has an active Pro subscription; nothing was charged
+	PurchaseErrorCodeAlreadySubscribed = "already_subscribed"
+	// the plan cannot be sold now: no price or product is configured for it
+	PurchaseErrorCodePlanUnavailable = "plan_unavailable"
+	// the data pack cannot be sold now: no price or product is configured for it
+	PurchaseErrorCodeItemUnavailable = "item_unavailable"
+	// the welcome offer is not, or no longer, redeemable by this network
+	PurchaseErrorCodeOfferUnavailable = "offer_unavailable"
+	// this deployment has no checkout configured
+	PurchaseErrorCodeCheckoutUnavailable = "checkout_unavailable"
+	// the request names an item, plan, provider, mode or reference the endpoint
+	// does not take: a client defect, not something the buyer can change
+	PurchaseErrorCodeInvalidRequest = "invalid_request"
+	// the email address the code goes to does not look like one
+	PurchaseErrorCodeInvalidEmail = "invalid_email"
+	// a data purchase for a network by name was sent without the name
+	PurchaseErrorCodeNetworkNameRequired = "network_name_required"
+	// no network has the given name
+	PurchaseErrorCodeNetworkNotFound = "network_not_found"
+	// too many attempts from this address; it may try again in a minute
+	PurchaseErrorCodeRateLimited = "rate_limited"
+	// the payment could not be started (Stripe or the database failed); a
+	// retry may work
+	PurchaseErrorCodeStartFailed = "start_failed"
 )
 
 const purchaseGuestSignInRequiredMessage = "Add a sign-in to your account before buying a plan."
+
+// The message of a payment that could not be started. The cause is logged, not
+// sent: it can carry Stripe's or the database's own words.
+const purchaseStartFailedMessage = "Could not start the payment. Please try again."
 
 // The auth-method lookup, model.HasAnyAuthMethod. Replaceable only by hermetic
 // tests, which answer the lookup without a database. Production never mutates
@@ -1452,15 +1484,17 @@ func endTerminalPlaySubscriptionRenewal(
 }
 
 // Runs in the transaction that finishes the renewal task and schedules the
-// next poll there. The subscription-ended notice is returned as work for after
-// that transaction commits: a finish that rolls back, or reruns its callback,
-// sends nothing, and the send does not hold the transaction open.
+// next poll there. The subscription-ended notice is added to the account
+// message outbox in the same transaction: a finish that rolls back leaves no
+// notice, a finish that reruns its callback (or a retried post) owes one
+// notice, and a crash after the commit no longer loses it. The delivery task
+// sends it after the commit.
 func PlaySubscriptionRenewalPost(
 	playSubscriptionRenewal *PlaySubscriptionRenewalArgs,
 	playSubscriptionRenewalResult *PlaySubscriptionRenewalResult,
 	clientSession *session.ClientSession,
 	tx server.PgTx,
-) ([]server.PostFunction, error) {
+) error {
 	if playSubscriptionRenewalResult.Canceled {
 		if !playSubscriptionRenewalResult.Terminal &&
 			!playSubscriptionRenewalResult.ExpiryTime.IsZero() {
@@ -1477,7 +1511,7 @@ func PlaySubscriptionRenewalPost(
 				playSubscriptionRenewal,
 			)
 		}
-		return nil, nil
+		return nil
 	}
 
 	if playSubscriptionRenewalResult.Renewed {
@@ -1507,28 +1541,29 @@ func PlaySubscriptionRenewalPost(
 			if errors.Is(err, model.ErrMissingUserAuth) {
 				// The notice is optional; a wallet/guest account must not strand
 				// completed renewal post-processing for lack of a recipient.
-				return nil, nil
+				return nil
 			}
-			return nil, err
+			return err
 		}
 		if userAuth == "" {
 			// the network or its admin is gone
-			return nil, nil
-		}
-		return []server.PostFunction{func() any {
-			awsMessageSender := GetAWSMessageSender()
-			err := awsMessageSender.SendAccountMessageTemplate(
-				userAuth,
-				&SubscriptionEndedTemplate{},
-			)
-			if err != nil {
-				glog.Infof("[sub]could not send the subscription ended notice for network %s: %s\n", networkId, err)
-			}
 			return nil
-		}}, nil
+		}
+		// one notice per lapse of this purchase on this network
+		addAccountMessageInTx(clientSession.Ctx, tx, &accountMessage{
+			key: fmt.Sprintf(
+				"%s/%s/%d",
+				networkId,
+				playSubscriptionRenewal.PurchaseToken,
+				playSubscriptionRenewalResult.ExpiryTime.Unix(),
+			),
+			networkId: &networkId,
+			userAuth:  userAuth,
+			template:  &SubscriptionEndedTemplate{},
+		})
 	}
 
-	return nil, nil
+	return nil
 }
 
 func VerifyCoinbaseBody(_ *session.ClientSession, req *http.Request) (io.Reader, error) {
@@ -2582,15 +2617,22 @@ func CreateSolanaPaymentIntent(
 	if intent.Plan == model.SolanaPlanYearlyOnboarding {
 		if EligibleOnboardingOffer(clientSession, clientSession.ByJwt.NetworkId) == nil {
 			return &SolanaPaymentIntentResult{
-				Error: &SolanaPaymentIntentError{Message: "The welcome offer is not available."},
+				Error: &SolanaPaymentIntentError{
+					Code:    PurchaseErrorCodeOfferUnavailable,
+					Message: "The welcome offer is not available.",
+				},
 			}, nil
 		}
 		offerApplied = true
 	}
 	priceUsd, ok := solanaPlanPriceUsdForTier(intent.Plan, tier.Tier)
 	if !ok || priceUsd <= 0 {
+		// an unknown plan or one with no configured price: not for sale now
 		return &SolanaPaymentIntentResult{
-			Error: &SolanaPaymentIntentError{Message: "Unknown plan."},
+			Error: &SolanaPaymentIntentError{
+				Code:    PurchaseErrorCodePlanUnavailable,
+				Message: "Unknown plan.",
+			},
 		}, nil
 	}
 	regularUsd := priceUsd
@@ -2616,7 +2658,10 @@ func CreateSolanaPaymentIntent(
 	if err != nil {
 		glog.Errorf("[sub]could not create solana payment intent: %s\n", err)
 		return &SolanaPaymentIntentResult{
-			Error: &SolanaPaymentIntentError{Message: "Could not start the payment. Please try again."},
+			Error: &SolanaPaymentIntentError{
+				Code:    PurchaseErrorCodeStartFailed,
+				Message: purchaseStartFailedMessage,
+			},
 		}, nil
 	}
 

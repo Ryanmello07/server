@@ -2,9 +2,7 @@ package work
 
 import (
 	"context"
-	"encoding/json"
 	"os"
-	"os/exec"
 	"strconv"
 	"testing"
 	"time"
@@ -73,31 +71,13 @@ func TestContractSettlementSameNetworkLargeNContentionFree(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 110*time.Second)
 		defer cancel()
 		f := newPrivateLoadFixtureCount(t, ctx, 0, 0, count)
-		executable, err := os.Executable()
-		server.Raise(err)
-		child := exec.CommandContext(ctx, executable, "-test.run=^TestPrivateProviderLoadedPeerProcess$", "-test.timeout=100s")
-		child.Env = append(os.Environ(), "URNETWORK_PRIVATE_LOAD_CHILD=1")
-		stdin, err := child.StdinPipe()
-		server.Raise(err)
-		stdout, err := child.StdoutPipe()
-		server.Raise(err)
-		var stderr privateLoadLockedBuffer
-		child.Stderr = &stderr
-		server.Raise(child.Start())
-		joined := false
-		defer func() {
-			if !joined {
-				_ = child.Process.Kill()
-				_ = child.Wait()
-			}
-		}()
-		encoder, decoder := json.NewEncoder(stdin), json.NewDecoder(stdout)
+		defer f.Close()
+		child := privateLoadStartPeerProcess(t, ctx, 100*time.Second)
+		defer child.close(t)
+		encoder, decoder := child.encoder, child.decoder
 		config := privateLoadProcessConfig{PG: server.Vault.RequireSimpleResource(server.DefaultPgVaultResourceName).Bytes(), Redis: server.Vault.RequireSimpleResource("redis.yml").Bytes(), Owner: f.owner, Peer: f.peer, Tokens: f.tokens[count/2:], Clients: f.clients[count/2:], PoolSize: 16}
 		server.Raise(encoder.Encode(config))
-		var ready privateLoadProcessReport
-		if err := decoder.Decode(&ready); err != nil || !ready.Ready {
-			t.Fatal("independent settlement process not ready", err)
-		}
+		child.requireReady(t)
 		local := f
 		local.tokens = f.tokens[:count/2]
 		local.clients = f.clients[:count/2]
@@ -108,62 +88,61 @@ func TestContractSettlementSameNetworkLargeNContentionFree(t *testing.T) {
 		if created.Completed+remoteCreated.Completed != count || created.Failed+remoteCreated.Failed != 0 {
 			t.Fatal("fully funded preparation failed")
 		}
-		conn, err := server.AcquireMaintenanceDbConn(ctx)
-		server.Raise(err)
-		defer conn.Release()
-		held, err := conn.Begin(ctx)
-		server.Raise(err)
-		defer held.Rollback(context.Background())
-		server.RaisePgResult(held.Exec(ctx, `SELECT balance_id FROM transfer_balance WHERE balance_id=$1 FOR UPDATE`, f.owner.BalanceId))
-		localReady, release := make(chan struct{}), make(chan struct{})
-		localResult := make(chan privateLoadProcessReport, 1)
-		go func() { localResult <- privateLoadSettleWave(ctx, t, local, created.Contracts, localReady, release) }()
-		server.Raise(encoder.Encode("prepare_settle"))
-		if err := decoder.Decode(&ready); err != nil || !ready.Ready {
-			t.Fatal("remote settlement barrier missing", err)
-		}
-		<-localReady
 		observe := privateLoadStartObserver(ctx, t)
-		server.Raise(encoder.Encode("go"))
-		close(release)
-		left := <-localResult
-		var right privateLoadProcessReport
-		server.Raise(decoder.Decode(&right))
-		activity := observe()
-		// Keep the grant held until both complete and durable journal rows are read.
-		if left.Completed+right.Completed != count || left.Failed+right.Failed != 0 {
-			t.Fatalf("settlement queued on shared grant: completed=%d failed=%d", left.Completed+right.Completed, left.Failed+right.Failed)
-		}
-		overlapStart := left.Started
-		if right.Started.After(overlapStart) {
-			overlapStart = right.Started
-		}
-		overlapEnd := left.Started.Add(left.Elapsed)
-		if end := right.Started.Add(right.Elapsed); end.Before(overlapEnd) {
-			overlapEnd = end
-		}
-		if !overlapStart.Before(overlapEnd) {
-			t.Fatal("independent settlement owners did not overlap")
-		}
-		if left.Elapsed > 3*time.Second || right.Elapsed > 3*time.Second {
-			t.Fatal("same-network settlement throughput regressed")
-		}
-		for _, key := range []string{"balance_lock_peak", "cache_lock_peak", "census_lock_peak"} {
-			if activity[key] != 0 {
-				t.Fatal("shared financial wait in current settlement", key, activity[key])
+		defer observe()
+		var credit model.ByteCount
+		err := privateLoadWithBarrier(ctx, privateLoadAcquireBarrier, `SELECT balance_id FROM transfer_balance WHERE balance_id=$1 FOR UPDATE`, f.owner.BalanceId, func() error {
+			localWave := privateLoadStartWave(ctx, func(waveCtx context.Context, ready chan<- struct{}, release <-chan struct{}) privateLoadProcessReport {
+				return privateLoadSettleWave(waveCtx, t, local, created.Contracts, ready, release)
+			})
+			defer localWave.Close()
+			server.Raise(encoder.Encode("prepare_settle"))
+			child.requireReady(t)
+			if err := localWave.Ready(ctx); err != nil {
+				t.Fatal(err)
 			}
-		}
-		var pending int
-		var consumed, credit model.ByteCount
-		server.Db(ctx, func(conn server.PgConn) {
-			server.Raise(conn.QueryRow(ctx, `SELECT count(*),sum(debit_byte_count) FROM transfer_debit_journal WHERE balance_id=$1 AND NOT applied`, f.owner.BalanceId).Scan(&pending, &consumed))
-			server.Raise(conn.QueryRow(ctx, `SELECT balance_byte_count FROM transfer_balance WHERE balance_id=$1`, f.owner.BalanceId).Scan(&credit))
+			server.Raise(encoder.Encode("go"))
+			localWave.Start()
+			left := localWave.Wait()
+			var right privateLoadProcessReport
+			server.Raise(decoder.Decode(&right))
+			activity := observe()
+			// Keep the grant held until both complete and durable journal rows are read.
+			if left.Completed+right.Completed != count || left.Failed+right.Failed != 0 {
+				t.Fatalf("settlement queued on shared grant: completed=%d failed=%d", left.Completed+right.Completed, left.Failed+right.Failed)
+			}
+			overlapStart := left.Started
+			if right.Started.After(overlapStart) {
+				overlapStart = right.Started
+			}
+			overlapEnd := left.Started.Add(left.Elapsed)
+			if end := right.Started.Add(right.Elapsed); end.Before(overlapEnd) {
+				overlapEnd = end
+			}
+			if !overlapStart.Before(overlapEnd) {
+				t.Fatal("independent settlement owners did not overlap")
+			}
+			if left.Elapsed > 3*time.Second || right.Elapsed > 3*time.Second {
+				t.Fatal("same-network settlement throughput regressed")
+			}
+			for _, key := range []string{"balance_lock_peak", "cache_lock_peak", "census_lock_peak"} {
+				if activity[key] != 0 {
+					t.Fatal("shared financial wait in current settlement", key, activity[key])
+				}
+			}
+			var pending int
+			var consumed model.ByteCount
+			server.Db(ctx, func(conn server.PgConn) {
+				server.Raise(conn.QueryRow(ctx, `SELECT count(*),sum(debit_byte_count) FROM transfer_debit_journal WHERE balance_id=$1 AND NOT applied`, f.owner.BalanceId).Scan(&pending, &consumed))
+				server.Raise(conn.QueryRow(ctx, `SELECT balance_byte_count FROM transfer_balance WHERE balance_id=$1`, f.owner.BalanceId).Scan(&credit))
+			})
+			if pending != count || consumed != model.ByteCount(11*count) || credit != 260*1024*model.Gib {
+				t.Fatal("pending exact consumption was not durable", pending, consumed, credit)
+			}
+			t.Logf("settlement clients=%d processes=2 completed=%d elapsed=%s/%s overlap=%s activity=%v", count, count, left.Elapsed, right.Elapsed, overlapEnd.Sub(overlapStart), activity)
+			return nil
 		})
-		if pending != count || consumed != model.ByteCount(11*count) || credit != 260*1024*model.Gib {
-			t.Fatal("pending exact consumption was not durable", pending, consumed, credit)
-		}
-		t.Logf("settlement clients=%d processes=2 completed=%d elapsed=%s/%s overlap=%s activity=%v", count, count, left.Elapsed, right.Elapsed, overlapEnd.Sub(overlapStart), activity)
-		server.Raise(held.Rollback(ctx))
+		server.Raise(err)
 		for shard := range model.TransferDebitShardCount {
 			for page := 0; page < 1+count/512; page++ {
 				result, err := model.FlushTransferDebits(ctx, shard, nil, 64)
@@ -180,8 +159,6 @@ func TestContractSettlementSameNetworkLargeNContentionFree(t *testing.T) {
 			t.Fatal("batched settlement accounting differs", credit)
 		}
 		server.Raise(encoder.Encode("stop"))
-		_ = stdin.Close()
-		server.Raise(child.Wait())
-		joined = true
+		server.Raise(child.wait())
 	})
 }

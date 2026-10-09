@@ -48,6 +48,9 @@ func TestLegacySettlementPageDeadlinePreservesJoinedFailureAndCommittedCursor(t 
 				server.RaisePgResult(tx.Exec(ctx, `UPDATE legacy_settlement_intent SET next_attempt_time=$2 WHERE contract_id=$1`, firstId, oldest))
 				server.RaisePgResult(tx.Exec(ctx, `UPDATE legacy_settlement_intent SET next_attempt_time=$2 WHERE contract_id=$1`, secondId, oldest.Add(time.Millisecond)))
 			})
+			// Setup-only identity rewrites must not add deferred cold projection
+			// repair to this financial cancellation and committed-cursor control.
+			refreshNetEscrow(ctx, []server.Id{f.balanceId})
 			owner, cancelParent := context.WithCancel(ctx)
 			bounded, expire := context.WithCancelCause(owner)
 			calls := 0
@@ -64,8 +67,10 @@ func TestLegacySettlementPageDeadlinePreservesJoinedFailureAndCommittedCursor(t 
 					if calls != 2 || id != secondId {
 						t.Fatal("legacy page changed the interrupted visit")
 					}
-					requireLegacySettlementTestState(t, ctx, f, firstId, false, true, 989, 100)
-					requireLegacySettlementTestState(t, ctx, f, secondId, true, false, 989, 100)
+					// Financial ownership has advanced; the page's optional mirror
+					// batch is deliberately still pending at this next-visit seam.
+					requireLegacySettlementTestState(t, ctx, f, firstId, false, true, 989, 200)
+					requireLegacySettlementTestState(t, ctx, f, secondId, true, false, 989, 200)
 					expire(errLegacySettlementPageBudget)
 					if c.cancelParent {
 						cancelParent()

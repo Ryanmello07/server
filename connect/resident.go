@@ -469,8 +469,11 @@ type ExchangeSettings struct {
 	ForwardEnforceActiveContracts bool
 
 	ContractManagerCheckTimeout time.Duration
-	DrainOneTimeout             time.Duration
-	DrainAllTimeout             time.Duration
+	// Retained for settings compatibility only; ignored. Packet allowance is
+	// always Redis-only, even if a caller keeps this obsolete flag enabled.
+	ContractHoleCompatibilityFallback bool
+	DrainOneTimeout                   time.Duration
+	DrainAllTimeout                   time.Duration
 
 	// drain coordination (CONNECTDRAIN2.md). `EnableDrainExcuse` gates the
 	// excuse markers written at drain / migrate and their consumption in the
@@ -677,6 +680,9 @@ type Exchange struct {
 	// Nil in production; constructor tests inject failure after child ownership
 	// exists but before the fallible peer-profile lookup publishes callbacks.
 	beforeResidentProfileForTest func(*Resident)
+	// Nil in production; nomination tests wait for retirement after lifecycle
+	// workers start to verify that cleanup cannot precede map publication.
+	afterResidentWorkersStartedForTest func(*Resident)
 
 	// the shared key-event subscriber (PEERSSTREAMS2.md); nil unless
 	// KeyEventDelivery.Enabled
@@ -894,6 +900,20 @@ func (self *Exchange) NominateLocalResidentWithContext(
 	instanceId server.Id,
 	residentIdToReplace *server.Id,
 ) bool {
+	nominated, _ := self.nominateLocalResident(callerCtx, clientId, instanceId, residentIdToReplace, false)
+	return nominated
+}
+
+// Nominates for a transport that may have declared provide intent. Returns
+// whether the resident was nominated, and whether a refusal was for the
+// concurrent client limit.
+func (self *Exchange) nominateLocalResident(
+	callerCtx context.Context,
+	clientId server.Id,
+	instanceId server.Id,
+	residentIdToReplace *server.Id,
+	provideIntent bool,
+) (bool, bool) {
 	admissionCtx, admissionCancel := context.WithCancel(callerCtx)
 	stopExchangeCancel := context.AfterFunc(self.ctx, admissionCancel)
 	defer func() {
@@ -901,7 +921,7 @@ func (self *Exchange) NominateLocalResidentWithContext(
 		admissionCancel()
 	}()
 	if admissionCtx.Err() != nil || self.ctx.Err() != nil {
-		return false
+		return false, false
 	}
 	// Admit before any model work. Close takes the same lock, so WaitForIdle
 	// cannot observe a zero worker count while a pre-close nomination is still
@@ -909,7 +929,7 @@ func (self *Exchange) NominateLocalResidentWithContext(
 	self.residentWorkerLock.Lock()
 	if self.residentWorkersClosed {
 		self.residentWorkerLock.Unlock()
-		return false
+		return false, false
 	}
 	self.residentWorkers.Add(1)
 	self.residentWorkerLock.Unlock()
@@ -939,15 +959,16 @@ func (self *Exchange) NominateLocalResidentWithContext(
 		if glog.V(1) {
 			glog.Infof("[exchange]nominate refused: draining\n")
 		}
-		return false
+		return false, false
 	}
 
 	// Refuse to nominate a resident for a client that would push the network past
-	// its limit, which keeps the client from becoming active. Public providers are
-	// exempt and a re-nomination of an already-connected client is not a new
-	// connection (see model.CanConnectNetworkPeer). This is a no-op while
+	// its limit, which keeps the client from becoming active. An intent provider
+	// is judged by its provider intent check and a re-nomination of an
+	// already-connected client is not a new connection (see
+	// model.CanConnectNetworkPeer). This is a no-op while
 	// enforce_concurrent_clients is false in pro.yml.
-	if !model.CanConnectNetworkPeer(admissionCtx, clientId) {
+	if !model.CanConnectNetworkPeer(admissionCtx, clientId, provideIntent) {
 		nominationRefusedCounter.WithLabelValues("concurrent_client_limit").Inc()
 		if glog.V(1) {
 			glog.Infof(
@@ -955,11 +976,11 @@ func (self *Exchange) NominateLocalResidentWithContext(
 				clientId,
 			)
 		}
-		return false
+		return false, true
 	}
 
 	if admissionCtx.Err() != nil {
-		return false
+		return false, false
 	}
 	residentId := server.NewId()
 
@@ -985,10 +1006,10 @@ func (self *Exchange) NominateLocalResidentWithContext(
 		if admissionCtx.Err() == nil {
 			abandonedNomination = nil
 		}
-		return false
+		return false, false
 	}
 	if admissionCtx.Err() != nil {
-		return false
+		return false, false
 	}
 
 	resident := newResidentDuringAdmission(
@@ -1003,7 +1024,24 @@ func (self *Exchange) NominateLocalResidentWithContext(
 		if err := resident.CloseAndWait(context.Background()); err != nil {
 			glog.Errorf("[r]abandoned resident close wait = %s\n", err)
 		}
-		return false
+		return false, false
+	}
+	// Publish before any lifecycle worker can remove this generation. A worker
+	// that retires immediately must not leave a later insertion behind it.
+	var replacedResident *Resident
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		replacedResident = self.residents[clientId]
+		self.residents[clientId] = resident
+		self.notifyResidentChangedLocked(clientId)
+		residentClientsGauge.Set(float64(len(self.residents)))
+	}()
+	if replacedResident != nil {
+		replacedResident.Cancel()
+	}
+	if glog.V(1) {
+		glog.Infof("[r]open %s\n", clientId)
 	}
 	workerStarted = true
 	// note: initial peer registration happens in ConnectionAnnounce.run once
@@ -1030,6 +1068,18 @@ func (self *Exchange) NominateLocalResidentWithContext(
 			if self.settings.EnableNetworkPeers && resident.peerNetworkId != nil && !resident.drained.Load() {
 				if resident.peerCategory == model.NetworkPeerCategoryProxy {
 					model.RemoveNetworkProxyPeer(
+						cleanupCtx,
+						*resident.peerNetworkId,
+						clientId,
+					)
+				} else if resident.peerCategory == model.NetworkPeerCategoryProvider {
+					model.RemoveNetworkProviderPeer(
+						cleanupCtx,
+						*resident.peerNetworkId,
+						clientId,
+					)
+				} else if resident.peerCategory == model.NetworkPeerCategoryIsolated {
+					model.RemoveNetworkIsolatedPeer(
 						cleanupCtx,
 						*resident.peerNetworkId,
 						clientId,
@@ -1068,24 +1118,11 @@ func (self *Exchange) NominateLocalResidentWithContext(
 			}
 		}
 	})
-
-	var replacedResident *Resident
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		replacedResident = self.residents[clientId]
-		self.residents[clientId] = resident
-		self.notifyResidentChangedLocked(clientId)
-		residentClientsGauge.Set(float64(len(self.residents)))
-	}()
-	if replacedResident != nil {
-		replacedResident.Cancel()
-	}
-	if glog.V(1) {
-		glog.Infof("[r]open %s\n", clientId)
+	if afterStarted := self.afterResidentWorkersStartedForTest; afterStarted != nil {
+		afterStarted(resident)
 	}
 
-	return true
+	return true, false
 }
 
 // Refreshes metadata for one resident. Transport cancellation must not change
@@ -1132,13 +1169,28 @@ func (self *Exchange) refreshResidentRegistration(resident *Resident) bool {
 				model.AddNetworkProxyPeer(peerCtx, *resident.peerNetworkId, clientId, self.settings.ExchangeResidentTtl)
 				return
 			}
+			if resident.peerCategory == model.NetworkPeerCategoryProvider {
+				// a provider install is counted but never a peer; the add
+				// doubles as the heartbeat
+				model.AddNetworkProviderPeer(peerCtx, *resident.peerNetworkId, clientId, self.settings.ExchangeResidentTtl)
+				return
+			}
+			if resident.peerCategory == model.NetworkPeerCategoryIsolated {
+				// an isolated client (ACL group "isolated") is counted but
+				// never a peer; the add doubles as the heartbeat
+				model.AddNetworkIsolatedPeer(peerCtx, *resident.peerNetworkId, clientId, self.settings.ExchangeResidentTtl)
+				return
+			}
 			if !model.RefreshNetworkPeer(peerCtx, *resident.peerNetworkId, clientId, residentId, self.settings.ExchangeResidentTtl) {
 				// the registration was lost (e.g. expired while the
 				// client was disconnected, or pruned at an expiry
 				// race); re-add with a fresh profile
 				// peersEnabled is not re-checked: peerNetworkId set means
 				// the network was enabled when the resident was created
-				if _, topLevel, _, peerProfile, _ := model.GetNetworkPeerProfile(peerCtx, clientId); topLevel && peerProfile != nil {
+				// only a client still in the default ACL group is re-listed:
+				// one that was isolated since is dropped here, and its
+				// retired resident record closes this resident on its poll
+				if _, topLevel, category, peerProfile, _ := model.GetNetworkPeerProfile(peerCtx, clientId); topLevel && peerProfile != nil && category == model.NetworkPeerCategoryClient {
 					model.AddNetworkPeer(peerCtx, *resident.peerNetworkId, peerProfile, residentId, self.settings.ExchangeResidentTtl)
 				}
 			}
@@ -2294,6 +2346,10 @@ func (self *ExchangeBuffer) WriteMessages(conn net.Conn, transferFrameBytesBatch
 	// keeps its backing for the next batch.
 	buffers := self.writeBuffers
 	n, err := buffers.WriteTo(conn)
+	// A failed WriteTo leaves its unconsumed tail in the shared backing array.
+	// Drop those borrowed references before returning the payload ownership.
+	clear(self.writeBuffers)
+	self.writeBuffers = self.writeBuffers[:0]
 	// A writev can finish a frame prefix before a later iovec fails. Account
 	// for that completed prefix without treating the partial trailing frame as
 	// a packet.
@@ -2762,12 +2818,26 @@ type ResidentTransport struct {
 	clientId   server.Id
 	instanceId server.Id
 
+	admission ResidentTransportAdmission
+
 	routes map[string]string
 
 	send    chan []byte
 	receive chan []byte
 
 	beforeReliableReceiveWaitForTest func()
+}
+
+// How the connection behind a resident transport is admitted against the
+// network's concurrent client limit.
+type ResidentTransportAdmission struct {
+	// the connection declared provide intent: its provider intent check decides
+	// the client limit (model.CanConnectNetworkPeer)
+	ProvideIntent bool
+	// called when a nomination is refused for the concurrent client limit, so
+	// the connection closes with the client limit exceeded signal. It must not
+	// block; it may be called again while the connection closes.
+	ClientLimitExceeded func()
 }
 
 // pooledMessageSendResult describes the final ownership of one queue offer.
@@ -3007,6 +3077,25 @@ func NewResidentTransportWithProperties(
 	instanceId server.Id,
 	properties connect.TransferCarrierProperties,
 ) *ResidentTransport {
+	return NewResidentTransportWithAdmission(
+		ctx,
+		exchange,
+		clientId,
+		instanceId,
+		properties,
+		ResidentTransportAdmission{},
+	)
+}
+
+// Adds the connection's client limit admission to the carrier properties.
+func NewResidentTransportWithAdmission(
+	ctx context.Context,
+	exchange *Exchange,
+	clientId server.Id,
+	instanceId server.Id,
+	properties connect.TransferCarrierProperties,
+	admission ResidentTransportAdmission,
+) *ResidentTransport {
 	header := ExchangeHeader{
 		Op:                                    ExchangeOpTransport,
 		UnreliableTransfer:                    properties.Unreliable,
@@ -3014,7 +3103,9 @@ func NewResidentTransportWithProperties(
 		UnreliableFlowIsolation:               properties.UnreliableFlowIsolation,
 		UnreliableFlowReserve:                 properties.UnreliableFlowReserve,
 	}
-	return newResidentTransport(ctx, exchange, header, clientId, instanceId)
+	transport := newResidentTransport(ctx, exchange, header, clientId, instanceId)
+	transport.admission = admission
+	return transport
 }
 
 func newResidentTransport(
@@ -3213,12 +3304,19 @@ func (self *ResidentTransport) Run() {
 		}
 
 		c := func() bool {
-			return self.exchange.NominateLocalResidentWithContext(
+			nominated, clientLimitExceeded := self.exchange.nominateLocalResident(
 				self.ctx,
 				self.clientId,
 				self.instanceId,
 				residentIdToReplace,
+				self.admission.ProvideIntent,
 			)
+			if clientLimitExceeded && self.admission.ClientLimitExceeded != nil {
+				// the connection closes with the signal; until then this keeps
+				// retrying at the reconnect pace
+				self.admission.ClientLimitExceeded()
+			}
+			return nominated
 		}
 		if glog.V(2) {
 			server.TraceWithReturn(
@@ -3298,7 +3396,7 @@ func NewResidentForward(
 	exchange *Exchange,
 	clientId server.Id,
 ) *ResidentForward {
-	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelCtx, cancel := context.WithCancel(server.WithoutPostgres(ctx))
 	transport := &ResidentForward{
 		ctx:      cancelCtx,
 		cancel:   cancel,
@@ -3572,8 +3670,8 @@ type Resident struct {
 	forwardWorkers       sync.WaitGroup
 
 	// Client callbacks only validate and offer borrowed input to these bounded
-	// queues. Their owned workers may rate-limit, query storage, or block as a
-	// sender without parking the shared Client receive sequence.
+	// queues. The control owner may use durable storage; forward workers use
+	// Redis allowance and may block as senders without parking shared receive.
 	controlIngressAdmission pooledMessageSendAdmission
 	forwardIngressAdmission pooledMessageSendAdmission
 	controlIngress          chan []*protocol.Frame
@@ -3600,6 +3698,8 @@ type Resident struct {
 	// Nil in production; tests use this barrier after forward cancellation and
 	// immediately before teardown joins the active consumer.
 	beforeForwardCloseJoinForTest func()
+	// Nil in production; forward tests force cleanup immediately after launch.
+	afterForwardWorkersStartedForTest func(*ResidentForward)
 	// Nil in production; tests observe the exact internal-client join boundary.
 	beforeClientCloseJoinForTest func()
 	// Nil in production; tests pause lazy shard construction before its worker
@@ -4046,8 +4146,9 @@ func (self *Resident) Run() {
 
 	// only top-level client-category peers get network peer updates.
 	// The listener polls the per-network version counter and sends the
-	// complete list on any change (PEERS2.md). Proxy clients are counted but
-	// get no listener — a hosted device does not consume the peer list.
+	// complete list on any change (PEERS2.md). Proxy and isolated clients
+	// are counted but get no listener — a hosted device does not consume the
+	// peer list, and an isolated client (ACL group "isolated") receives none.
 	if self.exchange.settings.EnableNetworkPeers && self.peerNetworkId != nil && self.peerCategory == model.NetworkPeerCategoryClient {
 		networkPeerListener := model.NewNetworkPeerListener(
 			self.ctx,
@@ -4273,27 +4374,16 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 	// FIXME deep packet inspection to look at the contract frames and verify contracts before forwarding
 
 	initForward := func() *ResidentForward {
-		// Fast path: reuse a live existing forward without doing any slow work.
-		// This is the per-frame lookup, so it takes only a read lock.
-		if existing := func() *ResidentForward {
+		var existing *ResidentForward
+		var limit bool
+		func() {
 			self.stateLock.RLock()
 			defer self.stateLock.RUnlock()
-			if f := self.forwards[destinationId]; f != nil && !f.IsDone() {
-				return f
+			if forward := self.forwards[destinationId]; forward != nil && !forward.IsDone() {
+				existing = forward
 			}
-			return nil
-		}(); existing != nil {
-			return existing
-		}
-
-		// Check the per-resident forward limit (snapshot; the limit can be
-		// momentarily exceeded by one if multiple goroutines race past this
-		// point, which is acceptable).
-		limit := func() bool {
-			self.stateLock.RLock()
-			defer self.stateLock.RUnlock()
-			_, ok := self.forwards[destinationId]
-			return !ok && self.exchange.settings.MaxConcurrentForwardsPerResident <= len(self.forwards)
+			_, known := self.forwards[destinationId]
+			limit = !known && self.exchange.settings.MaxConcurrentForwardsPerResident <= len(self.forwards)
 		}()
 		if limit {
 			glog.Infof("[rf]abuse forward limit %s->%s", sourceId, destinationId)
@@ -4301,10 +4391,11 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 			return nil
 		}
 
-		// Slow path: contract check may hit the DB. Do it without holding
-		// Resident.stateLock so concurrent forwards do not serialize on it.
+		// Every admitted packet offer uses the bounded Redis authorization
+		// cache, including a live forward. Checkpoints remain resumable in
+		// that projection; a meaningful final close withdraws admission.
 		if self.exchange.settings.ForwardEnforceActiveContracts {
-			if !self.residentContractManager.HasActiveContract(sourceId, destinationId) {
+			if self.residentContractManager == nil || !self.residentContractManager.HasActiveContract(sourceId, destinationId) {
 				if glog.V(1) {
 					glog.Infof("[rf]abuse no active contract %s->%s\n", sourceId, destinationId)
 				}
@@ -4312,9 +4403,33 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 				return nil
 			}
 		}
+		if existing != nil {
+			return existing
+		}
 
 		// Build a new forward. No lock needed.
 		forward := NewResidentForward(self.ctx, self.exchange, destinationId)
+		// Install before its worker can retire. A concurrent live candidate
+		// wins without starting any work for this unpublished candidate.
+		var replacedForward *ResidentForward
+		var raceWinner *ResidentForward
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if existing := self.forwards[destinationId]; existing != nil && !existing.IsDone() {
+				raceWinner = existing
+				return
+			}
+			replacedForward = self.forwards[destinationId]
+			self.forwards[destinationId] = forward
+		}()
+		if raceWinner != nil {
+			forward.Close()
+			return raceWinner
+		}
+		if replacedForward != nil {
+			replacedForward.Cancel()
+		}
 		if !self.startForwardWorker(forward, func() {
 			defer func() {
 				forward.Cancel()
@@ -4333,6 +4448,13 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 			}
 		}) {
 			forward.Close()
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if self.forwards[destinationId] == forward {
+					delete(self.forwards, destinationId)
+				}
+			}()
 			return nil
 		}
 		residentForwardIdleWatchersGauge.Inc()
@@ -4340,27 +4462,8 @@ func (self *Resident) processClientForward(path connect.TransferPath, transferFr
 			defer residentForwardIdleWatchersGauge.Dec()
 			forward.runIdleWatcher(sourceId)
 		})
-
-		// Install. Another goroutine may have raced ahead with a live forward
-		// while we were doing the contract check; if so, yield to it.
-		var replacedForward *ResidentForward
-		var raceWinner *ResidentForward
-		func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			if existing := self.forwards[destinationId]; existing != nil && !existing.IsDone() {
-				raceWinner = existing
-				return
-			}
-			replacedForward = self.forwards[destinationId]
-			self.forwards[destinationId] = forward
-		}()
-		if raceWinner != nil {
-			forward.Cancel()
-			return raceWinner
-		}
-		if replacedForward != nil {
-			replacedForward.Cancel()
+		if afterStarted := self.afterForwardWorkersStartedForTest; afterStarted != nil {
+			afterStarted(forward)
 		}
 		if glog.V(1) {
 			glog.Infof("[rf]open %s->%s\n", sourceId, destinationId)
@@ -4736,6 +4839,9 @@ func (self *Resident) Close() {
 		self.forwardWorkerLock.Unlock()
 
 		self.cancel()
+		if self.residentContractManager != nil {
+			self.residentContractManager.Close()
+		}
 		self.client.Cancel()
 		if self.clientReceiveUnsub != nil {
 			self.clientReceiveUnsub()
@@ -4776,7 +4882,11 @@ func (self *Resident) CloseAndWait(ctx context.Context) error {
 	// after the first snapshot. The client join makes this second sweep final.
 	self.cancelForwards()
 	forwardErr := waitForWorkerGroup(ctx, &self.forwardWorkers, "resident forward workers")
-	return errors.Join(clientErr, callbackErr, forwardErr)
+	var contractErr error
+	if self.residentContractManager != nil {
+		contractErr = self.residentContractManager.CloseAndWait(ctx)
+	}
+	return errors.Join(clientErr, callbackErr, forwardErr, contractErr)
 }
 
 type clientTransport struct {
@@ -4797,6 +4907,26 @@ func newLimiter(ctx context.Context, minTimeout time.Duration) *limiter {
 		minTimeout:    minTimeout,
 		lastCheckTime: time.Time{},
 	}
+}
+
+// Admits without sleeping. Refused attempts do not move the next admission
+// time, so a packet flood cannot postpone a legitimate future check forever.
+func (self *limiter) allow(now time.Time) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.ctx.Err() != nil || (!self.lastCheckTime.IsZero() && now.Before(self.lastCheckTime.Add(self.minTimeout))) {
+		return false
+	}
+	self.lastCheckTime = now
+	return true
+}
+
+// Reports when idle admission state can be discarded without changing the
+// next decision. The owner separately preserves any in-flight operation.
+func (self *limiter) expired(now time.Time) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.lastCheckTime.IsZero() || !now.Before(self.lastCheckTime.Add(self.minTimeout))
 }
 
 // a simple delay since the last call

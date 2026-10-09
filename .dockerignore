@@ -1,3 +1,7 @@
+.direnv
+.autobeam
+.git
+.gitignore
 # Ignore build artifacts and local test outputs
 *.test
 /tmp/

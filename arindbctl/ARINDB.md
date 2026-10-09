@@ -1,7 +1,7 @@
 # ARIN database design
 
 This document describes the implementation and retained research and measurements
-through 2026-10-06, including the discriminator reviews recorded in
+through 2026-10-08, including the discriminator reviews recorded in
 [CLASSIFICATION.md](CLASSIFICATION.md) and the release evidence below.
 `arindbctl` builds an immutable IPv4/IPv6 MaxMind database that combines
 registration facts, reviewed network-use evidence, and geographic risk. A
@@ -379,8 +379,9 @@ ASNs and the same 160 country contexts**. It adds 12 reviewed sibling ASNs to
 five existing operators and one new Thailand operator, `nt-th` with AS23969.
 Previous reviewed identities and all six negative groups are retained. These
 additions have passed native catalog parsing and the complete new artifact's
-readback gates; the selected-v13 counts above remain the baseline until the
-new resource is deployed and loaded. No regional ranking or service-presence
+readback gates. Config selected this successor on October 6; the bounded
+one-process mapping proof is recorded below. The v13 counts remain the
+historical comparison. No fleet-use, regional ranking or service-presence
 completion follows from these additions.
 
 For NT, APNIC's exact ASN record, the official TOT/CAT-to-NT merger history,
@@ -394,6 +395,937 @@ findings do not attribute the native Speed-minus-Quality population to either
 operator. Continue exact identity review for smaller access providers and the
 unfinished country/state/province ranking work under the same clean-default
 rule, preserving explicit contrary use.
+
+### US origin-identity gaps under review
+
+The retained October 6 count of the selected successor's catalog (`ec316ffc`) finds
+**nine subscriber groups with 13 ASNs in the US review context**, compared with
+**4,694 groups in Brazil**: 90.43% of its 5,191 subscriber groups. The global
+160-country count therefore does not establish balanced country coverage.
+These are origin-catalog counts, not all classifier approvals; direct
+registration rules already recognize, for example, Google Fiber and Webpass.
+Neither catalog concentration nor the sampled stored US country identifies
+any sampled provider's operator or explains its exclusion.
+
+Primary RIR identity and operator service records support this next,
+source-reviewed candidate:
+
+| Existing or new operator group | Additional exact ASNs |
+| --- | --- |
+| Charter / Spectrum | 10796, 20001, 11427, 11351, 11426, 12271, 33363 |
+| AT&T | 7132 |
+| Verizon US | 701 |
+| Optimum / former Suddenlink | 19108 |
+| Astound / RCN / Wave / Grande | 6079, 11404, 7459 |
+| GFiber | 16591 |
+
+The review joins exact RIR assignments to the operator's subscriber service,
+with operator-maintained ASN records where obtained. The three Charter ASNs
+11351/11426/12271 have the exact regional RIR assignments and Spectrum access
+service evidence, without a retained PeeringDB record. Verizon's
+[Internet Dedicated instructions](https://www.verizon.com/business/welcome-kits/internet-dedicated-services/)
+explicitly identify AS701; business subscribers qualify, and an NSP label
+alone does not establish hosting or proxy use. AT&T reports AS7132's peering
+consolidated into AS7018, so its addition does not establish current routes.
+Astound's [brand history](https://www.astound.com/industry-trends/newsroom/rcn-grande-wave-entouch-and-digital-west-now-astound-broadband/)
+and [residential service](https://www.astound.com/internet/) support its three
+exact reviewed siblings. GFiber's origin addition supplements existing direct
+registration approvals; it does not approve Google's cloud networks.
+
+AS22773 remains registered to Cox. [Cox's transaction history](https://www.coxenterprises.com/what-we-do/broadband)
+and [Charter's completion announcement](https://corporate.charter.com/newsroom/charter-and-cox-communications-complete-transaction)
+confirm the August 2026 acquisition, so the existing Charter-family placement
+is preserved rather than treated as a proven ownership error. Registration
+identity, corporate ownership and actual network use remain distinct facts.
+
+Candidate `4bc85427`, source-review gate `653c6a4e`, adds 14 ASNs and two groups:
+prospectively 5,193 subscriber groups, 5,459 ASNs and the same 160 country
+contexts, including 11 US groups and 27 ASNs. It preserves every previous
+identity, all six negative groups, policy and pinned evidence feeds. This is a
+catalog candidate, not a newly built or activated resource. Its three focused
+native parser/augmentation control families passed under independent gate
+`97a904b8`. It adds no regional rank completion and supplies no attribution of
+the retained Speed-only sample.
+
+The first full update with this catalog started at `2026-10-06T07:38:30Z`.
+The kernel records a global OOM kill of its exact `arindbctl` PID 4081336 at
+`08:21:31Z`; local reinspection at `12:52Z` found no surviving builder or
+supervisor. The retained stage has a registration-base file and manifest but only
+2,940,928 bytes of the final MMDB, no final manifest, no published bundle and
+no terminal executor receipt. It is not adoptable. The kernel proves the
+native termination; the missing supervisor receipt remains unexplained.
+
+The run started with 6,159,581,184 bytes of host `MemAvailable`. Its final
+sample had 10,497,654,784 bytes of group RSS and 904,335,360 available bytes;
+the original one-GiB memory floor allowed a 20-second grace. A prior successful
+same-builder update started with 12,261,048,320 available bytes and peaked at
+11,650,019,328 sampled RSS bytes. These observations establish inadequate
+joint resource admission in the failed run, not a catalog-specific memory
+regression or a bound on future peak usage. Terminal evidence is pinned by
+`6f37a760`; all old inputs and partial outputs remain intact.
+
+A fresh v2 executor preserves the exact builder and `4bc85427` catalog,
+requires 12 GiB available host memory at startup and stops at the first
+sample below the unchanged one-GiB live floor. Its 3,660-second wall limit,
+12-GiB RSS cap, 20-GiB work budget and eight-GiB filesystem floors are unchanged.
+Six local controls and independent predecessor-RED/candidate-GREEN admission
+and first-low-floor controls passed (`aa7972da`). Root still owns the exclusive
+heavy-work window, binding, launch, artifact readback and any later activation;
+the prepared wrapper supplies no completed artifact or Quality recovery claim.
+The corrected v2 Root binder and disabled composition passed independent
+review (`ffd1fdf0`). Full, native and mapped readback preparation also passed
+source review (`ff3b5ac2`, launcher `6ebb2c6a`), with actual native success and
+fresh output-bound contracts required before execution. These are preparation
+gates, not artifact or production observations.
+
+Two later source-reviewed candidates remain separate from that frozen build.
+The US follow-up (`8ef7afb4`, review `5513b5d6`) adds 14 more ASNs, yielding
+23 US-context groups and 41 ASNs. Its new groups cover PenTeleData, TDS,
+altafiber, Windstream, Midco, Breezeline, WOW, Fidium, Brightspeed, Ziply,
+Armstrong and Metronet, with reviewed additions to AT&T and Charter. The
+cumulative global follow-up (`924e1aff`, review `60d42484`) adds Indosat AS4761,
+BT/Plusnet AS6871, OneBroadband AS17665, XL Axiata AS24203 and YouFibre
+AS212655. It would contain 5,209 subscriber groups and 5,478 ASNs across the
+same 160 country contexts. Both preserve every negative object, policy and
+feed. Their cumulative native parser/augmentation controls later passed with
+the five-ASN successor below; its completed artifact passed the four readbacks
+recorded below.
+No retained Main provider sample is joined to these additions.
+
+A further cumulative candidate (`320b4c10`) appends five exact US ASNs to
+`924e1aff`. Independent source review `97259b87` accepted the registry,
+operator and first-party service joins under `identified-subscriber-default`:
+
+| Subscriber operator | Exact ASN | First-party service evidence and scope |
+| --- | --- | --- |
+| Lumen / CenturyLink Communications LLC | 209 | The [business Internet schedule](https://assets.lumen.com/is/content/Lumen/internet-services-service-schedule) names the matching legal provider and AS209 as a Lumen-network destination. It also covers transit; this is not proof that every AS209 prefix serves subscribers. |
+| Shentel / Glo Fiber | 4922 | [Glo Fiber terms](https://www.glofiber.com/en/terms) identify the exact registrant, Shenandoah Cable Television LLC, and its residential fiber-to-the-home service. |
+| Hughesnet | 6621 | The [current subscriber agreement](https://legal.hughesnet.com/ServiceTermsAndConditions-current.cfm) identifies Hughes Network Systems LLC and its residential satellite/Fusion service. |
+| Viasat | 7155 | The [currently linked residential agreement](https://www.viasat.com/content/dam/us-site/legal/documents/Customer_Agreement_Residential_v9_21.pdf) identifies Viasat Inc and residential Internet service. The registry's backbone label does not alone establish transit-only use. |
+| ALLO Communications | 15108 | The [residential subscriber agreement](https://www.allocommunications.com/terms-and-conditions/subscriber-agreement-for-residential-services/) identifies the exact legal registrant. Its general AUP also names web hosting; address-level exclusions remain necessary. |
+
+This successor contains **5,214 subscriber groups and 5,483 ASNs** across the
+same 160 country contexts, including **28 US groups and 46 US ASNs**. All
+prior catalog bytes, identities, six negative groups, policy and evidence feeds
+are preserved; the five entries are appended. Seven deterministic Python
+source controls passed, including rejection of an unchanged predecessor,
+unreviewed AS3356 expansion, negative removal, weaker visibility policy,
+changed existing provenance and country expansion. Independent composition
+review `5dd1d47d` verified all 26 source pins, the exact predecessor byte prefix
+and five appended entries, and repeated all seven controls. Six cumulative
+native parser/augmentation tests then passed under independent gate `ddd88d32`
+in 9.0 seconds with 297,844,736 bytes of sampled group RSS. They exercise the
+19 prior additions and five new identities with the existing vetoes. The complete
+generated artifact subsequently passed its separate readbacks. No AS3356,
+AS3549, affiliate, parent or
+customer ASN gains approval by association. Neither the frozen `4bc85427`
+update nor the separate earlier candidates were changed in place.
+
+The completed augmentation for `320b4c10` reuses the completed October 6
+registration base `257ca5e6` and runs `augment-subscribers` once.
+That 445,051,096-byte base already passed the complete registration traversal.
+Streamed hashing on October 6 at 17:37 UTC verified the retained base, its
+rules and GeoLite lineage, the builder and all 38 evidence snapshots. The new
+catalog's policy and every source stanza exactly match the completed bundle;
+the changed operator inventory still requires a new final MMDB. Exact regular
+copies of the catalog and snapshots are staged in a separate archive directory.
+Their earliest expiry remains `2026-10-08T02:03:14Z`; reuse does not refresh
+their observation times. The failed update's registration file has a different
+hash (`543c26d0`), despite matching input hashes and counts, and is not selected.
+
+The retained successful run spent approximately 691 seconds in augmentation
+out of 2,054 seconds overall, using adjacent manifest timestamps to delimit
+the phase. Its augmentation RSS rose from below one GiB to 11,937,247,232
+bytes. Reusing the base therefore avoids roughly 22.6 minutes of preceding
+work but does not establish a four-GiB build budget. The reuse
+executor retains 12-GiB host admission and RSS caps, the immediate one-GiB
+host floor and existing disk floors; only its native and wall deadlines shrink
+to 30 and 31 minutes. All 40 builder Go files, including tests, match between
+qualified source `0bb38ed6` and canonical `cf7ced9e`. This file parity does not
+establish equivalence of their surrounding module graphs. The prepared
+executor requires the qualified binary and original frozen graph. Independent
+gate `d9de0c9a` binds the six actual catalog controls, 14 synthetic controls,
+executor/Root-binder review and readback source review. Root bound the reviewed
+manifest in an exclusive resource window before launching the augmentation.
+
+The October 6 native run completed in 730.125 seconds with exit zero and no
+resource limit triggered. Its qualified executor reports a valid output of
+595,184,171 bytes, epoch `1791310718`, SHA-256
+`bfe386270592c8b30a9da6cce762d4bbf1661359e4cbcc34769ed89f8d0f5cbe`.
+Peak sampled group RSS was 11,847,909,376 bytes; the lowest sampled host
+available memory was 1,911,414,784 bytes. Status `1a34f240` and retained local
+observation `341bc4fc` bind that result. The new and preceding manifests have
+the same 40 input-hash roles; only the subscriber catalog hash differs.
+The explicit `reuse-manifest.json` records that registration and evidence were
+not refreshed, and their original observation and expiry times remain intact.
+
+The new manifest reports 4,706,008 inferred subscriber partitions versus
+3,198,507 in its predecessor. These are origin-stage counters before the
+hosting and address overlays, with changed partition boundaries; they are not
+independently traversed final populations, address totals or live-provider
+gains. All four exact-hash readbacks completed successfully on October 6 at
+21:31 UTC. Combined independent receipt `f72964a9` binds their contracts,
+output summaries, lineage and resource telemetry:
+
+| Readback | Actual receipt | Evidence checked | Elapsed seconds | Peak sampled group RSS bytes |
+| --- | --- | --- | ---: | ---: |
+| Full structure and origins | `a66f5ede` | 6,956,934 registration boundaries, 7,888,720 final boundaries and 1,227,465 independent-origin boundaries; exact origin LPM, preserved registration fields, monotonic base risk and no promotion of explicit base exclusions | 286.049 | 1,461,133,312 |
+| Native serving and capture | `1471cf7b` | 2,048 public samples matched typed state, risk, verified status, origin attribution and the actual database epoch | 40.056 | 1,036,943,360 |
+| Mapped capture | `65a88d99` | The same 2,048 samples passed against the exact new/new file pair and measured mapping bounds; two hash streams read 1,190,368,454 bytes | 11.048 | 1,071,816,704 |
+| Targeted hosting and address policy | `17a7ea7c` | 305 public samples across 14 feeds, including 72 subscriber-carrier hosting conflicts, retained the required hosting and VPN/Tor exclusions | 35.029 | 1,112,809,472 |
+
+Full contract `82d7f3b0` and native contract `3639f30f` bind the same final
+artifact, retained registration base and catalog. Full summary `b939c3a8`,
+public samples `440569b0` and policy summary `0ec02811` identify the actual
+outputs. The policy gate checks selected published samples, not every feed
+prefix. These results qualify the offline artifact for publication review;
+they establish neither Main adoption nor recovered provider Quality.
+
+Readiness receipt `67742a21` rechecked the unchanged artifact-status and handoff
+pins and the complete frozen readback source: 5,622 source files and 20,921
+dependency files matched. This source-only check used 36,429,824 bytes of peak
+RSS and did not traverse the database. The four readbacks then ran sequentially,
+with a two-GiB RSS and work limit and a 30-minute wall limit per phase. Each
+launch requires three GiB of available memory, ten GiB free on both filesystems
+and an idle Go/build lane; the existing live floors remained intact. Their
+completed native results above supersede the earlier preparation-only status.
+
+The additive Config payload contains `arin.mmdb`, `manifest.json`,
+`registration-manifest.json` and `reuse-manifest.json` under resource version
+`2026.10.6+1791310718`, totaling 595,202,871 bytes. A release must preserve the
+then-selected physical Config inventory, GeoLite/places resources, private
+profile and policy-two setting. The earlier 97-path packaging baseline is
+historical; it cannot replace a fresh owning inventory. The reuse manifest
+must remain explicit rather than be labelled as a new full update.
+
+The cumulative Config successor was physically staged with 111 paths and
+5,659,323,181 bytes, preserving all 106 paths in the freshly read selected
+baseline. Stage receipt `4cb423b9` binds the four added files and their version
+directory. Actual native precedence receipt `f08d56e9` confirms that generic
+and explicit ARIN resource resolution select the new exact database and epoch;
+GeoLite and places continue to resolve to epoch `1791253792`. This native
+control passed in 39.029 seconds with a sampled peak RSS of 1,027,596,288 bytes.
+
+The standard Config packager published version
+`2026.10.6-arin-cumulative-catalog+1065252460` from genuine Warp source
+`544e8234`, with build receipt `bb059589`. Its immutable registry index is
+`sha256:2f6bf9cd251e8097cb205ea7a72f3d49ba8cc01c732151809965941cd7b024c3`.
+Full image verification completed at October 6 23:21:53 UTC in manifest
+`eb21f8aa`: both amd64 and arm64 images match all 111 staged path types, modes
+and file hashes, both updater binaries match their local clean VCS builds,
+and the amd64 help/version smoke checks pass with networking disabled.
+Independent image gate `7fd1e946` binds that manifest and Root's successful
+verifier terminal `3030cd5c`. The image retains policy two and the native
+reader. Root's fresh baseline receipt `3d64d9a3` matched the prior selection.
+The normal Config selector then completed with exit zero at October 6
+23:26:14 UTC, selecting the cumulative version and requesting its supported
+restart. Receipt `c959ed7d` records the actual start at 23:26:04.646404 UTC and
+completion at 23:26:14.011087 UTC. This establishes selection; actual reader
+identity and provider-coverage observations remain separate evidence.
+
+Root's bounded fixed-key observation at October 6 23:41:46 UTC retained a
+fresh native census with **287 Quality, 4,974 Speed and 80,592 Online**
+providers. Its source interval was 23:30:34.980192 to 23:31:31.997039 UTC,
+and publication occurred at 23:36:57.588604 UTC. All three readiness markers
+were one in both passes. Actual receipt `0f5b92a7` and its independent
+reduction establish that global publication was available after selection.
+They do not identify the publisher's loaded ARIN reader, attribute the counts
+to the new catalog, prove affected-group availability, or repair historical
+classification rows. The catalog length and readiness markers also do not
+prove provider membership or usable selection.
+
+The October 7 04:24:05 UTC bounded native observation now supplies later
+post-release evidence. Actual receipt `7393f20e` passed the closed public
+contract replay and independent interpretation `8c9afb3e`. The publication
+contains **707 native Quality, 6,488 Speed and 77,317 Online** providers,
+including 5,781 Speed-without-Quality providers. Its source evaluation ran
+04:17:49.212198 to 04:18:36.970133 UTC and publication occurred at
+04:23:47.221464 UTC. The source is later than the actual V17 eight-Taskworker
+runtime observation completed at 04:12:48.888979 UTC. That runtime evidence is
+metric self-report; it does not identify the native publisher or every process
+holding an ARIN mapping. The earlier 287-Quality count is a different
+observation, not a control proving a catalog-caused increase.
+
+Two equal fixed Redis publication/sample pairs bracketed one indexed,
+read-only query. The query took 0.836 seconds and the native body took 1.077
+seconds. It classified 256 publication-salted-hash-selected Speed-only
+providers into these first-failing **current** facts:
+
+| Current fact | Sample providers | US | France |
+| --- | ---: | ---: | ---: |
+| Live nonquality classification and nonquality rollup | 248 | 211 | 10 |
+| Egress ratio now below the source threshold | 8 | 6 | 2 |
+
+All 256 observed live connection rows have selected epoch `1791310718` and a
+lookup within the selected-resource interval; the retained sample has no
+observed live-row lookup deficit. The aggregate does not establish one live
+row per provider. The eight ratio failures occur before live-classification
+checks in the ordered discriminator, while all sampled members passed the
+ratio at the earlier publication evaluation. These are different observation
+times, not a reconstruction of why the publisher originally excluded them.
+The 248 late-branch providers passed the earlier current guards and retained
+nonquality classifications plus nonquality rollups. Their stored booleans
+cannot distinguish an unknown subscriber identity, ambiguous ownership,
+explicit hosting/proxy/virtual-ISP exclusion, or an origin withholding reason.
+The sample proportions cannot be extrapolated to the 5,781-member Speed-only
+population, a country, or a state/province; missing first-failure categories
+also do not establish that their underlying conditions are absent elsewhere.
+
+The later October 7 19:04:31.441350 UTC fixed-key read reports **818 native
+Quality, 6,663 Speed and 77,705 Online** providers. Its source evaluation ran
+18:56:48.194453 to 18:57:18.485727 UTC; publication occurred at
+19:03:24.026978 UTC. The source age was 432.956 seconds, within the unchanged
+900-second limit, and all three readiness markers passed. Reader receipt
+`d06dc866` and the confirmed shared-queue owner receipt `c4a852bd` establish
+this one publication. They do not refresh the earlier 256-provider cause
+sample, attribute a count change to the catalog, or identify the actual
+publisher process.
+
+A separate native observation at 19:05:59.993286–19:06:00.302497 UTC found
+one stable edge1/g1 Connect owner with the qualified R22 source/image identity.
+Its mapped ARIN file is **593,608,472 bytes**, with embedded epoch
+`1791358781` (October 7 07:39:41 UTC), node count 7,729,703 and a 32-bit record
+size. The bounded tail differs from the retained October 6 `bfe38627` artifact
+at epoch `1791310718`. Receipt `5ba22638`, confirmed owner receipt `4fdd3805`
+and independent combined interpretation `5630a9ea` establish the mapped file
+metadata and the separate publication counts. The newer epoch and different
+tail do not establish catalog loss, catalog additions, request-time use,
+fleet adoption or a provider classification cause. Full artifact bytes were
+not read.
+
+The subsequent native observation at 19:51:34.006210–19:51:34.207707 UTC
+found one stable edge1/g1 owner reporting source `510777fb` and image-config
+digest `e1a993c2`. It retained the same mapped epoch, size and tail metadata.
+Those native fields establish observed process identity, not selected-release
+provenance or fleet adoption. Reader receipt `5faf5f91`, confirmed shared-queue
+owner receipt `5ea29679` and typed replay `c727b6e3` bind this observation.
+
+Three adjacent regular metadata files, totaling 16,377 bytes, were opened
+through the mapped file's parent directory descriptor with before/after owner,
+map, parent and file identity checks. Their claims agree: the update applied
+subscriber augmentation and completed validation with zero unavailable
+sources; the artifact uses classifier version one, quality policy two,
+`identified-subscriber-default` and a minimum origin visibility of ten peers.
+The update's **seed catalog is `320b4c10`**, and the artifact reports **5,220
+reviewed groups**. The recognized seed contains 5,214 subscriber groups and
+six negative groups. The artifact's refreshed
+catalog digest `59b33559` has a different role; its difference from the seed
+hash is not evidence of catalog loss. The registration output hash agrees
+with the augmentation base-input hash, and the registration and augmentation
+build clocks fall within the reported update interval, 07:29:54.774727 to
+07:43:02.552777 UTC. The artifact build time matches the mapped epoch.
+
+The artifact manifest claims 4,706,712 subscriber, 222,289 excluded, 2,721
+ambiguous and 2,699,276 unknown partitions. These are partition counts,
+not provider counts or predicted Quality gains. The adjacent claims support
+continued subscriber augmentation with the earlier reviewed seed; they do not
+claim the later `5bbba6ad` seed, 5,228 total groups or its twelve added ASNs.
+Full artifact bytes and current catalog contents were not rehashed. No
+provider cause, request-time use or effect on the earlier Quality publication
+was established. The later catalog artifact remains separate work; the next
+coverage discriminator must explain current provider classification causes
+while preserving the subscriber default and explicit negative exclusions.
+
+The October 8 review separates health admission from subscriber classification.
+At 05:01:29.497849 UTC, the bounded five-key read found **213 native Quality,
+2,676 Speed and 82,820 Online** providers. Source evaluation ran 04:51:20.846568
+to 04:53:13.717149 UTC and publication occurred at 04:58:09.975518 UTC. All three
+readiness markers passed; source age was 495.781 seconds. Independent actual
+interpretation `6e6b6f33` confirms this global publication. It does not establish
+every requested target's native pages or identify the publisher process.
+
+The 05:17:50.429906 UTC successor read found **209 Quality, 2,298 Speed and
+82,267 Online**, with fresh source evaluation 05:08:35.459416–05:10:28.263866 UTC
+and publication at 05:16:41.984371 UTC. Its retained accepted-outcome projection
+confirms selected egress-health policy **one**, ratio **4/5**, and the eight-hour
+window ending 05:10:11.368974 UTC. Among the 82,267 public Online providers, **79,629
+failed the ratio, 2,298 passed and 340 had no evidence**. The passing count
+equals native Speed. The larger health-source map contains 99,060 identities,
+including identities outside public Online; it is not an additional supply
+population. Closed replay and independent actual gate `7783eaa2` bind these
+counts and their distinct denominators. This is **accepted selected-policy URL
+health**, including non-quota, manual or old-cycle outcomes. Legacy nil-evidence
+records retain policy zero and do not enter the selected policy-one ratio.
+The ratio does not attribute failures to the current scheduled URL lane or
+establish its four-hour quota.
+
+In this snapshot, accepted-ratio failure is the largest native supply limit:
+96.79% of Online providers fail it. Holding that cohort, common gates and health
+evidence fixed, changing only the subscriber nonquality decision cannot recover
+those failures. There are separately 2,089 Speed-without-Quality providers;
+their membership does not establish a classifier mistake or an operator cause.
+Among Online providers, 72,851 have at least ten accepted outcomes in the
+eight-hour denominator. This does **not** prove ten accepted runs in four
+hours, successful probes, or complete quota delivery. The ten-run/four-hour
+quota and the ratio window are different requirements. No provider, route,
+destination or failed measurement stage is attributed by these aggregates.
+
+Source review `3c2fd48d` confirms URL phase ceilings of five seconds for DNS and
+read-idle, and three seconds for TCP and TLS, within the original attempt
+deadline. Those ceilings are distinct from the default success policy's
+two-second time-to-first-byte and 100,000-bit/s throughput threshold. The
+current source allows a configured success-policy object; its effective
+runtime content/performance values were not read. Setup, contract or admission
+failure before a measurable path is not a measured URL failure. Once a path
+is measurable, accepted DNS/TCP/TLS/read/content/performance failures can count
+as negative health evidence. Independent TLS-authentication evidence and
+zero-total reports have separate rules. The ratio uses selected-policy
+accepted outcomes with `total_count=1` and measurement timestamps; it does not
+add the quota's `url_probe` requirement. Raw class-failure percentages and
+pre-submit log summaries therefore cannot replace this accepted denominator.
+
+One conditional source inconsistency remains unproven on Main: a configured
+`evidence_max_age` shorter than eight hours leaves the history aggregation at
+eight hours, while freshness and expiry use the shorter age. The default
+eight-hour setting is unaffected. No current override or native reproduction
+establishes this as the cause of the observed ratio failures. A source-aged
+publisher error or an unavailable watcher quota sample is likewise distinct
+from this successfully read global census and from a provider's measured
+quality; target-level fallback availability still requires its own evidence.
+
+The separate 05:18:54.188938–05:18:54.377716 UTC native observation found one
+stable edge1/g1 Connect owner with observed source `295d587d` and image-config
+digest `6cdd1dd1`. It still mapped the 593,608,472-byte artifact at epoch
+`1791358781`, with the same bounded tail and three adjacent manifest hashes as
+the October 7 observation. Their claims still identify seed `320b4c10`,
+refreshed catalog `59b33559`, 5,220 groups, quality policy two and the
+identified-subscriber default. Actual interpretation `0464d3b1` is scoped to
+that owner and those metadata files. The false `matches_selected_catalog_tail`
+field compares the historical October 6 artifact at epoch `1791310718`; it is
+**not a failed comparison to a freshly read current selection**. Full artifact
+bytes, current provider causes, request use and fleet adoption remain unproved.
+
+The review also found a concrete RPKI over-admission defect: an invalid child
+origin could inherit a valid aggregate's exception solely because its different
+ASN belonged to the same reviewed operator. The isolated correction retains
+same-operator visibility inheritance but requires an identical complete ASN set
+for the RPKI aggregate exception. Native causal receipt `fb25c1b6` confirms the
+old behavior, exactly two failing unauthorized-sibling regressions on the old
+source, and passing corrected regressions plus six existing control families.
+Same-ASN max-length and independently authorized-sibling controls remain
+healthy. The correction is now in canonical source. A later focused native
+receipt (`arin-rpki-quality-native-sol-20261008-v1/receipt.json`) passed all seven
+selected control families on the qualified c276/text41 graph (`62697538` /
+`6af11164`), with the corrected production postimage unchanged. This is an
+over-admission correction, not an explanation for the low Quality count.
+Those controls do not replace artifact validation: a rebuilt resource and
+adoption are still required, and no affected Main provider or prefix population
+has been measured.
+
+The next cause discriminator is an isolated source candidate, not deployed
+diagnostic evidence. It caps requests at 64 exact connection keys and reuses
+the authenticated Connect owner registry, a fresh primary-key fact read, and
+the serving ARIN reader. It checks the same owner before and after decoding
+typed classification state, allocation/rule identity, complete bounded origin
+ASN sets and the four closed withholding reasons. It does not hash or open a
+second database, refresh stored lookup clocks, export addresses, or change
+Quality policy. The existing capture protocol is kept separate. Independent
+source reviews accepted the core (`5dbd1062`) and its bounded Connect-only
+caller (`482037ee`). The family-aware successor `c6fd08ab` then passed seventeen
+focused Go controls on the qualified c276/text41 graph (`da0e43df`), and the
+bounded selector passed all five local PG18 controls (`40c6b0a1`). Final
+publication-pair composition remains unqualified. A selected compatible service
+and explicit current diagnostic endpoint authority are also required before
+Root can execute it. The caller selects at most 32 exact
+Connect processes, retains missing or duplicate handler ownership as unknown,
+and does not require a native publisher endpoint or all-fleet retirement proof.
+Its public projection explicitly leaves publication binding unproved until the
+parent validates the unchanged source pair after capture. The October 8
+candidate is based on canonical `b3893b0a`. It samples one connection per provider, preserves refused rows in the original
+sample denominator, and cannot establish every connection's classification or
+an operator-wide error rate.
+
+A further source review found a possible mixed-family interaction. The
+reliability fold combines ARIN risk and nonquality flags across connections
+before separating proven address families, and the live Quality guard requires
+all live connections to be clean without a family predicate. Consequently, an
+IPv6 transport connection with unknown or withheld ARIN evidence can exclude
+a provider whose IPv4 connection is clean. This is a conditional source
+mechanism, not a measured cause among the 2,089 providers. A transport address
+also does not establish IPv6 provider service: legacy family intent still maps
+to IPv4 proof. The diagnostic successor reports only the closed connection
+address family (`ipv4` or `ipv6`), normalizes IPv4-mapped addresses and keeps
+owner/fact checks; it neither exports addresses nor changes admission policy.
+One selected IPv6 refusal does not prove that a clean IPv4 sibling exists or
+that the refusal is a rollout defect. Those questions remain evidence gaps.
+
+The selector limits each indexed connected/client read to 33 rows before
+sorting. A 33-row sentinel refuses that provider; smaller sets retain the
+lowest eligible connection deterministically. Source review `a707bf09`
+accepted the three-table plan guard and disabled local fixture adapter. The
+guard requires direct indexed limit children and point handler/location reads,
+with JIT disabled and a three-second SQL deadline. Its local controls preserve
+the full 64-provider denominator, accept the 32-row boundary, reject the
+33-row overflow, and refuse missing-index and unbounded-inner-sort plans.
+These synthetic results do not qualify Main's current plan or latency.
+Unavailable owners, changed owners, stale facts and unsupported records must
+remain explicit unknowns. The policy remains: an identified residential or
+business subscriber ISP defaults clean unless additional contrary evidence
+applies; explicit proxy, hosting, virtual-ISP, origin and independent risk
+exclusions remain in force.
+
+The separate October 7 US/France research packet proposes twelve exact
+subscriber ASNs on the unchanged `320b4c10` catalog baseline:
+
+| Reviewed operator group | Exact ASN additions | Country and limited regional evidence |
+| --- | --- | --- |
+| GCI | 8047 | Alaska communities, subject to address availability |
+| Alaska Communications | 7782 | Alaska home access; Lower-48 transport is not retail presence |
+| altafiber / Hawaiian Telcom | 36149 | Hawaii; extends the existing group while retaining 6181 |
+| Sonic | 7065, 46375 | California and limited Dallas activations, not statewide Texas coverage |
+| EPB | 26827 | Current Chattanooga/Tennessee; North Georgia remains dated historical evidence |
+| C Spire Fiber | 11272 | Listed fiber towns in Alabama, Florida, Mississippi and Tennessee |
+| SFR | 21502 | French household THD; extends the existing group while retaining 15557 |
+| K-Net | 24904 | Conditional named networks; 15 departments are a conservative subset |
+| Nordnet | 8362 | Conditional communes in 66 departments across 13 metropolitan regions |
+| Vialis | 12727, 42487 | Bas-Rhin and Haut-Rhin; the ASN name does not establish Moselle service |
+
+Each exact ASN has retained primary registry and subscriber-service evidence,
+with independent cross-review. AS36149 qualifies through Hawaiian Telcom's own
+residential terms before the documented altafiber relationship supplies group
+deduplication. Both Sonic legal entities have separate service evidence. GCI's
+retained ARIN contacts establish the current operating-network/brand link;
+the unavailable DBA certificate is not evidence of a formal legal name change.
+The Nordnet contract closes Manche to new customers, so its territorial listing
+does not establish new-order availability. K-Net's 15-department list is not
+exhaustive. FDN-to-AS20766 was rejected because the registry identity is Gitoyen;
+Ozone-to-AS39886 remains deferred. No affiliate ASN or prefix is approved by
+association.
+
+The tracked Main catalog is now the reviewed cumulative candidate `5bbba6ad`,
+with 5,222 subscriber groups, six negative groups and 5,495 unique subscriber
+ASNs across the same 160 countries. This source selection is distinct from the
+5,220-group resource mapped in the retained 05:18 UTC one-owner observation. US
+coverage becomes 33 groups/53 ASNs and France 8 groups/10 ASNs. These are
+catalog counts, not subscription counts, market ranks or Main Quality gains.
+Eight groups are new and two existing groups are extended; all unowned stanza
+bytes, six negative groups, evidence-feed pins and policy controls are retained.
+All six US operators have mixed hosting/cloud/colocation evidence, and French
+mixed-service caveats remain explicit. The identified-ISP default does not
+override an applicable hosting, proxy, virtual-ISP, address, origin or risk
+finding, and a mixed product portfolio alone does not exclude an entire ASN.
+
+Research and composition receipts are retained under
+`artifacts/arin-us-state-research-20261007-v1`,
+`artifacts/arin-fr-regional-research-20261007-v1`,
+`artifacts/arin-fr-independent-review-20261007-us-v1` and
+`artifacts/arin-us-fr-subscriber-candidate-20261007-v1`. US cross-review
+`8c20dd95`, France cross-review `986b3aa0` and composition source review
+`e16ae2f3` passed. Seven deterministic composition controls passed. Native
+receipt `4589c9e4` then passed the strict catalog parser and all twelve exact-ASN
+subtests on the immutable `cf6621c4` source with the qualified Go 1.27.1/e32
+module graph. Synthetic cases retained independent base exclusions/risk,
+visibility/RPKI withholding and exact proxy vetoes. This fixture-free gate
+opened no evidence feed or MMDB and does not qualify the entire later source
+graph. Fresh evidence/artifact construction, readbacks, publication and actual
+adoption have not run for this candidate. The already selected
+MMDB and its retained V17 measurement are unchanged. The later V19 Taskworker
+runtime observation at 05:21:14.641977 UTC is a separate eight-slot metric
+witness and does not relabel that earlier ARIN observation or prove a loaded
+reader's identity. State/province/country top-30 completeness remains open:
+availability and service-presence sources do not supply comparable subscriber
+rankings or attribute the sampled Main providers to these operators.
+
+The separate October 8 Canada packet proposes thirteen exact subscriber ASNs
+on the tracked `5bbba6ad` baseline. Its retained ARIN records identify each
+ASN's current registrant; primary operator or regulator sources establish
+subscriber service and, where needed, the legal-name/brand relationship:
+
+| Reviewed operator group | Exact ASN additions | Limited regional evidence |
+| --- | --- | --- |
+| Bell Canada | 855, 7122 | Atlantic business Internet terms; Winnipeg evidence remains dated 2021 |
+| Cogeco Connexion | 11290 | Eligible addresses in Ontario and Quebec |
+| Eastlink | 11260 | Named New Brunswick communities, St. John's and Irricana, Alberta |
+| TekSavvy | 5645 | Conditional home Internet in all ten provinces; no territory inference |
+| Northwestel | 22573 | Business Internet in all three territories and northern British Columbia |
+| Xplore | 22995 | Canadian residential fibre, fixed wireless and satellite; no admin1 projection |
+| Beanfield | 21949 | Eligible residential buildings in Ontario, Quebec and British Columbia |
+| Execulink | 7794 | Southwestern Ontario and qualified named communities |
+| Access Communications | 21804 | Rural Saskatchewan, subject to address/site qualification |
+| Tbaytel | 32277 | Northern Ontario; the Terrace Bay activation remains dated 2023 |
+| Valley Fiber | 396420 | Manitoba residential fibre with approximate coverage and address checks |
+| Sogetel | 4540 | Five named administrative regions within Quebec |
+
+Ten groups are new; Bell retains AS577 and Cogeco retains AS7992. Candidate
+`c95cfe5b` contains 5,232 subscriber groups, six negative groups and 5,508 unique
+subscriber ASNs across the same 160 countries. Canada context grows from six
+groups/seven ASNs to sixteen groups/twenty ASNs. These are proposed catalog
+counts, not measured provider coverage or Quality gains. All unowned stanza
+bytes, existing negative groups, feed pins and policy controls are preserved.
+
+The review records mixed hosting, colocation or cloud products for Bell,
+Eastlink, TekSavvy, Beanfield, Execulink and Sogetel. These products preserve
+the need for an applicable use discriminator; they neither approve hosting
+prefixes nor justify rejecting an entire subscriber operator. Ordinary
+subscriber resale remains eligible. Registry ambiguity, an unknown competing
+origin, independent exclusions/risk, weak origin visibility and invalid RPKI
+continue to follow the existing classifier policy. The URL success gate stays
+at least 0.8. This is a demonstrated catalog omission, not evidence that those
+independent gates are too strict or that any current Main provider will pass.
+
+The regional inventory has partial subscriber-service presence for all thirteen
+Canadian provinces and territories. TekSavvy's dedicated Saskatchewan page
+supplies conditional service evidence beyond its general nine-province fibre
+sentence; the generic address form does not establish service in the three
+territories. Northwestel's general operating area includes High Level, Alberta,
+but that alone is not counted as retail Internet service. Marketing footprint,
+historical rollout, homes passed and subscriber count remain distinct. No
+regional top-30 completeness, subscriber ranking or route geography is inferred.
+Of the retained September 30 APNIC Canada priority queue, eight ASNs are already
+reviewed subscribers, eleven are proposed here, one retains an explicit negative
+and ten remain unreviewed. Beanfield and Northwestel are additional candidates
+outside that queue. Starlink is already globally reviewed; the absence of CA
+context does not require another group while optional country withholding is
+disabled. Popularity and corporate affiliation alone never approve an ASN.
+
+Research, the exact config patch, source receipts and qualification inputs are
+retained under `artifacts/arin-ca-regional-research-20261008-v1`, frozen by
+`research-freeze.json` (`6cb20a1d`). Eastlink and Valley Fiber's unavailable raw
+HTTP requests are preserved as failures; separately retained official-page/PDF
+web-tool text projections are labelled as projections. Their hashes do not
+claim raw page/PDF identity. Nine data-only composition controls passed,
+including refusal of changed negatives, refreshed feed clocks, removed prior
+ASNs and unreviewed ASN/country additions. Independent source review and four
+native qualification tests are separate gates. Independent composition review
+`239ee059` verified all 176 frozen files and preservation controls; semantic
+subscriber-source review `a4b250db` accepted all thirteen registry-to-service
+judgments with the recorded mixed-use and projection limitations. Four native
+qualification tests passed in the combined Canada gate `e70099a3`. They cover strict catalog
+parsing, exact identities, base-state/risk preservation, unknown origins,
+visibility/RPKI withholding and six explicit negative-use classes. They open
+no evidence feed, MMDB or database. Source composition has not refreshed the
+expired evidence bundle or constructed, published or adopted a new resource.
+Current census coverage and actual provider impact remain unknown until the
+separate Root-owned observation and artifact gates succeed.
+
+The follow-up Canada packet reviews the ten remaining ASNs in that retained
+national priority queue. It proposes six additional subscriber ASNs and four
+hosting ASNs, each with its own exact registry record and primary service-use
+evidence:
+
+| Reviewed use | Operator group | Exact ASN additions |
+| --- | --- | --- |
+| Subscriber access | EBOX | 1403 |
+| Subscriber access | Altima Telecom | 22423, 396338 |
+| Subscriber access | OXIO | 398721 |
+| Subscriber access | Distributel Communications | 11814 |
+| Subscriber access | Primus Telecommunications Canada | 6407 |
+| Hosting | GLOBALTELEHOST / GTHost | 62563 |
+| Hosting | B2 Net Solutions / ServerMania | 55286 |
+| Hosting | Akamai / Linode cloud | 63949 |
+| Hosting | Datacamp Limited | 212238 |
+
+Cumulative candidate `cdcc4471` retains every `c95cfe5b` stanza and adds these
+nine groups. It contains 5,237 subscriber groups, ten negative groups and 5,514
+unique subscriber ASNs across 160 subscriber countries. Canada context is
+21 groups/26 ASNs. The cumulative change from tracked `5bbba6ad` is nineteen
+subscriber ASNs and four hosting ASNs. Neither proposal has produced a new
+Main resource or a measured provider gain.
+
+Current legal and support pages resolve EBOX, Altima, OXIO, Distributel and
+Primus to their subscriber brands. Separate registrants remain separate
+groups: Bell, TELUS and Cogeco relationships do not approve other ASNs or
+lend a parent group's route visibility. Primus's current support/billing
+page supplies the Primus Telecommunications Canada name and Bell division
+bridge when main-site legal pages are unavailable. Its published personal
+web-page/domain hosting caveat remains explicit. Distributel's EBOX sales link
+does not establish migration of all existing customers or routes.
+
+GTHost's legal term "Subscriber" describes customers of servers, VMs, storage
+and IP allocations. It is not subscriber-access evidence. Its terms identify
+GLOBALTELEHOST; ServerMania's own history identifies B2 Net Solutions. The
+Linode-named ASN is registered to Akamai in the exact APNIC record. RIPE's
+AS212238 organization record identifies Datacamp; the AS60068 named separately
+on Datacamp's corporate site is not added. RIR redirects and organization roles
+are retained explicitly, without treating maintainer contacts as operators.
+The four hosting additions veto clean inference without adding unsupported
+proxy, VPN, Tor or virtual-ISP risk flags.
+
+EBOX adds qualified Ontario/Quebec presence, Altima five named provinces and
+OXIO six; Primus and Distributel are not assigned provinces from general
+branding. The cumulative proposals supply use dispositions for all thirty
+ASNs in the retained September 30 Canada priority queue: twenty-five subscriber
+and five hosting identities. That queue is not a national or regional
+subscriber-market top thirty. All thirteen regional inventory rows remain
+partial, with rankings and subscription counts unknown.
+
+The follow-up is frozen under `artifacts/arin-ca-remaining-review-20261008-v1`
+by `research-freeze.json` (`c21eb1c7`). Its incremental `c95cfe5b` patch and
+cumulative `5bbba6ad` patch are both retained. Nine data-only composition
+controls passed, including refusal of hosting-to-subscriber changes,
+unsupported proxy risk, affiliate-ASN additions, changed prior identities and
+feed-clock relabelling. Independent composition review `57336ce6` verified
+all 132 frozen files and the preservation controls. Semantic source review
+`2b893d77` accepted the six access and four hosting identities with the recorded
+limitations. The five follow-up native tests also passed in combined gate
+`e70099a3`, adding actual hosting-origin vetoes and unsupported-risk checks to
+the access-identity controls. All nine tests used the exact clean `116350e6`
+source, two CPU cores, a 2-GiB memory cap and no swap; they opened no feed,
+MMDB or database. The ARIN Go source is unchanged at the later `53675285`
+canonical observation and from the qualified `bbc8972f` builder. This extends
+catalog/schema and decision qualification without claiming that every later
+server package was tested. Fresh feeds, artifact construction/readbacks,
+publication, mapped adoption and the separate URL health gate remain necessary.
+
+Root merged the Canada catalog into Config `07d0f94b` and its documentation
+into Server `84a43192`. A later clean Server `9bc8a7e5` observation still has
+the same 41 ARIN Go postimages as the native `116350e6` and compiled `bbc8972f`
+sources; the complete later server graph is outside that equivalence claim.
+The canonical catalog is byte-exact `cdcc4471`. Disabled preparation
+`artifacts/arin-canada-resource-preparation-20261008-v2` binds those source
+gates, the nine native controls and the current Config lineage. It preserves
+the incoming `713a53d` changes to `main/sn.yml` and
+`main/operator-gas-authority.yml`; ARIN work does not attest their financial
+activation or authorize restoring the earlier Config parent. The normal
+strict 38-source refresh, bounded 12-GiB augmentation and exact final-artifact
+readbacks remain unexecuted in this preparation. Neither integration nor its
+disabled build plan establishes current reader adoption or provider gains.
+
+The next country research packet reviews Singapore. The latest retained
+October 6 06:03 country-tagged sample contains 207 complete, consistent
+non-Quality classifications: 192 carry a stored US tag and three an SG tag,
+the largest non-US count. Those booleans do not identify an ASN, registrant,
+unknown origin or explicit exclusion. The later census/lifecycle lane has
+collected no newer country/ASN cause bins. Singapore is therefore a bounded
+research priority, not a measured missing-subscriber or Quality-gain finding;
+the dominant US count remains unexplained at the operator level.
+
+The separate proposal adds six exact subscriber ASNs and four hosting ASNs
+to merged `cdcc4471`, using current RIR records and primary operator/regulator
+evidence:
+
+| Reviewed use | Operator group | Exact ASN additions |
+| --- | --- | --- |
+| Subscriber access | Singtel Mobile | 45143 |
+| Subscriber access | SingNet | 3758 |
+| Subscriber access | SIMBA Telecom | 4817 |
+| Subscriber access | MyRepublic | 56300 |
+| Subscriber access | ViewQwest | 18106 |
+| Subscriber access | Whiz Communications | 135600 |
+| Hosting | FDCservers.net | 30058 |
+| Hosting | Zenlayer | 62610, 21859 |
+| Hosting | Contabo Asia | 141995 |
+
+APNIC still names Singapore Telecom Mobile for AS45143. Singtel's business
+transfer announcement and IMDA's spectrum instrument independently bridge it
+to Singtel Mobile Singapore effective October 1, 2010; current mobile terms
+identify the successor's subscriber service. AS56300 retains MYREPUBLIC
+LIMITED. The operative IMDA licence explicitly transfers that licence to
+MyRepublic Broadband on November 30, 2021. This is business/licence continuity,
+not an assumed corporate rename. Current fixed-access terms and support
+establish its subscriber service independently of StarHub ownership. The
+October 8, 2026 mobile-acquisition announcement remains conditional and does
+not prove completion, ASN migration or shared origin visibility.
+
+SingNet's current GOMO contract, SIMBA's mobile/fibre contracts, ViewQwest's
+residential terms and WhizComms' fibre-ready-premises contract supply direct
+access-service evidence. Their parent or affiliated ASNs are not imported.
+Ordinary broadband resale does not itself establish virtual-ISP risk.
+FDCservers and Zenlayer's server/cloud/transit offerings remain explicit
+non-subscriber uses. Contabo Asia has its own exact APNIC identity, corporate
+operational-domain bridge and official Singapore server products; the
+operator-maintained directory is supplementary context only. None of these
+hosting judgments invents proxy, VPN, Tor or virtual-ISP risk flags.
+
+Candidate `8adadba2` contains 5,243 subscriber groups, thirteen negative groups
+and 5,520 unique subscriber ASNs across the same 160 countries. Singapore
+context grows from three groups/five ASNs to nine groups/eleven ASNs. Every
+prior operator stanza, all ten prior negative groups and the complete
+feed/policy header remain byte-exact. Twelve data-only composition controls
+pass, including refusal of changed negatives, affiliate ASN additions,
+borrowed parent identities, changed country context and relabelled clocks.
+Empty HTTP-success bodies and a legal URL redirected to unrelated HTML remain
+unusable source evidence. The packet is frozen under
+`artifacts/arin-sg-priority-research-20261008-v1` by `research-freeze.json`
+(`a1a6ea27`). Independent semantic/composition review passed (`b20cdd57`),
+followed by all five pure native parser/decision controls (`3bad67ef`) on
+clean Server `116350e6`. Root merged the exact catalog into Config
+`6a0b12b5`. These source and native gates do not include feeds, an augmented
+resource, reader adoption or provider outcomes.
+
+The merged Canada/Singapore resource successor is frozen under
+`artifacts/arin-ca-sg-resource-preparation-20261008-v1`: handoff `2c4f14cc`,
+disabled build plan `bee5637e` and preparation freeze `078ff4bf`. It supersedes
+the Canada-only `cdcc4471` plan. Clean observations bind Config `6a0b12b5`,
+catalog `8adadba2` and Server `30a56d9a`; all 41 ARIN Go files match the
+qualified builder/native source. The incoming `713a53d` SN and operator-gas
+authority files remain byte-exact, and all eleven audited SN consumers match
+their reviewed source. Their financial readiness remains a separate gate.
+
+The plan requires 38 fresh strict evidence sources, preserves all thirteen
+negative groups and dispositions 37 subscriber plus eight hosting ASNs in
+the actual output. It retains the October 6 registration base with its real
+clock, then requires full/native/mapped, RPKI, policy and independent audit
+readbacks. The qualified historical CLI's actual Go 1.27.1/module graph is
+distinct from the pending security successor; no current scanner result or
+final successor graph is invented. Root must bind the chosen builder and
+exclusive resource window before execution.
+
+Separate disabled publication and measurement plans preserve the complete
+currently selected Config inventory, private hash-only profile provenance,
+GeoLite/places and current SN authority. They use the normal scanner-gated
+Config packager, exact image/version selection and explicit restart scope.
+Actual reader generations, fresh connection lookups, rollup/publication
+clocks and a coherent census must precede any current Quality-gain claim.
+URL success of at least 0.8 and the mature four-hour quota remain separate.
+No resource build, publication, Main capture or Quality gain follows from
+this preparation.
+
+The proposal dispositions the retained Singapore national APNIC queue as ten
+subscriber, eight explicitly negative and twelve unreviewed ASNs. Those
+estimated-user entries are not subscriber counts or market ranks. The five
+Community Development Council districts have a current official geographic
+inventory, distinct from URA planning regions. District-specific subscriber
+presence, subscription counts and top-30 ranks remain unknown; national
+marketing and conditional premises eligibility do not fill those gaps.
+
+A separate primary-source follow-up keeps Cloudflare AS13335 unclassified
+at the whole-operator level. Its current BYOIP and Magic Transit documentation
+explicitly covers customer-owned prefixes announced under AS13335, ISP/customer
+letters of agency and traffic returned to the customer's network; Direct
+Server Return can retain egress through that customer's ISP. The inference is
+limited: an origin ASN and corporate brand alone do not prove that every
+address is tenant compute or a forward-proxy/VPN exit. A blanket hosting or
+proxy addition could override independent subscriber-prefix evidence for
+transparent protected networks. This is a possible mechanism, not an observed
+Main classification error or permission to approve all Cloudflare space.
+Existing applicable relay-prefix, VPN and other negative/risk evidence remains
+authoritative. Exact source receipts and the explicit no-change decision are
+frozen in `artifacts/arin-sg-mixed-origin-research-20261008-v1`
+(`bc89ad16`); no catalog or classifier change follows from this finding.
+
+The twelve-ASN augmentation has a separately qualified reuse executor
+(`db1631d8`) and full/native/mapped readback preparation (`1a6c7beb`). It keeps
+the validated registration base, all 38 original feed bytes and observation
+times, and the qualified existing builder. That retained feed bundle expired
+on October 8 at 02:03:14 UTC and cannot build a current resource. The current
+RPKI/catalog preparation therefore requires fresh evidence, preserving the
+reviewed subscriber default and all requested negative-source families. It
+can reuse the validated October 6 registration base with its original clocks:
+registration source and rules are unchanged. Such a build is a fresh
+augmentation, not a fresh registration update. Full, native, mapped and targeted
+policy readbacks must bind the new artifact hash and epoch; the older four
+successful readbacks cannot qualify it. The separate resource window is still
+pending. Startup
+still requires 12 GiB of available host memory, nine GiB free on root and
+28 GiB on the archive, with the existing live floors. The measured preceding
+11.034-GiB RSS peak does not support lowering that memory admission merely
+because current capacity is smaller.
+
+An isolated disk-backed writer candidate addresses that peak without dropping
+records or classifier stages. It retains the existing prefix trie, key
+deduplication and insertion policy, while storing record values and the final
+encoded data section in bounded files. Decoding uses a fresh per-record
+unmarshaler, verified record hashes and bounded type/depth/count checks;
+failed reads, appends or closes prevent successful publication. The ARIN
+factory is explicitly opt-in through `ARINDB_WRITER_STORAGE=disk-v1`, and
+the ordinary writer remains the default. Disk mode stores a snapshot of each
+inserted value; the reviewed ARIN callbacks do not rely on later alias
+mutation. This implementation and its local module replacement remain an
+isolated source candidate.
+
+Independent native receipt `a629a27c` passed the complete writer-library
+package and three focused ARIN test families. The latter include complete
+synthetic MMDB/manifest comparisons and the existing exclusion/risk controls.
+The copied upstream library test needed a test-only `FromBytes` to `OpenBytes`
+API adaptation for the pinned dependency graph; production code was unchanged
+by that correction. These bounded tests do not establish full-input memory
+fit. Native receipt `151e695b` subsequently compiled a dedicated full-input
+profile binary and verified that its disabled test skips before reading any
+retained input. The full profile has not run.
+
+That profile compares every output MMDB byte with `bfe38627` and every manifest
+field except the explicit builder identity, using catalog `320b4c10`, all
+original snapshots and the exact October 6 build time. It is a historical
+differential experiment, not a new twelve-ASN artifact. Source review
+`99b9ef12` qualifies a Root-only wrapper with a six-GiB hard cgroup, no swap,
+seven-GiB host startup admission, complete input pinning, archive bounds and
+independent cgroup/Go-heap telemetry coverage checks. The smaller cap is an
+experimental limit, not a measured success or a change to production's
+12-GiB admission. Root must retain the actual terminal, full output comparison
+and complete resource observations before evaluating a new build contract.
+
+The separately reviewed Config client-temp change (`6f20230e`) passes a
+validated private archive `TMPDIR` through both Docker client entrypoints.
+It does not relocate Docker daemon storage. Existing Config build and
+verification free-space thresholds therefore remain unchanged; archive
+temporary files alone do not resolve insufficient root-image storage.
+
+Source inspection distinguishes the adoption owners. Connect announces call
+the controller's actual-address lookup and persist its database epoch and
+lookup time. API also opens the ARIN reader on IP-info and extender location
+paths, and its Quality guard consumes current connection facts. Taskworker
+rollup and native index publication consume those stored facts; they do not
+reclassify old addresses from the connection table. `ip.go` opens ARIN through
+`sync.OnceValues`, so an already initialized process retains its reader across
+a Config selection. Root must attest the actual mapped resource in every
+current or draining lookup owner and observe fresh post-cutover connection
+facts, completed rollup/index generations and native Quality supply. Desired
+Config, a fresh metric push, or a file visible inside one container cannot
+substitute for that adoption evidence. Missing and older-epoch connections
+remain explicit in aggregate coverage; raw provider addresses cannot be
+reconstructed from their stored hashes.
+
+The retained Atlas reference archive `458d5421` also remains available. Its
+existing validation report binds predecessor `2952a345`, so its precision and
+recall measurements do not describe this successor. A disabled, bounded
+source plan can apply the qualified validator to the new artifact after its
+readbacks. That host-labelled reference remains a review aid with geographic
+and population bias; it does not establish live-provider coverage or supply.
+
+Retained RIS routing measurements must also distinguish direct observations
+from inherited visibility. On the October 6 `02:03:14Z` IPv4 snapshot,
+PenTeleData AS3737 has 27 of 1,229 observed prefixes directly meeting the
+ten-peer floor. A bounded Python calculation of the classifier's nearest
+matching-parent rule brings all 1,229 to that floor or higher; TDS AS4181 similarly
+goes from 83 to 535 of 535. The calculation uses complete origin sets and
+reviewed operator identities and never sums peer counts (`7b353111`). It does
+not join RPKI, registration, risk/cloud, address lists, assignment, country
+policy or longest-prefix classification partitions. These are route visibility
+counts, not eligible addresses, customers, current Main providers or measured
+Quality gains. APNIC user estimates remain audit-priority inputs only.
+
+A source-only pass through all 1,589,823 rows of the same IPv4 and IPv6
+snapshots also measured direct visibility for the 38 subscriber ASNs added
+between catalogs `ec316ffc` and `320b4c10`. Repeated measurements agree
+(`ff93366d`); for the five latest US identities the IPv4 counts are:
+
+| Exact ASN | Observed distinct prefixes | Direct peer count at least ten |
+| --- | ---: | ---: |
+| AS209 | 1,590 | 1,588 |
+| AS4922 | 101 | 93 |
+| AS6621 | 371 | 371 |
+| AS7155 | 4,366 | 4,346 |
+| AS15108 | 57 | 57 |
+
+AS7132, another newly reviewed ASN, has no observed route in either retained
+snapshot. These per-ASN counts use the maximum direct count on repeated
+observations, never a sum. They omit parent and sibling-identity visibility
+and all classification discriminators; multi-origin prefixes can appear in
+more than one ASN's count. They add routing context to the catalog inventory,
+without establishing final classifier coverage or a provider gain.
+
+Source review also found a diagnostic loss in the inspected `db9f90a` shadow
+projection: the MMDB retains `origin_withheld_reason`, but the projection
+retains only origin ASNs and use state. The change prepared as `4ec4f8ab4`
+preserves the four closed withholding reasons for visibility, RPKI,
+reviewed-country policy and registry hosting assignment. Its exact production
+and test postimages passed ten local decoder, aggregation, authenticated-wire
+and compatibility controls; later module composition and runtime adoption
+remain separate checks. The selected catalog does not enable the optional
+reviewed-country policy, and the projection changes no classification or
+eligibility rule. An older strict coordinator rejects the added field, requiring
+coordinator compatibility before using an updated capture producer.
+
+The next bounded attribution needs a fresh generation-bound private sample,
+complete connection groups and an authenticated current owner to join typed
+classification, exact origin ASN sets and registration-rule provenance. The
+retained aggregate has no recoverable provider IDs or addresses. Existing
+capture enablement/expiry authority remains unproved, and a cold recorder
+hashes both database streams before mapping; the short RPC deadline does not
+turn that initialization into a bounded tail read. Those prerequisites remain
+separate from the catalog research and from any proposal to change serving
+classification.
 
 ## Output and provenance
 
@@ -526,13 +1458,19 @@ go build -ldflags "-X main.Version=$WARP_VERSION" -o /tmp/arindbctl ./arindbctl
 ```
 
 The all-release runner's `refresh_ip_databases` in `build/all/run.sh` runs
-exactly this before the config-updater image is built. Its inputs are
-`GEOIP_CONF_FILE`, `ARIN_CREDENTIALS_FILE`, `ARIN_RULES_FILE` and the optional
+exactly this before the config-updater image is built. Its input overrides
+are `GEOIP_CONF_FILE`, `ARIN_CREDENTIALS_FILE`, `ARIN_RULES_FILE` and
 `ARIN_SUBSCRIBER_CATALOG_FILE`, which defaults to
-`$WARP_HOME/config/$BUILD_ENV/arindb-subscribers/catalog.yml`. A catalog at the
-default path is used when present; an explicitly configured catalog that
-cannot be read stops the release rather than silently publishing a
-registration-only resource. `ARIN_RELAY_GEOFEEDS=1` adds the relay geofeeds.
+`$WARP_HOME/config/$BUILD_ENV/arindb-subscribers/catalog.yml`. The catalog is
+required: a missing or unreadable default or override stops the full release
+before the IP refresh compiles its binary or generates or publishes databases.
+The tracked Main default is
+the reviewed cumulative catalog `5bbba6ad`. This preserves its operator
+identities, visibility floor and country policy in subsequent full releases;
+update acquires fresh evidence instead of reusing the seed's old snapshots.
+The seed alone is not an offline augmentation bundle. Generic `arindbctl
+update` still supports an explicit registration-only invocation without
+`--subscriber-catalog`. `ARIN_RELAY_GEOFEEDS=1` adds the relay geofeeds.
 The runner moves `mmdb/` and `arindb/` into the versioned config resources,
 leaves `subscriber-evidence/` in `$BUILD_OUT/ip-databases`, and puts the update
 summary, including unavailable sources and the Atlas estimate, in the release
@@ -904,7 +1842,7 @@ or reproducing it, and refresh through the normal update path as evidence ages.
 The process-local reader does not automatically unload or reclassify records
 when an evidence timestamp expires.
 
-### Reviewed catalog artifact and staging (2026-10-06)
+### Reviewed catalog artifact and deployment (2026-10-06)
 
 The normal update produced resource `2026.10.6+1791253792`: 571,201,428 bytes,
 SHA-256 `2952a3458a574ffea68cf726a9e5d0116b49d6dbe6a105fccd287064875349d1`,
@@ -932,9 +1870,29 @@ Config paths, including the private-profile resource. Seven added files and
 two directories produce 106 paths totaling 5,064,120,310 bytes. Artifact and
 physical-inventory qualification are complete. The actual `6bd44a1b` native
 resolver control also selected all three pinned ARIN/GeoLite/places resources
-and loaded epoch `1791253792`. Image publication, Config selection and loaded
-Main-process proof remain separate rollout checkpoints at this recorded stage.
-No Main classification or Quality gain is attributed to this new artifact.
+and loaded epoch `1791253792`. Both Config image architectures passed independent
+verification. Root selected version
+`2026.10.6-arin-reviewed-catalog+1064574990`, index
+`sha256:a963d0c695067d1683647f6e091b3c838e9f402fe0f8e6a9c14582f6cbd7930c`,
+at `05:23:54.652287Z`–`05:23:58.314035Z`, with `restart=yes` requested.
+The successful deployment receipt is
+`c151b2603434c9278777bf2992e907592929651b24b409162f63b8ccd46d7ee9`;
+it does not establish every process restart or resource adoption.
+
+At `05:30:13.995316Z`–`05:30:14.125936Z`, one exact `cf1e52c3` amd64 Connect
+process at edge1/g1 had a stable mapping of epoch `1791253792`. Its file length
+was 571,201,428 bytes; the final 131,072 bytes and decoded metadata matched
+the new artifact's separately pinned fingerprints. Native owner, executable,
+process generation and mapped device/inode remained bound across the read.
+Independent actual gate
+`017830938ba80a170aa00c9660dc4fe790f2c52cac3177333482ca63090df09a`
+qualifies that observation. The legacy v13-match flag is false for this new
+artifact, as expected; it is not a failed new-artifact comparison.
+
+This proves one process mapping and a bounded fingerprint, not the full file
+hash, request-time use, fleet convergence or a classification/Quality gain.
+The observation preceded the subsequent `db9f` service rollout and does not
+prove resource adoption by its newer process generations.
 
 ### One mapped-process observation (2026-10-05)
 
@@ -1312,6 +2270,75 @@ Receipt `ec486133c964eea273c6d0abe1a61d237b17ac7c8c95d4ff8c7675c8335bf637`
 retains only aggregate output. No publisher identity, loaded-resource use,
 fixed-cohort improvement or historical 10,616-member attribution follows.
 
+The first post-Config comparison at `2026-10-06T05:31:10.144121Z` refused
+`source_before_cutover`: the key's parsed source completion preceded the new
+Config completion floor, `05:23:58.314035Z`. The native body completed in
+41.543 milliseconds after one fixed-pair read through one approved redirect;
+**no PostgreSQL query ran**. The cutoff check precedes the 900-second age,
+bucket/ratio and sample-membership checks, so none of those later checks was
+qualified. The refusal retained no exact source/publication clocks, counts or
+current classification reasons. Independent actual gate
+`5fae25ce0da8329a7a41fbea2efc5a3ffc6359fbd0c38142772d9050c8d1ef3f`
+binds the result. This is an older-than-cutover publication, not a zero pool or
+a measured failure of the 900-second age bound. It does not identify an active
+publisher or explain the publication delay. The earlier 547/6,569/56,100 counts
+remain historical. Both contacts' later local watcher/fallback checks passed;
+no automatic retry or freshness relaxation followed. Root separately scheduled
+the later successful observation below.
+
+At `2026-10-06T06:03:28.892641Z`, a matching native census/private companion
+pair contained **644 Quality, 5,264 Speed and 58,789 Online** providers. The
+source ran from `05:54:06.319159Z` to `05:56:07.092311Z` and published at
+`06:00:52.863356Z`: 120.773152 seconds of evaluation and 285.771045 seconds
+from completion to publication. Source age was 441.800330 seconds, within
+900 seconds and after the Config completion cutoff. Quality was 12.234043%
+of Speed, leaving **4,620 Speed-without-Quality** providers. The source's
+Online cohort had 5,264 passing and 53,525 failing selected-policy 4/5 URL
+ratios, with no missing evidence. Those ratio failures remain distinct from
+the Speed-only classification gap and cannot be cleared by changing ARIN.
+
+Two unchanged Redis pairs bracketed one read-only statement lasting 0.286216
+seconds; the native body took 487.168 milliseconds. The new private sample
+selected 256 of the 4,620 Speed-only members. Its current first-failing reasons
+were:
+
+| Current reason | Sample providers |
+| --- | ---: |
+| Non-Quality in both current connection facts and provider rollup | 207 |
+| URL ratio below 4/5 in the later rolling window | 24 |
+| Incomplete current classification | 22 |
+| No connection with a live handler | 3 |
+
+This statement used epoch `1791253792` and the exact Config-start lookup floor.
+Across the bounded sample it saw 251 live connection rows, of which 223 matched
+the selected epoch, client binding and lookup-time range. The remaining 28
+rows do not distinguish missing evidence, an epoch mismatch or a time/client
+binding failure; connection counts are not an additive partition of provider
+reasons. In particular, the 22 incomplete-classification providers do not by
+themselves prove a stale-row defect or authorize a rewrite.
+
+The 207 consistent non-Quality cases had complete current-epoch lookups and
+passed preceding identity, public-key, rollup, reliability, TLS and current
+URL checks. At least one live connection remained non-Quality, the rollup was
+non-Quality, and no live hard-risk flag was found. Stored countries placed 192
+of these cases in the US and 15 across ten other countries. The retained
+booleans still supply no operator/ASN attribution or unknown-versus-ambiguous
+versus-explicit-exclusion breakdown. No provider reached the verified-current-
+subscriber/soft-rollup discrepancy category. Reason order can hide later
+dimensions, so this is not an exhaustive risk/TLS intersection census or a
+basis for blanket subscriber promotion, risk removal or classification CAS.
+
+Compared with the earlier distinct publication, Quality is 97 higher, Speed
+is 1,305 lower and Online is 2,689 higher. Both publication and sample hashes
+changed; no fixed-provider improvement, catalog effect or release-performance
+benefit follows. The source interval began after Config selection and the
+`db9f` Taskworker terminal, but the key still has no publisher or loaded-resource
+identity. The separate `05:30` mapped-process observation does not join this
+publication to its publisher, sampled callers or request-time resource use.
+Receipt `8ee8e0e7c21c66f8226a0d08067b0e70484df23d0a7df9fa65ab7f4fb9274d9d`
+retains only bounded aggregates. Strict freshness and all query/transport
+limits were unchanged, and the later local watcher/fallback check passed.
+
 The native publication has source clocks but lacks ARIN epochs and exclusion
 reasons. These reviewed sources export no loaded-ARIN epoch gauge. The bounded
 process observation above supplies a mapped epoch for one process; its
@@ -1342,11 +2369,17 @@ For this release, retain the following evidence as rollout proceeds:
 1. The selected Config index and actual process resource path/hash/epoch after
    the owning restart; desired selectors and successful image publication are
    insufficient by themselves.
-2. Aggregate current, outdated and missing lookups at epoch `1791162091`, using
-   the actual cutover time, followed by native score-generation and provider
-   rollup convergence. Do not treat old stored facts as freshly reclassified.
-3. Actual Quality, Speed and Online results under their existing health,
-   reliability and common-risk gates, including fallback and publication age.
+2. Aggregate current, outdated and missing lookups at epoch `1791253792`,
+   using the Config start `2026-10-06T05:23:54.652287Z`, followed by native
+   score-generation and provider rollup convergence. Require source completion
+   at or after Config completion `05:23:58.314035Z`; that floor alone does not
+   identify the publisher or prove its source evaluation started after selection.
+   The successful 256-member Speed-only sample supplies one bounded check;
+   complete fleet coverage and per-reason missing/outdated evidence remain open.
+   Do not treat old stored facts as freshly reclassified.
+3. Continue generation-bound Quality, Speed and Online comparisons under their
+   existing health, reliability and common-risk gates, including request-local
+   fallback and publication age. Keep changing cohorts and source clocks explicit.
 4. Complete owner-side capture aggregates where available, preserving unknown,
    withheld, conflicting and overflow populations. Prioritize exact
    allocation-owner and origin-set research from those gaps, review the Atlas

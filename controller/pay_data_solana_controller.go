@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -86,9 +87,11 @@ type PayDataSolanaIntentResult struct {
 	Error        *PayDataCheckoutError `json:"error,omitempty"`
 }
 
-func payDataSolanaIntentError(message string) *PayDataSolanaIntentResult {
+// payDataSolanaIntentError is a refused intent: a `PurchaseErrorCode*` and its
+// message.
+func payDataSolanaIntentError(code string, message string) *PayDataSolanaIntentResult {
 	return &PayDataSolanaIntentResult{
-		Error: &PayDataCheckoutError{Message: message},
+		Error: &PayDataCheckoutError{Code: code, Message: message},
 	}
 }
 
@@ -155,19 +158,22 @@ func PayDataSolanaIntent(
 ) (*PayDataSolanaIntentResult, error) {
 	itemId := strings.TrimSpace(args.ItemId)
 	if _, ok := stripeDataPackByteCount(itemId); !ok {
-		return payDataSolanaIntentError("Unknown item."), nil
+		return payDataSolanaIntentError(PurchaseErrorCodeInvalidRequest, "Unknown item."), nil
 	}
 	reference := strings.TrimSpace(args.Reference)
 	if !payDataSolanaValidReference(reference) {
-		return payDataSolanaIntentError("Invalid payment reference."), nil
+		return payDataSolanaIntentError(PurchaseErrorCodeInvalidRequest, "Invalid payment reference."), nil
 	}
 	networkName := strings.TrimSpace(args.NetworkName)
 	if networkName == "" {
-		return payDataSolanaIntentError("Enter the network that should receive the data."), nil
+		return payDataSolanaIntentError(PurchaseErrorCodeNetworkNameRequired, "Enter the network that should receive the data."), nil
 	}
 
 	if !payDataCheckoutLimiter.allow(clientSession) {
-		return payDataSolanaIntentError("Too many payment attempts from this address. Try again in a minute."), nil
+		return payDataSolanaIntentError(
+			PurchaseErrorCodeRateLimited,
+			"Too many payment attempts from this address. Try again in a minute.",
+		), nil
 	}
 
 	// The price comes from pro.yml, keyed by the item. It is NEVER taken from the
@@ -175,12 +181,12 @@ func PayDataSolanaIntent(
 	priceUsd, ok := dataPackPriceUsd(itemId)
 	if !ok {
 		glog.Errorf("[paydata]no usable price in pro.yml for data pack %s\n", itemId)
-		return payDataSolanaIntentError("That data pack is not available."), nil
+		return payDataSolanaIntentError(PurchaseErrorCodeItemUnavailable, "That data pack is not available."), nil
 	}
 
 	networkId, storedName := model.FindNetworkByName(clientSession.Ctx, networkName)
 	if networkId == nil {
-		return payDataSolanaIntentError(fmt.Sprintf("No network named %s", networkName)), nil
+		return payDataSolanaIntentError(PurchaseErrorCodeNetworkNotFound, fmt.Sprintf("No network named %s", networkName)), nil
 	}
 
 	// the quote carries a reserved sub-cent suffix, so a payment sent without
@@ -199,7 +205,7 @@ func PayDataSolanaIntent(
 		// a duplicate reference or a failed insert must not send the buyer off to
 		// pay against an intent that does not exist
 		glog.Errorf("[paydata]could not create solana intent %s for %s: %s\n", reference, itemId, err)
-		return payDataSolanaIntentError("Could not start the payment. Please try again."), nil
+		return payDataSolanaIntentError(PurchaseErrorCodeStartFailed, purchaseStartFailedMessage), nil
 	}
 
 	glog.Infof(
@@ -351,8 +357,9 @@ func solanaMemoTexts(programId string, data string) []string {
 // duration from pro.yml and carries the received USDC as revenue. There is no
 // code: nothing was emailed and nothing needs redeeming.
 //
-// The applied note goes to the network's admin login when it is an email,
-// after the credit and best effort: the data is already there.
+// The applied note for the network's admin login, when it is an email, is
+// added to the account message outbox in the credit's transaction: it is owed
+// exactly when the credit commits, and the delivery task sends it after.
 func solanaCreditDataPack(
 	clientSession *session.ClientSession,
 	paymentSearchResult *model.PaymentIntentSearchResult,
@@ -419,6 +426,13 @@ func solanaCreditDataPack(
 			},
 		)
 		credited = true
+		addSolanaDataAppliedNoteInTx(
+			clientSession.Ctx,
+			tx,
+			networkId,
+			byteCount,
+			paymentSearchResult.PaymentReference,
+		)
 	}, server.TxReadCommitted)
 	if returnErr != nil {
 		return false, returnErr
@@ -431,19 +445,20 @@ func solanaCreditDataPack(
 		"[paydata]solana data pack %s applied to network %s (%s, %.2f USDC, %s)\n",
 		itemId, networkId, model.ByteCountHumanReadable(byteCount), tokenAmountReceivedUsd, signature,
 	)
-	solanaSendDataAppliedNote(clientSession, networkId, byteCount)
 	return true, nil
 }
 
-// solanaSendDataAppliedNote emails the network's admin that the data is on the
-// network, when their login is an email. Never fails the credit: the money
-// moved and the data landed; a missed note is not worth a webhook retry.
-func solanaSendDataAppliedNote(
-	clientSession *session.ClientSession,
+// Adds the note that the data is on the network for the network's admin, when
+// their login is an email, in the credit's transaction. One note per intent: a
+// credit that runs again adds none.
+func addSolanaDataAppliedNoteInTx(
+	ctx context.Context,
+	tx server.PgTx,
 	networkId server.Id,
 	byteCount model.ByteCount,
+	paymentReference string,
 ) {
-	networkName, userAuth, ok := model.GetNetworkAdminUserAuth(clientSession.Ctx, networkId)
+	networkName, userAuth, ok := model.GetNetworkAdminUserAuthInTx(ctx, tx, networkId)
 	if !ok || userAuth == "" {
 		return
 	}
@@ -451,14 +466,13 @@ func solanaSendDataAppliedNote(
 	if userAuthType != model.UserAuthTypeEmail {
 		return
 	}
-	err := GetAWSMessageSender().SendAccountMessageTemplate(
-		normalUserAuth,
-		&SubscriptionDataAppliedTemplate{
+	addAccountMessageInTx(ctx, tx, &accountMessage{
+		key:       fmt.Sprintf("solana_data_pack/%s", paymentReference),
+		networkId: &networkId,
+		userAuth:  normalUserAuth,
+		template: &SubscriptionDataAppliedTemplate{
 			BalanceByteCount: byteCount,
 			NetworkName:      networkName,
 		},
-	)
-	if err != nil {
-		glog.Infof("[paydata]could not send the data applied note for network %s: %s\n", networkId, err)
-	}
+	})
 }

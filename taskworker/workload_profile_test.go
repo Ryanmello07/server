@@ -50,6 +50,8 @@ func TestSubnetOperatorWorkloadKeepsRequiredTargets(t *testing.T) {
 		task.NewTaskTarget(work.RollupVerifyProviderStats), task.NewTaskTarget(work.RemoveOldVerifyProviderStats),
 		task.NewTaskTarget(work.RefreshVerifyProxyEgress), task.NewTaskTarget(work.CloseExpiredContracts),
 		task.NewTaskTarget(work.ReconcileNetEscrow), task.NewTaskTarget(work.FlushLegacySettlements),
+		model.NewLegacyPayerSettlementTaskTarget(),
+		task.NewTaskTarget(work.RefreshContractHoles),
 		task.NewTaskTarget(model.RemoveNetworkClientsTask),
 		task.NewTaskTarget(work.DbMaintenance), task.NewTaskTarget(work.BackfillClock),
 		task.NewTaskTarget(work.UpdateClientLocations), task.NewTaskTarget(work.UpdateClientScores),
@@ -187,7 +189,7 @@ func TestSubnetOperatorWorkloadPreservesProductionDefault(t *testing.T) {
 		}
 		// the geolocation-source pin refresh is retired and no longer seeded
 		// (connect/GEOMAP.md D24); the pool refresh is the egress default now
-		for _, target := range []task.Target{task.NewTaskTarget(work.Payout), task.NewTaskTarget(work.RefreshEgressDestinations), task.NewTaskTarget(work.StSyncChain)} {
+		for _, target := range []task.Target{task.NewTaskTarget(work.Payout), task.NewTaskTarget(work.RefreshEgressDestinations), task.NewTaskTarget(work.StSyncChain), task.NewTaskTarget(controller.DeliverAccountMessages)} {
 			name := target.TargetFunctionName()
 			if !worker.HasTarget(name) || !seeded[name] {
 				t.Errorf("ordinary production default lost scheduled/registered task %s", name)

@@ -404,6 +404,26 @@ const (
 	AuthLegacyExpired           AuthLegacyAcceptCause = "expired"
 )
 
+// AuthCredentialKind is the bounded kind of a credential a migration gate let
+// through: a network token (the network's sign-in token, with no client) or a
+// client token. A client token refreshes on its half-life, so its legacy
+// accepts fade on their own; a network token renews only at
+// POST /auth/network-refresh, so its count is the one that decides when
+// reject_expired can be flipped on.
+type AuthCredentialKind string
+
+const (
+	AuthCredentialNetwork AuthCredentialKind = "network"
+	AuthCredentialClient  AuthCredentialKind = "client"
+)
+
+func authCredentialKind(byJwt *ByJwt) AuthCredentialKind {
+	if byJwt.ClientId != nil {
+		return AuthCredentialClient
+	}
+	return AuthCredentialNetwork
+}
+
 var authRejectionCounter = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Namespace: "urnetwork",
@@ -419,9 +439,9 @@ var authLegacyAcceptCounter = prometheus.NewCounterVec(
 		Namespace: "urnetwork",
 		Subsystem: "auth",
 		Name:      "jwt_legacy_accepts_total",
-		Help:      "Credentials accepted only because an auth.yml migration gate is off, by cause",
+		Help:      "Credentials accepted only because an auth.yml migration gate is off, by cause and credential kind (network or client)",
 	},
-	[]string{"cause"},
+	[]string{"cause", "kind"},
 )
 
 func init() {
@@ -512,14 +532,14 @@ func ParseByJwtForAudience(ctx context.Context, jwtSigned string, audience strin
 		}
 		// gauge of remaining legacy-credential traffic, for deciding when to
 		// flip reject_missing_expiration on
-		authLegacyAcceptCounter.WithLabelValues(string(AuthLegacyMissingExpiration)).Inc()
+		authLegacyAcceptCounter.WithLabelValues(string(AuthLegacyMissingExpiration), string(authCredentialKind(byJwt))).Inc()
 	} else if now.After(byJwt.ExpiresAt.Time.Add(clockLeeway)) {
 		if rejectExpired() {
 			return nil, rejectByJwt(AuthRejectionExpired, "token is expired")
 		}
 		// gauge of stale-credential traffic, for deciding when to flip
 		// reject_expired on
-		authLegacyAcceptCounter.WithLabelValues(string(AuthLegacyExpired)).Inc()
+		authLegacyAcceptCounter.WithLabelValues(string(AuthLegacyExpired), string(authCredentialKind(byJwt))).Inc()
 	}
 	if byJwt.NotBefore != nil && now.Before(byJwt.NotBefore.Time.Add(-clockLeeway)) {
 		return nil, rejectByJwt(AuthRejectionNotYetValid, "token is not valid yet")
@@ -564,6 +584,38 @@ func ParseByJwtForAudience(ctx context.Context, jwtSigned string, audience strin
 // and client state. Password resets invalidate older credentials through
 // credential_change_time, and removed clients stop working immediately.
 func ValidateByJwtState(ctx context.Context, byJwt *ByJwt, requireClient bool) (returnErr error) {
+	if err := validateByJwtStateIdentity(byJwt, requireClient); err != nil {
+		return err
+	}
+	server.Db(ctx, func(conn server.PgConn) {
+		returnErr = validateByJwtStateQuery(ctx, conn, byJwt, nil)
+	})
+	return
+}
+
+// Checks durable child ownership and live credentials in one primary-key read.
+// The caller still authenticates the token and binds its owning account first.
+func ValidateByJwtStateForParent(ctx context.Context, byJwt *ByJwt, parentClientId server.Id) (returnErr error) {
+	if err := validateByJwtStateIdentity(byJwt, true); err != nil {
+		return err
+	}
+	server.Db(ctx, func(conn server.PgConn) {
+		returnErr = validateByJwtStateQuery(ctx, conn, byJwt, &parentClientId)
+	})
+	return
+}
+
+// Checks the same live state through the caller's already-owned transaction.
+// This grants no cached authority: each transaction attempt runs the query.
+func ValidateByJwtStateInTx(ctx context.Context, tx server.PgTx, byJwt *ByJwt, requireClient bool) error {
+	if err := validateByJwtStateIdentity(byJwt, requireClient); err != nil {
+		return err
+	}
+	return validateByJwtStateQuery(ctx, tx, byJwt, nil)
+}
+
+// Refuses incomplete identities before a standalone caller acquires a pool slot.
+func validateByJwtStateIdentity(byJwt *ByJwt, requireClient bool) error {
 	if byJwt == nil {
 		authRejectionCounter.WithLabelValues(string(AuthRejectionMissingToken)).Inc()
 		return errors.New("Missing signed token.")
@@ -572,10 +624,18 @@ func ValidateByJwtState(ctx context.Context, byJwt *ByJwt, requireClient bool) (
 		authRejectionCounter.WithLabelValues(string(AuthRejectionClientRequired)).Inc()
 		return errors.New("Client credential required.")
 	}
+	return nil
+}
 
+// One entered SQL query owns one observation, through a connection or a
+// transaction. Operational failures still unwind to the owning DB boundary.
+func validateByJwtStateQuery(ctx context.Context, conn server.PgCanQuery, byJwt *ByJwt, parentClientId *server.Id) error {
 	valid := false
 	var credentialChangeTime time.Time
-	server.Db(ctx, func(conn server.PgConn) {
+	func() {
+		query := beginStateQuery(ctx, byJwt.ClientId != nil)
+		defer query.finish(ctx)
+		queryFound := false
 		if byJwt.ClientId == nil {
 			result, err := conn.Query(ctx, `
 				SELECT network_user.credential_change_time
@@ -589,8 +649,10 @@ func ValidateByJwtState(ctx context.Context, byJwt *ByJwt, requireClient bool) (
 				if result.Next() {
 					server.Raise(result.Scan(&credentialChangeTime))
 					valid = true
+					queryFound = true
 				}
 			})
+			query.complete(queryFound, byJwt.CreateTime, credentialChangeTime)
 			return
 		}
 
@@ -606,15 +668,18 @@ func ValidateByJwtState(ctx context.Context, byJwt *ByJwt, requireClient bool) (
 				network_client.active = true
 			WHERE
 				network_user.user_id = $1 AND
-				($4::uuid IS NULL OR network_client.device_id = $4)
-		`, byJwt.UserId, byJwt.NetworkId, *byJwt.ClientId, byJwt.DeviceId)
+				($4::uuid IS NULL OR network_client.device_id = $4) AND
+				($5::uuid IS NULL OR network_client.source_client_id = $5)
+		`, byJwt.UserId, byJwt.NetworkId, *byJwt.ClientId, byJwt.DeviceId, parentClientId)
 		server.WithPgResult(result, err, func() {
 			if result.Next() {
 				server.Raise(result.Scan(&credentialChangeTime))
 				valid = true
+				queryFound = true
 			}
 		})
-	})
+		query.complete(queryFound, byJwt.CreateTime, credentialChangeTime)
+	}()
 
 	// the caller-facing message stays the same for both branches; the split
 	// (row gone/inactive vs credential rotation) is visible in the counter,
@@ -652,6 +717,17 @@ func ParseByJwtUnverified(ctx context.Context, jwtStr string) (*ByJwt, error) {
 	}
 
 	return byJwt, nil
+}
+
+// ByJwtNamesClientUnverified reports whether the token's claims, read without
+// verifying the signature and without any lookup, name a client. It never
+// authenticates: a caller verifies the token before relying on its claims.
+func ByJwtNamesClientUnverified(jwtStr string) bool {
+	byJwt := &ByJwt{}
+	if _, _, err := gojwt.NewParser().ParseUnverified(jwtStr, byJwt); err != nil {
+		return false
+	}
+	return byJwt.ClientId != nil
 }
 
 // func (self *ByJwt) Sign() string {

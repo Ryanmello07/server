@@ -32,7 +32,7 @@ func closeContractWithExpiryScope(ctx context.Context, scope *contractExpiryRepa
 	if err != nil {
 		return err
 	}
-	if closed {
+	if closed && scope.redis == nil {
 		RemoveFromStream(ctx, contractId)
 	}
 	return nil
@@ -50,11 +50,29 @@ func settleExpiredContractDispute(ctx context.Context, tag string, contractId se
 		// queued. The worker clears it only in the debit/outcome transaction;
 		// an accounting rejection rolls that clear back with everything else.
 		var owned bool
-		rows, queryErr := tx.Query(ctx, `SELECT contract_id FROM transfer_contract WHERE contract_id=$1 AND dispute AND outcome IS NULL FOR UPDATE`, contractId)
-		server.WithPgResult(rows, queryErr, func() { owned = rows.Next() })
+		var expiryOwned bool
+		var retained []byte
+		rows, queryErr := tx.Query(ctx, `SELECT usage_unverified,provider_usage FROM transfer_contract WHERE contract_id=$1 AND dispute AND outcome IS NULL FOR UPDATE`, contractId)
+		server.WithPgResult(rows, queryErr, func() {
+			owned = rows.Next()
+			if owned {
+				server.Raise(rows.Scan(&expiryOwned, &retained))
+			}
+		})
 		if !owned {
 			return
 		}
+		if !expiryOwned {
+			panic(errors.New("disputed expiry lacks retained ownership"))
+		}
+		_, proofErr := retainedContractExpiryUsage(retained)
+		server.Raise(proofErr)
+		// Ordinary CloseContract refuses a disputed row. This expiry owner may
+		// finalize its existing checkpoints after their original proof commits,
+		// retaining every byte count and the immutable proof. A failed financial
+		// transaction rolls these flags back with its dispute clear; legacy work
+		// commits them with its intent and keeps the dispute until settlement.
+		server.RaisePgResult(tx.Exec(ctx, `UPDATE contract_close SET checkpoint=false WHERE contract_id=$1 AND checkpoint`, contractId))
 		var legacy bool
 		server.Raise(tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM transfer_escrow WHERE contract_id=$1 AND NOT redis_reserved)`, contractId).Scan(&legacy))
 		if legacy {
@@ -93,9 +111,13 @@ func settleExpiredContractDispute(ctx context.Context, tag string, contractId se
 func continueContractExpiry(ctx context.Context, tag string, openContract *contractExpiryState, scope *contractExpiryRepairScope) error {
 	// Force close may synthesize a missing endpoint close. Its billing
 	// outcome must not be mistaken for verified bilateral subnet usage.
-	contractExpiryContinuationTx(ctx, openContract.contractId, scope, func(tx server.PgTx) {
-		server.RaisePgResult(tx.Exec(ctx, `UPDATE transfer_contract SET usage_unverified=true WHERE contract_id=$1 AND outcome IS NULL`, openContract.contractId))
-	})
+	// Both preparation callers commit before continuing. Reuse that sticky
+	// flag; states without the write-preparation witness keep the fallback.
+	if !openContract.usageUnverifiedRetained {
+		contractExpiryContinuationTx(ctx, openContract.contractId, scope, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `UPDATE transfer_contract SET usage_unverified=true WHERE contract_id=$1 AND outcome IS NULL`, openContract.contractId))
+		})
+	}
 	if openContract.dispute {
 		settleExpiredContractDispute(ctx, tag, openContract.contractId, scope)
 		return nil
@@ -221,7 +243,7 @@ func continueContractExpiry(ctx context.Context, tag string, openContract *contr
 		var posts []func() any
 		var err error
 		contractExpiryContinuationTx(ctx, openContract.contractId, scope, func(tx server.PgTx) {
-			posts, _, err = settleEscrowForegroundInTx(ctx, tx, openContract.contractId, ContractOutcomeSettled)
+			posts, _, err = settleEscrowForegroundWithExpiryScopeInTx(ctx, tx, openContract.contractId, ContractOutcomeSettled, scope)
 			if scope != nil {
 				server.Raise(err)
 			}

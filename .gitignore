@@ -22,6 +22,11 @@ plans/
 
 # local beta database dumps (contain user data; never commit)
 beta-backups/
+
+# Python diagnostic bytecode
+**/__pycache__/
+**/*.pyc
+
 # binaries
 client/build
 bringyourctl/bringyourctl
@@ -40,3 +45,6 @@ connect/sim-latency/sim-latency
 beta-vault/dkim/
 
 .android-output.lock
+
+# Local Cloudflare tooling state
+.cloudflare/

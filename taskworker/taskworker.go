@@ -54,6 +54,7 @@ func initTaskSchedule(ctx context.Context) {
 		controller.ScheduleOnboardingResultsRollup(clientSession, tx, onboarding.NextRollupAt(server.NowUtc()))
 		controller.ScheduleOnboardingEmailTrackerSync(clientSession, tx, server.NowUtc())
 		controller.ScheduleSubscriptionMetricsSync(clientSession, tx, server.NowUtc())
+		controller.ScheduleDeliverAccountMessages(clientSession, tx)
 		work.SchedulePayout(clientSession, tx)
 		work.ScheduleProcessPendingPayouts(clientSession, tx)
 		work.ScheduleCancelHungAccountPayments(clientSession, tx)
@@ -78,8 +79,6 @@ func initTaskSchedule(ctx context.Context) {
 		work.ScheduleRemoveLocationLookupResults(clientSession, tx)
 		work.ScheduleRemoveCompletedContracts(clientSession, tx)
 		work.ScheduleReconcileNetEscrow(clientSession, tx)
-		work.ScheduleFlushTransferDebits(clientSession, tx)
-		work.ScheduleFlushLegacySettlements(clientSession, tx)
 		work.ScheduleDbMaintenance(clientSession, tx, 0)
 		work.ScheduleWarmNetworkGetProviderLocations(clientSession, tx)
 		work.ScheduleRemoveExpiredAuthAttempts(clientSession, tx)
@@ -93,6 +92,7 @@ func initTaskSchedule(ctx context.Context) {
 		// registered task below without scheduling a successor
 		work.ScheduleProviderEgressProbeTasks(clientSession, tx)
 		work.ScheduleRefreshEgressDestinations(clientSession, tx)
+		work.ScheduleRollupProviderEgressTallies(clientSession, tx)
 		work.ScheduleExtenderProbe(clientSession, tx)
 		work.ScheduleExtenderPublish(clientSession, tx)
 		work.ScheduleRemoveOldExtenderLatencies(clientSession, tx)
@@ -105,6 +105,7 @@ func initTaskSchedule(ctx context.Context) {
 		work.ScheduleRollupTransferAuditEvents(clientSession, tx)
 		work.ScheduleRemoveOldClientReliabilityStats(clientSession, tx)
 		work.ScheduleRollupClientReliabilityStats(clientSession, tx)
+		work.ScheduleRollupClientDataUsage(clientSession, tx)
 		work.ScheduleUpdateClientReliabilityScores(clientSession, tx)
 		work.ScheduleRemoveOldProvideKeyChanges(clientSession, tx)
 		work.ScheduleUpdateNetworkReliabilityWindow(clientSession, tx)
@@ -139,6 +140,7 @@ func initTaskSchedule(ctx context.Context) {
 			glog.Infof("[taskworker]reaped %d pending provider egress probe tasks while probing is disabled\n", removedCount)
 		}
 	}, server.TxReadCommitted)
+	work.ScheduleSettlementAccountingTasks(ctx)
 }
 
 // InitTaskWorker preserves the historical exact Go signature, including
@@ -201,7 +203,11 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.CancelHungAccountPayments,
 			work.CancelHungAccountPaymentsPost,
 		),
-		task.NewTaskTargetWithCommitPost(
+		task.NewTaskTargetWithPost(
+			controller.DeliverAccountMessages,
+			controller.DeliverAccountMessagesPost,
+		),
+		task.NewTaskTargetWithPost(
 			controller.PlaySubscriptionRenewal,
 			controller.PlaySubscriptionRenewalPost,
 			"bringyour.com/bringyour/controller.PlaySubscriptionRenewal",
@@ -237,7 +243,8 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.SweepOrphanNetworkClientData,
 			work.SweepOrphanNetworkClientDataPost,
 		),
-		task.NewTaskTarget(model.ApplyLegacyProviderTotals),
+		model.NewLegacyProviderTotalsTaskTarget(),
+		model.NewLegacyNetEscrowMirrorTaskTarget(),
 		task.NewTaskTargetWithPost(
 			model.RemoveNetworkClientsTask,
 			model.RemoveNetworkClientsTaskPost,
@@ -246,6 +253,7 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.SweepOrphanContractData,
 			work.SweepOrphanContractDataPost,
 		),
+		task.NewTaskTargetWithPost(work.RefreshContractHoles, work.RefreshContractHolesPost),
 		task.NewTaskTargetWithPost(
 			work.IndexSearchLocations,
 			work.IndexSearchLocationsPost,
@@ -277,6 +285,10 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			"bringyour.com/bringyour/controller.AdvancePayment",
 		),
 		task.NewTaskTargetWithPost(
+			controller.ProviderIntentCheck,
+			controller.ProviderIntentCheckPost,
+		),
+		task.NewTaskTargetWithPost(
 			work.SetMissingConnectionLocations,
 			work.SetMissingConnectionLocationsPost,
 		),
@@ -288,8 +300,9 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.RemoveCompletedContracts,
 			work.RemoveCompletedContractsPost,
 		),
-		task.NewTaskTargetWithPost(work.FlushTransferDebits, work.FlushTransferDebitsPost),
-		task.NewTaskTargetWithPost(work.FlushLegacySettlements, work.FlushLegacySettlementsPost),
+		work.NewTransferDebitTaskTarget(),
+		work.NewLegacySettlementDispatcherTaskTarget(),
+		model.NewLegacyPayerSettlementTaskTarget(),
 		task.NewTaskTargetWithPost(
 			work.ReconcileNetEscrow,
 			work.ReconcileNetEscrowPost,
@@ -336,6 +349,7 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.ProviderEgressProbe,
 			work.ProviderEgressProbePost,
 		),
+		task.NewTaskTargetWithPost(work.RollupProviderEgressTallies, work.RollupProviderEgressTalliesPost),
 		task.NewTaskTargetWithPost(
 			work.RefreshEgressDestinations,
 			work.RefreshEgressDestinationsPost,
@@ -387,6 +401,10 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 		task.NewTaskTargetWithPost(
 			work.RollupClientReliabilityStats,
 			work.RollupClientReliabilityStatsPost,
+		),
+		task.NewTaskTargetWithPost(
+			work.RollupClientDataUsage,
+			work.RollupClientDataUsagePost,
 		),
 		task.NewTaskTargetWithPost(
 			work.UpdateClientReliabilityScores,

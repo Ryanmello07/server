@@ -28,6 +28,9 @@ type pgPoolWireFixture struct {
 	workers     sync.WaitGroup
 	query       func(int, string) bool
 	queryError  func(int, string) *pgproto3.ErrorResponse
+	queryRows   func(int, string) ([]pgproto3.FieldDescription, [][][]byte)
+	// A late-reply barrier runs after row/command replies have been flushed.
+	beforeReady func(int, string)
 	// the number of coming commits to answer with a rollback, as postgres does
 	// for a transaction aborted by an error the client never received
 	commitRollbacks atomic.Int32
@@ -142,7 +145,22 @@ func (self *pgPoolWireFixture) dial(ctx context.Context, network string, address
 					txStatus = 'I'
 					backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(strings.ToUpper(message.String))})
 				default:
+					if self.queryRows != nil {
+						fields, values := self.queryRows(connectionIndex, message.String)
+						if fields != nil {
+							backend.Send(&pgproto3.RowDescription{Fields: fields})
+							for _, row := range values {
+								backend.Send(&pgproto3.DataRow{Values: row})
+							}
+						}
+					}
 					backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(commandTag)})
+				}
+				if self.beforeReady != nil {
+					if err := backend.Flush(); err != nil {
+						return
+					}
+					self.beforeReady(connectionIndex, message.String)
 				}
 				backend.Send(&pgproto3.ReadyForQuery{TxStatus: txStatus})
 				if err := backend.Flush(); err != nil {

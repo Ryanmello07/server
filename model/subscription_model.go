@@ -25,6 +25,7 @@ import (
 
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/session"
+	"github.com/urnetwork/server/task"
 )
 
 type ByteCount = int64
@@ -471,6 +472,21 @@ func Testing_DeleteNetEscrow(ctx context.Context, balanceId server.Id) {
 // direction that starves the available balance and produces spurious
 // "Insufficient balance". Only networks with nonzero net drift are returned.
 func ReconcileNetEscrow(ctx context.Context, apply bool) (driftByNetworkId map[server.Id]ByteCount, balanceCount int) {
+	return reconcileNetEscrow(ctx, apply, false)
+}
+
+// ReconcileCachedNetEscrow repairs scheduled mirror drift using a durable
+// snapshot only when its revision matches the same-statement source revision.
+// Revision triggers invalidate legacy changes; misses retain exact census.
+// Fleet repair never writes the cache. Operators use ReconcileNetEscrow for an independent
+// exact audit, including detection of a corrupted same-revision cache entry.
+func ReconcileCachedNetEscrow(ctx context.Context) (driftByNetworkId map[server.Id]ByteCount, balanceCount int) {
+	return reconcileNetEscrow(ctx, true, true)
+}
+
+// Both callers retain page-local authority and the same Redis revision fence.
+// Only scheduled repair may reuse the durable snapshot cache.
+func reconcileNetEscrow(ctx context.Context, apply, useCache bool) (driftByNetworkId map[server.Id]ByteCount, balanceCount int) {
 	now := server.NowUtc()
 	driftByNetworkId = map[server.Id]ByteCount{}
 
@@ -519,12 +535,11 @@ func ReconcileNetEscrow(ctx context.Context, apply bool) (driftByNetworkId map[s
 		for i, row := range rows {
 			balanceIds[i] = row.balanceId
 		}
-		// Read reservations immediately before correcting this page. Do not move
-		// this above the pagination loop: that recreates the stale-global-snapshot
-		// incident described in the function comment. Keep the query on the fast
-		// unsettled partial path so its statement-snapshot-to-Redis-GET window stays
-		// bounded as well.
-		pending := openEscrowReservedForBalances(ctx, balanceIds)
+		// Read reservations immediately before correcting this page. A durable
+		// cached amount is exact only at the revision read in the same statement;
+		// stale or missing amounts retain the per-balance history fallback. Never
+		// move this above pagination and recreate a stale global snapshot.
+		pending := readReconcileNetEscrowSnapshots(ctx, balanceIds, useCache)
 		drift := reconcileNetEscrowBatch(ctx, pending, balanceIds, apply)
 		for _, row := range rows {
 			driftByNetworkId[row.networkId] += drift[row.balanceId]
@@ -592,7 +607,7 @@ func ReconcileNetEscrow(ctx context.Context, apply bool) (driftByNetworkId map[s
 		for i, row := range rows {
 			balanceIds[i] = row.balanceId
 		}
-		pending := openEscrowReservedForBalances(ctx, balanceIds)
+		pending := readReconcileNetEscrowSnapshots(ctx, balanceIds, useCache)
 		drift := reconcileNetEscrowBatch(ctx, pending, balanceIds, apply)
 		for _, row := range rows {
 			driftByNetworkId[row.networkId] += drift[row.balanceId]
@@ -830,6 +845,7 @@ func openEscrowReservedForBalances(ctx context.Context, balanceIds []server.Id) 
 	if len(balanceIds) == 0 {
 		return pending
 	}
+	defer enterLegacySettlementTiming(ctx, legacySettlementColdCensus)()
 	server.Tx(ctx, func(tx server.PgTx) {
 		configureNetEscrowReservationPageTimeout(ctx, tx, netEscrowReservationPageStatementTimeout)
 		pending = readNetEscrowSnapshots(ctx, tx, balanceIds)
@@ -1185,22 +1201,20 @@ func (self *ForceCloseAccountingError) QuarantinedAccountingRejectionCount() int
 	return self.quarantinedAccountingRejectionCount
 }
 
-// Single-cause wrappers preserve identity; multi-errors never grant authority.
+// Only a complete, bounded single-cause chain preserves sentinel authority.
+// Truncated, cyclic, nil, and multi-error graphs cannot authorize an outcome.
 func isOnlyContractError(err error, expected error) bool {
-	for err != nil {
-		if err == expected {
-			return true
-		}
-		// errors.Join and other multi-errors may contain the expected sentinel
-		// alongside a real failure. They must remain fail-closed.
-		if _, ok := err.(interface{ Unwrap() []error }); ok {
+	causes := server.InspectErrorCauses(err)
+	if !causes.Complete || causes.NilBranches != 0 {
+		return false
+	}
+	for _, cause := range causes.Nodes {
+		if _, multiple := cause.Err.(interface{ Unwrap() []error }); multiple {
 			return false
 		}
-		unwrapper, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
+		if cause.Leaf {
+			return cause.Err == expected
 		}
-		err = unwrapper.Unwrap()
 	}
 	return false
 }
@@ -1265,7 +1279,11 @@ func finishForceCloseDisputeSettlement(ctx context.Context, settleErr error, ver
 
 func finishForceCloseContract(closeErr error, quarantine func() error, cleanup func() error) error {
 	alreadySettled := isOnlyContractAlreadySettled(closeErr)
-	if closeErr != nil && !alreadySettled {
+	// A busy financial/publication owner retains the original settlement. Its
+	// scheduling refusal cannot authorize the malformed no-payout transition,
+	// even if that owner has already released before the next branch runs.
+	ownershipBusy := isOnlyContractError(closeErr, errTransferBalanceOwnershipBusy)
+	if closeErr != nil && !alreadySettled && !ownershipBusy && forceCloseErrorAllowsQuarantine(closeErr) {
 		closeErr = errors.Join(closeErr, quarantine())
 	}
 
@@ -1290,6 +1308,7 @@ const (
 type TransferEscrow struct {
 	ContractId          server.Id
 	CompanionContractId *server.Id
+	ExpirationTime      time.Time
 	Priority            Priority
 	TransferByteCount   ByteCount
 	Balances            []*TransferEscrowBalance
@@ -1560,6 +1579,16 @@ func createTransferEscrowInTx(
 		); err != nil {
 			return nil, nil, err
 		}
+		// a paying client at a data cap refuses the same way, on both paths
+		// (network_client_data_cap_model.go). The capped set is checked in
+		// memory, so payers in networks without a capped client add no query.
+		payerClientId := sourceId
+		if sourceNetworkId != payerNetworkId {
+			payerClientId = destinationId
+		}
+		if err := clientDataCapEscrowError(ctx, tx, payerNetworkId, payerClientId, contractTransferByteCount, server.NowUtc()); err != nil {
+			return nil, nil, err
+		}
 	}
 	if admission := redisAdmissionFromContext(ctx); admission != nil && contractTransferByteCount > 0 {
 		return createRedisTransferEscrowInTx(ctx, tx, admission, sourceNetworkId, sourceId,
@@ -1700,6 +1729,9 @@ func createTransferEscrowInTx(
 	if err := validateProberShardAdmissionDeadlineInTx(ctx, tx, shardDeadline); err != nil {
 		return nil, nil, err
 	}
+	if err := validateCompanionContractExpirationInTx(ctx, tx, companionContractId); err != nil {
+		return nil, nil, err
+	}
 	pending := make(map[server.Id]netEscrowSnapshot, len(balanceIds))
 	if 0 < contractTransferByteCount {
 		for _, balanceId := range balanceIds {
@@ -1710,6 +1742,7 @@ func createTransferEscrowInTx(
 			pending[balanceId] = snapshot
 		}
 	}
+	var expirationTime time.Time
 	server.BatchInTx(ctx, tx, func(batch server.PgBatch) {
 		for _, balanceId := range balanceIds {
 			escrow := balanceEscrows[balanceId]
@@ -1730,6 +1763,9 @@ func createTransferEscrowInTx(
 
 		batch.Queue(
 			`
+	            WITH creation_clock AS MATERIALIZED (
+	                SELECT clock_timestamp() AT TIME ZONE 'UTC' AS create_time
+	            )
 	            INSERT INTO transfer_contract (
 	                contract_id,
 	                source_network_id,
@@ -1741,13 +1777,15 @@ func createTransferEscrowInTx(
 	                payer_network_id,
 	                usage_origin_is_source,
 	                create_time,
-	                priority
+	                priority,
+	                expiration_time
 	            )
-	            VALUES (
+	            SELECT
 	                $1, $2, $3, $4, $5, $6, $7, $8, ($7::uuid IS NULL),
-	                clock_timestamp() AT TIME ZONE 'UTC',
-	                $9
-	            )
+	                create_time, $9,
+	                date_trunc('milliseconds', create_time) + $10 * INTERVAL '1 millisecond'
+	            FROM creation_clock
+	            RETURNING expiration_time
 	        `,
 			contractId,
 			sourceNetworkId,
@@ -1758,7 +1796,8 @@ func createTransferEscrowInTx(
 			companionContractId,
 			payerNetworkId,
 			priority,
-		)
+			DefaultContractExpiration.Milliseconds(),
+		).QueryRow(func(row pgx.Row) error { return row.Scan(&expirationTime) })
 
 		batch.Queue(
 			contractExtenderInsertSql,
@@ -1774,7 +1813,9 @@ func createTransferEscrowInTx(
 			batch.Queue(netEscrowPublishAdmissionCacheSQL, netEscrowAdmissionCacheArgs(pending, balanceIds)...)
 		}
 	})
+	server.AddTxCommitCount(tx, &contractOpenedCounter, 1)
 	providerWorkRetainReservationInTx(ctx, tx, contractId)
+	contractHoleEventInTx(ctx, tx, contractId, sourceId, destinationId, "create", expirationTime)
 
 	if 0 < contractTransferByteCount {
 		// The escrow insert and subsequent open-contract insert each advance
@@ -1801,6 +1842,7 @@ func createTransferEscrowInTx(
 	transferEscrow = &TransferEscrow{
 		ContractId:          contractId,
 		CompanionContractId: companionContractId,
+		ExpirationTime:      expirationTime,
 		TransferByteCount:   contractTransferByteCount,
 		Priority:            priority,
 		Balances:            balances,
@@ -1900,6 +1942,8 @@ func CreateTransferEscrow(
 	destinationId server.Id,
 	contractTransferByteCount ByteCount,
 ) (transferEscrow *TransferEscrow, returnErr error) {
+	// Keep one authority, including absence, across admission recovery reruns.
+	ctx = providerWorkSessionContext(ctx)
 	return runRedisContractAdmission(ctx, func(ctx context.Context) (*TransferEscrow, error) {
 		return createTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, contractTransferByteCount)
 	})
@@ -1915,6 +1959,8 @@ func createTransferEscrow(
 	destinationId server.Id,
 	contractTransferByteCount ByteCount,
 ) (transferEscrow *TransferEscrow, returnErr error) {
+	// Direct owners also resolve optional file and key work before acquiring pg.
+	ctx = providerWorkSessionContext(ctx)
 	var posts []func() any
 
 	if err := transferEscrowTx(ctx, sourceNetworkId, contractTransferByteCount, func(tx server.PgTx) {
@@ -2000,6 +2046,8 @@ func CreateCompanionTransferEscrow(
 	contractTransferByteCount ByteCount,
 	originContractTimeout time.Duration,
 ) (transferEscrow *TransferEscrow, returnErr error) {
+	// Recovery reruns and payer handoffs retain the operation's pinned source.
+	ctx = providerWorkSessionContext(ctx)
 	return runRedisContractAdmission(ctx, func(ctx context.Context) (*TransferEscrow, error) {
 		return createCompanionTransferEscrow(ctx, sourceNetworkId, sourceId, destinationNetworkId, destinationId, contractTransferByteCount, originContractTimeout)
 	})
@@ -2016,11 +2064,15 @@ func createCompanionTransferEscrow(
 	contractTransferByteCount ByteCount,
 	originContractTimeout time.Duration,
 ) (transferEscrow *TransferEscrow, returnErr error) {
+	// Direct callers must not load or verify an optional file while holding pg.
+	ctx = providerWorkSessionContext(ctx)
 	var posts []func() any
 	payerNetworkId := destinationNetworkId
 	requestedBytes := contractTransferByteCount
 	var inheritedPayer *server.Id
 	create := func(tx server.PgTx) {
+		originOutcome := server.ContractCompanionOriginError
+		defer func() { server.RecordContractCompanionOriginOutcome(ctx, originOutcome) }()
 		// A transaction retry or payer handoff must re-read the current origin,
 		// without retaining a previous attempt's clamp, posts or outcome.
 		transferEscrow, posts, returnErr, inheritedPayer = nil, nil, nil, nil
@@ -2029,6 +2081,8 @@ func createCompanionTransferEscrow(
 		// with null companion_contract_id
 		// there can be many companion contracts for an original contract
 
+		leavePlainOriginRead := server.BeginContractCompanionOriginRead(ctx, server.ContractCompanionPlainOrigin)
+		defer leavePlainOriginRead()
 		result, err := tx.Query(
 			ctx,
 			`
@@ -2041,11 +2095,13 @@ func createCompanionTransferEscrow(
                             SELECT transfer_byte_count FROM transfer_contract
                             WHERE
                                 (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END) AND
+                                COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                                 source_id = $1 AND destination_id = $2 AND
                                 companion_contract_id IS NULL
                             UNION ALL
                             SELECT transfer_byte_count FROM transfer_contract
                             WHERE open = false AND $3 <= close_time AND
+                                COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                                 source_id = $1 AND destination_id = $2 AND
                                 companion_contract_id IS NULL
                         ) AS eligible_probe_origins
@@ -2058,6 +2114,7 @@ func createCompanionTransferEscrow(
 							-- The CASE is equivalent to the generated open flag but
 							-- opaque to legacy false-zero open/outcome indexes.
 							(CASE WHEN outcome IS NULL THEN dispute = false ELSE false END) AND
+                            COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                             source_id = $1 AND
                             destination_id = $2 AND
                             companion_contract_id IS NULL
@@ -2073,6 +2130,7 @@ func createCompanionTransferEscrow(
                         WHERE
                             open = false AND
                             $3 <= close_time AND
+                            COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                             source_id = $1 AND
                             destination_id = $2 AND
                             companion_contract_id IS NULL
@@ -2102,6 +2160,7 @@ func createCompanionTransferEscrow(
 				server.Raise(result.Scan(&companionContractId, &proberReservationByteCount))
 			}
 		})
+		leavePlainOriginRead()
 
 		if companionContractId == nil {
 			// Fall back to a companion contract as the origin anchor. In an
@@ -2121,6 +2180,8 @@ func createCompanionTransferEscrow(
 			// Plain origins stay preferred; the chain is bounded
 			// in practice at depth two (a reply carrier answering a return
 			// direction).
+			leaveFallbackOriginRead := server.BeginContractCompanionOriginRead(ctx, server.ContractCompanionFallbackOrigin)
+			defer leaveFallbackOriginRead()
 			result, err := tx.Query(
 				ctx,
 				`
@@ -2135,6 +2196,7 @@ func createCompanionTransferEscrow(
                                 FROM transfer_contract
                                 WHERE
                                     (CASE WHEN outcome IS NULL THEN dispute = false ELSE false END) AND
+                                    COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                                     source_id = $1 AND destination_id = $2 AND
                                     companion_contract_id IS NOT NULL
                                 UNION ALL
@@ -2142,6 +2204,7 @@ func createCompanionTransferEscrow(
                                     source_network_id, destination_network_id
                                 FROM transfer_contract
                                 WHERE open = false AND $3 <= close_time AND
+                                    COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                                     source_id = $1 AND destination_id = $2 AND
                                     companion_contract_id IS NOT NULL
                                 -- Filter private ownership outside the pair boundary;
@@ -2164,6 +2227,7 @@ func createCompanionTransferEscrow(
 								-- Keep both generic open and outcome-null partial
 								-- indexes ineligible for this pair lookup.
 								(CASE WHEN outcome IS NULL THEN dispute = false ELSE false END) AND
+                                COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                                 source_id = $1 AND
                                 destination_id = $2 AND
                                 companion_contract_id IS NOT NULL
@@ -2180,6 +2244,7 @@ func createCompanionTransferEscrow(
                             WHERE
                                 open = false AND
                                 $3 <= close_time AND
+                                COALESCE(expiration_time, create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                                 source_id = $1 AND
                                 destination_id = $2 AND
                                 companion_contract_id IS NOT NULL
@@ -2203,14 +2268,17 @@ func createCompanionTransferEscrow(
 					server.Raise(result.Scan(&companionContractId, &proberReservationByteCount, &inheritedPayer))
 				}
 			})
+			leaveFallbackOriginRead()
 		}
 
 		if companionContractId == nil {
+			originOutcome = server.ContractCompanionOriginMissing
 			returnErr = ErrMissingCompanionOrigin
 			return
 		}
 
 		if inheritedPayer != nil && payerNetworkId != *inheritedPayer {
+			originOutcome = server.ContractCompanionOriginPayerHandoff
 			// End this read-only transaction before joining the true payer's
 			// process-local queue. Never wait for another gate with a connection.
 			return
@@ -2219,7 +2287,6 @@ func createCompanionTransferEscrow(
 			returnErr = errors.New("probe companion origin payer changed")
 			return
 		}
-
 		if proberReservationByteCount != nil {
 			contractTransferByteCount = min(contractTransferByteCount, *proberReservationByteCount)
 		}
@@ -2235,6 +2302,9 @@ func createCompanionTransferEscrow(
 			contractTransferByteCount,
 			companionContractId,
 		)
+		if returnErr == nil {
+			originOutcome = server.ContractCompanionOriginFound
+		}
 	}
 	if err := transferEscrowTx(ctx, payerNetworkId, requestedBytes, create); err != nil {
 		return nil, err
@@ -2297,6 +2367,7 @@ func GetOpenTransferEscrowsOrderedByPriorityCreateTime(
 					-- This is equivalent to the generated-open expression but
 					-- remains opaque to false-zero legacy partial indexes.
 					(CASE WHEN transfer_contract.outcome IS NULL THEN transfer_contract.dispute = false ELSE false END) AND
+                    COALESCE(transfer_contract.expiration_time, transfer_contract.create_time + interval '60 minutes') > statement_timestamp() AT TIME ZONE 'UTC' AND
                     transfer_contract.source_id = $1 AND
                     transfer_contract.destination_id = $2 AND
                     transfer_contract.transfer_byte_count <= $3 AND
@@ -2336,7 +2407,7 @@ func GetTransferEscrow(ctx context.Context, contractId server.Id) (transferEscro
                     transfer_byte_count,
                     priority
 
-                FROM transfer_byte_count
+                FROM transfer_contract
                 WHERE
                     contract_id = $1
             `,
@@ -2409,9 +2480,27 @@ func CreateContractNoEscrowWithUsageOrigin(
 	contractTransferByteCount ByteCount,
 	usageOriginIsSource bool,
 ) (contractId server.Id, returnErr error) {
+	contractId, _, returnErr = CreateContractNoEscrowWithExpiration(ctx, sourceNetworkId, sourceId,
+		destinationNetworkId, destinationId, contractTransferByteCount, usageOriginIsSource)
+	return
+}
+
+// Returns the INSERT's immutable database deadline only after its transaction
+// commits. The usage origin is independent of the no-escrow funding mode.
+func CreateContractNoEscrowWithExpiration(
+	ctx context.Context,
+	sourceNetworkId server.Id,
+	sourceId server.Id,
+	destinationNetworkId server.Id,
+	destinationId server.Id,
+	contractTransferByteCount ByteCount,
+	usageOriginIsSource bool,
+) (contractId server.Id, expirationTime time.Time, returnErr error) {
+	// Pin before acquisition so transaction retries reuse even an absent source.
+	ctx = providerWorkSessionContext(ctx)
 	leaveTransaction := server.EnterContractCreationStage(ctx, server.ContractStageTransaction)
 	server.Tx(ctx, func(tx server.PgTx) {
-		contractId, returnErr = createContractNoEscrowInTx(
+		contractId, expirationTime, returnErr = createContractNoEscrowInTx(
 			ctx,
 			tx,
 			sourceNetworkId,
@@ -2437,6 +2526,7 @@ func CreateContractNoEscrowWithUsageOrigin(
 	return
 }
 
+// Returns the attempt's INSERT result; the caller owns the commit boundary.
 func createContractNoEscrowInTx(
 	ctx context.Context,
 	tx server.PgTx,
@@ -2446,12 +2536,12 @@ func createContractNoEscrowInTx(
 	destinationId server.Id,
 	contractTransferByteCount ByteCount,
 	usageOriginIsSource bool,
-) (contractId server.Id, returnErr error) {
+) (contractId server.Id, expirationTime time.Time, returnErr error) {
 	ctx = providerWorkSessionContext(ctx)
 	// A shard-owned probe always pays from its private grant. Ordinary network
 	// and friends-and-family contracts keep their existing no-payer behavior.
 	if _, err := validateProberShardPayerInTx(ctx, tx, sourceNetworkId, destinationNetworkId, server.Id{}); err != nil {
-		return server.Id{}, err
+		return server.Id{}, time.Time{}, err
 	}
 	if err := lockActiveContractClientsInTx(
 		ctx,
@@ -2461,13 +2551,16 @@ func createContractNoEscrowInTx(
 		destinationNetworkId,
 		destinationId,
 	); err != nil {
-		return server.Id{}, err
+		return server.Id{}, time.Time{}, err
 	}
 
 	contractId = server.NewId()
-	server.RaisePgResult(tx.Exec(
+	server.Raise(tx.QueryRow(
 		ctx,
 		`
+	            WITH creation_clock AS MATERIALIZED (
+	                SELECT clock_timestamp() AT TIME ZONE 'UTC' AS create_time
+	            )
                 INSERT INTO transfer_contract (
                     contract_id,
                     source_network_id,
@@ -2476,12 +2569,14 @@ func createContractNoEscrowInTx(
                     destination_id,
                     transfer_byte_count,
                     usage_origin_is_source,
-                    create_time
+                    create_time,
+                    expiration_time
                 )
-	            VALUES (
+	            SELECT
 	                $1, $2, $3, $4, $5, $6, $7,
-	                clock_timestamp() AT TIME ZONE 'UTC'
-	            )
+	                create_time, date_trunc('milliseconds', create_time) + $8 * INTERVAL '1 millisecond'
+	            FROM creation_clock
+	            RETURNING expiration_time
 	        `,
 		contractId,
 		sourceNetworkId,
@@ -2490,7 +2585,8 @@ func createContractNoEscrowInTx(
 		destinationId,
 		contractTransferByteCount,
 		usageOriginIsSource,
-	))
+		DefaultContractExpiration.Milliseconds(),
+	).Scan(&expirationTime))
 	server.RaisePgResult(tx.Exec(
 		ctx,
 		contractExtenderInsertSql,
@@ -2500,7 +2596,9 @@ func createContractNoEscrowInTx(
 		ContractPartySource,
 		ContractPartyDestination,
 	))
+	server.AddTxCommitCount(tx, &contractOpenedCounter, 1)
 	providerWorkRetainReservationInTx(ctx, tx, contractId)
+	contractHoleEventInTx(ctx, tx, contractId, sourceId, destinationId, "create", expirationTime)
 	return
 }
 
@@ -2550,7 +2648,7 @@ func closeContractReport(
 	terminalReplay := false
 	server.Tx(ctx, func(tx server.PgTx) {
 		applied, terminalReplay, returnErr = applyContractCloseReportInTx(ctx, tx, contractId, clientId, usedTransferByteCount, checkpoint, reportId)
-	}, server.TxReadCommitted)
+	}, server.TxReadCommitted, server.OptNoRetry())
 
 	if terminalReplay {
 		return
@@ -2635,6 +2733,9 @@ func applyContractCloseReportInTx(ctx context.Context, tx server.PgTx,
 				returnErr = fmt.Errorf("close report identity payload conflicts")
 			} else {
 				terminalReplay = outcome != nil || dispute
+				if !priorCheckpoint || terminalReplay {
+					contractHoleEventInTx(ctx, tx, contractId, sourceId, destinationId, "remove")
+				}
 			}
 			return
 		}
@@ -2711,6 +2812,11 @@ func applyContractCloseReportInTx(ctx context.Context, tx server.PgTx,
 		server.RaisePgResult(tx.Exec(ctx, `INSERT INTO contract_close_report
  (contract_id,party,report_id,used_transfer_byte_count,checkpoint) VALUES($1,$2,$3,$4,$5)`,
 			contractId, party, *reportId, usedTransferByteCount, checkpoint))
+	}
+	// A checkpoint permits resuming the same contract. A final party close
+	// revokes transport permission even when financial settlement is deferred.
+	if !checkpoint {
+		contractHoleEventInTx(ctx, tx, contractId, sourceId, destinationId, "remove")
 	}
 	return
 }
@@ -2800,7 +2906,7 @@ func settleContractWithExpiryScope(ctx context.Context, contractId server.Id, sc
 				diff := sourceUsedTransferByteCount - destinationUsedTransferByteCount
 				if math.Abs(float64(diff)) <= AcceptableTransfersByteDifference {
 					// fmt.Printf("CLOSE CONTRACT SETTLE (%s) %s\n", clientId.String(), contractId.String())
-					posts, closed, returnErr = settleEscrowForegroundInTx(ctx, tx, contractId, ContractOutcomeSettled)
+					posts, closed, returnErr = settleEscrowForegroundWithExpiryScopeInTx(ctx, tx, contractId, ContractOutcomeSettled, scope)
 				} else {
 					if scope == nil {
 						glog.Infof("[sub]contract[%s]diff %d (%d <> %d)\n", contractId.String(), diff, sourceUsedTransferByteCount, destinationUsedTransferByteCount)
@@ -2836,7 +2942,7 @@ func SettleEscrow(ctx context.Context, contractId server.Id, outcome ContractOut
 
 	server.Tx(ctx, func(tx server.PgTx) {
 		posts, _, returnErr = settleEscrowForegroundInTx(ctx, tx, contractId, outcome)
-	}, server.TxReadCommitted)
+	}, server.TxReadCommitted, server.OptNoRetry())
 
 	if returnErr != nil {
 		return
@@ -2851,38 +2957,48 @@ func claimContractOutcomeInTx(
 	contractId server.Id,
 	outcome ContractOutcome,
 ) (bool, error) {
-	ctx = providerWorkSessionContext(ctx)
 	usage, err := contractUsageSnapshotInTx(ctx, tx, contractId, outcome)
 	if err != nil {
 		return false, err
 	}
-	// Open observations and terminal originals share the database clock after
-	// this same row fence; a handler clock skew cannot reverse their order.
+	return claimContractOutcomeWithUsageInTx(ctx, tx, contractId, outcome, usage)
+}
+
+// The usage came from this transaction's locked contract and original reports.
+// Keep the guarded outcome write, signed provenance and commit event together.
+func claimContractOutcomeWithUsageInTx(ctx context.Context, tx server.PgTx, contractId server.Id, outcome ContractOutcome, usage *contractUsageSnapshot) (bool, error) {
+	ctx = providerWorkSessionContext(ctx)
+	// Return the database clock from the outcome write, avoiding another round
+	// trip while grants are held. The signed original uses this exact stored time.
 	var closedAt time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() AT TIME ZONE 'UTC'`).Scan(&closedAt); err != nil {
-		return false, err
-	}
-	tag := server.RaisePgResult(tx.Exec(
+	var sourceId, destinationId server.Id
+	err := tx.QueryRow(
 		ctx,
 		`
             UPDATE transfer_contract
             SET
                 outcome = $2,
-                close_time = $3,
-                provider_usage = $4
+                close_time = clock_timestamp() AT TIME ZONE 'UTC',
+                provider_usage = $3
             WHERE
                 contract_id = $1 AND
                 outcome IS NULL
+            RETURNING close_time, source_id, destination_id
         `,
 		contractId,
 		outcome,
-		closedAt,
 		usage,
-	))
-	if tag.RowsAffected() == 1 {
-		providerWorkRetainOutcomeInTx(ctx, tx, contractId, outcome, closedAt)
+	).Scan(&closedAt, &sourceId, &destinationId)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
 	}
-	return tag.RowsAffected() == 1, nil
+	if err != nil {
+		return false, err
+	}
+	server.AddTxCommitCount(tx, &contractClosedCounter, 1)
+	providerWorkRetainOutcomeInTx(ctx, tx, contractId, outcome, closedAt)
+	contractHoleEventInTx(ctx, tx, contractId, sourceId, destinationId, "remove")
+	return true, nil
 }
 
 // contractParticipantsInTx returns the service side of a contract: the
@@ -2954,131 +3070,35 @@ func contractParticipantsWithUsageOriginInTx(
 		returnErr = fmt.Errorf("Contract not found while loading participants: %s", contractId.String())
 		return
 	}
+	return contractParticipantsFromOwnerInTx(ctx, tx, contractId, contractParticipantOwner{
+		sourceNetworkId: sourceNetworkId, sourceId: sourceId,
+		destinationNetworkId: destinationNetworkId, destinationId: destinationId,
+		payerNetworkId: payerNetworkId, companionContractId: companionContractId, streamId: streamId,
+	}, usageOriginIsSource)
+}
 
-	// Plain contracts originate at source; companion contracts reverse the
-	// payer and originate at destination. payer_network_id is authoritative for
-	// eligibility and also disambiguates direction whenever the endpoints are
-	// in different networks. companion_contract_id handles the same-network
-	// case, where comparing endpoint network ids cannot identify the payer.
-	originIsSource := companionContractId == nil
-	originNetworkId = sourceNetworkId
-	if payerNetworkId != nil {
-		originNetworkId = *payerNetworkId
-		if sourceNetworkId != destinationNetworkId {
-			switch *payerNetworkId {
-			case sourceNetworkId:
-				originIsSource = true
-			case destinationNetworkId:
-				originIsSource = false
-			default:
-				returnErr = fmt.Errorf(
-					"Contract payer network %s is not an endpoint network: %s",
-					payerNetworkId.String(),
-					contractId.String(),
-				)
-				return
-			}
-		}
-	} else if !originIsSource {
-		originNetworkId = destinationNetworkId
-	}
-
-	if usageOriginIsSource != nil {
-		originIsSource = *usageOriginIsSource
-	}
-	originId := sourceId
-	egress := ContractParticipant{ClientId: destinationId, NetworkId: destinationNetworkId}
-	if !originIsSource {
-		originId = destinationId
-		egress = ContractParticipant{ClientId: sourceId, NetworkId: sourceNetworkId}
-	}
-
-	participantsByClientId := map[server.Id]ContractParticipant{}
-	// A client appearing in several roles is one provider only when its
-	// retained network agrees. Source order cannot choose its payout owner.
-	addParticipant := func(participant ContractParticipant) error {
-		if participant.ClientId == originId {
-			return nil
-		}
-		if prior, exists := participantsByClientId[participant.ClientId]; exists {
-			if prior.NetworkId != participant.NetworkId {
-				return fmt.Errorf("contract provider %s has conflicting retained networks: %s", participant.ClientId, contractId)
-			}
-			return nil
-		}
-		participantsByClientId[participant.ClientId] = participant
-		return nil
-	}
-	if err := addParticipant(egress); err != nil {
-		returnErr = err
-		return
-	}
-	if streamId != nil {
-		result, err = tx.Query(
-			ctx,
-			`
-				SELECT
-					contract_participant.client_id,
-					contract_participant.network_id
-				FROM transfer_contract
-				INNER JOIN contract_participant ON
-					contract_participant.stream_id = transfer_contract.stream_id
-				WHERE transfer_contract.contract_id = $1
-			`,
-			contractId,
-		)
-		server.WithPgResult(result, err, func() {
-			for result.Next() {
+// Reuse only the locked contract's header. Shared stream membership is not
+// protected by this contract's lock, so each caller still reads fresh rows.
+func contractParticipantsFromOwnerInTx(ctx context.Context, tx server.PgTx, contractId server.Id, owner contractParticipantOwner, usageOriginIsSource *bool) ([]ContractParticipant, server.Id, error) {
+	retained := []ContractParticipant{}
+	read := func(query string) {
+		rows, err := tx.Query(ctx, query, contractId)
+		server.WithPgResult(rows, err, func() {
+			for rows.Next() {
 				var participant ContractParticipant
-				server.Raise(result.Scan(&participant.ClientId, &participant.NetworkId))
-				if err := addParticipant(participant); err != nil {
-					returnErr = err
-					return
-				}
+				server.Raise(rows.Scan(&participant.ClientId, &participant.NetworkId))
+				retained = append(retained, participant)
 			}
 		})
-		if returnErr != nil {
-			return
-		}
 	}
-
-	// The extender parties of the contract are hops like any other
-	// (connect/EXTENDER.md J3), so they join the same map before the split:
-	// keying by client id counts an extender whose provider client is already
-	// a participant once, and an extender on the payer network keeps its even
-	// share out of the payout through the same eligibility rule.
-	result, err = tx.Query(
-		ctx,
-		`
-			SELECT
-				client_id,
-				network_id
-			FROM contract_extender
-			WHERE contract_id = $1
-		`,
-		contractId,
-	)
-	server.WithPgResult(result, err, func() {
-		for result.Next() {
-			var participant ContractParticipant
-			server.Raise(result.Scan(&participant.ClientId, &participant.NetworkId))
-			if err := addParticipant(participant); err != nil {
-				returnErr = err
-				return
-			}
-		}
-	})
-	if returnErr != nil {
-		return
+	if owner.streamId != nil {
+		read(`SELECT contract_participant.client_id,contract_participant.network_id
+            FROM transfer_contract INNER JOIN contract_participant ON
+                contract_participant.stream_id=transfer_contract.stream_id
+            WHERE transfer_contract.contract_id=$1`)
 	}
-
-	for _, participant := range participantsByClientId {
-		participants = append(participants, participant)
-	}
-	slices.SortFunc(participants, func(a ContractParticipant, b ContractParticipant) int {
-		return a.ClientId.Cmp(b.ClientId)
-	})
-	return
+	read(`SELECT client_id,network_id FROM contract_extender WHERE contract_id=$1`)
+	return contractParticipantsFromRows(contractId, owner, usageOriginIsSource, retained)
 }
 
 // evenContractPayoutShare partitions a non-negative integer exactly. Stable
@@ -3240,6 +3260,12 @@ func settleEscrowInTx(
 }
 
 func settleEscrowForegroundInTx(ctx context.Context, tx server.PgTx, contractId server.Id, outcome ContractOutcome) ([]func() any, bool, error) {
+	return settleEscrowForegroundWithExpiryScopeInTx(ctx, tx, contractId, outcome, nil)
+}
+
+// Ordinary and scoped closes use the same durable debit owner. The caller's
+// expiry transaction already enforces its scope before this continuation.
+func settleEscrowForegroundWithExpiryScopeInTx(ctx context.Context, tx server.PgTx, contractId server.Id, outcome ContractOutcome, _ *contractExpiryRepairScope) ([]func() any, bool, error) {
 	return settleEscrowWithOptionsInTx(ctx, tx, contractId, outcome, true, false)
 }
 
@@ -3261,8 +3287,25 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 	var result pgx.Rows
 	var err error
 	if asyncDebit {
+		// Native close writes no shared grant. Its immutable provider owner
+		// still needs queue admission before publishing the outcome and debt.
+		admitted, ownershipErr := server.TryTxOwnership(ctx, tx,
+			[]server.PgOwnershipKey{task.RunOnceOwnershipKey(task.RunOnce("legacy_provider_totals", contractId))})
+		if ownershipErr != nil {
+			return nil, false, ownershipErr
+		}
+		if !admitted {
+			return nil, false, errTransferBalanceOwnershipBusy
+		}
 		result, err = tx.Query(ctx, `SELECT balance_id FROM transfer_escrow WHERE contract_id=$1 ORDER BY balance_id`, contractId)
 	} else {
+		admitted, ownershipErr := tryLegacyFinancialOwnershipInTx(ctx, tx, []server.Id{contractId})
+		if ownershipErr != nil {
+			return nil, false, ownershipErr
+		}
+		if !admitted {
+			return nil, false, errTransferBalanceOwnershipBusy
+		}
 		result, err = tx.Query(ctx, `
 			SELECT transfer_balance.balance_id
 			FROM transfer_balance INNER JOIN transfer_escrow USING (balance_id)
@@ -3280,121 +3323,17 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 	})
 	var usedTransferByteCount ByteCount
 	var clockTransferByteCount ByteCount
-
-	switch outcome {
-	case ContractOutcomeSettled:
-		result, err := tx.Query(
-			ctx,
-			`
-                SELECT
-                    used_transfer_byte_count,
-                    party,
-                    checkpoint
-                FROM contract_close
-                WHERE
-                    contract_id = $1
-            `,
-			contractId,
-		)
-		var partyByteCounts [2]ByteCount
-		partyCount := 0
-		checkpointCount := 0
-		server.WithPgResult(result, err, func() {
-			for result.Next() {
-				var usedTransferByteCountForParty ByteCount
-				var party ContractParty
-				var checkpoint bool
-				server.Raise(result.Scan(
-					&usedTransferByteCountForParty,
-					&party,
-					&checkpoint,
-				))
-				// Count the checkpoint row's byte count like any other close:
-				// settleContract already established one party is non-checkpoint,
-				// so no more activity is coming and the checkpoint's
-				// `used_transfer_byte_count` is that party's final contribution.
-				if checkpoint {
-					checkpointCount += 1
-				}
-				if partyCount < len(partyByteCounts) {
-					partyByteCounts[partyCount] = usedTransferByteCountForParty
-				}
-				if party == ContractPartyDestination {
-					clockTransferByteCount = usedTransferByteCountForParty
-				}
-				partyCount += 1
-			}
-		})
-		if partyCount != 2 {
-			returnErr = fmt.Errorf("Must have 2 parties to settle contract (found %d).", partyCount)
-			return
-		}
-		// Defensive: refuse to settle if both parties are checkpoint.
-		// settleContract shouldn't route here; flag the logic bug rather than settle.
-		if checkpointCount == 2 {
-			returnErr = fmt.Errorf("Cannot settle contract with both parties checkpoint.")
-			return
-		}
-		usedTransferByteCount, returnErr = meanContractByteCount(partyByteCounts[0], partyByteCounts[1])
-		if returnErr != nil {
-			return
-		}
-	case ContractOutcomeDisputeResolvedToSource, ContractOutcomeDisputeResolvedToDestination:
-		var party ContractParty
-		switch outcome {
-		case ContractOutcomeDisputeResolvedToSource:
-			party = ContractPartySource
-		default:
-			party = ContractPartyDestination
-		}
-		result, err := tx.Query(
-			ctx,
-			`
-                SELECT
-                    used_transfer_byte_count
-                FROM contract_close
-                WHERE
-                    contract_id = $1 AND
-                    party = $2
-            `,
-			contractId,
-			party,
-		)
-		server.WithPgResult(result, err, func() {
-			if result.Next() {
-				server.Raise(result.Scan(&usedTransferByteCount))
-				if party == ContractPartyDestination {
-					clockTransferByteCount = usedTransferByteCount
-				}
-			}
-		})
-		if party != ContractPartyDestination {
-			result, err = tx.Query(
-				ctx,
-				`
-                    SELECT used_transfer_byte_count
-                    FROM contract_close
-                    WHERE contract_id = $1 AND party = $2
-                `,
-				contractId,
-				ContractPartyDestination,
-			)
-			server.WithPgResult(result, err, func() {
-				if result.Next() {
-					server.Raise(result.Scan(&clockTransferByteCount))
-				}
-			})
-		}
-	default:
-		returnErr = fmt.Errorf("Unknown contract outcome: %s", outcome)
-		return
+	settlementOwner, err := readContractSettlementOwnerInTx(ctx, tx, contractId)
+	if err != nil {
+		return nil, false, err
 	}
-	if usedTransferByteCount < 0 || clockTransferByteCount < 0 {
-		returnErr = fmt.Errorf("negative contract close byte count")
+
+	usedTransferByteCount, clockTransferByteCount, returnErr = contractSettlementReportAmounts(settlementOwner.reports, outcome)
+	if returnErr != nil {
 		return
 	}
 
-	contractParticipants, originNetworkId, err := contractParticipantsInTx(ctx, tx, contractId)
+	contractParticipants, originNetworkId, err := contractParticipantsFromOwnerInTx(ctx, tx, contractId, settlementOwner.participants, nil)
 	if err != nil {
 		returnErr = err
 		return
@@ -3412,56 +3351,16 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 		contractId,
 	)
 
-	// balance id -> settled byte count, return byte count, gross payout. The
-	// settled count is what the payer consumed; it remains independent of how
-	// many participant shares are eligible for payout.
-	sweepPayouts := map[server.Id]sweepPayout{}
-	netSettledByteCount := ByteCount(0)
-
+	escrows := []contractSettlementEscrow{}
 	server.WithPgResult(result, err, func() {
 		for result.Next() {
-			var balanceId server.Id
-			var escrowBalanceByteCount ByteCount
-			var startBalanceByteCount ByteCount
-			var netRevenue NanoCents
-			server.Raise(result.Scan(
-				&balanceId,
-				&escrowBalanceByteCount,
-				&startBalanceByteCount,
-				&netRevenue,
-			))
-			if escrowBalanceByteCount < 0 {
-				returnErr = fmt.Errorf("negative escrow byte count")
-				return
-			}
-
-			payoutByteCount := min(usedTransferByteCount-netSettledByteCount, escrowBalanceByteCount)
-			returnByteCount := escrowBalanceByteCount - payoutByteCount
-			netSettledByteCount += payoutByteCount
-			payout := NanoCents(math.Round(
-				ProviderRevenueShare * float64(netRevenue) * float64(payoutByteCount) / float64(startBalanceByteCount),
-			))
-
-			sweepPayouts[balanceId] = sweepPayout{
-				escrowBalanceByteCount: escrowBalanceByteCount,
-				payoutByteCount:        payoutByteCount,
-				returnByteCount:        returnByteCount,
-				payout:                 payout,
-			}
-			// fmt.Printf("SETTLE %s %s: payout %d (%d nanocents) return %d\n", contractId.String(), balanceId.String(), payoutByteCount, payout, returnByteCount)
+			var escrow contractSettlementEscrow
+			server.Raise(result.Scan(&escrow.balanceId, &escrow.amount, &escrow.start, &escrow.revenue))
+			escrows = append(escrows, escrow)
 		}
 	})
+	sweepPayouts, returnErr := contractSettlementSweepPayouts(usedTransferByteCount, escrows)
 	if returnErr != nil {
-		return
-	}
-
-	// if len(sweepPayouts) == 0 {
-	// 	returnErr = fmt.Errorf("Invalid contract.")
-	// 	return
-	// }
-
-	if netSettledByteCount < usedTransferByteCount {
-		returnErr = errContractInsufficientEscrow
 		return
 	}
 
@@ -3472,9 +3371,26 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 	)
 
 	reservationSnapshots := readSettlementNetEscrowSnapshots(ctx, tx, settlementReservationIds(positiveReservations))
-	closed, returnErr = claimContractOutcomeInTx(ctx, tx, contractId, outcome)
+	usage, err := settlementOwner.usageSnapshotInTx(ctx, tx, contractId, outcome)
+	if err != nil {
+		return nil, false, err
+	}
+	closed, returnErr = claimContractOutcomeWithUsageInTx(ctx, tx, contractId, outcome, usage)
 	if returnErr != nil || !closed {
 		return
+	}
+	// The outcome claim runs once per contract, so the paying client's billable
+	// bytes are metered once (network_client_data_cap_model.go): a redis
+	// increment after the commit, for the client billing pays from. A crash
+	// before the post under-counts; nothing re-meters a contract.
+	if hasEscrow && 0 < usedTransferByteCount {
+		if payerClientId, _, _, err := contractOrigin(contractId, settlementOwner.participants, nil); err == nil {
+			meteredByteCount := usedTransferByteCount
+			posts = append(posts, func() any {
+				RecordClientDataUsage(ctx, payerClientId, meteredByteCount, server.NowUtc())
+				return nil
+			})
+		}
 	}
 	if asyncDebit {
 		// Journal insertion and outcome claim share a commit. No provider payout
@@ -3494,7 +3410,7 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 	}
 	publishSettlementNetEscrowSnapshots(ctx, tx, reservationSnapshots, positiveReservations, true)
 	if 0 < clockTransferByteCount {
-		posts = append(posts, clockTransferPost(ctx, clockTransferByteCount))
+		posts = append(posts, legacySettlementClockPost(ctx, clockTransferByteCount))
 	}
 
 	// run all the posts in parallel in as small blocks as reasonable to minimize the work for serialization errors
@@ -3503,14 +3419,14 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 		metadataPost := func() any {
 			server.Tx(ctx, func(tx server.PgTx) {
 				settleEscrowMetadataInTx(ctx, tx, contractId, server.NowUtc(), sweepPayouts)
-			}, server.TxReadCommitted)
+			}, server.TxReadCommitted, server.OptNoRetry())
 			return nil
 		}
-		if inlineFinancial {
+		if inlineFinancial && !asyncDebit {
 			// Only the synchronous branch actually owns the grant rows. Reuse
 			// its exact reservation locks and already-advanced snapshots when
 			// they cover every metadata target; unusual sets retain fresh locks.
-			if asyncDebit || !settleEscrowOwnedMetadataInTx(ctx, tx, contractId, server.NowUtc(), sweepPayouts, positiveReservations, reservationSnapshots) {
+			if !settleEscrowOwnedMetadataInTx(ctx, tx, contractId, server.NowUtc(), sweepPayouts, positiveReservations, reservationSnapshots) {
 				settleEscrowMetadataInTx(ctx, tx, contractId, server.NowUtc(), sweepPayouts)
 			}
 			metadataPost = func() any { return nil }
@@ -3545,9 +3461,17 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 			}
 		}
 		if len(mirrorBalanceIds) > 0 {
-			mirrorPost := func() any {
+			if inlineFinancial {
+				// One durable owner per balance coalesces every close, including a
+				// cache hit that can be invalidated before this post gets to run.
+				queueLegacyNetEscrowMirrorsInTx(ctx, tx, mirrorBalanceIds)
+			}
+			mirrorPost := observeLegacySettlementPost(ctx, legacySettlementMirror, func() any {
 				refreshNetEscrow(ctx, mirrorBalanceIds)
 				return nil
+			})
+			if inlineFinancial {
+				mirrorPost = legacySettlementMirrorPost(ctx, mirrorBalanceIds)
 			}
 			if len(reservationSnapshots) < len(positiveReservations) {
 				// A cold mirror must follow this metadata attempt: otherwise it
@@ -3563,15 +3487,18 @@ func settleEscrowWithOptionsInTx(ctx context.Context, tx server.PgTx, contractId
 			} else {
 				posts = append(posts, metadataPost, mirrorPost)
 			}
-		} else {
+		} else if !asyncDebit {
 			posts = append(posts, metadataPost)
 		}
 	}
 
-	if len(redisReservations) > 0 {
+	// The durable debit worker alone updates marked escrow metadata and releases
+	// its Redis reservation after the debit commit. A foreground metadata post
+	// can race that same row; releasing earlier also duplicates its cleanup work.
+	// Retain the original reservation until the worker confirms consumption.
+	// Unusual mixed-mode reservations keep their existing reconciliation path.
+	if len(redisReservations) > 0 && !asyncDebit {
 		posts = append(posts, func() any {
-			// Read committed journal state, not captured transaction predictions.
-			// Lost posts leave the original reservation conservatively outstanding.
 			ReconcileRedisContractReservation(ctx, contractId)
 			return nil
 		})
@@ -3657,7 +3584,8 @@ func setContractDisputeInTx(
 	contractId server.Id,
 	dispute bool,
 ) bool {
-	tag := server.RaisePgResult(tx.Exec(
+	var sourceId, destinationId server.Id
+	err := tx.QueryRow(
 		ctx,
 		`
             UPDATE transfer_contract
@@ -3667,12 +3595,24 @@ func setContractDisputeInTx(
             WHERE
                 contract_id = $1 AND
                 outcome IS NULL
+            RETURNING source_id, destination_id
         `,
 		contractId,
 		dispute,
 		server.NowUtc(),
-	))
-	return tag.RowsAffected() == 1
+	).Scan(&sourceId, &destinationId)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false
+	}
+	server.Raise(err)
+	operation := "remove"
+	if !dispute {
+		// Reopening requires the complete close predicate; let background source
+		// reconciliation restore it rather than guessing from one updated flag.
+		operation = "invalidate"
+	}
+	contractHoleEventInTx(ctx, tx, contractId, sourceId, destinationId, operation)
+	return true
 }
 
 func GetOpenContractIdsWithNoPartialClose(
@@ -4156,6 +4096,14 @@ func ForceCloseOpenContractIdsPage(ctx context.Context, minTime time.Time, maxCo
 			// a missing or corrupt original proof grants no new credit.
 			usage, usageErr := contractUsageSnapshotInTx(ctx, tx, openContract.contractId, ContractOutcomeSettled)
 			server.Raise(usageErr)
+			// Quarantine changes no debit, but the terminal transition advances
+			// every retained legacy reservation revision. Admit that complete
+			// scope after private contract custody and before the outcome write.
+			admitted, ownershipErr := tryContractTransferBalanceOwnershipInTx(ctx, tx, []server.Id{openContract.contractId})
+			server.Raise(ownershipErr)
+			if !admitted {
+				server.Raise(errTransferBalanceOwnershipBusy)
+			}
 			commandTag := server.RaisePgResult(tx.Exec(
 				ctx,
 				`
@@ -4176,7 +4124,11 @@ func ForceCloseOpenContractIdsPage(ctx context.Context, minTime time.Time, maxCo
 				usage,
 			))
 			claimed = commandTag.RowsAffected() == 1
-		}, server.TxReadCommitted)
+			if claimed {
+				server.AddTxCommitCount(tx, &contractClosedCounter, 1)
+				contractHoleEventInTx(ctx, tx, openContract.contractId, openContract.sourceId, openContract.destinationId, "remove")
+			}
+		}, server.TxReadCommitted, server.OptNoRetry())
 
 		// the quarantine settles the contract with no payout, so release its
 		// reservation back to the payer's available balance instead of leaking
@@ -4316,6 +4268,7 @@ func ForceCloseOpenContractIdsPage(ctx context.Context, minTime time.Time, maxCo
 					prepareErr := runForceClose(func() error {
 						var err error
 						server.Tx(ctx, func(tx server.PgTx) {
+							fresh = nil
 							var pending bool
 							server.Raise(tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legacy_settlement_intent WHERE contract_id=$1)`, openContract.contractId).Scan(&pending))
 							if pending {
@@ -4343,7 +4296,7 @@ func ForceCloseOpenContractIdsPage(ctx context.Context, minTime time.Time, maxCo
 					if fresh != nil {
 						openContract = fresh
 						closeErr = runForceClose(func() error {
-							return continueContractExpiry(ctx, tag, openContract, nil)
+							return continueContractExpiry(forceCloseContinuationContext(ctx, openContract.contractId), tag, openContract, nil)
 						})
 					}
 					var quarantineErr, cleanupErr error
@@ -5287,6 +5240,24 @@ func removeDueContractBatches(ctx context.Context, minTime time.Time, minStraggl
 	for {
 		var processedCount int64
 		server.MaintenanceTx(ctx, func(tx server.PgTx) {
+			// Fix the bounded contract slice before shared balance ownership.
+			// The mutation below can only revisit these admitted identities;
+			// newly due contracts remain for the next pass.
+			var contractIds []server.Id
+			rows, err := tx.Query(ctx, `SELECT contract_id FROM transfer_contract
+ WHERE reap_time IS NOT NULL AND reap_time<$1 ORDER BY reap_time LIMIT $2`, minTime.UTC(), maxRowCount)
+			server.WithPgResult(rows, err, func() {
+				for rows.Next() {
+					var id server.Id
+					server.Raise(rows.Scan(&id))
+					contractIds = append(contractIds, id)
+				}
+			})
+			admitted, err := tryContractTransferBalanceOwnershipInTx(ctx, tx, contractIds)
+			server.Raise(err)
+			if !admitted || len(contractIds) == 0 {
+				return
+			}
 			result, err := tx.Query(
 				ctx,
 				`
@@ -5297,7 +5268,8 @@ func removeDueContractBatches(ctx context.Context, minTime time.Time, minStraggl
 					FROM transfer_contract
 					WHERE
 						transfer_contract.reap_time IS NOT NULL AND
-						transfer_contract.reap_time < $1
+						transfer_contract.reap_time < $1 AND
+						transfer_contract.contract_id=ANY($4::uuid[])
 					ORDER BY transfer_contract.reap_time
 					LIMIT $3
 				), protected AS MATERIALIZED (
@@ -5371,19 +5343,36 @@ func removeDueContractBatches(ctx context.Context, minTime time.Time, minStraggl
 					DELETE FROM transfer_contract
 					USING candidate
 					WHERE transfer_contract.contract_id = candidate.contract_id
+					RETURNING transfer_contract.contract_id, source_id, destination_id,
+						outcome IS NULL AS unresolved
 				)
-				SELECT COUNT(*) FROM due
+				SELECT (SELECT COUNT(*) FROM due), contract_id, source_id, destination_id, unresolved
+				FROM deleted_contract
+				UNION ALL
+				SELECT (SELECT COUNT(*) FROM due), NULL, NULL, NULL, false
+				WHERE NOT EXISTS (SELECT 1 FROM deleted_contract)
 				`,
 				minTime.UTC(),
 				minStragglerCreateTime.UTC(),
 				maxRowCount,
+				contractIds,
 			)
 			server.WithPgResult(result, err, func() {
-				if result.Next() {
-					server.Raise(result.Scan(&processedCount))
+				for result.Next() {
+					var contractId, sourceId, destinationId *server.Id
+					var unresolved bool
+					server.Raise(result.Scan(&processedCount, &contractId, &sourceId, &destinationId, &unresolved))
+					if contractId != nil {
+						// Deleting unresolved custody is its terminal lifecycle event.
+						// Read the deleted version so a concurrent outcome wins once.
+						if unresolved {
+							server.AddTxCommitCount(tx, &contractClosedCounter, 1)
+						}
+						contractHoleEventInTx(ctx, tx, *contractId, *sourceId, *destinationId, "remove")
+					}
 				}
 			})
-		}, server.TxReadCommitted)
+		}, server.TxReadCommitted, server.OptNoRetry())
 		if processedCount == 0 || budgetEnd.Before(server.NowUtc()) {
 			return
 		}
@@ -5530,210 +5519,6 @@ func SweepOrphanContractData(
 	)
 }
 
-// sweepOrphanContractSteps is the ordered list of child tables the contract
-// sweep pages. The order is part of the persisted cursor (SweepOrphanCursor.Step
-// indexes it), so inserting or removing a step invalidates in-flight cursors —
-// sweepOrphanSteps restarts the pass rather than skipping a table when the
-// persisted step is out of range.
-func sweepOrphanContractSteps() []sweepOrphanStep {
-	return []sweepOrphanStep{
-		// contract_close, keyed by (contract_id, party)
-		{
-			table: "contract_close",
-			newCursorTargets: func() []any {
-				return []any{new(server.Id), new(string)}
-			},
-			sql: `
-		WITH slice AS (
-			SELECT contract_id, party
-			FROM contract_close
-			WHERE ($1 OR (contract_id, party) > ($2, $3))
-			ORDER BY contract_id, party
-			LIMIT $4
-		), del AS (
-			DELETE FROM contract_close
-			USING slice
-			WHERE
-				contract_close.contract_id = slice.contract_id AND
-				contract_close.party = slice.party AND
-				NOT EXISTS (
-					SELECT 1 FROM transfer_contract
-					WHERE transfer_contract.contract_id = contract_close.contract_id
-				)
-			RETURNING 1
-		), bound AS (
-			SELECT contract_id, party
-			FROM slice
-			ORDER BY contract_id DESC, party DESC
-			LIMIT 1
-		)
-		SELECT
-			(SELECT count(*) FROM slice),
-			(SELECT count(*) FROM del),
-			bound.contract_id, bound.party
-		FROM bound
-		`,
-		},
-
-		// transfer_escrow, keyed by (contract_id, balance_id)
-		{
-			table: "transfer_escrow",
-			newCursorTargets: func() []any {
-				return []any{new(server.Id), new(server.Id)}
-			},
-			sql: `
-		WITH slice AS (
-			SELECT contract_id, balance_id
-			FROM transfer_escrow
-			WHERE ($1 OR (contract_id, balance_id) > ($2, $3))
-			ORDER BY contract_id, balance_id
-			LIMIT $4
-		), del AS (
-			DELETE FROM transfer_escrow
-			USING slice
-			WHERE
-				transfer_escrow.contract_id = slice.contract_id AND
-				transfer_escrow.balance_id = slice.balance_id AND
-				NOT EXISTS (
-					SELECT 1 FROM transfer_contract
-					WHERE transfer_contract.contract_id = transfer_escrow.contract_id
-				)
-			RETURNING 1
-		), bound AS (
-			SELECT contract_id, balance_id
-			FROM slice
-			ORDER BY contract_id DESC, balance_id DESC
-			LIMIT 1
-		)
-		SELECT
-			(SELECT count(*) FROM slice),
-			(SELECT count(*) FROM del),
-			bound.contract_id, bound.balance_id
-		FROM bound
-		`,
-		},
-
-		// transfer_escrow_sweep, keyed by (contract_id, balance_id, network_id)
-		{
-			table: "transfer_escrow_sweep",
-			newCursorTargets: func() []any {
-				return []any{new(server.Id), new(server.Id), new(server.Id)}
-			},
-			sql: `
-		WITH slice AS (
-			SELECT contract_id, balance_id, network_id
-			FROM transfer_escrow_sweep
-			WHERE ($1 OR (contract_id, balance_id, network_id) > ($2, $3, $4))
-			ORDER BY contract_id, balance_id, network_id
-			LIMIT $5
-		), del AS (
-			DELETE FROM transfer_escrow_sweep
-			USING slice
-			WHERE
-				transfer_escrow_sweep.contract_id = slice.contract_id AND
-				transfer_escrow_sweep.balance_id = slice.balance_id AND
-				transfer_escrow_sweep.network_id = slice.network_id AND
-				NOT EXISTS (
-					SELECT 1 FROM transfer_contract
-					WHERE transfer_contract.contract_id = transfer_escrow_sweep.contract_id
-				)
-			RETURNING 1
-		), bound AS (
-			SELECT contract_id, balance_id, network_id
-			FROM slice
-			ORDER BY contract_id DESC, balance_id DESC, network_id DESC
-			LIMIT 1
-		)
-		SELECT
-			(SELECT count(*) FROM slice),
-			(SELECT count(*) FROM del),
-			bound.contract_id, bound.balance_id, bound.network_id
-		FROM bound
-			`,
-		},
-
-		// contract_participant, keyed by (stream_id, client_id)
-		{
-			table: "contract_participant",
-			newCursorTargets: func() []any {
-				return []any{new(server.Id), new(server.Id)}
-			},
-			sql: `
-		WITH slice AS (
-			SELECT stream_id, client_id
-			FROM contract_participant
-			WHERE ($1 OR (stream_id, client_id) > ($2, $3))
-			ORDER BY stream_id, client_id
-			LIMIT $4
-		), del AS (
-			DELETE FROM contract_participant
-			USING slice
-			WHERE
-				contract_participant.stream_id = slice.stream_id AND
-				contract_participant.client_id = slice.client_id AND
-				NOT EXISTS (
-					SELECT 1 FROM transfer_contract
-					WHERE transfer_contract.stream_id = contract_participant.stream_id
-				)
-			RETURNING 1
-		), bound AS (
-			SELECT stream_id, client_id
-			FROM slice
-			ORDER BY stream_id DESC, client_id DESC
-			LIMIT 1
-		)
-		SELECT
-			(SELECT count(*) FROM slice),
-			(SELECT count(*) FROM del),
-			bound.stream_id, bound.client_id
-		FROM bound
-		`,
-		},
-
-		// contract_extender, keyed by (contract_id, extender_id, party).
-		// Appended, not grouped with the other contract-keyed tables, so that
-		// a cursor persisted before this step existed still names the table it
-		// was paging.
-		{
-			table: "contract_extender",
-			newCursorTargets: func() []any {
-				return []any{new(server.Id), new(server.Id), new(string)}
-			},
-			sql: `
-		WITH slice AS (
-			SELECT contract_id, extender_id, party
-			FROM contract_extender
-			WHERE ($1 OR (contract_id, extender_id, party) > ($2, $3, $4))
-			ORDER BY contract_id, extender_id, party
-			LIMIT $5
-		), del AS (
-			DELETE FROM contract_extender
-			USING slice
-			WHERE
-				contract_extender.contract_id = slice.contract_id AND
-				contract_extender.extender_id = slice.extender_id AND
-				contract_extender.party = slice.party AND
-				NOT EXISTS (
-					SELECT 1 FROM transfer_contract
-					WHERE transfer_contract.contract_id = contract_extender.contract_id
-				)
-			RETURNING 1
-		), bound AS (
-			SELECT contract_id, extender_id, party
-			FROM slice
-			ORDER BY contract_id DESC, extender_id DESC, party DESC
-			LIMIT 1
-		)
-		SELECT
-			(SELECT count(*) FROM slice),
-			(SELECT count(*) FROM del),
-			bound.contract_id, bound.extender_id, bound.party
-		FROM bound
-		`,
-		},
-	}
-}
-
 // SweepOrphanCursor is a resumable position in a multi-table orphan sweep: which
 // table step, and how far that step's key cursor has advanced. It is returned in
 // the task result and handed back as the next run's start, which is what keeps a
@@ -5747,12 +5532,14 @@ type SweepOrphanCursor struct {
 	Key  []string `json:"key,omitempty"`
 }
 
-// sweepOrphanStep is one child table's paged orphan sweep: the slice statement
-// (shape documented on sweepOrphanCursor) and a source of fresh typed pointers
-// for its key columns.
+// A step supplies the page SQL and fresh typed cursor targets. Contract-scale
+// steps separate first/resumed SQL. Smaller legacy steps omit firstSql and use
+// the boolean-plus-cursor parameter convention documented below.
 type sweepOrphanStep struct {
 	table            string
+	firstSql         string
 	sql              string
+	deleteSql        string
 	newCursorTargets func() []any
 }
 
@@ -5863,55 +5650,18 @@ func decodeSweepCursorKey(key []string, targets []any) (values []any, ok bool) {
 	return values, true
 }
 
-// sweepOrphanCursor pages a child table by its primary key in fixed-size slices
-// and deletes orphan rows (parent gone) within each slice, returning the total
-// removed. Paging by the key (WHERE key > cursor ORDER BY key LIMIT sliceSize)
-// means every statement scans a BOUNDED slice of the table, even when orphans
-// are rare (steady state ~= 0). This is the fix for the incident pattern of the
-// old "DELETE ... USING (SELECT ... WHERE NOT EXISTS(parent) LIMIT n)" sweep: a
-// bare LIMIT can only stop once it has FOUND n orphans, so with no orphans it
-// scanned the entire child table every call. Each slice runs in its own
-// maintenance tx (server.MaintenanceTx), so no single statement holds a long
-// lock; a full call still pages the whole table one bounded slice at a time.
+// Page a child table and advance past every examined key, including retained
+// rows. Each page has its own read-committed maintenance transaction. Contract
+// steps use firstSql(limit) or sql(cursor..., limit) to select and lock a page,
+// then deleteSql(locked tuple addresses) in the same transaction. The second
+// statement sees row versions returned after a concurrent update's lock wait.
 //
-// sql must be a single statement parameterized as:
-//
-//	$1           bool, true only for the first slice (disables the lower bound)
-//	$2..$(k+1)   the cursor: the previous slice's max key columns, in key order
-//	$(k+2)       the slice size
-//
-// and it must return exactly one row when the slice is non-empty:
-//
-//	(slice row count int8, deleted row count int8, max key columns...)
-//
-// or no rows when the slice is empty (the table has been fully paged). The
-// canonical shape (single-uuid key, see the composite variants at the call
-// sites) is:
-//
-//	WITH slice AS (
-//	    SELECT pk FROM child
-//	    WHERE ($1 OR pk > $2)
-//	    ORDER BY pk LIMIT $3
-//	), del AS (
-//	    DELETE FROM child USING slice
-//	    WHERE child.pk = slice.pk
-//	      AND NOT EXISTS (SELECT 1 FROM parent WHERE parent.fk = child.fk)
-//	    RETURNING 1
-//	), bound AS (
-//	    SELECT pk FROM slice ORDER BY pk DESC LIMIT 1
-//	)
-//	SELECT (SELECT count(*) FROM slice), (SELECT count(*) FROM del), bound.pk
-//	FROM bound
-//
-// bound reads slice (materialized once, pre-delete), so the cursor advances past
-// every row the slice examined — deleted or not — and no row is skipped at a
-// slice boundary. newCursorTargets returns k fresh pointers to scan the max key
-// columns into; their dereferenced values become the next slice's cursor.
-//
-// startKey resumes an earlier call at that key (nil starts at the head of the
-// table). Paging stops when the table is fully paged (done) or maxRowCount rows
-// have been examined, whichever comes first; when it stops early, endKey is the
-// resume point. maxRowCount <= 0 pages to the end.
+// Legacy small-table steps omit firstSql and use sql(first, cursor..., limit).
+// Contract pages return (examined int8, locked tuple addresses text[], max key
+// columns...). Legacy pages return (examined int8, deleted int8, max keys...).
+// A nonempty page supplies its original cursor; no result row means EOF.
+// Nil startKey starts at the head; maxRowCount <= 0 pages to EOF, otherwise the
+// returned cursor resumes the next invocation without restarting the history.
 func sweepOrphanCursor(
 	ctx context.Context,
 	step sweepOrphanStep,
@@ -5928,30 +5678,74 @@ func sweepOrphanCursor(
 		cursor = derefCursor(step.newCursorTargets())
 	}
 	for {
+		query := step.sql
 		args := make([]any, 0, len(cursor)+2)
-		args = append(args, firstSlice)
-		args = append(args, cursor...)
+		if step.firstSql != "" {
+			if firstSlice {
+				query = step.firstSql
+			} else {
+				args = append(args, cursor...)
+			}
+		} else {
+			// Small legacy sweeps still use the boolean-plus-cursor form.
+			args = append(args, firstSlice)
+			args = append(args, cursor...)
+		}
 		args = append(args, sliceSize)
 
 		var sliceCount, deletedCount int64
-		targets := step.newCursorTargets()
+		var targets []any
 		gotRow := false
+		ownershipRefused := false
 		server.MaintenanceTx(ctx, func(tx server.PgTx) {
-			// reset in case the tx is retried on a transient error
 			sliceCount = 0
 			deletedCount = 0
 			gotRow = false
+			targets = step.newCursorTargets()
+			var lockedTuples []string
 			scanTargets := make([]any, 0, len(targets)+2)
-			scanTargets = append(scanTargets, &sliceCount, &deletedCount)
+			scanTargets = append(scanTargets, &sliceCount)
+			if step.deleteSql != "" {
+				scanTargets = append(scanTargets, &lockedTuples)
+			} else {
+				scanTargets = append(scanTargets, &deletedCount)
+			}
 			scanTargets = append(scanTargets, targets...)
-			result, err := tx.Query(ctx, step.sql, args...)
-			server.WithPgResult(result, err, func() {
-				if result.Next() {
-					server.Raise(result.Scan(scanTargets...))
-					gotRow = true
+			if step.table == "transfer_escrow" {
+				var admitted bool
+				sliceCount, lockedTuples, targets, gotRow, admitted = ownedTransferEscrowOrphanPageInTx(ctx, tx, firstSlice, cursor, sliceSize)
+				if !admitted {
+					ownershipRefused = true
+					return
 				}
-			})
-		}, server.TxReadCommitted)
+			} else {
+				result, err := tx.Query(ctx, query, args...)
+				server.WithPgResult(result, err, func() {
+					if result.Next() {
+						server.Raise(result.Scan(scanTargets...))
+						gotRow = true
+					}
+				})
+			}
+			// WithPgResult closes the page before the fresh snapshot is taken.
+			// The acquired child locks stay held until this transaction commits.
+			if 0 < len(lockedTuples) {
+				if int64(len(lockedTuples)) > sliceCount {
+					panic("orphan sweep locked beyond its selected page")
+				}
+				tag, err := tx.Exec(ctx, step.deleteSql, lockedTuples)
+				server.Raise(err)
+				deletedCount = tag.RowsAffected()
+			}
+		}, server.TxReadCommitted, server.OptNoRetry())
+		if ownershipRefused {
+			// Keep the refused page's input cursor. Durable orphan rows remain
+			// discoverable after the admitted financial owner has completed.
+			if firstSlice {
+				return removedCount, rowCount, nil, false
+			}
+			return removedCount, rowCount, cursor, false
+		}
 
 		removedCount += deletedCount
 		rowCount += int(sliceCount)

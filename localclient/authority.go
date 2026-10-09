@@ -43,6 +43,7 @@ type Authority struct {
 // Signature, audience, current client and credential rotation are checked now
 // and again on every operation. A local address is never an authentication.
 func New(ctx context.Context, token, apiUrl string) (*Authority, error) {
+	ctx = jwt.WithStateQuerySource(ctx, jwt.StateQueryHostedBootstrap)
 	return server.HandleError2(func() (*Authority, error) {
 		claims, err := jwt.ParseByJwtForAudience(ctx, token, jwt.ByJwtAudienceApi)
 		if err != nil {
@@ -73,6 +74,28 @@ func (self *Authority) token() string {
 }
 
 func (self *Authority) authenticate(ctx context.Context, token string, parentOnly bool) (*session.ClientSession, error) {
+	claims, err := self.parseClaimsPreflight(ctx, token, parentOnly)
+	if err != nil {
+		return nil, err
+	}
+	if *claims.ClientId == self.clientId {
+		err = jwt.ValidateByJwtState(ctx, claims, true)
+	} else {
+		err = jwt.ValidateByJwtStateForParent(ctx, claims, self.clientId)
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &connect.HttpStatusError{StatusCode: http.StatusUnauthorized}
+	}
+	return self.newSession(ctx, claims), nil
+}
+
+// Signature, audience and owning account/parent binding are local preflight.
+// Child source ownership and live state are checked together by authenticate;
+// parent-only mint instead validates live state in its writing transaction.
+func (self *Authority) parseClaimsPreflight(ctx context.Context, token string, parentOnly bool) (*jwt.ByJwt, error) {
 	if self.closed.Load() {
 		return nil, context.Canceled
 	}
@@ -93,20 +116,19 @@ func (self *Authority) authenticate(ctx context.Context, token string, parentOnl
 		if *claims.DeviceId != self.deviceId {
 			return nil, &connect.HttpStatusError{StatusCode: http.StatusUnauthorized}
 		}
-	} else if parentOnly || !self.ownsChild(ctx, *claims.ClientId) {
+	} else if parentOnly {
 		return nil, &connect.HttpStatusError{StatusCode: http.StatusUnauthorized}
 	}
-	if err = jwt.ValidateByJwtState(ctx, claims, true); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, &connect.HttpStatusError{StatusCode: http.StatusUnauthorized}
-	}
+	return claims, nil
+}
+
+// The operation owns the session and must validate its claims before writing.
+func (self *Authority) newSession(ctx context.Context, claims *jwt.ByJwt) *session.ClientSession {
 	ctx = model.WithContractOriginNotifications(ctx, self.notifications)
 	if self.appearances != nil {
 		ctx = model.WithProviderAppearances(ctx, self.appearances)
 	}
-	return session.NewLocalClientSession(ctx, "0.0.0.0:0", claims), nil
+	return session.NewLocalClientSession(ctx, "0.0.0.0:0", claims)
 }
 
 // Restored window identities belong to the durable parent, not merely an
@@ -133,20 +155,28 @@ func convert[T any](value any) (*T, error) {
 }
 
 func (self *Authority) AuthNetworkClient(ctx context.Context, args *connect.AuthNetworkClientArgs) (*connect.AuthNetworkClientResult, error) {
+	ctx = jwt.WithStateQuerySource(ctx, jwt.StateQueryHostedMint)
 	return server.HandleError2(func() (*connect.AuthNetworkClientResult, error) {
 		if args == nil || args.ClientId != nil || args.SourceClientId == nil || server.Id(*args.SourceClientId) != self.clientId {
 			return nil, errors.New("local mint requires its owning parent")
 		}
-		s, err := self.authenticate(ctx, self.token(), true)
+		claims, err := self.parseClaimsPreflight(ctx, self.token(), true)
 		if err != nil {
 			return nil, err
 		}
+		s := self.newSession(ctx, claims)
 		defer s.Cancel()
 		request, err := convert[model.AuthNetworkClientArgs](args)
 		if err != nil {
 			return nil, err
 		}
-		result, err := controller.AuthNetworkClient(request, s)
+		result, err := controller.AuthNetworkClientFromParent(request, s)
+		if errors.Is(err, model.ErrClientParentInactive) {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, &connect.HttpStatusError{StatusCode: http.StatusUnauthorized}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -155,6 +185,7 @@ func (self *Authority) AuthNetworkClient(ctx context.Context, args *connect.Auth
 }
 
 func (self *Authority) RemoveNetworkClient(ctx context.Context, args *connect.RemoveNetworkClientArgs) (*connect.RemoveNetworkClientResult, error) {
+	ctx = jwt.WithStateQuerySource(ctx, jwt.StateQueryHostedRetire)
 	return server.HandleError2(func() (*connect.RemoveNetworkClientResult, error) {
 		if args == nil || server.Id(args.ClientId) == self.clientId || !self.ownsChild(ctx, server.Id(args.ClientId)) {
 			return nil, errors.New("local retirement requires an owned derived client")
@@ -173,6 +204,7 @@ func (self *Authority) RemoveNetworkClient(ctx context.Context, args *connect.Re
 }
 
 func (self *Authority) ConnectControl(ctx context.Context, token string, args *connect.ConnectControlArgs) (*connect.ConnectControlResult, error) {
+	ctx = jwt.WithStateQuerySource(ctx, jwt.StateQueryHostedControl)
 	return server.HandleError2(func() (*connect.ConnectControlResult, error) {
 		if args == nil {
 			return nil, errors.New("local control request is absent")
@@ -196,6 +228,7 @@ func (self *Authority) ConnectControl(ctx context.Context, token string, args *c
 }
 
 func (self *Authority) FindProviders2(ctx context.Context, token string, args *connect.FindProviders2Args) (*connect.FindProviders2Result, error) {
+	ctx = jwt.WithStateQuerySource(ctx, jwt.StateQueryHostedDiscovery)
 	return server.HandleError2(func() (*connect.FindProviders2Result, error) {
 		if args == nil {
 			return nil, errors.New("local discovery request is absent")
@@ -236,6 +269,7 @@ func (self *Authority) Get(ctx context.Context, requestUrl, token string) ([]byt
 		if err != nil {
 			return nil, err
 		}
+		ctx = jwt.WithStateQuerySource(ctx, authorityStateQuerySource("GET", path))
 		if token == "" && strings.HasPrefix(path, "/key/") {
 			token = self.token()
 		}
@@ -295,6 +329,7 @@ func (self *Authority) Post(ctx context.Context, requestUrl string, body []byte,
 		if err != nil {
 			return nil, err
 		}
+		ctx = jwt.WithStateQuerySource(ctx, authorityStateQuerySource("POST", path))
 		if len(body) > 1024*1024 {
 			return nil, errors.New("local control request exceeds bound")
 		}

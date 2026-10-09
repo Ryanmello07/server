@@ -9577,4 +9577,284 @@ var migrations = []any{
 		ALTER TABLE transfer_balance ADD COLUMN grant_kind varchar(32) NULL;
 	`),
 	newSqlMigration(providerWorkSessionContentionRepairSql),
+	// Account messages commit with the state change that owes them, and a task
+	// delivers them after the commit (db_account_message_outbox.go). A new table:
+	// nothing is rewritten, and old binaries never read it.
+	newSqlMigration(accountMessageOutboxSchemaSql),
+	// The search update log is read in commit order
+	// (search.SearchUpdatePosition): each record carries the transaction that
+	// wrote it, and a poll reads a transaction's records once it has finished.
+	// Read by update id alone, a record that committed after a later record had
+	// been read went unread. The constant default leaves the existing rows
+	// unrewritten, at 0, the oldest; new rows, from new and old binaries alike,
+	// take their transaction's id. The lock timeout keeps the ALTER from
+	// queueing every search write behind a long lock holder; a migrate that
+	// times out is re-run.
+	newSqlMigration(`
+		SET LOCAL lock_timeout = '5s';
+		ALTER TABLE search_value_update
+			ADD COLUMN xid xid8 NOT NULL DEFAULT '0',
+			ALTER COLUMN xid SET DEFAULT pg_current_xact_id();
+	`),
+	// The poll reads a realm's records in (xid, update id) order.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS search_value_update_realm_xid_update_id
+	`, `
+		CREATE INDEX CONCURRENTLY search_value_update_realm_xid_update_id
+		ON search_value_update (realm, xid, update_id)
+	`, `
+		DROP INDEX IF EXISTS search_value_update_realm_xid_update_id;
+		CREATE INDEX search_value_update_realm_xid_update_id
+		ON search_value_update (realm, xid, update_id)
+	`),
+	// Network wallet consent chains and the settled earning wallet of each
+	// published release epoch (db_network_wallet_mapping_consent.go). New
+	// tables: nothing is rewritten, and old binaries never read them.
+	newSqlMigration(networkWalletMappingConsentSchemaSql),
+	// Egress URL probe priority for intent providers in their qualification
+	// grace (model/provider_intent_model.go): one row per provider while its
+	// attempt is pending, read by primary key from the URL probe admission. A
+	// new table: nothing is rewritten. It must exist before a binary that reads
+	// it serves.
+	newSqlMigration(`
+		CREATE TABLE provider_intent_probe_priority (
+			client_id uuid NOT NULL PRIMARY KEY,
+			priority_since timestamp NOT NULL,
+			update_time timestamp NOT NULL
+		)
+	`),
+	// Provider installs: top-level clients created with provide intent
+	// (POST /network/auth-client provide_intent). Like proxy_device_config, the
+	// row is the client's category for its life: never a network peer and not
+	// counted by the peer valve or the top-level client cap
+	// (model/peer_model.go). A new table: nothing is rewritten. It must exist
+	// before a binary that reads it serves.
+	newSqlMigration(`
+		CREATE TABLE network_client_provider_intent (
+			client_id uuid NOT NULL PRIMARY KEY,
+			create_time timestamp NOT NULL
+		)
+	`),
+	// 789: global hotkey wallet consent chains and the networks that submitted
+	// them, per-network hotkey delegations and the hotkey mode of settled
+	// earning wallets (db_hotkey_wallet_mapping_consent.go). New tables plus
+	// nullable columns and a widened mode check on st_payout_wallet_resolution:
+	// existing rows are validated, not rewritten, and old binaries keep writing
+	// valid rows.
+	newSqlMigration(hotkeyWalletMappingConsentSchemaSql),
+	// 790: only new writers assign an absolute contract deadline. No default or
+	// backfill: old contracts and rolling old writers retain their quiet expiry.
+	newSqlMigration(`
+		SET LOCAL lock_timeout = '5s';
+		ALTER TABLE transfer_contract ADD COLUMN expiration_time timestamp NULL;
+	`),
+	// 791: nullable per-intent scheduling key; no default and no table rewrite.
+	newSqlMigration(legacySettlementPayerSchemaSql),
+	// 792: seek past a whole payer without scanning its contract prefix.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS legacy_settlement_intent_payer_due
+	`, `
+		CREATE INDEX CONCURRENTLY legacy_settlement_intent_payer_due
+		ON legacy_settlement_intent (shard, payer_network_id, next_attempt_time, contract_id)
+		WHERE payer_network_id IS NOT NULL
+	`, `
+		DROP INDEX IF EXISTS legacy_settlement_intent_payer_due;
+		CREATE INDEX legacy_settlement_intent_payer_due
+		ON legacy_settlement_intent (shard, payer_network_id, next_attempt_time, contract_id)
+		WHERE payer_network_id IS NOT NULL
+	`),
+	// 793: registration discovers only the still-unassigned bounded prefix.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS legacy_settlement_intent_payer_missing
+	`, `
+		CREATE INDEX CONCURRENTLY legacy_settlement_intent_payer_missing
+		ON legacy_settlement_intent (shard, contract_id) WHERE payer_network_id IS NULL
+	`, `
+		DROP INDEX IF EXISTS legacy_settlement_intent_payer_missing;
+		CREATE INDEX legacy_settlement_intent_payer_missing
+		ON legacy_settlement_intent (shard, contract_id) WHERE payer_network_id IS NULL
+	`),
+	// 794: the tiered extender directory (connect/EXTENDER.md R). The tier an
+	// extender is signed into and the one place a canary is published, both
+	// on the extender row with defaults an old binary never reads; the
+	// release ledger of the gated tier (R3: requests per identity and
+	// vantage, releases per record and country); and the block reports the
+	// per-country blocked state is derived from (R4). New columns with
+	// defaults and new tables: nothing is rewritten.
+	newSqlMigration(`
+		SET LOCAL lock_timeout = '5s';
+		ALTER TABLE network_extender ADD COLUMN directory_tier smallint NOT NULL DEFAULT 0;
+		ALTER TABLE network_extender ADD COLUMN canary_channel varchar NULL;
+
+		CREATE TABLE network_extender_release_request (
+			request_id uuid NOT NULL PRIMARY KEY,
+			identity bytea NOT NULL,
+			vantage varchar NOT NULL,
+			request_time timestamp NOT NULL
+		);
+		CREATE INDEX network_extender_release_request_identity_request_time
+		ON network_extender_release_request (identity, request_time);
+		CREATE INDEX network_extender_release_request_vantage_request_time
+		ON network_extender_release_request (vantage, request_time);
+
+		CREATE TABLE network_extender_release (
+			release_id uuid NOT NULL PRIMARY KEY,
+			extender_id uuid NOT NULL,
+			identity bytea NOT NULL,
+			country_code varchar NOT NULL,
+			epoch bigint NOT NULL,
+			release_time timestamp NOT NULL
+		);
+		CREATE INDEX network_extender_release_extender_id_country_code_release_time
+		ON network_extender_release (extender_id, country_code, release_time);
+		CREATE INDEX network_extender_release_release_time
+		ON network_extender_release (release_time);
+
+		CREATE TABLE network_extender_block_report (
+			report_id uuid NOT NULL PRIMARY KEY,
+			extender_id uuid NOT NULL,
+			client_id uuid NOT NULL,
+			country_code varchar NOT NULL,
+			report_time timestamp NOT NULL
+		);
+		CREATE INDEX network_extender_block_report_extender_id_country_code_report_time
+		ON network_extender_block_report (extender_id, country_code, report_time);
+		CREATE INDEX network_extender_block_report_report_time
+		ON network_extender_block_report (report_time);
+	`),
+	newSqlMigration(`
+		-- Atomic releases read prior disclosures by identity and epoch.
+		CREATE INDEX network_extender_release_identity_epoch
+		ON network_extender_release (identity, epoch, extender_id)
+	`),
+	// 796: retain run-once requests that commit after an execution was claimed.
+	newSqlMigration(taskRunOnceGenerationSchemaSql),
+	// 797: the Embed plan's per-network top-level client limit
+	// (model/network_client_limit_model.go, EMBED1.md). An absent row is the
+	// default LimitTopLevelClientIdsPerNetwork; ops sets a row for a network on
+	// an Embed plan with `bringyourctl network client-limit`. Only the
+	// AuthNetworkClient create cap reads it; the peer valve keeps the constant.
+	// A new table: nothing is rewritten. It must exist before a binary that
+	// reads it serves.
+	newSqlMigration(`
+		CREATE TABLE network_top_level_client_limit (
+			network_id uuid NOT NULL PRIMARY KEY,
+			top_level_client_limit integer NOT NULL,
+			update_time timestamp NOT NULL
+		)
+	`),
+	// 798: per-client data caps and usage (model/network_client_data_cap_model.go,
+	// EMBED1.md). network_client_data_cap holds a top-level client's optional
+	// monthly and running-total limits, its running total, and the capped
+	// markers the escrow admission snapshot reads through the partial indexes.
+	// network_client_data_usage is the monthly usage of every top-level client,
+	// rolled up from redis by the RollupClientDataUsage task;
+	// network_client_data_usage_drain makes each drained (block, shard) apply
+	// exactly once and network_client_data_usage_rollup bounds the drain scan.
+	// New tables: nothing is rewritten. They must exist before a binary that
+	// reads them serves.
+	newSqlMigration(`
+		CREATE TABLE network_client_data_cap (
+			client_id uuid NOT NULL PRIMARY KEY,
+			network_id uuid NOT NULL,
+			monthly_byte_limit bigint NULL,
+			total_byte_limit bigint NULL,
+			total_period_start timestamp NOT NULL,
+			total_used_byte_count bigint NOT NULL DEFAULT 0,
+			monthly_capped_period_start timestamp NULL,
+			total_capped boolean NOT NULL DEFAULT false,
+			create_time timestamp NOT NULL,
+			update_time timestamp NOT NULL
+		);
+		CREATE INDEX network_client_data_cap_network_id_client_id
+		ON network_client_data_cap (network_id, client_id)
+		WHERE monthly_byte_limit IS NOT NULL OR total_byte_limit IS NOT NULL;
+		CREATE INDEX network_client_data_cap_total_capped
+		ON network_client_data_cap (client_id) WHERE total_capped;
+		CREATE INDEX network_client_data_cap_monthly_capped
+		ON network_client_data_cap (monthly_capped_period_start)
+		WHERE monthly_capped_period_start IS NOT NULL;
+		CREATE INDEX network_client_data_cap_monthly_paused
+		ON network_client_data_cap (client_id) WHERE monthly_byte_limit = 0;
+
+		CREATE TABLE network_client_data_usage (
+			client_id uuid NOT NULL,
+			period_start timestamp NOT NULL,
+			network_id uuid NOT NULL,
+			used_byte_count bigint NOT NULL,
+			update_time timestamp NOT NULL,
+			PRIMARY KEY (client_id, period_start)
+		);
+		CREATE INDEX network_client_data_usage_period_start
+		ON network_client_data_usage (period_start);
+
+		CREATE TABLE network_client_data_usage_drain (
+			block_number bigint NOT NULL,
+			shard integer NOT NULL,
+			drain_time timestamp NOT NULL,
+			PRIMARY KEY (block_number, shard)
+		);
+		CREATE INDEX network_client_data_usage_drain_drain_time
+		ON network_client_data_usage_drain (drain_time);
+
+		CREATE TABLE network_client_data_usage_rollup (
+			singleton_id smallint NOT NULL PRIMARY KEY,
+			max_drained_block bigint NOT NULL,
+			update_time timestamp NOT NULL
+		);
+	`),
+	// 799: services contact-sales leads (model/services_lead_model.go). A new
+	// table: nothing is rewritten. It must exist before a binary that writes it
+	// serves.
+	newSqlMigration(`
+		CREATE TABLE services_lead (
+			lead_id uuid NOT NULL PRIMARY KEY,
+			create_time timestamp NOT NULL,
+			name varchar(256) NOT NULL,
+			email varchar(256) NOT NULL,
+			company varchar(256) NOT NULL,
+			monthly_active_users bigint NOT NULL,
+			monthly_data_budget_byte_count bigint NOT NULL,
+			message text NOT NULL,
+			notify_time timestamp NULL
+		);
+		CREATE INDEX services_lead_create_time ON services_lead (create_time);
+	`),
+	// 800: per-client ACL groups (model/network_client_acl_group_model.go). A
+	// row exists only for a non-default group: no row means "default". An
+	// "isolated" client never appears in the network's peer list, receives none
+	// and does not count toward the peer valve. A new table: nothing is
+	// rewritten. It must exist before a binary that reads it serves, since the
+	// peer profile and the peer valve query it.
+	newSqlMigration(`
+		CREATE TABLE network_client_acl_group (
+			client_id uuid NOT NULL PRIMARY KEY,
+			network_id uuid NOT NULL,
+			acl_group varchar(32) NOT NULL,
+			update_time timestamp NOT NULL
+		);
+		CREATE INDEX network_client_acl_group_network_id
+		ON network_client_acl_group (network_id, client_id);
+	`),
+	// 801: per-network Embed enablement (model/network_embed_model.go). A row
+	// marks the network as Embed-enabled: ops writes it once a sales contract is
+	// signed, and the data-cap and ACL-group APIs refuse every other network. A
+	// new table: nothing is rewritten. It must exist before a binary that reads
+	// it serves, since those routes check it first.
+	newSqlMigration(`
+		CREATE TABLE network_embed (
+			network_id uuid NOT NULL PRIMARY KEY,
+			enable_time timestamp NOT NULL
+		);
+	`),
+	// 802: a disable keeps the network_embed row and sets disable_time, so a
+	// network that was ever Embed-enabled stays known (AUTHZ1.md, decision 2).
+	// Its client tokens, handed to a third party's users, stay refused on the
+	// admin routes after a disable, while the Embed APIs follow the current
+	// flag (disable_time IS NULL). A nullable column: no row is rewritten. It
+	// must exist before a binary that reads it serves, since the Embed APIs and
+	// the client token gate read it.
+	newSqlMigration(`
+		ALTER TABLE network_embed ADD COLUMN disable_time timestamp NULL;
+	`),
 }

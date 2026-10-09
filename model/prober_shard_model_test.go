@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/jwt"
 	"github.com/urnetwork/server/session"
@@ -92,7 +91,7 @@ func TestProberShardIndependentNetworksAndPayerIsolation(t *testing.T) {
 			t.Fatal("two shards shared a contract")
 		}
 		server.Tx(ctx, func(tx server.PgTx) {
-			_, crossErr = createContractNoEscrowInTx(ctx, tx, a.NetworkId, a.ClientId, p.providerNetworkId, p.providerId, 0, true)
+			_, _, crossErr = createContractNoEscrowInTx(ctx, tx, a.NetworkId, a.ClientId, p.providerNetworkId, p.providerId, 0, true)
 		})
 		if crossErr == nil {
 			t.Fatal("private contract bypassed its payer")
@@ -368,13 +367,9 @@ func TestProberShardDrainOrdersAgainstRealContractAdmission(t *testing.T) {
 				defer cancel()
 				owner := shardTestOwner(t, ctx, shardTestKey(0))
 				peer := newEscrowSelectionTestClients(t, ctx)
-				conn := acquireContractLifecycleTestConnection(t, ctx)
-				defer conn.Release()
-				tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer tx.Rollback(context.Background())
+				tx, finish := beginRareGrantTestTx(t, ctx)
+				defer finish(false)
+				var err error
 				pid := contractLifecycleTestBackendPid(t, ctx, tx)
 				if admissionFirst {
 					_, _, err = createTransferEscrowInTx(ctx, tx, owner.NetworkId, owner.ClientId, peer.providerNetworkId, peer.providerId, owner.NetworkId, 1024, nil)
@@ -398,9 +393,9 @@ func TestProberShardDrainOrdersAgainstRealContractAdmission(t *testing.T) {
 						done <- err
 					}
 				}()
-				defer func() { tx.Rollback(context.Background()); cancel(); <-finished }()
+				defer func() { finish(false); cancel(); <-finished }()
 				requireContractLifecycleBlockedBy(t, ctx, tx, pid)
-				if err := tx.Commit(ctx); err != nil {
+				if err := finish(true); err != nil {
 					t.Fatal(err)
 				}
 				err = <-done
@@ -468,32 +463,73 @@ func TestProberShardIndependentSimultaneousReservations(t *testing.T) {
 		a := shardTestOwner(t, ctx, shardTestKey(0))
 		b := shardTestOwner(t, ctx, shardTestKey(1))
 		peer := newEscrowSelectionTestClients(t, ctx)
-		firstConn := acquireContractLifecycleTestConnection(t, ctx)
-		defer firstConn.Release()
-		secondConn := acquireContractLifecycleTestConnection(t, ctx)
-		defer secondConn.Release()
-		first, err := firstConn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-		if err != nil {
-			t.Fatal(err)
+		firstReady := make(chan *TransferEscrow, 1)
+		firstDone := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		release := sync.OnceFunc(func() { close(releaseFirst) })
+		var firstErr error
+		go func() {
+			defer close(firstDone)
+			server.HandleError(func() {
+				var posts []func() any
+				server.Raise(transferEscrowTx(ctx, a.NetworkId, 1024, func(tx server.PgTx) {
+					escrow, retainedPosts, err := createTransferEscrowInTx(ctx, tx, a.NetworkId, a.ClientId, peer.providerNetworkId, peer.providerId, a.NetworkId, 1024, nil)
+					server.Raise(err)
+					if !server.TxOwnsKeys(tx, transferBalanceOwnershipKeys([]server.Id{a.BalanceId})) {
+						server.Raise(errors.New("first reservation lost its balance owner"))
+					}
+					posts = retainedPosts
+					firstReady <- escrow
+					select {
+					case <-releaseFirst:
+					case <-ctx.Done():
+						server.Raise(ctx.Err())
+					}
+				}))
+				server.RunPosts(ctx, posts...)
+			}, func(err error) { firstErr = err })
+		}()
+		defer func() {
+			release()
+			select {
+			case <-firstDone:
+				if firstErr != nil {
+					t.Error("first shard admission did not finish", firstErr)
+				}
+			case <-time.After(35 * time.Second):
+				t.Error("first shard admission did not join cleanup")
+			}
+		}()
+		select {
+		case escrow := <-firstReady:
+			if escrow == nil || len(escrow.Balances) != 1 || escrow.Balances[0].BalanceId != a.BalanceId {
+				t.Fatal("first shard did not reserve its own balance")
+			}
+		case <-firstDone:
+			t.Fatal("first shard admission stopped before its reservation", firstErr)
+		case <-ctx.Done():
+			t.Fatal("first shard admission did not reach its reservation", ctx.Err())
 		}
-		defer first.Rollback(context.Background())
-		escrow, _, err := createTransferEscrowInTx(ctx, first, a.NetworkId, a.ClientId, peer.providerNetworkId, peer.providerId, a.NetworkId, 1024, nil)
-		if err != nil || escrow == nil || len(escrow.Balances) != 1 || escrow.Balances[0].BalanceId != a.BalanceId {
-			t.Fatal("first shard did not reserve its own balance", err)
+
+		// The first real owner cannot release its grant until this allocation
+		// returns. A database lock timeout detects cross-shard contention;
+		// no transaction wrapper may borrow the admitted financial keys.
+		var escrow *TransferEscrow
+		var posts []func() any
+		server.Raise(transferEscrowTx(ctx, b.NetworkId, 1024, func(tx server.PgTx) {
+			server.RaisePgResult(tx.Exec(ctx, `SET LOCAL lock_timeout='1s'`))
+			var err error
+			escrow, posts, err = createTransferEscrowInTx(ctx, tx, b.NetworkId, b.ClientId, peer.providerNetworkId, peer.providerId, b.NetworkId, 1024, nil)
+			server.Raise(err)
+			if !server.TxOwnsKeys(tx, transferBalanceOwnershipKeys([]server.Id{b.BalanceId})) {
+				server.Raise(errors.New("second reservation lost its balance owner"))
+			}
+		}))
+		if escrow == nil || len(escrow.Balances) != 1 || escrow.Balances[0].BalanceId != b.BalanceId {
+			t.Fatal("independent shard did not reserve its own balance")
 		}
-		second, err := secondConn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer second.Rollback(context.Background())
-		// Keep the first grant locked. NOWAIT makes cross-shard serialization
-		// fail immediately instead of relying on a timing threshold.
-		clients := peer
-		clients.payerNetworkId, clients.payerId = b.NetworkId, b.ClientId
-		escrow, err = independentGrantTestCreate(ctx, noWaitGrantTestTx{second}, clients)
-		if err != nil || escrow == nil || len(escrow.Balances) != 1 || escrow.Balances[0].BalanceId != b.BalanceId {
-			t.Fatal("independent shard contended with another shard's balance", err)
-		}
+		release()
+		server.RunPosts(ctx, posts...)
 	})
 }
 

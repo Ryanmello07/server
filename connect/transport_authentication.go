@@ -7,7 +7,29 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/urnetwork/server"
+	"github.com/urnetwork/server/jwt"
 )
+
+type connectAuthFinalReadTestKey struct{}
+
+// Parse the instance without publishing an admission, then perform the full
+// live authorization at the final read boundary. That query already binds the
+// active client, device and network to the current administrator and credential
+// epoch; a second weaker membership query would add no authority. Preserve
+// credential-error precedence when the instance is malformed too.
+func connectClientAuthentication(ctx context.Context, byJwt *jwt.ByJwt, instanceBytes []byte) (server.Id, int, error) {
+	instanceId, instanceErr := server.IdFromBytes(instanceBytes)
+	if before, ok := ctx.Value(connectAuthFinalReadTestKey{}).(func()); ok {
+		before()
+	}
+	if err := jwt.ValidateByJwtState(ctx, byJwt, true); err != nil {
+		return server.Id{}, http.StatusUnauthorized, err
+	}
+	if instanceErr != nil {
+		return server.Id{}, http.StatusBadRequest, instanceErr
+	}
+	return instanceId, 0, nil
+}
 
 // Only the pre-admission checks cross this boundary. Db reports exhausted
 // dependency work by panic, but H1+ must reject it before writing its 101.

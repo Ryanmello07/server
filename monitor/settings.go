@@ -416,10 +416,17 @@ type SignalSettings struct {
 	PGQuerySampleContinuous bool
 	PGQuerySampleUntil      time.Time
 	StateDir                string
+	sharedSshAdmission      sshAdmissionBackend
 	// SettingsGenerationCheck is armed by LoadSignalSettings. Embedders that
 	// assemble SignalSettings directly may omit it; synthetic tests inject it
 	// without touching Config or Vault.
 	SettingsGenerationCheck SettingsGenerationCheck
+	// Optional per-execution coverage sink, including healthy and unavailable
+	// observations. The callback must return promptly; errors remain visible.
+	UrlProbeCoverageObserver func(UrlProbeCoverageObservation) error
+	// Retains every validated selection reason, including observations that do
+	// not cross an alert threshold. No request or target identities are retained.
+	ProviderSelectionObserver func(ProviderSelectionObservation) error
 
 	SSHConnectTimeout time.Duration
 	CommandTimeout    time.Duration
@@ -649,6 +656,7 @@ func configFromSignalSettings(settings SignalSettings) *monitorConfig {
 		pgQuerySampleContinuous: settings.PGQuerySampleContinuous,
 		publicUdp:               clonePublicUdpSettings(settings.PublicUdp),
 		stateDir:                settings.StateDir,
+		sharedSshAdmission:      settings.sharedSshAdmission,
 		sshConnectTimeout:       settings.SSHConnectTimeout,
 		commandTimeout:          settings.CommandTimeout,
 	}
