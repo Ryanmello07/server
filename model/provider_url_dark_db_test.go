@@ -708,3 +708,53 @@ func TestUrlDarkCountedTurnsAndWindows(t *testing.T) {
 		urlDarkTestAssert(ctx, t, city, 15, append(fleet, notAdmitted, otherPolicy, lateControls, anchored, ownSuccess), lateControls, anchored)
 	})
 }
+
+// Guards where the URL-dark load sits: in newProviderCommonFilterForClients.
+// The score export (UpdateClientScores) builds its filter with that
+// constructor directly, and leaves out of the published pools every provider
+// the filter calls a hard egress failure. Were the load only in
+// newProviderCountFilterForClients, which wraps it for the other consumers,
+// the export would publish a URL-dark provider and no other test would
+// notice: they assert through the hard-exclusion read, the counts, the status
+// and the inspection, and a request refuses the provider on its own
+// hard-exclusion read.
+//
+// So: a URL-dark provider is in no published score pool of its city, while
+// the healthy providers connected exactly like it are. Same fixture as
+// TestUrlDarkExcludedEverywhere.
+func TestUrlDarkExcludedFromScoreExport(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
+		egressTestPasses(ctx, t)
+
+		// control: the verdict exists, so a pool without the provider is the
+		// export honoring it
+		connect.AssertEqual(t, CountProviderEgress(ctx).ReasonCounts[ProviderExcludedUrlDark], int64(1))
+		for _, rankMode := range []RankMode{RankModeQuality, RankModeSpeed} {
+			for _, forceMinimum := range []bool{false, true} {
+				scores := egressTestCachedScores(ctx, t, city, rankMode, forceMinimum)
+				healthy := 0
+				for _, provider := range fleet {
+					if scores[provider.clientId] != nil {
+						healthy++
+					}
+				}
+				t.Logf("mode=%s force_minimum=%t: pool=%d healthy=%d/%d dark=%t",
+					rankMode, forceMinimum, len(scores), healthy, len(fleet), scores[dark.clientId] != nil)
+				// control: a pool without the healthy providers would say
+				// nothing about the dark one
+				if healthy == 0 {
+					t.Errorf("mode=%s force_minimum=%t: no healthy provider is in the published score pool", rankMode, forceMinimum)
+				}
+				if scores[dark.clientId] != nil {
+					t.Errorf("mode=%s force_minimum=%t: the URL-dark provider is in the published score pool", rankMode, forceMinimum)
+				}
+			}
+		}
+	})
+}
