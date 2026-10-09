@@ -351,8 +351,8 @@ probing starts within about 30 minutes, not immediately. Progress shows in the
 taskworker log as `provider-url-probe task: shard=N/4 ...` lines.
 
 Beta also carries a **URL-dark hard exclusion** (`model/provider_url_dark.go`):
-a provider whose last three counted turns returned nothing at all, spanning at
-least 30 minutes, with no success in the prior 8 hours, is excluded until a turn
+a provider whose last three counted turns returned nothing at all, with no
+success in the prior 8 hours, is excluded until a turn
 succeeds. Inspect any provider with
 `docker exec server-api-1 /app/bringyourctl provider inspect --client_id=<id>`.
 

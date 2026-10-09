@@ -217,7 +217,7 @@ func TestUrlDarkExcludedEverywhere(t *testing.T) {
 		now := server.NowUtc()
 		fleet := urlDarkTestFleet(ctx, t, city, 10)
 		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
-		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-70*time.Minute), now.Add(-50*time.Minute), now.Add(-30*time.Minute))
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
 
 		urlDarkTestAssert(ctx, t, city, 11, append(fleet, dark), dark)
 		status := GetClientProviderStatus(ctx, dark.networkId, dark.clientId)
@@ -254,7 +254,7 @@ func TestUrlDarkPassingTurnReadmits(t *testing.T) {
 		now := server.NowUtc()
 		fleet := urlDarkTestFleet(ctx, t, city, 10)
 		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
-		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-70*time.Minute), now.Add(-50*time.Minute), now.Add(-30*time.Minute))
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
 		urlDarkTestAssert(ctx, t, city, 11, append(fleet, dark), dark)
 
 		urlDarkTestTurn(ctx, dark.clientId, now.Add(-10*time.Minute), providerUrlDarkSuccess)
@@ -310,7 +310,7 @@ func TestUrlDarkRecentSuccessWithinEightHours(t *testing.T) {
 		now := server.NowUtc()
 		fleet := urlDarkTestFleet(ctx, t, city, 10)
 		newest := now.Add(-30 * time.Minute)
-		times := []time.Time{now.Add(-70 * time.Minute), now.Add(-50 * time.Minute), newest}
+		times := []time.Time{now.Add(-50 * time.Minute), now.Add(-40 * time.Minute), newest}
 		recent := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		urlDarkTestTurn(ctx, recent.clientId, newest.Add(-7*time.Hour), providerUrlDarkSuccess)
 		old := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
@@ -340,7 +340,7 @@ func TestUrlDarkServingFloorHonorsOldest(t *testing.T) {
 			first := now.Add(-3*time.Hour + time.Duration(i)*5*time.Minute)
 			// it last answered more than eight hours before its failures
 			urlDarkTestTurn(ctx, provider.clientId, first.Add(-9*time.Hour), providerUrlDarkSuccess)
-			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(20*time.Minute), first.Add(40*time.Minute))
+			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
 			dark = append(dark, provider)
 		}
 		// population 15, floor 10: the five that answered longest ago stand
@@ -375,7 +375,7 @@ func TestUrlDarkPartialFailureStaysOnline(t *testing.T) {
 		earlierSuccess := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		interleaved := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		urlDarkTestTurn(ctx, earlierSuccess.clientId, now.Add(-3*time.Hour), providerUrlDarkSuccess)
-		urlDarkTestDark(ctx, earlierSuccess.clientId, 3, now.Add(-70*time.Minute), now.Add(-50*time.Minute), now.Add(-30*time.Minute))
+		urlDarkTestDark(ctx, earlierSuccess.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
 		pattern := []providerUrlDarkTurn{
 			providerUrlDarkNoResponse, providerUrlDarkNoResponse, providerUrlDarkSuccess,
 			providerUrlDarkNoResponse, providerUrlDarkNoResponse, providerUrlDarkSuccess,
@@ -478,7 +478,7 @@ func TestUrlDarkServingFloorIgnoresOtherExclusions(t *testing.T) {
 			first := now.Add(-3*time.Hour + time.Duration(i)*5*time.Minute)
 			// it last answered more than eight hours before its failures
 			urlDarkTestTurn(ctx, provider.clientId, first.Add(-9*time.Hour), providerUrlDarkSuccess)
-			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(20*time.Minute), first.Add(40*time.Minute))
+			urlDarkTestDark(ctx, provider.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
 			dark = append(dark, provider)
 		}
 		// 20 connected public providers, but only 15 not otherwise excluded:
@@ -497,10 +497,10 @@ func TestUrlDarkHorizon(t *testing.T) {
 		fleet := urlDarkTestFleet(ctx, t, city, 10)
 		stale := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		first := now.Add(-providerUrlDarkHorizon - time.Hour)
-		urlDarkTestDark(ctx, stale.clientId, 3, first, first.Add(20*time.Minute), first.Add(40*time.Minute))
+		urlDarkTestDark(ctx, stale.clientId, 3, first, first.Add(10*time.Minute), first.Add(20*time.Minute))
 		inside := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		first = now.Add(-providerUrlDarkHorizon + time.Hour)
-		urlDarkTestDark(ctx, inside.clientId, 3, first, first.Add(20*time.Minute), first.Add(40*time.Minute))
+		urlDarkTestDark(ctx, inside.clientId, 3, first, first.Add(10*time.Minute), first.Add(20*time.Minute))
 
 		urlDarkTestAssert(ctx, t, city, 12, append(fleet, stale, inside), inside)
 	})
@@ -528,7 +528,7 @@ func TestUrlDarkReadFailsOpen(t *testing.T) {
 
 		fleet := urlDarkTestFleet(ctx, t, city, 10)
 		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
-		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-70*time.Minute), now.Add(-50*time.Minute), now.Add(-30*time.Minute))
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
 		quarantined := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		server.Tx(ctx, func(tx server.PgTx) {
 			server.RaisePgResult(tx.Exec(ctx, `INSERT INTO provider_egress_url_security(client_id,url_key,destination,measured_at,tls_failure)
@@ -642,11 +642,11 @@ func TestUrlDarkServingFloorKeyIsStable(t *testing.T) {
 		// created first so a tie on the key would favor it by client id
 		recent := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		urlDarkTestTurn(ctx, recent.clientId, now.Add(-12*time.Hour), providerUrlDarkSuccess)
-		urlDarkTestDark(ctx, recent.clientId, 3, now.Add(-160*time.Minute), now.Add(-140*time.Minute), now.Add(-120*time.Minute))
+		urlDarkTestDark(ctx, recent.clientId, 3, now.Add(-2*time.Hour), now.Add(-119*time.Minute), now.Add(-118*time.Minute))
 		longDark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
 		first := now.Add(-20 * time.Hour)
-		urlDarkTestDark(ctx, longDark.clientId, 3, first, first.Add(20*time.Minute), first.Add(40*time.Minute))
-		urlDarkTestDark(ctx, longDark.clientId, 3, now.Add(-60*time.Minute), now.Add(-40*time.Minute), now.Add(-20*time.Minute))
+		urlDarkTestDark(ctx, longDark.clientId, 3, first, first.Add(time.Minute), first.Add(2*time.Minute))
+		urlDarkTestDark(ctx, longDark.clientId, 3, now.Add(-20*time.Minute), now.Add(-19*time.Minute), now.Add(-18*time.Minute))
 
 		// population 11, floor 10: one verdict stands
 		urlDarkTestAssert(ctx, t, city, 11, append(fleet, recent, longDark), longDark)
@@ -666,7 +666,7 @@ func TestUrlDarkCountedTurnsAndWindows(t *testing.T) {
 		version := SelectedProviderUrlProbePolicyVersion()
 		// each case sits hours from the others, so no window reaches another's
 		threeTurns := func(first time.Time) []time.Time {
-			return []time.Time{first, first.Add(20 * time.Minute), first.Add(40 * time.Minute)}
+			return []time.Time{first, first.Add(10 * time.Minute), first.Add(20 * time.Minute)}
 		}
 
 		notAdmitted := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
@@ -706,33 +706,5 @@ func TestUrlDarkCountedTurnsAndWindows(t *testing.T) {
 		urlDarkTestDark(ctx, ownSuccess.clientId, 3, first.Add(8*time.Hour), first.Add(8*time.Hour+10*time.Minute))
 
 		urlDarkTestAssert(ctx, t, city, 15, append(fleet, notAdmitted, otherPolicy, lateControls, anchored, ownSuccess), lateControls, anchored)
-	})
-}
-
-// A verdict needs its K failures to span providerUrlDarkMinimumSpan, never
-// less than the control window. This closes the outage onset: in the first
-// control window of a prober-side outage, successes from before it still
-// satisfy the control, so its failures are not excused yet, but a run that
-// spans the window cannot fit inside that blind interval.
-func TestUrlDarkNeedsMinimumSpan(t *testing.T) {
-	server.DefaultTestEnv().Run(t, func(t testing.TB) {
-		ctx := context.Background()
-		city := egressTestCity(ctx, "Dark Test City", "Example Region", "Exampleland", "zz")
-		now := server.NowUtc()
-		fleet := urlDarkTestFleet(ctx, t, city, 10)
-		span := providerUrlDarkMinimumSpan(GetProviderEgressRules())
-		connect.AssertEqual(t, span >= providerUrlDarkControlWindow, true)
-
-		// three controlled failures inside one control window: an outage onset
-		// looks exactly like this, so it is not a verdict
-		onset := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
-		first := now.Add(-3 * time.Hour)
-		urlDarkTestDark(ctx, onset.clientId, 3, first, first.Add(span/3), first.Add(span-time.Minute))
-		// the same failures spanning exactly the minimum are a verdict
-		spanned := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
-		first = now.Add(-6 * time.Hour)
-		urlDarkTestDark(ctx, spanned.clientId, 3, first, first.Add(span/2), first.Add(span))
-
-		urlDarkTestAssert(ctx, t, city, 12, append(fleet, onset, spanned), spanned)
 	})
 }

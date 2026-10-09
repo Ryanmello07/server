@@ -27,16 +27,6 @@ import (
 const providerUrlDarkControlWindow = 30 * time.Minute
 const providerUrlDarkControlProviders = 3
 
-// The shortest run of failures, first to last, that is a verdict: the rules'
-// DarkMinimumSpan, but never shorter than the control window. That floor is
-// what closes the outage onset. In the first control window of a prober-side
-// outage the control still sees successes from before it, so its failures
-// cannot be excused yet; a run that spans at least the window cannot fit
-// inside that blind interval, so it cannot complete from outage failures alone.
-func providerUrlDarkMinimumSpan(rules ProviderEgressRules) time.Duration {
-	return max(rules.DarkMinimumSpan(), providerUrlDarkControlWindow)
-}
-
 // Only counted turns this recent are walked. The prober paces a dark provider
 // in bursts about four hours apart (providerUrlProbeRunWindowSql), so several
 // always fall inside; one it has not reached in a day is not judged, which
@@ -129,12 +119,11 @@ func providerUrlDarkCountedSql(alias string, version int) string {
 //
 // A member is dark when its K most recent non-excused counted turns are all
 // no-response and it has no counted success within ProviderEgressHealthMaxAge
-// of the newest of them, and those K span at least providerUrlDarkMinimumSpan
-// from first to last. Any later success or forwarded turn breaks the run.
+// of the newest of them. Any later success or forwarded turn breaks the run.
 //
 // $1 public provide mode, $2 K, $3 control window seconds, $4 success
 // lookback seconds, $5 horizon start, $6 client ids when scoped.
-func providerUrlDarkSql(version int, clientScoped bool, minimumSpan time.Duration) string {
+func providerUrlDarkSql(version int, clientScoped bool) string {
 	scope := ""
 	if clientScoped {
 		scope = "AND population.client_id = ANY($6)"
@@ -189,7 +178,6 @@ func providerUrlDarkSql(version int, clientScoped bool, minimumSpan time.Duratio
 		FROM recent
 		GROUP BY recent.client_id, recent.answered_at
 		HAVING count(*) = $2
-		AND max(recent.measured_at) - min(recent.measured_at) >= make_interval(secs => %[10]d)
 		AND NOT EXISTS (
 			SELECT 1 FROM provider_egress_health_history AS success
 			WHERE success.client_id = recent.client_id AND %[6]s AND success.ok_count = 1
@@ -209,7 +197,6 @@ func providerUrlDarkSql(version int, clientScoped bool, minimumSpan time.Duratio
 		providerEgressEligibilitySql("provider_location"),
 		providerUrlDarkCountedSql("answered", version),
 		providerUrlDarkCountedSql("newest", version),
-		int64(minimumSpan/time.Second),
 	)
 }
 
@@ -288,7 +275,7 @@ func honorProviderUrlDarkVerdicts(populationCount int, verdicts []providerUrlDar
 // those members (the size is still the fleet's).
 func loadProviderUrlDarkVerdicts(ctx context.Context, clientIds []server.Id) (populationCount int, verdicts []providerUrlDarkVerdict, returnErr error) {
 	rules := GetProviderEgressRules()
-	query := providerUrlDarkSql(SelectedProviderUrlProbePolicyVersion(), clientIds != nil, providerUrlDarkMinimumSpan(rules))
+	query := providerUrlDarkSql(SelectedProviderUrlProbePolicyVersion(), clientIds != nil)
 	args := []any{
 		ProvideModePublic,
 		int64(rules.DarkConsecutiveFailures),
