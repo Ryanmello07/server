@@ -46,7 +46,7 @@ The server contains:
 ## Prerequisites
 
 - Linux host with Docker Engine 24+ and Docker Compose v2.
-- `curl`, `openssl`, and Go 1.26+ installed on the host (Go is only used by setup scripts that generate the MMDB).
+- `curl`, `openssl`, and Go installed on the host (Go is only used by setup scripts that generate the MMDB). `go.mod` asks for Go 1.27.2: an older Go fetches that toolchain by itself unless `GOTOOLCHAIN=local` is set.
 - Public IP address if you want to use the server from another machine.
 - TCP ports 80 and 443 available on the host (Caddy terminates tls and is the only ingress).
 
@@ -65,9 +65,9 @@ To fully rotate secrets:
 ```bash
 ./beta-down.sh
 rm -f beta-vault/beta-secrets.env
-rm -f beta-vault/vault/pg.yml beta-vault/vault/redis.yml beta-vault/vault/jwt.yml \
-      beta-vault/vault/password.yml beta-vault/vault/client.yml beta-vault/vault/proxy.yml \
-      beta-vault/vault/provider_egress.yml
+rm -f beta-vault/vault/pg.yml beta-vault/vault/pg_maintenance.yml beta-vault/vault/redis.yml \
+      beta-vault/vault/jwt.yml beta-vault/vault/password.yml beta-vault/vault/client.yml \
+      beta-vault/vault/proxy.yml beta-vault/vault/provider_egress.yml
 rm -rf beta-vault/vault/tls beta-vault/config/mmdb beta-vault/config/arindb
 ./beta-setup.sh
 ```
@@ -410,6 +410,7 @@ The first run of `./beta-setup.sh` creates these files. They are ignored by Git 
 ```
 beta-vault/beta-secrets.env
 beta-vault/vault/pg.yml
+beta-vault/vault/pg_maintenance.yml
 beta-vault/vault/redis.yml
 beta-vault/vault/jwt.yml
 beta-vault/vault/password.yml
@@ -568,6 +569,23 @@ cat beta-vault/vault/pg.yml
 ```
 
 If they differ, stop the stack and delete both files so `./beta-setup.sh` regenerates them consistently.
+
+### The taskworker panics with `database ownership requires an explicit direct maintenance resource`
+
+Since the 2026-10-09 upstream merge the task queue, settlement and balance
+debits run on a direct postgres session, and the server refuses to guess its
+route: `beta-vault/vault/pg_maintenance.yml` must exist. `./beta-setup.sh`
+writes it with the same values as `pg.yml` (beta has no pooler in front of
+postgres). A vault generated before that merge does not have the file. On a
+running deployment copy it, which stops nothing:
+
+```bash
+cp -p beta-vault/vault/pg.yml beta-vault/vault/pg_maintenance.yml
+docker compose -f docker-compose.beta.yml restart taskworker api connect proxy
+```
+
+`./beta-setup.sh` writes it too, but that script takes the whole stack down
+and rebuilds the images first.
 
 ### Redis connection errors
 

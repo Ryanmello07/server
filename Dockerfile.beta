@@ -2,7 +2,10 @@
 # Beta self-contained build for URnetwork server + connect + bringyourctl.
 # Build context must be the urnetwork parent directory so sibling modules can be copied.
 
-FROM golang:1.26.5-bookworm AS build
+# The image's Go must be at least the `go` line of go.mod (1.27.2 since the
+# 2026-10-09 upstream merge). The golang images set GOTOOLCHAIN=local, so an
+# older one refuses to build instead of fetching the toolchain go.mod names.
+FROM golang:1.27.2-bookworm AS build
 
 # Layout inside the builder image mirrors the local urnetwork monorepo.
 WORKDIR /workspace
@@ -16,9 +19,15 @@ COPY ./sn /workspace/sn
 # required since the upstream merge: go.mod replaces goidenticons with ../goidenticons
 COPY ./goidenticons /workspace/goidenticons
 # required since the 2026-10-06 upstream merge: go.mod replaces gvisor.dev/gvisor
-# with ../gvisor (the urnetwork fork, pinned in .github/workflows/test.yml). The
-# merge also dropped the operator-proxy and warp replaces -- nothing imports
-# either any more -- so they are no longer copied.
+# with ../gvisor (the urnetwork fork, branch `go`). That merge also dropped the
+# operator-proxy and warp replaces -- nothing imports either any more -- so
+# they are no longer copied.
+#
+# Upstream removed .github/workflows/test.yml on 2026-10-06, and the sibling
+# pins it carried went with it. local/source-graph/lock.yml remains but lags:
+# at upstream 866080aa it still names the 2026-10-06 revisions and Go 1.26.7.
+# Each beta sync therefore records the sibling revisions it built and tested
+# against in its merge commit message.
 COPY ./gvisor /workspace/gvisor
 
 WORKDIR /workspace/server

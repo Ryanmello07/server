@@ -65,6 +65,20 @@ password: "${POSTGRES_PASSWORD}"
 db: "postgres"
 EOF
 
+    # Required since the 2026-10-09 upstream merge. The task queue and the
+    # settlement paths take database ownership on a direct postgres session
+    # (server.OwnedTx), and refuse to run unless the vault names that route
+    # explicitly: with no pg_maintenance.yml the taskworker panics with
+    # "database ownership requires an explicit direct maintenance resource".
+    # Upstream points pg.yml at a pooler and this file at postgres itself.
+    # Beta has no pooler, so both name the same server.
+    cat > "$VAULT/pg_maintenance.yml" <<EOF
+authority: "postgres:5432"
+user: "postgres"
+password: "${POSTGRES_PASSWORD}"
+db: "postgres"
+EOF
+
     cat > "$VAULT/redis.yml" <<EOF
 authority: "redis:6379"
 password: "${REDIS_PASSWORD}"
