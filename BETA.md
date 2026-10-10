@@ -403,6 +403,16 @@ Endpoints that require an external account or paid API key will return an error 
 
 These routes are still registered but their handlers fail gracefully because the corresponding vault/config files contain only stub values.
 
+Account deletion (`POST /auth/network-delete`) differs from upstream on a vault
+with no `vault/stripe.yml`: upstream asks Stripe about every network it deletes
+and panicked there (HTTP 500), so beta's Stripe step
+(`controller/network_remove_stripe_beta.go`) lets the deletion go on when the
+network has neither a Stripe renewal that has not ended nor a Stripe customer
+id, and refuses it with upstream's `Failed to unsubscribe Stripe` when it has
+one. With a `vault/stripe.yml` the step is upstream's, unchanged; never take
+that file away from a deployment that has sold Stripe subscriptions, because a
+subscription that only Stripe knows of would then outlive its account.
+
 ## Generated files
 
 The first run of `./beta-setup.sh` creates these files. They are ignored by Git and must never be committed:

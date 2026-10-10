@@ -50,7 +50,7 @@ var defaultNetworkRemoveSteps = networkRemoveSteps{
 		return model.GetRemoveNetworkStoreSnapshot(clientSession.Ctx, clientSession.ByJwt.NetworkId)
 	},
 	appleRenewing:     networkRemoveAppleRenewing,
-	unsubscribeStripe: UnsubscribeStripe,
+	unsubscribeStripe: networkRemoveUnsubscribeStripe, // beta: network_remove_stripe_beta.go
 	cancelPlay:        networkRemoveCancelPlay,
 	removeNetwork: func(clientSession *session.ClientSession, storeSnapshot *model.RemoveNetworkStoreSnapshot) (model.RemoveNetworkOutcome, map[string]bool) {
 		return model.RemoveNetworkWithStoreSnapshot(
