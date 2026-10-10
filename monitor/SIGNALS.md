@@ -607,6 +607,61 @@ preserve bounded per-minute completion history, pending claim/lease state,
 direct PostgreSQL capacity, active reindex progress, and Redis cluster state;
 attribute the failed layer before mutating it.
 
+Aggregate task throughput does not clear recurring-task starvation. On
+2026-10-10 at 01:56 UTC, a complete three-minute window contained 14,947
+finished tasks but no completions for the location, score, reliability, or
+search publishers. Their six exact RunOnce rows were overdue by 4.3–5 hours,
+with no recorded claim or retry error; the reliability rollup watermark was
+also nearly five hours old. Eight current, ready Taskworkers did not clear
+this failure. Compare each source-owned RunOnce key's generated
+`available_block` with the current block, its lease and advisory ownership,
+registered target, and position in the bounded claim candidate window.
+Timestamp eligibility alone does not prove claim admission. The claimant
+orders by available block before priority and examines a finite prefix;
+older work can conceal later recurring tasks. Prove that mechanism before
+changing scheduling or releasing ownership.
+
+The next bounded read at 02:11 UTC found all first 68 due candidates were
+`CloseScheduledContract` rows in the same older available block; the six
+canaries were eligible in later blocks and absent from that prefix. A 69th
+row proved more due work. This describes the captured window; live worker
+batch sizes and every worker's cursor were not observed. A native control
+using the prior claim order committed 144 successful close-task handoffs,
+with zero paid closures, zero free closures, zero completions for the six
+recurring admission canaries, and zero task errors. Task finalizations can
+acknowledge a durable financial handoff while the contract remains open;
+verify the downstream payer/source task and actual contract outcome. With
+function lanes, the same native checkpoint had 24 paid closures, 12 free
+closures, and all six canary completions; the joined 288-contract control
+passed financial conservation and terminal replay. These are local controls.
+
+Cache absence has distinct product effects. Missing `{cl}i` makes the initial
+provider picker return an empty successful response. Missing
+`{provider_hard_exclusions}` removes cohort coverage and causes provider
+selection to read candidate exclusions from PostgreSQL, adding request-path
+database pressure. A normal one-shot location publication restored both and
+returned 92 public locations in about 0.6 seconds during that incident. This
+is publication evidence, not natural recurrence, current Quality coverage,
+or end-user transport recovery. Require subsequent recurring completions,
+renewed cache lifetime, and advancing reliability watermark. A stale rollup
+watermark prevents reliability score publication; merely restarting workers
+or re-scheduling an already overdue key does not repair missed claim admission.
+
+Location and score publications have independent lifetimes: the normal
+location task writes `{cl}i` and per-location values for 30 minutes; the score
+task writes the `ClientFilter` values used by `loadLocationStables` for 300
+minutes. Refreshing locations does not refresh those filters. Missing selected
+filter bytes or a nonpositive decoded `Count` omit a location while the API
+returns a successful response. Check the selected caller/alias/baseline filter
+and its lifetime as well as the initial catalog.
+
+A later normal location publication acknowledged 1,749 updated locations, but
+the public result stayed empty. At 02:38 UTC, `{cl}i` was present as a
+27,768-byte string with about 1,537 seconds remaining. Publication acknowledgment
+and cache presence therefore did not establish public restoration. Retain
+bounded decoded catalog counts and selected filter evidence before attributing
+that empty result; key length alone is not a location count.
+
 `Interrupted: context canceled` alone does not identify deployment drain or a
 short attempt. `claim_time` advances with the lease heartbeat; release minus
 claim is not execution duration. Correlate the task family's authoritative
@@ -1493,6 +1548,49 @@ work, and an empty delta is unknown rather than healthy. Attribute only from a
 complete time-aligned discriminator. The stable control is a current state
 summary back inside its band plus a fresh, complete attribution snapshot; an
 old cached battery or later alert silence is not that control.
+
+
+The 2026-10-09 19:29Z protected current-session capture supplied a fresh
+attribution control: three native-primary frames contained 465, 348 and 391
+idle client transactions. Top groups included transaction starts and both
+companion-origin read prefixes. The oldest continuous-idle representative was
+about 9.6–10.0 seconds old and changed identity; only one selected idle backend
+retained the same backend generation, transaction/query starts, state change,
+and SQL prefix through all three frames. That companion read's reported
+command-start-to-idle interval was 0.191 ms, followed by 0.918–3.145 seconds
+idle. This is evidence about that last command and idle gap, not its group's
+query duration, execution rate, or CPU share. Generic transaction starts do
+not identify the owning application callback. The companion wait loop sleeps
+outside its transaction; its retry interval does not explain an idle holder.
+
+The sole captured blocking edge joined two endpoint-write-fence statements
+with the same source-owned Connect process tag; the blocker was idle for
+3.47 seconds after acquiring its fence. Its owning helper next sends the
+cooperating-marker statement, with no Redis call between those statements.
+This narrows the missing observation to the application/driver/pool handoff;
+it does not establish its delay cause, exact caller, payer, runtime source
+parity, or a whole-system root. Separately, active wait groups changed among
+ClientRead, BufferContent, ProcArray, WALInsert and BufferMapping. Do not
+assign those active waits to SQL retained only as another backend's idle last
+statement. Capture a bounded active SQL representative in the same frame, or
+use qualified application phase evidence, before making that attribution.
+
+Source completeness and false-negative qualifier: this read covered the
+current database, retained six idle groups plus the oldest idle and bounded
+lock edges, and omitted 31–52 smaller idle groups per frame. The active wait
+group list was complete in these frames; active SQL ownership was not. Two
+retained statement prefixes reached the catalog's 1,023-byte text limit; their
+suffixes and parameter values remain unknown. State, last SQL and wait fields
+can change on different publication boundaries even within a catalog read;
+one selected idle row also reported a lightweight-lock wait. Keep that
+inconsistency as a sampling limit, not proof that a statement kept executing
+while idle. Missing/departed, prepared, and other-database blocker identities
+remain unresolved. False-positive qualifier: rotating young idle groups and
+a sampled fence edge do not prove a transaction leak, a Redis stall, or a
+persistent lock root, and grant no cancellation authority. Retain the count
+warning and require current backend generation plus phase/transport evidence
+for action. This discriminator did not change the standing probe's cache,
+thresholds, cadence, or redaction contract.
 
 ### 1.3a PostgreSQL client-slot capacity and rejected logins
 Probe: `pg-capacity`
@@ -2548,6 +2646,19 @@ the shape, omit the whole Warp identity prefix from the sample, and redact
 UUID-shaped or explicitly named customer/entity identifiers in both. Otherwise
 two unrelated failures in one window can render a correct top shape beside
 misleading or private evidence from another shape.
+
+Task finalization remains a separate failure boundary from the function result.
+A recovered `task finalization failed` or `task completion batch remains
+unacknowledged` record can accompany an execution that returned successfully.
+`urnetwork_taskworker_finalization_errors_total` observes failed handbacks per
+participating task; `execution_errors_total` does not cover this boundary.
+Correlate a current metric increase with the exact running artifact and bounded
+original error. A typed deadline alone does not distinguish owner admission,
+database work, or an uncertain commit. An inner recovery stack attributed to `worker.Run` can establish a failed
+invocation, not process death; `/status` readiness remains a startup latch and
+cannot certify collector progress. Preserve the existing panic PAGE and its
+line-count semantics. The new attempt counter is not a deduplicated incident
+count, and missing or pre-metric-build series cannot establish zero failures.
 
 Generic `panic` retains its service-wide, empty-frame PAGE at five diagnostic
 lines/minute, including malformed or unowned records. A bounded structured
@@ -4433,6 +4544,27 @@ backend errors cannot become an empty allowed set. Verify running reader and
 writer ancestry, task completion, renewed coverage/TTL and bounded fallback
 work under comparable successful requests before claiming recovery.
 
+The October 9 incident has a second discriminator: a retained 979-byte Main
+query prefix matched the candidate-materialized hard-exclusion SQL. It does
+not match `providerSubscriberExclusionsSql`, whose inputs are candidate,
+connection, handler and location facts, with no URL-security table. Keep the
+truncated query-family match separate from the external subscriber-query count;
+it does not establish the reported onset, current fleet activity or fix adoption.
+Disabling subscriber Quality policy does not disable the common TLS quarantine.
+
+Existing indexes and a 256-candidate cap do not bound each candidate's URL
+history. The `MATERIALIZED` security input can read every clean URL before its
+consumers apply `tls_failure`. Apply that same predicate inside the input to use
+the existing `provider_egress_url_security_unresolved` partial index and preserve
+all unresolved TLS refusals. The regression must include 93 clean URLs per
+provider, exact refusal identities and actual examined URL rows under custom
+and generic plans; the earlier three-URL fixture missed this amplification.
+Missing or uncovered v3 cohort entries repeat primary read-through without
+filling that cache, so a valid partial publication can still sustain this work.
+Native plan improvements alone do not establish Main recovery: retain the
+current reader/writer generation, checked coverage, TTL and independent CPU/wait
+evidence above.
+
 The October 6 07:46Z non-executing plan showed why the sparse-index repair was
 insufficient: the unscoped query still estimated 54.4 million output rows,
 including 52.8 million ARIN exceptions, with all six inspected indexes valid
@@ -6064,6 +6196,127 @@ The unit of evidence must match the question:
 | Did financial ownership commit? | The same invocation's acknowledged transaction plus a later exact outcome/escrow witness when the response was incomplete or ambiguous. | Staged outcome writes, entering commit, process exit 0, a returned batch with refused rows, or a post callback's return alone is not financial success. |
 | Did recovery finish? | Terminal outcome and unsettled reservation state, then the applicable debit journal, provider-total marker and Redis/stream/packet projections under their own owners. | Intent deletion, low CPU, no errors, a drained journal or terminal count cannot certify every downstream projection or customer UI. |
 
+For an overdue legacy intent, retain `usage_origin_is_source`,
+`usage_unverified`, the immutable expiry proof, report readiness and the actual
+serial owner together. A NULL payer key and a NULL usage direction are different
+conditions. NULL direction is an intentional legacy representation, not proof
+of corruption. Source review on 2026-10-09 found that existing intents are
+excluded from ordinary expiry preparation, explicit expiry repair refuses
+`legacy_intent_present`, and the explicit settlement drain does not prepare
+proofs. A due intent with unknown direction and no unverified-usage proof can
+therefore remain behind the settlement path. Verify that exact conjunction in a
+fresh bounded point read before attributing an account failure to it. Its repair
+must retain report validation, owner/rekey and grant admission, and use the
+existing expiry policy; do not invent a direction or bypass accounting custody.
+
+The same source review found a separate known-direction gap: an accepted
+settlement intent with a checkpoint or a missing final peer also remains behind
+those expiry exclusions. A partial report is valid expiry input; ordinary
+expiry retains its original proof before finalizing checkpoints or adding a
+billing-only peer. The intent owner must use that same continuation after
+owner/grant admission, keeping proof, reports and unchanged accounting in its
+transaction. Preserve an accepted adjudication: its selected original report
+may become final, but a missing selected report cannot be supplied from the
+other party. Retained proof does not by itself authorize a batch to skip these
+report rules. Synthetic public-producer regressions compare ordinary expiry
+with existing intents after the 60-minute fallback, including exact usage,
+rollback and replay. All 35 focused partial-expiry, source-batch and retained-proof
+controls passed on the final candidate in local native qualification.
+These source findings do not attribute the six selected customer intents to
+this cause before their separately qualified exact report-state read.
+
+Separate public-producer controls reproduce positive 17-byte free-contract
+expiry failures: `SetContractDispute` can leave a checkpoint, and an interrupted
+`CloseContract` can leave both final reports without an intent. Their old ordinary
+expiry routes required escrow; local native causal RED/GREEN controls verify
+normal closure through the existing source-client no-payout owner. Escrow absence
+alone grants no free authority. The locked retained header must select
+`SourceClient` before synthetic expiry reports or a no-payout outcome, including
+existing-intent and direct public-close continuations. A concrete custody refusal
+keeps a retained payer's liability unresolved and suppresses malformed-quarantine
+fallback, preserving accepted intent authority, reservations and terminal replay.
+Public endpoint reports retain their existing separate commit. The paid
+missing-escrow fixtures deliberately remove custody to test refusal; they are
+not Main observations. Source review and local native controls do not identify
+a live account cause or establish deployment, exact visitation or recovery.
+
+The 2026-10-09 recovery merge `d2caf053` adds a raw-page progress discriminator:
+a page can finish every selected visit and still retain its old task cursor.
+In the causal control, 128 independent proof failures exceeded the ordinary
+128-node error-inspection budget when their causes were joined across the page.
+The model could no longer attest completed visits. Fixing that boundary alone
+still pinned the page because task retry-argument validation inspected the same
+wide failure with one global budget. A separate control reproduced the failure
+with 128 independently completed accounting rejections. This is a lost scan
+checkpoint, not evidence that those rows were unvisited or financially settled.
+
+Keep the ordinary 128-node/32-edge inspection limits. The explicit completed-row
+receipt permits at most 512 original members, matching the two 256-row raw
+streams, and revalidates each member independently at the model and task
+boundaries. Nested/multiple batches, incomplete or malformed members, worker
+interruption and cancellation cannot grant cursor authority. Keep each lane's
+captured epoch and position through the budget wrapper and task arguments;
+advance only after its complete raw page joins. Completed rejected, skipped or
+delegated visits can advance even without a verified close. An interrupted page
+retains its previous checkpoint. End of pass starts a new pass so unresolved
+rows return; a moving cursor alone still does not establish shrinking debt.
+
+Progress remains a failed task when a completed row failed: preserve its task
+identity, original diagnostics, failure metrics and normal retry-count increment.
+An operational failure retains ordinary backoff; a fully classified accounting
+failure retains its existing bounded retry policy and separate verified,
+rejected and quarantined counts. No success post or financial action is granted
+by persisting a cursor. Underfunding must retain the rejected contract's reports,
+reservation, balance and liability. Ordinary expiry may first commit its valid
+original-report proof; later passes must retain that exact proof rather than
+treating this legitimate transition as an accounting mutation or rewriting it.
+
+The qualified native controls failed on the old model, on the fixed model with
+old task inspection, and on the 128-rejection accounting case. The corrected
+composition then passed 13 tests across five packages, including
+`TestCloseExpiredManyOperationalVisitsKeepFailureAndReachNextRawPage` and
+`TestCloseExpiredManyAccountingRejectionsKeepCursorCountsAndCustody`. They
+persist the failing page, reach a healthy tail on the next invocation, revisit
+the unresolved head next pass and preserve protected active rows. The accounting
+control separately preserves one verified sibling and all 128 rejected
+liabilities. These are local source/fixture qualifications, not evidence of
+live target visitation or backlog clearance.
+
+Keep the two discovery routes distinct: due contracts without an intent enter
+the ordinary expiry sweep; existing intents remain with their source/payer
+dispatcher and financial owner. `bringyourctl contracts queue-expiry` publishes
+one sweep plus 16 legacy dispatchers under the same 17 existing RunOnce keys in
+one owned transaction. It creates absent owners or coalesces an earlier wake,
+preserving saved cursors, task identity and active claim state; a wake during
+successful EOF completion survives for the successor. Its counts acknowledge
+only committed queue requests. The kickoff itself closes no contract, adds no
+future-deadline scheduling guarantee and does not override a later failed
+execution's normal backoff. Require subsequent bounded page/epoch handoffs and
+the exact accounting/projection witnesses above before claiming recovery.
+
+Measure close throughput over the complete invocation through debit/provider
+outputs, replay and worker join, including the configured collection delay.
+Fewer transactions or protocol replies are useful work measurements, not a
+wall-time speedup. A zero-retry assertion does not measure PostgreSQL lock waits.
+A wait observer needs real row/advisory blocking controls, a joined final
+sample, measured query cost and coverage gaps. Failed coverage leaves waits
+unqualified even when every sampled heavyweight-lock count is zero. Retain
+LWLock/IO separately, and report unprobed blocking edges as unknown. Use the
+same observer and resource limits in compared arms; never subtract its
+overlapping query wall time to manufacture a speedup.
+
+The local 2026-10-09 2048-public-close run plus its anchor satisfied accounting
+and actual held-owner exclusion: all 2049 contracts and provider markers
+completed, with no remaining intents, journals or unsettled reservations, no
+actual transaction reruns and no wire errors. The overall test nevertheless
+failed observer coverage: 164 gaps exceeded the 50 ms limit, with a conservative
+97.0422 ms blind interval. Zero sampled SQL lock waits therefore leaves the
+zero-SQL-wait gate inconclusive. All gaps overlapped PostgreSQL CPU-throttle
+sample intervals in its one-CPU fixture; this is correlation, not exclusive
+causal attribution. Keep the accounting result and observer failure separate;
+neither missing samples nor delayed observer callbacks prove a shared-writer
+violation, and this run does not establish production capacity.
+
 The 2026-10-07 retained case demonstrates the scope boundary. The original fixed
 32-contract cohort was all closed/SETTLED with zero unsettled escrow at
 10:06:00.785079Z. A separate complete payer count at 10:06:36.913535Z was 179,540
@@ -6192,6 +6445,14 @@ or stale series cannot certify zero retries or zero debt. The counter/dashboard
 owner addresses committed-rate visibility; exact traces and existing source-
 qualified point readers address bounded causal questions. Neither introduces
 automatic account cleanup, a broader financial scan or a new fleet SLO.
+
+The singleton legacy financial owner and explicit applying drain combine
+`BEGIN` with their existing two transaction-local timeouts in one request.
+The existing financial transaction, rollback and post ownership are unchanged;
+the newer bounded forward cohorts retain their separate 500 ms statement budget.
+The native two-slot control checks one fewer Query/ReadyForQuery cycle per
+transaction. Its elapsed time does not establish production throughput, grant
+availability or backlog recovery. Read-only previews retain repeatable read.
 
 ### 2.6 Open-contract set size — the close-backlog canary
 Probe: `open-contracts`
@@ -25711,6 +25972,38 @@ error — deliberate, so fleet status sampling doesn't count drains).
 - GOTCHA: readiness is start-time-latched by design. A runtime redis outage
   does not flip /status; that is 1.2's job (task canaries).
 
+The 2026-10-10 bounded fleet capture found all eight `a1b91a4d` Taskworkers
+ready while each emitted task-finalization timeouts. The retained recovery
+stacks belonged to the inner `worker.Run` supervisor. Readiness therefore did
+not establish continuing Run-loop intake. In that source, a fatal handback
+stops refill and removes the returned task from the active set, but retains its
+execution guard and heartbeat until every sibling function and committed post
+joins. Only then does the original failure reach the supervisor for restart.
+An `eval active` line can consequently describe retained custody after the task
+function has already returned.
+
+The source correction cancels sibling function contexts when ordinary, cohort
+or batch finalization fails, then keeps the same join and guard-release order.
+Already committed detached posts still run to completion; uncertain handbacks
+are never replayed, and the failed task's durable lease remains unchanged.
+Canceled siblings use ordinary retry policy. A real five-second pre-BEGIN
+ownership refusal reproduced the uncanceled-sibling stall on the old source;
+the candidate passed ten native controls covering cancellation, exact guards,
+committed post generations, RunOnce minimum deadlines and subsequent Run
+progress. This establishes a cooperative sibling-drain correction. A function
+that ignores cancellation or an unjoined post still retains custody.
+
+A separate two-frame exact-key capture, 5.363 seconds apart, found the selected
+task's own pending, finished and execution keys free. Its conditional current
+payer-continuation queue key was held by different active sessions and
+transactions in the two frames, each executing the normal `ScheduleTaskInTx`
+RunOnce UPSERT with no observed SQL wait or blocker. This establishes publisher
+turnover, not one continuously held five-second blocker. The current owner
+mapping is conditional: the earlier finalizer's returned result and requested
+key set were not captured. Do not attribute all fleet timeouts to this sampled
+publisher. Verify actual post-adoption completion and queue progress separately
+from readiness and from the controlled source fix.
+
 ### 12.3 Stuck leases (post-SIGKILL / crash)
 Probe: `stuck-leases`
 
@@ -32216,11 +32509,15 @@ Probe: `router-conntrack`
 
 Every five minutes under §18.4's access/budget contract, read live
 `nf_conntrack_count`, `nf_conntrack_max`, module `hashsize`, and
-`/proc/net/stat/nf_conntrack`. Read-only kernel values, not declarations, prove
+`/proc/net/stat/nf_conntrack` when available. Read-only kernel values, not declarations, prove
 the observed applied sizes. Table and hash targets from the frozen desired
 config are independently optional: compare each known field, retain unknown
 for an absent/invalid counterpart, and never invent a platform default.
 Live pressure and counters remain observable even with no explicit target.
+Count/max/hash validity is independent of the optional per-CPU counter file:
+an absent, failed, partial or malformed counter read retains valid live sizes
+and pressure alongside `cannot-observe` for counters. A failed outer capture,
+hostname/boot fence or required scalar read still invalidates the observation.
 
 WARN `router-conntrack-capacity` (sustain 2) reports any known desired/live
 size mismatch. WARN `router-conntrack-pressure` (sustain 2) reports live
@@ -32240,6 +32537,20 @@ duplicate insertion/races and is an unknown-cause qualifier, not packet-loss
 proof. Concrete capacity or pressure findings survive an unknown counter
 pair; private counters are reduced to fixed scalar summaries only.
 
+An optional unprivileged kernel-ring read reduces only exact timestamped
+`nf_conntrack: table full, dropping packet` messages to a retained count and
+latest boot-relative timestamp. The firmware's repeated `nf_conntrack:`
+prefix is supported. No raw kernel text enters the observation or alerts.
+When the live table is full and the latest explicit message is at most 15
+minutes old on the bracketed boot, `router-conntrack-drops` retains this
+capacity-loss evidence even if per-CPU counters are unavailable. The latter
+remain unknown independently. Full occupancy alone, a missing/empty log,
+malformed/future timestamps or stale messages never prove packet loss. Log
+retention and rate limiting make message counts incomplete historical
+evidence, not a current packet-drop rate or a counter delta. After an applied
+capacity increase, old messages alone cannot establish current full-table
+loss. No zero-drop or recovery claim follows from this optional log path.
+
 False positives include temporary bursts near the static occupancy band and
 counter meanings that differ on unsupported kernels. False negatives include
 short bursts between cadences, resets/hotplug that invalidate pairing,
@@ -32249,6 +32560,32 @@ resource headroom follows from a healthy bounded software sample. Operator
 closure requires current applied limits, a reviewed memory/traffic budget,
 and complete subsequent zero-drop pairs; no restart, table flush, resizing,
 deployment or audit-completion inference is authorized by these observations.
+
+**2026-10-09 IPv4 outage evidence.** On `by-us-fmt-5-8`, the live count and
+maximum were both 262,144 in the 23:03:19Z and 23:03:20Z samples, with 32,768
+hash buckets. A bounded kernel read retained 32 explicit table-full packet-drop
+messages; the newest was approximately 306.6 seconds older than the second
+sample. This confirms recent kernel capacity loss while the sampled table
+remained full, not a measured loss rate during those two samples. The
+4.9.79-UBNT firmware lacked `/proc/net/stat/nf_conntrack`, so `insert_failed`,
+`drop` and `early_drop` deltas were unavailable, not zero. The WAN INVALID
+counter increased too, but covers broader causes and cannot be substituted
+for conntrack capacity-drop evidence. Live routes showed routed public LB
+addresses; zero DNAT rules/counters were consistent with that topology.
+
+An outside IPv4 sweep failed 18 of 20 API/Connect endpoint attempts before
+the operator increased the live maximum to 1,048,576. A subsequent read
+observed that maximum, unchanged 32,768 buckets and counts 306,563 then
+306,528, approximately 29.2 percent occupancy. The independent outside sweep
+at 23:17:55Z–23:17:57Z completed TLS and received HTTP on all 20 attempts
+across ten active public LB addresses. This establishes restored sampled
+TLS/HTTP reachability after the operator change and supports the capacity
+diagnosis on the observed router. It does not assign every earlier failure
+across other routers to this one cause, prove authenticated Connect/WebSocket
+or UDP/QUIC operation, or supply the missing zero-drop counter pairs. The
+operator change superseded the prepared capacity plan; no hash resize,
+conntrack flush, persistent configuration deployment or further router
+mutation followed from the probe.
 
 ## 19. Web platform association metadata
 
@@ -33506,6 +33843,42 @@ logs require verbosity one. Collector delivery or a capped log tail can conceal
 those lines despite a terminal counter. The execution counter alone does not attribute
 an earlier failure rate or certify recovered payer throughput.
 
+
+### Finalization failure attempt counters
+
+`urnetwork_taskworker_finalization_errors_total{task,cause}` counts each distinct
+participating task once when its finalization invocation returns an error or
+panics. Single, batch, and cohort boundaries own the observation for both Run
+and finite EvalTasks. A cohort delegated to the batch owner is counted once.
+A failed shared transaction counts every participating member; if a known
+pre-commit rollback permits individual fallback, each individual call is a new
+attempt. Expected mixed-backend compatibility fallback occurs before a
+transaction and is excluded. Internal transaction retries that ultimately
+succeed emit no terminal finalization failure. A returned Post error that is
+successfully persisted as a durable retry also emits no finalization failure.
+
+Labels resolve only registered targets and aliases, with `unregistered` for
+unknown stored names. Causes reuse the bounded typed execution classifier;
+non-error panics use `non_error_panic`. No task ID, queue key, payer, argument,
+raw error or raw SQLSTATE is exported. A finalization deadline is not authority
+to label owner contention or a particular SQL phase.
+
+This is an attempt diagnostic, not a rollback or financial-failure counter.
+Unknown commit replies count as observed handback failures while their database
+outcomes remain unknown to the caller; metric instrumentation never replays
+work. Business success may precede a failed handback. Acknowledged lifecycle
+counters keep their existing transaction-bound rules and are not decremented.
+Function and finalization error populations overlap and must not be summed.
+The dashboard shows both separately at the top, by task and typed finalization
+cause. `finalizations_total` contains only acknowledged succeeded, rescheduled,
+and post_rescheduled outcomes, not failed handbacks or external Post errors.
+
+False-positive qualifier: a failed batch followed by successful individual
+fallback still records the failed attempt, and a lost reply can follow a real
+commit. Neither proves a failed settlement. False-negative qualifiers: old
+builds, missing scrapes, process exit before scrape, incomplete fleet coverage,
+and a stuck finalization that has not returned can conceal failure observations.
+Zero or absent counter rates and a ready worker are not proof of closure progress.
 
 ### Task submission, completion and RunOnce conflict counters
 

@@ -9857,4 +9857,32 @@ var migrations = []any{
 	newSqlMigration(`
 		ALTER TABLE network_embed ADD COLUMN disable_time timestamp NULL;
 	`),
+	// 803: retained source identity classifies historical inferred payer hints.
+	// This additive owner release must be deployed before combined dispatch.
+	newSqlMigration(ContractCloseOwnerSchemaSql),
+	// 804: source clients have an independent bounded due-order lane.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS legacy_settlement_intent_source_due
+	`, `
+		CREATE INDEX CONCURRENTLY legacy_settlement_intent_source_due
+		ON legacy_settlement_intent(shard,source_client_id,next_attempt_time,contract_id)
+		WHERE payer_network_id IS NULL AND source_client_id IS NOT NULL
+	`, `DROP INDEX IF EXISTS legacy_settlement_intent_source_due; `+ContractCloseSourceDueIndexSql),
+	// 805: enroll all unresolved owners, including old non-NULL payer hints.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS legacy_settlement_intent_owner_missing
+	`, `
+		CREATE INDEX CONCURRENTLY legacy_settlement_intent_owner_missing
+		ON legacy_settlement_intent(shard,contract_id) WHERE source_client_id IS NULL
+	`, `DROP INDEX IF EXISTS legacy_settlement_intent_owner_missing; `+ContractCloseOwnerMissingIndexSql),
+	newSqlMigration(sessionSchemaSql),
+	newRestartableOnlineSqlMigration(`DROP INDEX CONCURRENTLY IF EXISTS network_client_session_active`,
+		`CREATE INDEX CONCURRENTLY network_client_session_active ON network_client(network_id,session_id,client_id) WHERE active AND session_id IS NOT NULL`, sessionClientIndexSql),
+	newRestartableOnlineSqlMigration(`DROP INDEX CONCURRENTLY IF EXISTS auth_code_origin_session`,
+		`CREATE INDEX CONCURRENTLY auth_code_origin_session ON auth_code(network_id,origin_session_id) WHERE active AND origin_session_id IS NOT NULL`, sessionAuthCodeIndexSql),
+	// 809: function fairness seeks never filter a different function's backlog.
+	newRestartableOnlineSqlMigration(`DROP INDEX CONCURRENTLY IF EXISTS pending_task_function_poll_order`,
+		`CREATE INDEX CONCURRENTLY pending_task_function_poll_order ON pending_task
+		(regexp_replace(function_name, '/v[0-9]+', '', 'g'), available_block, run_priority DESC, run_max_time_seconds DESC, task_id)`,
+		`DROP INDEX IF EXISTS pending_task_function_poll_order; `+TaskClaimFunctionIndexSql),
 }
