@@ -758,3 +758,81 @@ func TestUrlDarkExcludedFromScoreExport(t *testing.T) {
 		}
 	})
 }
+
+// The score export publishes a second family of pools, one per location
+// group, from a source statement of its own
+// (clientScoreLocationGroupSourceSQL), and a request that names a group is
+// served from them. TestUrlDarkExcludedFromScoreExport reads the per-location
+// pools only, and its city is in no group, so it says nothing about these:
+// were the hard-exclusion skip of UpdateClientScores to cover the location
+// rows alone, a URL-dark provider would be published in every group that holds
+// its city, region or country, and that test would pass.
+//
+// So: a URL-dark provider is in no published pool of a group it belongs to,
+// while the healthy providers connected exactly like it are in each. Two
+// groups, so that the provider's source row carries more than one group id
+// and reaches them through different location levels: one holds the city, the
+// other the region and the country.
+func TestUrlDarkExcludedFromScoreExportLocationGroups(t *testing.T) {
+	server.DefaultTestEnv().Run(t, func(t testing.TB) {
+		ctx := context.Background()
+		city := egressTestCity(ctx, "Dark Group City", "Example Region", "Exampleland", "zz")
+		cityGroup := &LocationGroup{
+			Name:              "Dark Test City Group",
+			Promoted:          true,
+			MemberLocationIds: []server.Id{city.CityLocationId},
+		}
+		CreateLocationGroup(ctx, cityGroup)
+		wideGroup := &LocationGroup{
+			Name:              "Dark Test Region And Country Group",
+			Promoted:          true,
+			MemberLocationIds: []server.Id{city.RegionLocationId, city.CountryLocationId},
+		}
+		CreateLocationGroup(ctx, wideGroup)
+		now := server.NowUtc()
+		fleet := urlDarkTestFleet(ctx, t, city, 10)
+		dark := egressTestConnect(ctx, t, city, egressTestFast, nil, nil)
+		urlDarkTestDark(ctx, dark.clientId, 3, now.Add(-50*time.Minute), now.Add(-40*time.Minute), now.Add(-30*time.Minute))
+		egressTestPasses(ctx, t)
+
+		// control: the verdict exists, so a pool without the provider is the
+		// export honoring it
+		connect.AssertEqual(t, CountProviderEgress(ctx).ReasonCounts[ProviderExcludedUrlDark], int64(1))
+		for _, group := range []*LocationGroup{cityGroup, wideGroup} {
+			for _, rankMode := range []RankMode{RankModeQuality, RankModeSpeed} {
+				for _, forceMinimum := range []bool{false, true} {
+					// the group cache only, no location id: what the group
+					// source statement published and nothing else
+					scores, err := loadClientScores(
+						forceMinimum,
+						rankMode,
+						ctx,
+						map[server.Id]bool{},
+						map[server.Id]bool{group.LocationGroupId: true},
+						server.Id{},
+						1000,
+						[]ipFamilyFacet{ipFamilyFacetDualstack, ipFamilyFacetV4Only},
+					)
+					connect.AssertEqual(t, err, nil)
+					healthy := 0
+					for _, provider := range fleet {
+						if scores[provider.clientId] != nil {
+							healthy++
+						}
+					}
+					t.Logf("group=%q mode=%s force_minimum=%t: pool=%d healthy=%d/%d dark=%t",
+						group.Name, rankMode, forceMinimum, len(scores), healthy, len(fleet), scores[dark.clientId] != nil)
+					// control: a group pool that was never published, or that
+					// lacks the healthy providers, would say nothing about the
+					// dark one
+					if healthy == 0 {
+						t.Errorf("group=%q mode=%s force_minimum=%t: no healthy provider is in the published group score pool", group.Name, rankMode, forceMinimum)
+					}
+					if scores[dark.clientId] != nil {
+						t.Errorf("group=%q mode=%s force_minimum=%t: the URL-dark provider is in the published group score pool", group.Name, rankMode, forceMinimum)
+					}
+				}
+			}
+		}
+	})
+}
