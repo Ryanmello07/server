@@ -225,13 +225,18 @@ const clientKeyPolicyNamespaceArtifactQuery = `(
 
 // Admission pins the complete installed function, its relation and its enabled
 // insert/update trigger; a numeric head cannot hide a disabled custody guard.
-var contractUsageGuardArtifactQuery = `(
+func contractUsageGuardBodyArtifactQuery(bodies ...string) string {
+	quoted := make([]string, len(bodies))
+	for index, body := range bodies {
+		quoted[index] = "'" + strings.ReplaceAll(body, "'", "''") + "'"
+	}
+	return `(
     EXISTS (
         SELECT 1 FROM pg_proc AS function_record
         WHERE function_record.oid = to_regprocedure('public.transfer_contract_usage_guard()')
           AND function_record.prorettype = 'trigger'::regtype
           AND function_record.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
-          AND function_record.prosrc = '` + strings.ReplaceAll(server.ContractUsageGuardFunctionBodySql, "'", "''") + `'
+          AND function_record.prosrc IN (` + strings.Join(quoted, ",") + `)
     )
     AND EXISTS (
         SELECT 1 FROM pg_trigger AS trigger_record
@@ -244,8 +249,17 @@ var contractUsageGuardArtifactQuery = `(
           AND NOT trigger_record.tgisinternal
     )
 )`
+}
 
-var migrationArtifacts = append(append([]migrationArtifact{
+// The original custody contract accepts its published successor too. The new
+// version separately requires that successor, so old heads remain coherent
+// while an old function installed at the new head is schema drift.
+var contractUsageGuardArtifactQuery = contractUsageGuardBodyArtifactQuery(
+	server.ContractUsageGuardOriginalFunctionBodySql, server.ContractUsageGuardFunctionBodySql)
+
+var contractDeadlineUsageGuardArtifactQuery = contractUsageGuardBodyArtifactQuery(server.ContractUsageGuardFunctionBodySql)
+
+var migrationArtifacts = append(append(append([]migrationArtifact{
 	{name: "competition_round", requiredVersion: 588, rowColumn: 1},
 	{name: "competition_job_immutable_guard", requiredVersion: 589, rowColumn: 2},
 	{name: "competition_round.providers_sha256", requiredVersion: 590, rowColumn: 3},
@@ -434,15 +448,7 @@ var migrationArtifacts = append(append([]migrationArtifact{
 	name: "legacy settlement assigned-payer due index", requiredVersion: 792, rowColumn: 203,
 }, migrationArtifact{
 	name: "legacy settlement missing-payer registration index", requiredVersion: 793, rowColumn: 204,
-}, migrationArtifact{
-	name: "task run-once wake and claim generations", requiredVersion: 796, rowColumn: 205,
-}, migrationArtifact{
-	name: "retained contract close source identity and exact owner assignment", requiredVersion: 803, rowColumn: 206,
-}, migrationArtifact{
-	name: "escrow-free source close due index", requiredVersion: 804, rowColumn: 207,
-}, migrationArtifact{
-	name: "unresolved contract close owner registration index", requiredVersion: 805, rowColumn: 208,
-})
+}), migrationCurrentSuffixArtifacts()...)
 
 func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, error) {
 	// Every artifact is queried before its version is checked. Nullable catalog
@@ -2202,8 +2208,7 @@ func (migrationsProbe) check(ctx context.Context, env *probeEnv) ([]finding, err
 		       `+contractCloseInventoryArtifactQuery+snMainnetMigrationArtifactQueries()+`,
 		       `+contractExpirationArtifactQuery+`,
 		       `+strings.Join(legacySettlementPayerArtifactQueries, ",\n")+`,
-		       `+taskRunOnceGenerationArtifactQuery+`,
-		       `+strings.Join(contractCloseOwnerArtifactQueries, ",\n")+`
+		       `+migrationCurrentSuffixArtifactQueries()+`
 		FROM version;
 	`)
 	if err != nil {

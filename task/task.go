@@ -36,10 +36,14 @@ import (
 // their full report; only typed cancellation is benign.
 func taskPanicError(r any) error {
 	if server.IsDoneError(r) {
+		message := fmt.Sprintf("Interrupted: %v", r)
 		if glog.V(1) {
-			return fmt.Errorf("Interrupted: %s", server.ErrorJson(r, debug.Stack()))
+			message = fmt.Sprintf("Interrupted: %s", server.ErrorJson(r, debug.Stack()))
 		}
-		return fmt.Errorf("Interrupted: %v", r)
+		if cause, ok := r.(error); ok {
+			return &taskInterruptedPanic{message: message, cause: cause}
+		}
+		return errors.New(message)
 	}
 	return fmt.Errorf("Unhandled: %s", server.ErrorJson(r, debug.Stack()))
 }
@@ -141,9 +145,10 @@ func taskAdvisoryLockKey(taskId server.Id) int64 {
 }
 
 type taskClaimGuard struct {
-	conn         server.PgConn
-	releaseOnce  sync.Once
-	admissionKVs map[server.Id]*taskClaimReservation
+	conn              server.PgConn
+	completionSession *server.PgOwnedSession
+	releaseOnce       sync.Once
+	admissionKVs      map[server.Id]*taskClaimReservation
 	// Collector-owned exact identities also prevent reentrant session claims.
 	taskIds        map[server.Id]bool
 	groupKeyStates map[taskClaimGroupKey]*taskClaimGroupState
@@ -153,6 +158,9 @@ type taskClaimGuard struct {
 func (self *taskClaimGuard) ping(ctx context.Context) error {
 	if self == nil || self.conn == nil {
 		return errors.New("task claim guard is not active")
+	}
+	if err := self.completionSessionError(); err != nil {
+		return err
 	}
 	return self.conn.Ping(ctx)
 }
@@ -590,6 +598,28 @@ func ScheduleTaskIfAbsent[T any, R any](
 	return
 }
 
+// Raises the maximum run time of the task pending under runOnce to at least
+// maxTime, the same merge a RunOnce reschedule applies. Schedules nothing when
+// no task is pending under the key, and never shortens a longer time. A claimed
+// attempt keeps the deadline it was claimed with; the next claim uses the
+// raised time. Reports whether a pending task was raised.
+func RaiseRunOnceMaxTimeInTx(ctx context.Context, tx server.PgTx, runOnce *RunOnceOption, maxTime time.Duration) bool {
+	if runOnce == nil {
+		panic("RaiseRunOnceMaxTimeInTx requires a non-nil runOnce key")
+	}
+	tag := server.RaisePgResult(tx.Exec(
+		ctx,
+		`
+			UPDATE pending_task
+			SET run_max_time_seconds = $2
+			WHERE run_once_key = $1 AND run_max_time_seconds < $2
+		`,
+		runOnce.String(),
+		int(maxTime/time.Second),
+	))
+	return 0 < tag.RowsAffected()
+}
+
 func GetTasks(ctx context.Context, taskIds ...server.Id) map[server.Id]*Task {
 	return getTasks(ctx, false, taskIds...)
 }
@@ -705,6 +735,7 @@ func getTasksInConn(ctx context.Context, query server.PgCanQuery, exactClaim boo
 				&rescheduleError,
 				&task.RescheduleErrorCount,
 			))
+			task.storedFunctionName = task.FunctionName
 			if byJwtJson != nil {
 				task.ClientByJwtJson = *byJwtJson
 			}
@@ -1087,6 +1118,7 @@ func RemoveFinishedTasks(ctx context.Context, minTime time.Time, postErrorMinTim
 type Task struct {
 	TaskId               server.Id
 	FunctionName         string
+	storedFunctionName   string
 	ArgsJson             string
 	ClientAddress        string
 	ClientAddressHash    []byte
@@ -1309,6 +1341,11 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 	timerDone := make(chan struct{})
 	after := self.runAfter
 	if after == nil {
+		if hook, ok := ctx.Value(taskRunTimerKey{}).(func(context.Context, time.Duration) <-chan time.Time); ok {
+			after = func(duration time.Duration) <-chan time.Time { return hook(clientSession.Ctx, duration) }
+		}
+	}
+	if after == nil {
 		after = time.After
 	}
 
@@ -1329,6 +1366,10 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 		if r := recover(); r != nil {
 			returnErr = taskPanicError(r)
 		}
+		// Capture the body's own cancellation authority before cleanup. A
+		// locally canceled child racing a collector stop is not interrupted
+		// by that collector, and max-time attribution takes precedence.
+		bodyCancelCause := context.Cause(clientSession.Ctx)
 		// Join before reading the timer's result, including recovered panics.
 		// A canceled max-time context must not lose its timeout attribution.
 		clientSession.Cancel()
@@ -1336,6 +1377,9 @@ func (self *TaskTarget[T, R]) RunSpecific(ctx context.Context, task *Task) (
 		if timeout {
 			returnErr = errors.Join(errors.New("Timeout"), returnErr)
 			runPost = nil
+		}
+		if bodyCancelCause == errTaskCollectorInterrupted && taskCancellationOnly(returnErr) {
+			returnErr = &taskCollectorInterruption{cause: returnErr}
 		}
 	}()
 
@@ -1472,7 +1516,7 @@ type TaskWorkerSettings struct {
 	// Filtering precedes the candidate limit, including the owner of a RunPost
 	// retry, so an unrelated backlog cannot starve registered work.
 	ClaimRegisteredTargetsOnly bool
-	// Run alternates bounded indexed function lanes with the ordinary queue.
+	// Run and EvalTasks alternate indexed function lanes with the ordinary queue.
 	// Owners enable this only after the matching migration is available.
 	FairClaimFunctions bool
 	// Opt-in per-instance limits, keyed by canonical target function name.
@@ -1530,11 +1574,12 @@ type TaskWorker struct {
 	// A fixture can lose the finalizer's reply after its real commit returned.
 	completionBatchCommitReturned func()
 
-	stateLock          sync.Mutex
-	draining           bool
-	claimTargetCounts  map[string]int
-	claimFunctionNames []string
-	claimFunctionTurn  uint64
+	stateLock            sync.Mutex
+	draining             bool
+	claimTargetCounts    map[string]int
+	claimFunctionNames   []string
+	claimCheckpointNames []string
+	claimFunctionTurn    uint64
 
 	inflightCount      atomic.Int64
 	drainCanceledCount atomic.Int64
@@ -1776,6 +1821,12 @@ func (self *TaskWorker) AddTargets(taskTargets ...Target) {
 		self.claimFunctionNames = append(self.claimFunctionNames, name)
 	}
 	slices.Sort(self.claimFunctionNames)
+	self.claimCheckpointNames = self.claimCheckpointNames[:0]
+	for name, target := range self.targets {
+		if _, ok := target.(TaskClaimCheckpointTarget); ok {
+			self.claimCheckpointNames = append(self.claimCheckpointNames, updateFunctionName(name))
+		}
+	}
 }
 
 // metricName resolves only registered targets and aliases; an arbitrary stale
@@ -1917,6 +1968,9 @@ func (self *TaskWorker) takeTasksWithGuard(ctx context.Context, n int, guard *ta
 	isolatedPending bool,
 	returnErr error,
 ) {
+	if err := guard.completionSessionError(); err != nil {
+		return nil, guard, false, err
+	}
 	if options.poll != nil {
 		options.poll.availableAt = time.Time{}
 	}
@@ -1947,15 +2001,16 @@ func (self *TaskWorker) takeTasksWithGuard(ctx context.Context, n int, guard *ta
 		}
 	}()
 
-	tx, err := guard.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: server.TxReadCommitted})
+	rawTx, err := guard.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: server.TxReadCommitted})
 	if err != nil {
 		return nil, guard, false, err
 	}
 	defer func() {
 		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), DefaultTaskFinalizeTimeout)
-		_ = tx.Rollback(rollbackCtx)
+		_ = rawTx.Rollback(rollbackCtx)
 		rollbackCancel()
 	}()
+	tx := newClaimBudgetTx(ctx, rawTx)
 	if err := server.ValidatePgTaskClaimTransaction(ctx, guard.conn, tx); err != nil {
 		return nil, guard, false, err
 	}
@@ -2266,6 +2321,7 @@ claimCandidates:
 	releaseTime := claimTime.Add(TaskLeaseTimeout)
 	claimedWakeGenerations := map[server.Id]int64{}
 	claimedGenerations := map[server.Id]int64{}
+	var checkpointClaims []taskClaimCheckpoint
 	if len(taskIds) != 0 {
 		// The short timestamp bounds crash recovery; the session advisory lock
 		// above is the durable duplicate-execution guard for a live owner. All
@@ -2274,18 +2330,23 @@ claimCandidates:
 		rows, err := tx.Query(
 			ctx,
 			`
-				UPDATE pending_task
+				WITH prior AS MATERIALIZED (
+					SELECT task_id,run_once_wake_at FROM pending_task WHERE task_id=ANY($1)
+				)
+				UPDATE pending_task AS pending
 				SET
 					claim_time = $2,
 					release_time = $3,
 					run_once_wake_at = NULL,
-					claim_generation = pending_task.claim_generation + 1
-				WHERE task_id = ANY($1)
-				RETURNING task_id, run_once_generation, claim_generation
+					claim_generation = pending.claim_generation + 1
+				FROM prior WHERE pending.task_id=prior.task_id
+				RETURNING pending.task_id,pending.run_once_generation,pending.claim_generation,
+					pending.function_name,CASE WHEN regexp_replace(pending.function_name, '/v[0-9]+', '', 'g')=ANY($4::text[]) THEN pending.args_json ELSE '' END,prior.run_once_wake_at
 			`,
 			taskIds,
 			claimTime,
 			releaseTime,
+			self.claimCheckpointNames,
 		)
 		if err != nil {
 			return nil, guard, false, err
@@ -2293,12 +2354,20 @@ claimCandidates:
 		for rows.Next() {
 			var taskId server.Id
 			var wakeGeneration, claimGeneration int64
-			if err := rows.Scan(&taskId, &wakeGeneration, &claimGeneration); err != nil {
+			var name, argsJson string
+			var wakeAt *time.Time
+			if err := rows.Scan(&taskId, &wakeGeneration, &claimGeneration, &name, &argsJson, &wakeAt); err != nil {
 				rows.Close()
 				return nil, guard, false, err
 			}
 			claimedWakeGenerations[taskId] = wakeGeneration
 			claimedGenerations[taskId] = claimGeneration
+			if target, ok := self.targets[updateFunctionName(name)].(TaskClaimCheckpointTarget); ok {
+				checkpointClaims = append(checkpointClaims, taskClaimCheckpoint{
+					target: target, taskId: taskId, argsJson: argsJson, generation: wakeGeneration,
+					claim: claimGeneration, wakeAt: wakeAt,
+				})
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -2306,6 +2375,27 @@ claimCandidates:
 		}
 		if len(claimedGenerations) != len(taskIds) {
 			return nil, guard, false, errors.New("task claim generation ownership missing")
+		}
+		// A resumed target must durably absorb the wake being cleared by this
+		// claim. Pure argument preparation and the exact fenced update share
+		// this transaction; a crash cannot lose the requested fresh pass.
+		for _, checkpoint := range checkpointClaims {
+			argsJson, err := checkpoint.target.TaskClaimCheckpointArgs(checkpoint.taskId, checkpoint.argsJson, checkpoint.generation, checkpoint.wakeAt)
+			if err != nil {
+				// Malformed progress remains this body's ordinary error; it
+				// cannot abort unrelated tasks selected in the same claim.
+				continue
+			}
+			if argsJson != checkpoint.argsJson {
+				tag, err := tx.Exec(ctx, `UPDATE pending_task SET args_json=$3 WHERE task_id=$1 AND claim_generation=$2`,
+					checkpoint.taskId, checkpoint.claim, argsJson)
+				if err != nil {
+					return nil, guard, false, err
+				}
+				if tag.RowsAffected() != 1 {
+					return nil, guard, false, errTaskClaimOwnership
+				}
+			}
 		}
 	}
 
@@ -2436,6 +2526,8 @@ type taskExecutionResult struct {
 	runEndTime   time.Time
 	resultJson   string
 	runPost      func(server.PgTx) ([]server.PostFunction, error)
+	// Only the collector's explicit cancellation cause grants a short retry.
+	collectorInterrupted bool
 }
 
 // return taskIds of the finished tasks, rescheduled tasks
@@ -2465,8 +2557,8 @@ func (self *TaskWorker) EvalTasks(n int) (
 	// survive cancellation of the process-serving context. Task functions
 	// still receive root/drain cancellation below; this detached orchestration
 	// context only keeps the collector alive long enough to finalize them.
-	evalCtx, evalCancel := context.WithCancel(context.WithoutCancel(self.ctx))
-	defer evalCancel()
+	evalCtx, evalCancel := context.WithCancelCause(context.WithoutCancel(self.ctx))
+	defer evalCancel(nil)
 
 	for _, task := range tasks {
 		// update legacy function names
@@ -2474,7 +2566,9 @@ func (self *TaskWorker) EvalTasks(n int) (
 	}
 	executionTargets := self.prepareTaskBatchTargets(tasks)
 
-	taskCtx, taskCancel := context.WithCancel(evalCtx)
+	// Execution cancellation must not drop the results that prove each claimed
+	// sibling joined. Only the collector closes the result-delivery context.
+	taskCtx, taskCancel := context.WithCancel(context.WithoutCancel(evalCtx))
 	results := make(chan *taskExecutionResult, len(tasks))
 	executionAdmissions := claimGuard.retainExecutionAdmissions(tasks)
 
@@ -2522,7 +2616,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 		// A later collector/ownership failure must not discard work from an
 		// already committed finish. Cancel live functions before external work,
 		// keeping that handback detached and the batch guard until it returns.
-		evalCancel()
+		evalCancel(errTaskCollectorInterrupted)
 		server.RunPosts(context.WithoutCancel(evalCtx), commitPosts...)
 	}()
 	var finalizePanic any
@@ -2537,7 +2631,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 				glog.Infof("[%s]task finalization failed: %v\n", r.task.TaskId, recovered)
 			}
 		}()
-		posts, postRescheduled := self.finalizeTask(r)
+		posts, postRescheduled := self.finalizeTaskWithGuard(r, claimGuard)
 		delete(heartbeatTasks, r.task.TaskId)
 		commitPosts = append(commitPosts, posts...)
 		switch {
@@ -2559,6 +2653,12 @@ func (self *TaskWorker) EvalTasks(n int) (
 		startTime := self.heartbeatNow()
 		nextHeartbeatTime := startTime.Add(ReleaseTimeout / 3)
 		heartbeat := func() {
+			if claimGuard.completionSessionError() != nil {
+				// A quarantined borrowed scope cannot perform more direct SQL.
+				// Keep its session until all sibling results and posts join.
+				nextHeartbeatTime = self.heartbeatNow().Add(ReleaseTimeout / 3)
+				return
+			}
 			elapsedSeconds := float32(self.heartbeatNow().Sub(startTime)/time.Millisecond) / 1000
 			if 10 <= elapsedSeconds {
 				for _, task := range heartbeatTasks {
@@ -2612,7 +2712,7 @@ func (self *TaskWorker) EvalTasks(n int) (
 				finalize(ready[0])
 				return
 			}
-			retrySingles, err := self.finalizeTaskBatch(ready)
+			retrySingles, err := self.finalizeTaskBatchWithGuard(ready, claimGuard)
 			switch {
 			case err == nil:
 				for _, r := range ready {
@@ -2661,6 +2761,12 @@ func (self *TaskWorker) EvalTasks(n int) (
 			finalizeReady(ready)
 		}
 		for {
+			if err := claimGuard.completionSessionError(); err != nil {
+				if finalizePanic == nil {
+					finalizePanic = err
+				}
+				evalCancel(errTaskCollectorInterrupted)
+			}
 			// Finalizing ready results must not reset the lease clock. Check
 			// an overdue heartbeat between bounded handbacks even when result
 			// delivery is continuously ready; the guard connection stays serial.

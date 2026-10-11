@@ -15,6 +15,9 @@ type retryDelayError struct {
 	cause         error
 	delay         time.Duration
 	retryArgsJson *string
+	// The target attests committed progress despite cancellation causes. Only
+	// a live task context may keep this; otherwise both hints are withdrawn.
+	committedProgress bool
 }
 
 // Preserve the original durable error text.
@@ -33,6 +36,20 @@ func WithRetryDelay(err error, delay time.Duration) error {
 	return &retryDelayError{cause: err, delay: delay}
 }
 
+// A target may attest a committed progress checkpoint after its ordinary
+// adapter returns, including a budget interruption. Only that exact root hint
+// shortens continuation delay; failure text/count and normal handback remain.
+// Collector interruption already has its own nonfailure retry policy.
+func WithCommittedProgressRetry(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, interrupted := err.(*taskCollectorInterruption); interrupted {
+		return err
+	}
+	return &retryDelayError{cause: err, delay: RescheduleTimeout, committedProgress: true}
+}
+
 // WithRetryDelayAndArgs checkpoints only target-attested completed work on a
 // failing task. It snapshots a small object of next arguments; error text,
 // error count, task identity and retry delay remain owned by the normal retry.
@@ -44,6 +61,26 @@ func WithRetryDelayAndArgs(err error, delay time.Duration, args any) error {
 		return hinted
 	}
 	return withTaskRetryArgs(hint, args)
+}
+
+// A target attests that it finished every item it selected, and that each
+// cancellation or deadline in this failure ended one item's own bounded
+// operation while the task context stayed live. The checkpoint and bounded
+// delay then survive those causes. Task-context cancellation still withdraws
+// both, and an unencodable checkpoint keeps ordinary backoff, not a hot retry.
+func WithCompletedItemsRetryDelayAndArgs(err error, delay time.Duration, args any) error {
+	if err == nil || !validTaskRetryDelay(delay) {
+		return err
+	}
+	hint := &retryDelayError{cause: err, delay: delay, committedProgress: true}
+	if !taskRetryCheckpointAllowed(hint) {
+		return err
+	}
+	checkpointed, ok := withTaskRetryArgs(hint, args).(*retryDelayError)
+	if !ok || checkpointed.retryArgsJson == nil {
+		return err
+	}
+	return checkpointed
 }
 
 // Checkpoints target-attested completed work while preserving ordinary error
@@ -66,11 +103,12 @@ func withTaskRetryArgs(hint *retryDelayError, args any) error {
 		return hint
 	}
 	argsJson := string(data)
-	return &retryDelayError{cause: hint.cause, delay: hint.delay, retryArgsJson: &argsJson}
+	return &retryDelayError{cause: hint.cause, delay: hint.delay, retryArgsJson: &argsJson, committedProgress: hint.committedProgress}
 }
 
 // A root hint owns its complete failure; joins/wrappers never grant checkpoint
-// authority to another error. Cancellation and ownership loss remain retriable.
+// authority to another error. Cancellation and ownership loss remain retriable
+// unless the target attested item-local stops under its live task context.
 func taskRetryCheckpointAllowed(hint *retryDelayError) bool {
 	if hint == nil {
 		return false
@@ -80,7 +118,7 @@ func taskRetryCheckpointAllowed(hint *retryDelayError) bool {
 	}
 	causes := inspectTaskRetryCauses(hint)
 	return (hint.delay == 0 || validTaskRetryDelay(hint.delay)) && causes.complete &&
-		!causes.canceled && !causes.drained && !causes.targetMissing
+		(!causes.canceled || hint.committedProgress) && !causes.drained && !causes.targetMissing
 }
 
 // Reads an immutable checkpoint only from the exact completed target failure.
@@ -147,7 +185,7 @@ func taskErrorRetryDelayWithCauses(err error, errorCount int, randomUnit float64
 		backoffMaxExponent = 0
 	} else if causes.complete && causes.targetMissing {
 		backoffMaxExponent = targetNotFoundBackoffMaxExponent
-	} else if hint, ok := err.(*retryDelayError); ok && causes.complete && validTaskRetryDelay(hint.delay) && !causes.canceled {
+	} else if hint, ok := err.(*retryDelayError); ok && causes.complete && validTaskRetryDelay(hint.delay) && (!causes.canceled || hint.committedProgress) {
 		return hint.delay, errorCountDelta
 	}
 	return errorRescheduleDelay(

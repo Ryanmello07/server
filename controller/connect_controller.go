@@ -805,6 +805,10 @@ func CreateContract(
 		}
 		if companion {
 			resolution.path = contractResolutionStreamFallback
+			// The fallback settles return traffic on the origin that already
+			// carries the forward direction. It is not a session-setup race,
+			// so one lookup decides it instead of the companion origin wait.
+			ctx = withCompanionOriginSingleLookup(ctx)
 			glog.V(2).Infof("[contract][companion-fallback]%s->%s relationship=%d not provided; using companion Stream\n", clientId, destinationId, provideRelationship)
 		}
 	}
@@ -1024,11 +1028,16 @@ func nextContract(
 	)
 }
 
-// The lifecycle lookup, origin escrow creation and payer plan lookup
-// newContract performs. Tests replace them to check, without a database, which
-// byte count the controller requests and signs for a given escrow.
+// The lifecycle lookup, degradation valve, escrow and zero escrow creation and
+// payer plan lookup newContract performs. Tests replace them to check, without
+// a database, which byte count the controller requests and signs for a given
+// escrow, and which creation path it takes.
 var findActiveClientPairNetworks = model.FindActiveClientPairNetworks
+var zeroContractCost = model.ZeroContractCost
 var createTransferEscrow = model.CreateTransferEscrow
+var createCompanionTransferEscrow = model.CreateCompanionTransferEscrow
+var createZeroEscrowContract = model.CreateZeroEscrowContract
+var createZeroEscrowCompanionContract = model.CreateZeroEscrowCompanionContract
 var isProNetwork = model.IsProNetwork
 
 // Returns the network whose balance escrows a contract, following the order in
@@ -1076,6 +1085,14 @@ func payerMaxContractTransferByteCount(ctx context.Context, payerNetworkId serve
 
 // Model creation owns commit and returns its immutable database deadline.
 // Later stream work may reject the response but never changes that deadline.
+// Public and companion contracts always try escrow first, so a payer is
+// charged, shrink-to-fit included, while anything is left. Only when escrow
+// admission finds the balance exhausted (model.ErrContractBalanceExhausted)
+// and the contract degradation valve is open (model/network_degradation_model.go)
+// is the contract created without escrow instead (model/subscription_zero_escrow.go),
+// at the request size and the payer's escrow priority. Every other refusal,
+// including a data cap or test drain, stands. Network and friends-and-family
+// contracts are unchanged.
 func newContract(
 	ctx context.Context,
 	sourceId server.Id,
@@ -1202,7 +1219,7 @@ func newContract(
 		defer originWatch.Close()
 		leaveOrigin := server.EnterContractCreationStage(ctx, server.ContractStageCompanionOrigin)
 		escrow, err := waitForCompanionOrigin(ctx, originWatch, func() (*model.TransferEscrow, error) {
-			return model.CreateCompanionTransferEscrow(
+			escrow, err := createCompanionTransferEscrow(
 				ctx,
 				sourceNetworkId,
 				sourceId,
@@ -1211,6 +1228,20 @@ func newContract(
 				contractTransferByteCount,
 				contractManagerSettings.OriginContractLinger,
 			)
+			// deduct first: free data only once the payer has nothing left and
+			// the valve is open; the companion keeps its origin link
+			if errors.Is(err, model.ErrContractBalanceExhausted) && zeroContractCost(ctx) {
+				return createZeroEscrowCompanionContract(
+					ctx,
+					sourceNetworkId,
+					sourceId,
+					destinationNetworkId,
+					destinationId,
+					contractTransferByteCount,
+					contractManagerSettings.OriginContractLinger,
+				)
+			}
+			return escrow, err
 		}, originWatch.Update)
 		leaveOrigin()
 		if err != nil {
@@ -1221,6 +1252,7 @@ func newContract(
 		expirationTime = escrow.ExpirationTime
 		// The prober's companion reservation may be smaller than the remote
 		// provider requested. Sign only the capacity actually held in escrow.
+		// A zero escrow companion holds none and returns the request.
 		contractTransferByteCount = escrow.TransferByteCount
 		priority = escrow.Priority
 
@@ -1258,6 +1290,18 @@ func newContract(
 			destinationId,
 			contractTransferByteCount,
 		)
+		// deduct first: free data only once the payer has nothing left and
+		// the valve is open
+		if errors.Is(err, model.ErrContractBalanceExhausted) && zeroContractCost(ctx) {
+			escrow, err = createZeroEscrowContract(
+				ctx,
+				sourceNetworkId,
+				sourceId,
+				destinationNetworkId,
+				destinationId,
+				contractTransferByteCount,
+			)
+		}
 		if err != nil {
 			returnErr = err
 			return
@@ -1265,7 +1309,8 @@ func newContract(
 		contractId = escrow.ContractId
 		expirationTime = escrow.ExpirationTime
 		// The escrow shrinks to fit when the payer's balance is below the
-		// request. Sign only the capacity actually held in escrow.
+		// request. Sign only the capacity actually held in escrow. A zero
+		// escrow contract holds none and returns the request.
 		contractTransferByteCount = escrow.TransferByteCount
 		priority = escrow.Priority
 
@@ -1440,23 +1485,18 @@ func CloseContract(
 		if err != nil || reportId == (server.Id{}) {
 			return model.ErrContractCloseReportInvalid
 		}
-		applied, err := model.CloseContractWithReport(ctx, model.ContractCloseReport{
+		added, err := model.CloseContractWithReportUsage(ctx, model.ContractCloseReport{
 			ReportId: reportId, ContractId: contractId, ClientId: clientId,
 			AckedByteCount: usedTransferByteCount, UnackedByteCount: closeContract.UnackedByteCount,
 			Checkpoint: checkpoint, OriginalReport: closeContract.OriginalReport, OriginalInventory: closeContract.OriginalInventory,
 		})
-		if applied {
-			// Count the committed original once, even if later settlement needs retry.
-			transferByteCounter.Add(float64(usedTransferByteCount))
-		}
+		// Count the committed increment even if later settlement needs retry.
+		transferByteCounter.Add(float64(added))
 		return err
 	}
-	// Empty-id peers retain the original cumulative checkpoint contract.
-	err := model.CloseContract(ctx, contractId, clientId, usedTransferByteCount, checkpoint)
-	if err == nil {
-		// the acked byte count is incremental per checkpoint, so this sums to
-		// the total transferred bytes (matching the contract_close accumulation)
-		transferByteCounter.Add(float64(usedTransferByteCount))
-	}
+	// Legacy checkpoints conservatively retain a lower bound. A successful
+	// duplicate (including a final replay) contributes no additional bytes.
+	added, err := model.CloseContractUsage(ctx, contractId, clientId, usedTransferByteCount, checkpoint)
+	transferByteCounter.Add(float64(added))
 	return err
 }

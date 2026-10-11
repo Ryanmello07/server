@@ -128,16 +128,21 @@ func (self *TaskWorker) executeTaskRunCohort(ctx context.Context, slot *taskRunS
 // owner and one finalization deadline. No known or ambiguous failure replays the
 // cohort as independent finalizations with fresh per-member budgets.
 func (self *TaskWorker) finalizeTaskRunCohort(results []*taskExecutionResult) (returnErr error) {
+	return self.finalizeTaskRunCohortWithGuard(results, nil)
+}
+
+func (self *TaskWorker) finalizeTaskRunCohortWithGuard(results []*taskExecutionResult, guard *taskClaimGuard) (returnErr error) {
+	observation := newTaskFinalizationObservation()
 	delegated := false
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if !delegated {
-				self.observeTaskFinalizationFailure(results, recovered)
+				self.observeTaskFinalizationFailure(results, recovered, observation)
 			}
 			panic(recovered)
 		}
 		if !delegated {
-			self.observeTaskFinalizationFailure(results, returnErr)
+			self.observeTaskFinalizationFailure(results, returnErr, observation)
 		}
 	}()
 	if len(results) < 2 || len(results) > taskCompletionBatchLimit {
@@ -167,7 +172,7 @@ func (self *TaskWorker) finalizeTaskRunCohort(results []*taskExecutionResult) (r
 	}
 	if allSucceeded {
 		delegated = true
-		_, err := self.finalizeTaskBatch(results)
+		_, err := self.finalizeTaskBatchWithGuard(results, guard)
 		return err
 	}
 	timeout := self.settings.FinalizeTimeout
@@ -177,14 +182,15 @@ func (self *TaskWorker) finalizeTaskRunCohort(results []*taskExecutionResult) (r
 	bounded, cancel := context.WithTimeout(context.WithoutCancel(self.ctx), timeout)
 	defer cancel()
 	server.HandleError(func() {
-		server.OwnedTx(bounded, keys, func(tx server.PgTx) {
+		guard.finalizeOwnedTx(bounded, keys, func(tx server.PgTx) {
 			for _, result := range results {
-				posts, postRescheduled := self.finalizeTaskInTx(bounded, tx, result)
+				posts, postRescheduled := self.finalizeTaskInTx(bounded, tx, result, observation)
 				if len(posts) != 0 || postRescheduled {
 					panic(errors.New("Run cohort produced an uncertified post"))
 				}
 			}
-		}, server.TxReadCommitted, server.OptNoRetry())
+		}, &observation.db)
+		observation.acknowledged = true
 		if self.completionBatchCommitReturned != nil {
 			self.completionBatchCommitReturned()
 		}

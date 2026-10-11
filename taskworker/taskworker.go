@@ -108,6 +108,8 @@ func initTaskSchedule(ctx context.Context) {
 		work.ScheduleRemoveOldClientReliabilityStats(clientSession, tx)
 		work.ScheduleRollupClientReliabilityStats(clientSession, tx)
 		work.ScheduleRollupClientDataUsage(clientSession, tx)
+		// seeded only while degraded.yml enables the contract degradation valve
+		work.ScheduleCheckContractDegradation(clientSession, tx)
 		work.ScheduleUpdateClientReliabilityScores(clientSession, tx)
 		work.ScheduleRemoveOldProvideKeyChanges(clientSession, tx)
 		work.ScheduleUpdateNetworkReliabilityWindow(clientSession, tx)
@@ -140,6 +142,9 @@ func initTaskSchedule(ctx context.Context) {
 		}
 		if removedCount := work.RemoveDisabledProviderEgressProbeTasks(ctx, tx); 0 < removedCount {
 			glog.Infof("[taskworker]reaped %d pending provider egress probe tasks while probing is disabled\n", removedCount)
+		}
+		if removedCount := work.RemoveDisabledContractDegradationTasks(ctx, tx); 0 < removedCount {
+			glog.Infof("[taskworker]reaped %d pending contract degradation checks while degraded.yml disables them\n", removedCount)
 		}
 	}, server.TxReadCommitted)
 	work.ScheduleSettlementAccountingTasks(ctx)
@@ -182,7 +187,7 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 			work.ExportProvidersMapPost,
 		),
 		task.NewTaskTarget(work.BackfillClock),
-		task.NewTaskTargetWithPost(work.MaintainNetworkSessions, work.MaintainNetworkSessionsPost),
+		work.NewMaintainNetworkSessionsTaskTarget(),
 		task.NewTaskTargetWithPost(
 			work.WebSearchAnalytics,
 			work.WebSearchAnalyticsPost,
@@ -228,11 +233,7 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 		),
 		work.NewStartupContractClosureTaskTarget(),
 		work.NewScheduledContractClosureTaskTarget(),
-		task.NewTaskTargetWithPost(
-			work.CloseExpiredContracts,
-			work.CloseExpiredContractsPost,
-			"bringyour.com/service/taskworker/work.CloseExpiredContracts",
-		),
+		work.NewCloseExpiredContractsTaskTarget(),
 		task.NewTaskTargetWithPost(
 			work.CloseExpiredNetworkClientHandlers,
 			work.CloseExpiredNetworkClientHandlersPost,
@@ -411,6 +412,10 @@ func initTaskWorkerWithSettings(ctx context.Context, settings *task.TaskWorkerSe
 		task.NewTaskTargetWithPost(
 			work.RollupClientDataUsage,
 			work.RollupClientDataUsagePost,
+		),
+		task.NewTaskTargetWithPost(
+			work.CheckContractDegradation,
+			work.CheckContractDegradationPost,
 		),
 		task.NewTaskTargetWithPost(
 			work.UpdateClientReliabilityScores,

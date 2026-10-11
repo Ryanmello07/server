@@ -16,9 +16,17 @@ func (self *TaskWorker) finalizeTask(r *taskExecutionResult) (
 	commitPosts []server.PostFunction,
 	postRescheduled bool,
 ) {
+	return self.finalizeTaskWithGuard(r, nil)
+}
+
+func (self *TaskWorker) finalizeTaskWithGuard(r *taskExecutionResult, guard *taskClaimGuard) (
+	commitPosts []server.PostFunction,
+	postRescheduled bool,
+) {
+	observation := newTaskFinalizationObservation()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			self.observeTaskFinalizationFailure([]*taskExecutionResult{r}, recovered)
+			self.observeTaskFinalizationFailure([]*taskExecutionResult{r}, recovered, observation)
 			panic(recovered)
 		}
 	}()
@@ -36,12 +44,12 @@ func (self *TaskWorker) finalizeTask(r *taskExecutionResult) (
 	keys, owned, err := taskCompletionOwnershipKeys(self.targets[task.FunctionName], task, r.resultJson, r.err == nil)
 	server.Raise(err)
 	finish := func(tx server.PgTx) {
-		commitPosts, postRescheduled = self.finalizeTaskInTx(finalizeCtx, tx, r)
+		commitPosts, postRescheduled = self.finalizeTaskInTx(finalizeCtx, tx, r, observation)
 	}
 	if owned {
-		server.OwnedTx(finalizeCtx, keys, finish, server.TxReadCommitted, server.OptNoRetry())
+		guard.finalizeOwnedTx(finalizeCtx, keys, finish, &observation.db)
 	} else {
-		server.Tx(finalizeCtx, finish)
+		server.Tx(finalizeCtx, finish, &observation.db)
 	}
 	return
 }
@@ -49,10 +57,11 @@ func (self *TaskWorker) finalizeTask(r *taskExecutionResult) (
 // The caller owns one finite handback deadline and transaction. A certified
 // cohort can share those owners across member errors without extending either
 // budget, replaying a transaction, or borrowing another member's queue key.
-func (self *TaskWorker) finalizeTaskInTx(finalizeCtx context.Context, tx server.PgTx, r *taskExecutionResult) (
+func (self *TaskWorker) finalizeTaskInTx(finalizeCtx context.Context, tx server.PgTx, r *taskExecutionResult, observation *taskFinalizationObservation) (
 	commitPosts []server.PostFunction,
 	postRescheduled bool,
 ) {
+	observation.body = taskFinalizationQueueUpdate
 	task := r.task
 	commitPosts = nil
 	postRescheduled = false
@@ -67,6 +76,12 @@ func (self *TaskWorker) finalizeTaskInTx(finalizeCtx context.Context, tx server.
 			task.RescheduleErrorCount,
 			mathrand.Float64(),
 		)
+		if r.collectorInterrupted {
+			// The body was stopped to release a failed collector's custody.
+			// Preserve its error and pending owner without growing task backoff.
+			delay = errorRescheduleDelay(RescheduleTimeout, RescheduleBackoffMaxTimeout, 0, 0, mathrand.Float64())
+			errorCountDelta = 0
+		}
 		var retryArgsJson *string
 		if self.ctx.Err() == nil && self.drainCtx.Err() == nil {
 			retryArgsJson = taskRetryArgsJson(r.err)
@@ -79,7 +94,8 @@ func (self *TaskWorker) finalizeTaskInTx(finalizeCtx context.Context, tx server.
 						reschedule_error = $2,
 						reschedule_error_count = pending_task.reschedule_error_count + $5,
 						args_json = COALESCE($6, pending_task.args_json),
-						run_at = $3,
+						run_at = CASE WHEN run_once_generation > $8 AND run_once_wake_at IS NOT NULL
+							THEN LEAST($3, run_once_wake_at) ELSE $3 END,
 						release_time = $4
 					WHERE task_id = $1 AND claim_generation = $7
 				`,
@@ -90,6 +106,7 @@ func (self *TaskWorker) finalizeTaskInTx(finalizeCtx context.Context, tx server.
 			errorCountDelta,
 			retryArgsJson,
 			task.ClaimGeneration,
+			task.RunOnceGeneration,
 		))
 		if tag.RowsAffected() != 1 {
 			server.Raise(errTaskClaimOwnership)
@@ -99,7 +116,9 @@ func (self *TaskWorker) finalizeTaskInTx(finalizeCtx context.Context, tx server.
 
 	wakeAt := finishTaskOwnerInTx(finalizeCtx, tx, r)
 
+	observation.body = taskFinalizationTransactionalPost
 	posts, err := r.runPost(tx)
+	observation.body = taskFinalizationQueueUpdate
 	if err == nil {
 		commitPosts = posts
 		taskRunOnceWakeAfterPost(finalizeCtx, tx, task.TaskId, wakeAt)

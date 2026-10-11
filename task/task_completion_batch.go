@@ -91,14 +91,19 @@ SELECT (SELECT count(*) FROM copied),(SELECT count(*) FROM removed),
 // row cannot poison its neighbors. Once the body succeeds, any commit error is
 // left unresolved: no replay or completion count may assume acknowledgement.
 func (self *TaskWorker) finalizeTaskBatch(results []*taskExecutionResult) (retrySingles bool, returnErr error) {
+	return self.finalizeTaskBatchWithGuard(results, nil)
+}
+
+func (self *TaskWorker) finalizeTaskBatchWithGuard(results []*taskExecutionResult, guard *taskClaimGuard) (retrySingles bool, returnErr error) {
+	observation := newTaskFinalizationObservation()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			self.observeTaskFinalizationFailure(results, recovered)
+			self.observeTaskFinalizationFailure(results, recovered, observation)
 			panic(recovered)
 		}
 		// Mixed backend policies are an expected pre-transaction fallback.
 		if returnErr != errTaskCompletionBatchMode {
-			self.observeTaskFinalizationFailure(results, returnErr)
+			self.observeTaskFinalizationFailure(results, returnErr, observation)
 		}
 	}()
 	if len(results) < 2 || len(results) > taskCompletionBatchLimit {
@@ -149,6 +154,7 @@ func (self *TaskWorker) finalizeTaskBatch(results []*taskExecutionResult) (retry
 	bodyComplete := false
 	server.HandleError(func() {
 		finish := func(tx server.PgTx) {
+			observation.body = taskFinalizationQueueUpdate
 			var copied, removed, successors, expectedSuccessors, invalidGenerations, insertedSuccessors int
 			server.Raise(tx.QueryRow(ctx, taskCompletionBatchSql, ids, starts, ends, values,
 				generations, successorIds, time.Time{}, claims).Scan(&copied, &removed, &successors, &expectedSuccessors, &invalidGenerations, &insertedSuccessors))
@@ -161,13 +167,14 @@ func (self *TaskWorker) finalizeTaskBatch(results []*taskExecutionResult) (retry
 			bodyComplete = true
 		}
 		if owned {
-			server.OwnedTx(ctx, keys, finish, server.TxReadCommitted, server.OptNoRetry())
+			guard.finalizeOwnedTx(ctx, keys, finish, &observation.db)
 		} else {
-			server.Tx(ctx, finish, server.OptNoRetry())
+			server.Tx(ctx, finish, server.OptNoRetry(), &observation.db)
 		}
+		observation.acknowledged = true
 		if self.completionBatchCommitReturned != nil {
 			self.completionBatchCommitReturned()
 		}
 	}, func(err error) { returnErr = err })
-	return returnErr != nil && !bodyComplete && !errors.Is(returnErr, errTaskCompletionBatchOwnership), returnErr
+	return returnErr != nil && !bodyComplete && guard.completionSessionError() == nil && !errors.Is(returnErr, errTaskCompletionBatchOwnership), returnErr
 }

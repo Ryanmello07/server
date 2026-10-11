@@ -80,7 +80,7 @@ func Testing_WithPgOwnershipObservation(ctx context.Context, observe func(PgOwne
 	return context.WithValue(ctx, pgOwnershipObservationKey{}, &PgOwnershipObservation{Observe: observe})
 }
 
-// This option is private: only OwnedTx can donate an admitted connection to
+// This option is private: only ownership admission can donate a connection to
 // the ordinary transaction engine. Its sole caller owns all lifecycle fields.
 type pgOwnedConnection struct {
 	conn        PgConn
@@ -91,6 +91,9 @@ type pgOwnedConnection struct {
 	entered     bool
 	released    bool
 	discard     bool
+	// A retained caller owns the connection and supplies exact-scope cleanup.
+	// Ordinary OwnedTx leaves this nil and retains its existing pool lifecycle.
+	releaseScope func(context.Context) error
 }
 
 // Admit the complete key set before BEGIN, then reuse the normal transaction
@@ -100,14 +103,32 @@ type pgOwnedConnection struct {
 // business transaction. Key-count work is proportional to the complete set,
 // with bounded SQL chunks and a finite admission context, never a fallback.
 func OwnedTx(ctx context.Context, keys []PgOwnershipKey, callback func(PgTx), options ...any) {
+	dbPhaseObservation(options).enter(DbOperationOwnershipConfiguration)
 	checkPostgresAllowed(ctx)
 	ownedTxWithResource(ctx, keys, requirePgOwnershipResource(), AcquireMaintenanceDbConn, callback, options...)
+}
+
+// Probe once on the same direct maintenance route. False means a known busy
+// key set whose partial locks and checkout have already been released. Every
+// route, acquisition, protocol, callback or commit failure still propagates.
+func TryOwnedTx(ctx context.Context, keys []PgOwnershipKey, callback func(PgTx), options ...any) bool {
+	dbPhaseObservation(options).enter(DbOperationOwnershipConfiguration)
+	checkPostgresAllowed(ctx)
+	return ownedTxWithResourcePolicy(ctx, keys, requirePgOwnershipResource(), AcquireMaintenanceDbConn, false, callback, options...)
 }
 
 // The production caller supplies only the explicit direct resource/acquirer.
 // A private transport seam exercises actual pgx replies without global pools.
 func ownedTxWithResource(ctx context.Context, keys []PgOwnershipKey, resource pgOwnershipResource,
 	acquire func(context.Context) (PgConn, error), callback func(PgTx), options ...any) {
+	ownedTxWithResourcePolicy(ctx, keys, resource, acquire, true, callback, options...)
+}
+
+// Both policies share authority checks, transaction custody and acknowledged
+// cleanup. Only a known pre-BEGIN refusal can return without business work.
+func ownedTxWithResourcePolicy(ctx context.Context, keys []PgOwnershipKey, resource pgOwnershipResource,
+	acquire func(context.Context) (PgConn, error), wait bool, callback func(PgTx), options ...any) bool {
+	phase := dbPhaseObservation(options)
 	keys = normalizePgOwnershipKeys(keys)
 	if len(keys) == 0 {
 		panic(errors.New("database ownership requires at least one key"))
@@ -125,6 +146,7 @@ func ownedTxWithResource(ctx context.Context, keys []PgOwnershipKey, resource pg
 	admissionCtx, cancel := context.WithTimeout(ctx, PgOwnershipAdmissionTimeout)
 	defer cancel()
 	for {
+		phase.enter(DbOperationOwnershipAcquire)
 		started := timing.start()
 		conn, err := acquire(admissionCtx)
 		timing.finish(DbTimingAcquire, started)
@@ -138,9 +160,11 @@ func ownedTxWithResource(ctx context.Context, keys []PgOwnershipKey, resource pg
 		admitted := false
 		func() {
 			defer owner.release(ctx)
+			phase.enter(DbOperationAdmission)
+			phase.enterAdmission(DbAdmissionPrecheck)
 			Raise(resource.validate(conn))
 			var err error
-			admitted, err = tryPgOwnershipKeys(admissionCtx, conn, keys, false, owner.backendPid)
+			admitted, err = tryPgOwnershipKeys(admissionCtx, conn, keys, false, owner.backendPid, phase)
 			if err != nil {
 				if admissionCtx.Err() != nil {
 					err = dbContextDoneCause(admissionCtx, err)
@@ -151,14 +175,22 @@ func ownedTxWithResource(ctx context.Context, keys []PgOwnershipKey, resource pg
 			if !admitted {
 				// Return pool capacity before observing or waiting. A crowded
 				// resource cannot retain every slot needed by unrelated work.
+				phase.enterAdmission(DbAdmissionCleanup)
 				Raise(owner.release(ctx))
-				owner.observe(PgOwnershipWaiting)
+				if wait {
+					phase.enterAdmission(DbAdmissionAcknowledgedBusyWait)
+					owner.observe(PgOwnershipWaiting)
+				} else {
+					owner.observe(PgOwnershipRefused)
+				}
 				return
 			}
 			owner.admitted = true
 			owner.observe(PgOwnershipAdmitted)
 			ownedOptions := append(append([]any{}, options...), owner, OptNoRetry())
 			Tx(ctx, func(tx PgTx) {
+				// Session validation precedes the admitted business callback.
+				phase.enter(DbOperationBegin)
 				var backendPid uint32
 				Raise(tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&backendPid))
 				if backendPid != owner.backendPid {
@@ -168,11 +200,12 @@ func ownedTxWithResource(ctx context.Context, keys []PgOwnershipKey, resource pg
 				transaction := tx.(*postCommitPgTx)
 				transaction.ownershipAllowed = false
 				transaction.ownershipKeys = keys
+				phase.enter(DbOperationCallback)
 				callback(tx)
 			}, ownedOptions...)
 		}()
-		if admitted {
-			return
+		if admitted || !wait {
+			return admitted
 		}
 		select {
 		case <-admissionCtx.Done():
@@ -386,14 +419,18 @@ func (self *pgTransactionOwnership) observe(kind PgOwnershipEventKind) {
 // Nonblocking probes are explicitly bounded per statement. Every returned key
 // comes from a supplied array; no advisory function runs on a queue scan or an
 // expression whose LIMIT could be evaluated after acquiring additional locks.
-func tryPgOwnershipKeys(ctx context.Context, query PgCanQuery, keys []PgOwnershipKey, transactional bool, backendPid uint32) (bool, error) {
-	admitted, _, err := tryPgOwnershipKeyReplies(ctx, query, keys, transactional, backendPid, false)
+func tryPgOwnershipKeys(ctx context.Context, query PgCanQuery, keys []PgOwnershipKey, transactional bool, backendPid uint32, phases ...*DbPhaseObservation) (bool, error) {
+	admitted, _, err := tryPgOwnershipKeyReplies(ctx, query, keys, transactional, backendPid, false, phases...)
 	return admitted, err
 }
 
 // The direct execution variant retains a nonzero backend identity from every
 // row and chunk. No startup PID or earlier pooled connection supplies proof.
-func tryPgOwnershipKeyReplies(ctx context.Context, query PgCanQuery, keys []PgOwnershipKey, transactional bool, backendPid uint32, exec bool) (bool, uint32, error) {
+func tryPgOwnershipKeyReplies(ctx context.Context, query PgCanQuery, keys []PgOwnershipKey, transactional bool, backendPid uint32, exec bool, phases ...*DbPhaseObservation) (bool, uint32, error) {
+	var phase *DbPhaseObservation
+	if len(phases) != 0 {
+		phase = phases[0]
+	}
 	function := "pg_try_advisory_lock"
 	if transactional {
 		function = "pg_try_advisory_xact_lock"
@@ -411,6 +448,7 @@ func tryPgOwnershipKeyReplies(ctx context.Context, query PgCanQuery, keys []PgOw
 		if exec {
 			args = append([]any{pgx.QueryExecModeExec}, args...)
 		}
+		phase.enterAdmission(DbAdmissionProbe)
 		rows, err := query.Query(ctx, `SELECT pg_backend_pid(),`+function+`(owner.first,owner.second)
 			FROM unnest($1::integer[],$2::integer[]) AS owner(first,second)`, args...)
 		if err != nil {
@@ -485,6 +523,9 @@ func (self *pgOwnedConnection) release(ctx context.Context) (returnErr error) {
 		return nil
 	}
 	self.released = true
+	if self.releaseScope != nil {
+		return self.releaseScope(ctx)
+	}
 	if !self.discard && !self.conn.Conn().IsClosed() && self.conn.Conn().PgConn().TxStatus() == 'I' {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), PgCloseTimeout)
 		_, err := self.conn.Exec(cleanupCtx, `SELECT pg_advisory_unlock_all()`)

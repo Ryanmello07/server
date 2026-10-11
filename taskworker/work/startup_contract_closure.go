@@ -19,8 +19,10 @@ const startupContractClosurePublicationSize = 256
 
 // One timestamp supplies the default lifetime for this complete startup pass.
 type ScheduleOpenContractClosuresArgs struct {
-	PageSize  int       `json:"page_size"`
-	StartedAt time.Time `json:"started_at"`
+	Private   bool                            `json:"_private_task_arguments,omitempty"`
+	PageSize  int                             `json:"page_size"`
+	StartedAt time.Time                       `json:"started_at"`
+	Progress  *startupContractClosureProgress `json:"_startup_scan_progress,omitempty"`
 }
 
 type ScheduledContractClose struct {
@@ -30,14 +32,23 @@ type ScheduledContractClose struct {
 
 type ScheduleOpenContractClosuresResult struct{}
 
+// A pass enumerates every nonterminal contract and resumes from committed
+// checkpoints, so one attempt can run for hours. The default task deadline cut
+// every attempt short and the pass never finished.
+const startupContractClosureMaxTime = 24 * time.Hour
+
 func ScheduleOpenContractClosuresOnStartup(clientSession *session.ClientSession, tx server.PgTx) {
 	task.ScheduleTaskInTx(tx, ScheduleOpenContractClosures,
 		&ScheduleOpenContractClosuresArgs{PageSize: startupContractClosurePageSize, StartedAt: server.NowUtc().Truncate(time.Microsecond)},
-		clientSession, task.RunOnce("schedule_open_contract_closures_on_startup"), task.RunAt(server.NowUtc()))
+		clientSession, task.RunOnce("schedule_open_contract_closures_on_startup"), task.RunAt(server.NowUtc()),
+		task.MaxTime(startupContractClosureMaxTime))
+	// An earlier release scheduled the same pass under this key with a 30s
+	// deadline. Keep that pending pass and give it the same deadline.
+	task.RaiseRunOnceMaxTimeInTx(clientSession.Ctx, tx, task.RunOnce("schedule_open_contract_closures"), startupContractClosureMaxTime)
 }
 
-// Every page belongs to this invocation. The old queued After field is ignored;
-// retry starts at the head and coalesces any children already committed.
+// One logical pass retains its original start time. The old queued After field
+// remains ignored; only a claim-fenced committed checkpoint can resume a pass.
 func ScheduleOpenContractClosures(args *ScheduleOpenContractClosuresArgs, clientSession *session.ClientSession) (*ScheduleOpenContractClosuresResult, error) {
 	if args == nil || args.StartedAt.IsZero() {
 		return nil, fmt.Errorf("startup contract scan has no start time")
@@ -50,6 +61,12 @@ func ScheduleOpenContractClosures(args *ScheduleOpenContractClosuresArgs, client
 		return nil, fmt.Errorf("invalid startup contract scan page size")
 	}
 	var lastContractId server.Id
+	var retryFrom *server.Id
+	checkpoint, _ := clientSession.Ctx.Value(startupContractClosureCheckpointKey{}).(*startupContractClosureCheckpoint)
+	if checkpoint != nil {
+		lastContractId = checkpoint.progress.After
+		retryFrom = checkpoint.progress.RetryFrom
+	}
 	for {
 		if err := clientSession.Ctx.Err(); err != nil {
 			return nil, err
@@ -72,14 +89,25 @@ func ScheduleOpenContractClosures(args *ScheduleOpenContractClosuresArgs, client
 			})
 		}, server.OptNoRetry())
 		// Release the maintenance connection before ordinary queue writes.
-		// A partial page never advances the cursor past an unpublished child.
+		// A busy group cannot hold back independent later pages. Its earliest
+		// predecessor remains debt in each later committed checkpoint.
 		for offset := 0; offset < len(contracts); offset += startupContractClosurePublicationSize {
 			chunk := contracts[offset:min(offset+startupContractClosurePublicationSize, len(contracts))]
 			keys := make([]server.PgOwnershipKey, 0, len(chunk))
 			for _, contract := range chunk {
 				keys = append(keys, task.RunOnceOwnershipKey(task.RunOnce("close_scheduled_contract", contract.ContractId)))
 			}
-			server.OwnedTx(clientSession.Ctx, keys, func(tx server.PgTx) {
+			if checkpoint != nil {
+				keys = append(keys, checkpoint.key)
+			}
+			var next *startupContractClosureProgress
+			if checkpoint != nil {
+				copyProgress := *checkpoint.progress
+				copyProgress.After = chunk[len(chunk)-1].ContractId
+				copyProgress.RetryFrom = retryFrom
+				next = &copyProgress
+			}
+			admitted := server.TryOwnedTx(clientSession.Ctx, keys, func(tx server.PgTx) {
 				server.BatchInTx(clientSession.Ctx, tx, func(batch server.PgBatch) {
 					for _, contract := range chunk {
 						args := &CloseScheduledContractArgs{Private: true, ScheduledContractClose: contract}
@@ -88,12 +116,35 @@ func ScheduleOpenContractClosures(args *ScheduleOpenContractClosuresArgs, client
 							task.MaxTime(30*time.Second), task.RequireQueueOwnership(tx))
 					}
 				})
+				if checkpoint != nil {
+					checkpoint.write(clientSession.Ctx, tx, args, next)
+				}
 			}, server.TxReadCommitted, server.OptNoRetry())
+			if admitted {
+				if checkpoint != nil {
+					checkpoint.progress = next
+					checkpoint.published = true
+				}
+			} else if retryFrom == nil {
+				predecessor := lastContractId
+				retryFrom = &predecessor
+			}
+			lastContractId = chunk[len(chunk)-1].ContractId
 		}
 		if len(contracts) == 0 {
 			break
 		}
-		lastContractId = contracts[len(contracts)-1].ContractId
+	}
+	if retryFrom != nil {
+		if checkpoint != nil {
+			next := *checkpoint.progress
+			next.After, next.RetryFrom = *retryFrom, nil
+			server.OwnedTx(clientSession.Ctx, []server.PgOwnershipKey{checkpoint.key}, func(tx server.PgTx) {
+				checkpoint.write(clientSession.Ctx, tx, args, &next)
+			}, server.TxReadCommitted, server.OptNoRetry())
+			checkpoint.progress = &next
+		}
+		return nil, task.WithRetryDelay(fmt.Errorf("startup contract scan child publication ownership is busy"), task.RescheduleTimeout)
 	}
 	return &ScheduleOpenContractClosuresResult{}, nil
 }
@@ -120,9 +171,15 @@ type CloseScheduledContractArgs struct {
 	ScheduledContractClose
 }
 
+// A deferred close keeps RetryAt so an older Post still reschedules it at its
+// deadline; a current Post honors the later deferral instead.
 type CloseScheduledContractResult struct {
-	Owner   *model.ContractCloseOwner `json:"owner,omitempty"`
-	RetryAt *time.Time                `json:"retry_at,omitempty"`
+	Owner          *model.ContractCloseOwner             `json:"owner,omitempty"`
+	RetryAt        *time.Time                            `json:"retry_at,omitempty"`
+	Reconciliation *model.ContractDeadlineReconciliation `json:"reconciliation,omitempty"`
+	DeferredUntil  *time.Time                            `json:"deferred_until,omitempty"`
+	// Due siblings newly closed by this task's second owner turn.
+	OwnerBatchClosed int `json:"owner_batch_closed,omitempty"`
 }
 
 func scheduleContractClose(clientSession *session.ClientSession, tx server.PgTx, args *CloseScheduledContractArgs) {
@@ -132,23 +189,60 @@ func scheduleContractClose(clientSession *session.ClientSession, tx server.PgTx,
 }
 
 // An early queue wake does not grant deadline authority. Normal task retries
-// retain failed closes; success means terminal or a durable financial handoff.
+// retain failed closes; a due success means the terminal commit completed.
+// A committed terminal or missing contract finishes from one unlocked read.
+// A funded close admits its balance owner without waiting, closes, and reads
+// the owner's due siblings; one more owner turn retires up to a batch of them.
+// A held owner defers this close rather than holding the worker slot.
 func CloseScheduledContract(args *CloseScheduledContractArgs, clientSession *session.ClientSession) (*CloseScheduledContractResult, error) {
 	if args == nil || !args.Private || args.ContractId == (server.Id{}) || args.Deadline.IsZero() {
 		return nil, fmt.Errorf("invalid scheduled contract close")
 	}
-	if server.NowUtc().Before(args.Deadline) {
+	now := server.NowUtc()
+	if now.Before(args.Deadline) {
 		return &CloseScheduledContractResult{RetryAt: &args.Deadline}, nil
 	}
-	owner, err := model.CloseContractAtDeadline(clientSession.Ctx, args.ContractId, args.Deadline)
-	return &CloseScheduledContractResult{Owner: owner}, err
+	ctx := clientSession.Ctx
+	custody, err := model.ReadContractDeadlineCustody(ctx, []server.Id{args.ContractId})
+	if err != nil {
+		return nil, err
+	}
+	state := custody[args.ContractId]
+	switch {
+	case state == nil || !state.Found:
+		return &CloseScheduledContractResult{Reconciliation: &model.ContractDeadlineReconciliation{ContractId: args.ContractId, Missing: true}}, nil
+	case state.Outcome != nil:
+		return &CloseScheduledContractResult{Reconciliation: &model.ContractDeadlineReconciliation{
+			ContractId: args.ContractId, Outcome: *state.Outcome, AlreadyClosed: true}}, nil
+	case len(state.BalanceIds) == 0:
+		// No grant owns this contract, so there is no shared owner to batch.
+		closed, err := model.ReconcileContractAtDeadline(ctx, args.ContractId, args.Deadline)
+		return &CloseScheduledContractResult{Reconciliation: closed}, err
+	}
+	closed, err := model.ReconcileContractOwnerAtDeadline(ctx, state.BalanceIds,
+		model.ContractDeadline{ContractId: args.ContractId, Deadline: args.Deadline}, dueScheduledCloses(now))
+	if err != nil {
+		return nil, err
+	}
+	if closed.Busy {
+		deferredUntil := server.NowUtc().Add(scheduledCloseOwnerBusyDeferral)
+		return &CloseScheduledContractResult{RetryAt: &args.Deadline, DeferredUntil: &deferredUntil}, nil
+	}
+	return &CloseScheduledContractResult{Reconciliation: closed.Reconciliation, OwnerBatchClosed: closed.SiblingsClosed}, nil
 }
 
-// Repair only retained routing hints in the same commit as their owner wake.
-// Busy or changed custody yields a new child without changing its deadline.
+// Early wakes retain the deadline. Owner handoffs are only for results written
+// by older workers; new due results already committed terminal reconciliation.
+// Register those retained hints with their owner wake; busy or changed custody
+// yields a new child without changing its deadline. A busy owner deferral wakes
+// later; its unchanged arguments keep the original deadline authority.
 func CloseScheduledContractPost(args *CloseScheduledContractArgs, result *CloseScheduledContractResult,
 	clientSession *session.ClientSession, tx server.PgTx) error {
-	if result.RetryAt != nil {
+	if result.DeferredUntil != nil {
+		task.ScheduleTaskInTx(tx, CloseScheduledContract, args, clientSession,
+			task.RunOnce("close_scheduled_contract", args.ContractId), task.RunAt(*result.DeferredUntil),
+			task.MaxTime(30*time.Second), task.RequireQueueOwnership(tx))
+	} else if result.RetryAt != nil {
 		scheduleContractClose(clientSession, tx, args)
 	}
 	if result.Owner != nil {

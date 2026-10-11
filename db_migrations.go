@@ -42,6 +42,7 @@ type OnlineSqlMigration struct {
 	recoverySql string
 	sql         string
 	auditSql    string
+	completion  *onlineIndexMigrationCompletion
 }
 
 func newOnlineSqlMigration(sql string, auditSql string) *OnlineSqlMigration {
@@ -205,10 +206,7 @@ func ApplyDbMigrationsUpTo(ctx context.Context, upTo int) {
 				glog.Infof("[migrate][%d/%d]online sql = %s\n", i+1, len(migrations), v.sql)
 			}
 			MaintenanceDb(ctx, func(conn PgConn) {
-				Raise(executeOnlineSqlMigration(ctx, v, func(ctx context.Context, sql string) error {
-					_, err := conn.Exec(ctx, sql)
-					return err
-				}))
+				Raise(executeOnlineSqlMigrationOnConn(ctx, conn, v))
 			}, OptReadWrite(), OptNoRetry())
 		case *CodeMigration:
 			if DbMigrationVerbose {
@@ -9896,5 +9894,35 @@ var migrations = []any{
 		 CREATE INDEX transfer_contract_audit_closed_null_day
 		 ON transfer_contract (close_time, contract_id)
 		 WHERE outcome IS NULL AND close_time IS NOT NULL`,
-	),
+	).withIndexCompletion(810, "transfer_contract", "transfer_contract_audit_closed_null_day",
+		"CREATE INDEX transfer_contract_audit_closed_null_day ON public.transfer_contract USING btree (close_time, contract_id) WHERE ((outcome IS NULL) AND (close_time IS NOT NULL))",
+		"((outcome IS NULL) AND (close_time IS NOT NULL))"),
+	// 811: a recurring grant and its task receipt commit together. Retain these
+	// small receipts after balances expire so a delayed replay cannot mint again.
+	// Apply before deploying taskworkers that pass a grant run identity.
+	newSqlMigration(`
+		CREATE TABLE transfer_balance_grant_run (
+			run_id uuid NOT NULL,
+			grant_kind varchar(32) NOT NULL,
+			start_time timestamp NOT NULL,
+			end_time timestamp NOT NULL,
+			PRIMARY KEY (run_id, grant_kind)
+		);
+	`),
+	// 812: terminal expiration can retain existing excluded proof without
+	// rewriting it or manufacturing a new legacy exclusion at settlement.
+	newSqlMigration(contractDeadlineUsageGuardSchemaSql),
+	// 813: id-less checkpoints retain a conservative lower bound. Apply before
+	// deploying close-report writers; existing aggregates are not rewritten.
+	newSqlMigration(`ALTER TABLE contract_close
+		ADD COLUMN legacy_checkpoint_byte_count bigint,
+		ADD COLUMN identified_checkpoint_byte_count bigint`),
+	// 814: durable payout planning (db_payment_plan_assignment.go). New tables
+	// and a guard on transfer_escrow_sweep.payment_id updates; nothing is
+	// rewritten. Apply before deploying taskworkers that stage plan sweeps.
+	newSqlMigration(paymentPlanAssignmentSchemaSql),
+	// 815: committed payout reliability windows (db_payment_plan_reliability.go).
+	// New tables; nothing is rewritten. Apply before deploying taskworkers that
+	// commit reliability scores before the plan transaction.
+	newSqlMigration(paymentPlanReliabilitySchemaSql),
 }

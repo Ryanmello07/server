@@ -5,6 +5,9 @@ is being encoded as an automated probe in the monitor service — architecture
 and probe mapping in MONITOR.md (this directory). History: this file began as
 server/MONITOR.md, the distilled incident-diagnosis runbook.
 
+For investigation methods, including synchronous production reproductions and
+deterministic queue-starvation controls, see [DEBUG.md](DEBUG.md).
+
 Distilled from the 2026-07-15 incident day (redis cluster instability + pg
 coupling + the network-peers pubsub outage) and the preceding two weeks of
 database performance work. Historical incident entries were used to diagnose or
@@ -180,6 +183,7 @@ active missing capability and must not be read as green.
 |---|---|---|
 | 1.7 | Coverage gap | Shared SSH status taxonomy preserves every source failure; automatic observer-overlay route attribution is missing an inventory/configured observer-interface or gateway contract. `settings-freshness`, `edge-ipv6`, and `vpn-sessions` do not supply that contract. |
 | 2.5c | Runbook | `contract-rate`, `legacy-settlements`, `transfer-debits`, `open-contracts`, `task-health`, `migrations`, `pg-cpu`, `active-queries`, `wait-events`; exact target visitation and complete post-commit projection remain separately qualified evidence, not automatic probe coverage. |
+| 2.6b | Coverage gap | A probe of the contract degradation valve state is missing: `open-contracts` and `contract-rate` show the close backlog and creation rate that drive it, not whether exhausted payers get free contracts or providers go unpaid. |
 | 2.19d | Coverage gap | Country-list provenance, published country-pool generation and country-linked URL-draw receipts remain missing. `egress-site-pool` checks shared pool health and `url-probe-coverage` checks accepted URL quota coverage; neither attests country-ranked lists or the normal general/country sampling split. |
 | 5.1 | Runbook | `contract-rate`, `task-canaries`, `redis-cluster`, `connection-rate`, `log-errors` |
 | 5.2 | Runbook | `redis-cluster`, `redis-process`, `log-errors` |
@@ -3027,6 +3031,28 @@ incomplete output remains unknown, not catalog absence. RUN-MAIN.md retains
 direct-file one-shot completion markers. Abrupt termination and other service
 entrypoints have separate lifecycle owners; this is not a blanket instruction
 to restore descriptors before those services have stopped their producers.
+
+An output destination failure can also stall an otherwise live watcher. On
+2026-10-10, the exact watcher generation retained 64,459 bytes in its 65,536-byte
+stdout pipe across two local frames; its alert file ended midline and stopped
+advancing. A later private SQL sample completed durably, but its next eligible
+cadence had no attempt. `RunLoop` schedules a probe's next cadence after its
+serialized alert handler returns, so blocked output can stop future probes.
+The source left the pipe reader open when the forwarding goroutine returned
+after a destination write failure. Native `/dev/full` controls reproduce that
+orphaned reader and blocked writer; they do not establish the historical errno
+or prove disk exhaustion. The forwarding goroutine now closes its owned reader
+on every exit, and short writes and failed crash notices terminate forwarding.
+Upstream writes then fail with EPIPE or ordinary stdout/stderr SIGPIPE behavior;
+the repair neither discards subsequent output silently nor retries the failed
+destination. Successful streams larger than the pipe still drain and scrub.
+A full pipe alone can be ordinary downstream backpressure; require stationary
+output and overdue durable cadence evidence before declaring coverage lost.
+An active unit, an old completed sample, or absence of alerts cannot establish
+current coverage. A destination that never returns remains outside this finite
+write-error control. Preserve alert files, private SQL receipts and the cadence
+checkpoint across a single-owner stop/join/promotion; require advancing output
+and subsequent eligible completed samples before marking coverage recovered.
 
 Implementation regression learned 2026-08-30: the standing tailer, restart
 health, and scanner-overflow tests existed, but `Monitor.RunLoop` still ran the
@@ -6181,6 +6207,40 @@ over arbitrary payer counts, missing registrations, held owners or scheduler
 capacity. Schema readiness, current worker adoption and a fresh same-cohort
 outcome/reservation witness remain separate Main gates.
 
+#### Legacy drain: owner registration, payer claims and head revisits
+
+On 2026-10-10 the Main drain was bounded by three separate stages, none of
+them the chronological due head. The shard tasks only dispatch: every sampled
+`FlushLegacySettlements` result had `visited=0`. Settlement runs in one
+`ApplyLegacyPayerSettlements` task per payer, so one dense payer cannot hold
+another payer's turn. Busy outcomes were 8 of 18,946 visits.
+
+1. Owner registration. A TABLESAMPLE of about 40,000 intents found 88% with
+   neither `payer_network_id` nor `source_client_id`; payer and source
+   discovery cannot see those rows until registration classifies them.
+   Resolving a sample of them found two thirds belonging to ordinary payers.
+   Registration ran about 220 rows per second: one page per shard per
+   dispatcher turn, with each shard's turn claimed about every 18 seconds.
+   Read the rate from the sum of `dispatch.registered` over recent
+   `FlushLegacySettlements` results, not from table counters.
+2. Payer task claims. 3,747 payer tasks were due and the median claim delay,
+   `run_start_time - run_at` over recent finished payer tasks, was 2.7 hours.
+   With N registered functions, each got one lane turn per 2N claims, and the
+   older queued close backlog took every global claim.
+3. Head revisits of a dense payer. The head payer's turns each settled one
+   contract while `timings.selection` took about 14 of their 15 seconds. The
+   head revisit bounded its interval only by a row comparison on
+   `(next_attempt_time, contract_id)`, next to plain due-time bounds. PostgreSQL
+   ends the index scan on the plain bound and filters the row comparison, so a
+   revisit with no head left read the payer's whole remaining due range in
+   every shard: 138,153 buffers and 26.5 seconds cold on Main. The revisit now
+   also bounds `next_attempt_time` by its interval's end and read 70 buffers.
+
+Before blaming contention for a slow drain, sample registration state, the
+payer claim delay, and the selection versus financial split in payer
+`timings`. A deadline close of the same contract also deletes its intent in
+its own financial transaction; table delete rates mix both owners.
+
 ### 2.5c Contract progress evidence — selection, commit and projection
 
 This runbook joins the existing probes; it adds no account scan or automatic
@@ -6703,8 +6763,8 @@ coverage, but can discard the acceleration checkpoint. After every taskworker
 converges, require the exact executor artifact and consecutive persisted
 catch-up bounds/handoffs, then a bounded same-cohort terminal/reservation witness.
 
-The absolute-lifetime path uses the one `CloseExpiredContracts` coordinator,
-seeded immediately by both workload profiles after startup dependency admission.
+The recurring absolute-lifetime path uses the one `CloseExpiredContracts`
+coordinator, seeded immediately by both workload profiles after startup dependency admission.
 Legacy ledger, Redis admission and no-escrow creation all persist a database-clock
 deadline of 60 minutes and return that exact value for the provider-signed
 contract. Checkpoints do not update it. Both open/disputed selection and the
@@ -6819,8 +6879,8 @@ passed five selected tests after the fix (receipt SHA-256
 This follow-up does not identify a writer, backfill stored deadlines, or establish
 deployment beyond the frozen `db179741` R54 source.
 
-Startup uses one RunOnce key for this coordinator, preserving an existing
-cursor instead of inserting one task per contract. Its ordinary Post persists
+`CloseExpiredContracts` startup uses one RunOnce key for that coordinator,
+preserving an existing cursor instead of inserting one task per contract. Its ordinary Post persists
 the next bounded scan and schedules another run; a startup request during an
 active claim must advance that successor to the earliest explicit wake without
 replacing the Post's arguments. Native synthetic startup controls cover both
@@ -6828,6 +6888,84 @@ profiles, fresh bilateral checkpoints on due legacy and Redis contracts,
 unchanged live/NULL neighbors, exact 17+17-byte debit and restart replay. Their
 cold legacy reservation projection converges only after its separately queued
 mirror task completes; a terminal close alone is not that projection's receipt.
+
+The separate `ScheduleOpenContractClosures` startup pass uses
+`schedule_open_contract_closures_on_startup` and publishes per-contract
+`CloseScheduledContract` children. It reads every `outcome IS NULL` shape in
+1,024-row primary-key pages, including disputed nonterminal rows, and publishes
+groups of at most 256 under their complete child RunOnce ownership keys. One
+retained `StartedAt` supplies the default deadline; explicit expiration and an
+existing earlier child wake remain authoritative. A short page is not EOF.
+
+2026-10-10 local admission discriminator: the previous blocking owner could
+spend its five-second admission limit on one busy child key, abort the pass,
+then retry from the head. Two real worker attempts over 2,049 synthetic contracts
+each left 1,537 independent children unqueued while two child ownership keys
+were held. Fix `3e51c22e` uses `TryOwnedTx` on the same direct maintenance
+session route: a known busy group releases all partial keys and its checkout
+before later groups proceed. Any skipped group makes EOF return an error, so
+the original scanner and arguments remain pending for ordinary retry. Errors
+during acquisition, probing or refusal cleanup still propagate, as do business
+and commit errors.
+
+Independent PG18/Redis qualification reproduced that baseline failure and
+passed 35 focused scanner, ownership, packet-guard and startup-profile controls.
+With two 256-row groups held, 1,537 new children were published and two existing
+children retained; 510 remained absent until release, then all 2,049 were queued
+and the scanner completed. The entire regression took 2.55 seconds, including
+setup, two busy attempts and the final pass; this only bounds the final pass
+from above, not its isolated latency. Controls include
+`TestStartupContractClosureBusyChildOwnersKeepLaterPagesMoving` and
+`TestTryOwnedTxBusyReleasesPartialKeysAndCheckout`; native receipt
+`sol-startup-busy-pages-native-GO.json` has SHA-256
+`c1f6b5943c93c344f45ab848fefbc6a7a96c34a014d7ac1f130af6617837a968`.
+
+That admission repair still let a whole pass exceeding its unchanged 120-second
+budget repeat the head. A later bounded Main read retained the current parent's
+`Timeout\nInterrupted: context canceled`, hour-scale backoff, and six unchanged
+open contract headers without pending children. Claim heartbeat timestamps and
+absence within capped finished history do not establish run duration, every
+prior visit, or the origin of every cancellation.
+
+The native budget control over 4,103 rows reproduced the mechanism: five
+attempts interrupted through the real task timer after committed publication
+still left only the first 1,024 children on old source. Commit `63804c389`
+checkpoints each group of at most 256 children with the exact parent's queue
+ownership and claim fence in the same transaction. Retries retain the pending
+identity, original `StartedAt`, failure history, and skipped busy-group debt.
+A budget interruption receives the two-second continuation only after
+acknowledged progress.
+The task budget remains 120 seconds. New RunOnce requests retain their earliest
+fresh-pass wake without canceling the active pass. Successful EOF restores the
+original arguments; a failed finalizer retains progress. The candidate reached
+all 4,103 children over five bounded attempts, preserving explicit expirations
+and the original NULL fallback. See
+`TestStartupContractClosureBudgetResumesCommittedPass`; child publication is
+not terminal closure or completed accounting.
+
+A separate bounded current body-error capture classified 205 financial-admission
+source frames among 208 owning-stack records. Seven complete retained exemplars
+proved the exact financial-ownership busy refusal; the eighth showed a pre-BEGIN
+pool-acquisition timeout. These capped record counts are not unique failures or
+fleet rates and do not distinguish a held grant from a held provider account.
+Native held-owner controls reproduced both the shared provider refusal and
+grant admission after business rows were locked.
+The same commit admits the complete grant and per-contract publication owners
+before BEGIN, then rechecks the locked scope. The terminal commit records exact
+Redis debit journals and immutable provider allocations; existing workers apply
+those projections. Legacy unmarked escrow retains its direct debit. Original
+reports, funding limits, escrow payouts and terminal replay remain authoritative;
+no timeout increase or transaction replay hides an ownership error.
+
+The combined PG18/Redis gate passed 52 focused controls, including 2,048 public
+Redis contracts across 64 payers, four providers and 32 overlapping callers,
+real debit/provider drains, conservation and terminal replay. Acknowledged
+pre-BEGIN waiting was permitted and counted; this is not a zero-wait or Main
+throughput claim. Require fresh parent progress/EOF, bounded child and terminal
+outcomes, downstream financial completion, and matched creation/closure rates
+before claiming backlog recovery. Native receipt
+`sol-combined-scanner-deadline-native-GO.json` has SHA-256
+`cf066ec8346b644f5c3b131c69f61c295e09db9f090ad3ecb91add18f7467e83`.
 
 A fully classified accounting refusal with a remaining raw cursor or sweep
 needs the bounded 2–4-second continuation cadence. Selecting the 1–5-minute idle
@@ -7334,6 +7472,58 @@ deterministic later-successor test locks both invariants. This approximately
 72x same-task split remains pre-rollout evidence for the 25k checkpoint and
 process-local load sensitivity; it is not permission to erase the timeout or
 raise its deadline.
+
+### 2.6b Contract degradation valve — zero contract cost
+
+`model/network_degradation_model.go`. While `config/<env>/degraded.yml` sets
+`enabled: true`, the taskworker's run-once `CheckContractDegradation` task
+runs every 15 minutes. It counts contracts created in the last 60 minutes
+(`transfer_contract_create_time`) and contracts that reached a terminal
+outcome in the last 60 minutes (`transfer_contract_closed_usage`). One check
+with `close_count < 0.7 × open_count` publishes `zero_cost=true` in the Redis
+key `network_degradation:zero_contract_cost:v1`. Charging resumes only on the
+second consecutive healthy check (`close_count >= 0.7 × open_count`, or no
+creations). The key has a one hour TTL (four checks), so a stopped or
+disabled task, a missing or malformed key, or a Redis error all close the
+valve.
+
+Active still deducts first. Every public and companion contract, probe
+shards included, escrows against its payer as usual, shrink-to-fit
+included, while the payer has anything left. Only when escrow admission
+finds the payer's balance exhausted (a complete grant census below the
+shrink floor) is that contract created free instead of refused with
+InsufficientBalance: no `transfer_escrow` rows, no payer, no balance
+reserved or debited, and **provider payouts are zero for those
+contracts**. They settle through the no-escrow path with no sweep, debit,
+provider totals or points; only the payment-independent subnet usage
+snapshot is kept, as for network-mode traffic. Per-client data caps and the
+acceptance-test drain still refuse, and free traffic does not advance a
+data cap. The valve never changes an existing contract; it decides only how
+an exhausted payer's new contract is funded.
+
+- `urnetwork_contract_degradation_zero_cost` (taskworker gauge, 1 while the
+  last published state is zero cost) and
+  `urnetwork_contract_degradation_contracts{kind="open"|"close"}`.
+- `urnetwork_contract_degradation_checks_total{outcome}`: `zero_cost`,
+  `resuming` (healthy, zero cost held for one more check) and `charging`; the
+  failures `measurement_failed`, `state_read_failed`, `publish_failed` and
+  `superseded` publish nothing, and the published state ages out within its TTL.
+- `urnetwork_zero_escrow_contracts_total{kind="public"|"companion"}` on every
+  contract-creating service (api, connect, taskworker, proxy): the free
+  contracts actually created for exhausted payers.
+- `urnetwork_zero_contract_cost_reads_total{result}` on the same services: 15
+  second cache refreshes, read only after an exhausted refusal. Only
+  `zero_cost` lets that contract be free; `charging`, `missing`, `expired`,
+  `malformed`, `error` and `disabled` keep the refusal.
+- Log lines `[degradation]contract check <outcome>: open=… close=… ratio=…
+  healthy=… consecutive_healthy=… zero_cost=…`.
+
+Treat an active valve as an incident signal for §2.6: it hides the
+out-of-balance symptom of exhausted payers while providers go unpaid for
+their traffic. A sustained
+`measurement_failed` means the check cannot see the backlog, and the valve
+fails closed to normal charging an hour after its last publication. No probe
+reads the valve yet; the numbered coverage crosswalk records the gap.
 
 ### 2.7 New-connection rate — existing-sessions vs new-connects discriminator
 Probe: `connection-rate`
@@ -8419,7 +8609,7 @@ unchanged. New labels are finite vocabulary only:
   `count_zero` (forced count <=0), `count_small` (forced count 1–2),
   `count_positive` (forced count >=3), or `forced_minimum`;
 - `ip_family`: `any`, `v4`, `v6`, `dualstack`, `unknown`;
-- `rank_mode`: `quality`, `speed`, `unknown`;
+- `rank_mode`: `quality`, `speed`, `online`, `unknown`;
 - `outcome`: `nonempty`, `zero`, `error`, `canceled`; and
 - `reason`: the fixed completed-result reason or the failed request stage.
 
@@ -14038,6 +14228,40 @@ from pgx. Pool and wrapper snapshots are sampled separately; subtracting them
 is not an exact ownership partition. Compare actual producer generations and
 fresh metrics before using this discriminator; it changes no financial
 outcome, retry, commit/rollback, pool sizing or socket-disposal decision.
+
+Puddle starts its idle clock before construction. The successful initial Ping
+records its completion on the same physical connection, preventing a slow
+constructor from immediately receiving another validation query. The ordinary
+greater-than-one-second idle check resumes once that validation is also older
+than one second; an absent or malformed completion record cannot bypass it.
+This changes no caller, Ping, cleanup or SQL budget and establishes no Main
+cause by itself. Idle-Ping failures remain outside wrapper cleanup tracking
+and the constructor-only phase metrics below.
+
+`urnetwork_pg_pool_startup_phases_active{pool,phase}` separates the existing
+constructor's `initial_ping` from `failed_startup_cleanup`. Both remain part of
+pgx's `constructing` population; they exclude idle-connection validation and
+borrowed-connection disposal. Acquisition cancellation does not erase a phase
+still running under pgx's detached constructor context. Each actual pool
+generation owns fresh counters; an unused or closed pool emits no series.
+`urnetwork_pg_pool_startup_phases_completed_total{pool,phase,outcome}` counts
+actual phase returns as `ok`, `deadline`, `canceled` or `other`. Deadline includes
+typed context, socket and pgx timeouts, without identifying their cause or caller.
+Cleanup `ok` specifically means `CleanupDone` was observed; a successful or
+failed `Close` return alone does not establish physical cleanup. Cleanup budget
+expiry counts as `deadline`, never as a confirmed join, and does not change the
+original validation error or disposal budget.
+
+`urnetwork_pg_pool_startup_phase_duration_seconds_total{pool,phase}` sums only
+completed phase durations. Divide its rate by all completion outcomes for that
+phase to measure completed mean duration; still-active work has no completed
+duration. Compare fresh, matching producer generations with constructor starts
+and acquire outcomes before distinguishing churn from retained work. Pool and
+phase snapshots are separate, so subtracting active phases from `constructing`
+is not an exact instantaneous residual. Remaining pre-hook work may be DNS,
+TCP or PostgreSQL login; these metrics do not distinguish those stages, prove
+PgBouncer peer routing, or attribute a timeout to executing application SQL.
+The observer adds no SQL, socket, timer, worker, retry or connection budget.
 
 The 2026-10-01 grant-allocation discriminator adds a concrete lock-fanout
 boundary. Twelve direct-primary snapshots at 19:21:38–19:22:06 UTC retained
@@ -20340,6 +20564,60 @@ the additive ALTER. Constant defaults avoid a row backfill, but the ALTER still
 needs an AccessExclusive lock. A refused lock admission must be retried as a
 separate bounded migration attempt; the concurrent-index repair's longer lock
 timeout must not be reused for this operation.
+
+The 2026-10-10 native monitor gate found eleven missing artifact contracts at
+794–795, 797–802 and 806–808: the source published head 808, while the probe
+represented only 184 of the required 195 versions from 614 onward. This was a
+detector coverage gap, not evidence that Main lacked those objects. Versions
+794–812 now share one ordered artifact/SQL list, restoring the existing
+version-minus-589 row protocol without changing the migration DDL. The existing
+796 and 803–805 predicates retain their definitions in that list.
+
+Version 811 requires the durable recurring-grant receipt table and composite
+run/kind identity. Version 812 requires the exact deadline usage guard that
+permits retirement with unchanged, previously retained excluded proof. The
+older usage-guard artifact accepts both published bodies; the version-812
+artifact requires the new body. A coherent predecessor stays behind without
+false schema drift, while a reverted guard at the new head reports drift.
+
+Versions 794–795 require the tier and canary columns, extender request,
+release and block-report ledgers with their primary keys, retention/lookup
+indexes, and the separate identity/epoch release index. Versions 797–802
+require the network client limit, client cap and usage/drain/rollup tables,
+services leads, per-client ACL groups, and retained Embed enable/disable
+timestamps. The cap indexes must retain the published OR, capped, monthly
+period and zero-limit predicates. Version 806 requires the nullable client
+and auth-code session associations, durable session operations and their
+recovery/quota indexes, auth-code redemption with both its composite primary
+key and unique request key, and the session-index repair outbox. Versions
+807–808 independently require the exact active, non-NULL session indexes on
+clients and auth codes; invalid or not-ready concurrent builds remain drift.
+
+The subsequent scheduler release added version 809; the native monitor gate
+detected its missing artifact contract before watcher promotion. Version 809
+requires the exact nonunique btree `pending_task_function_poll_order`: global
+function-version normalization, available block, descending run priority and
+maximum runtime, then task ID, with no partial predicate or included keys.
+Invalid or not-ready builds remain drift. This schema check does not establish
+runtime task fairness or task completion.
+
+Version 810 requires the exact nonunique btree
+`transfer_contract_audit_closed_null_day` on `(close_time, contract_id)`, with
+both `outcome IS NULL` and `close_time IS NOT NULL`, no included keys, and valid
+and ready build state. The older contract-ID-only unsettled index cannot satisfy
+this day-range contract. Missing, reordered, broader-predicate or incomplete
+indexes remain schema drift; the schema match alone does not prove audit speed.
+
+These checks pin ordinary durable tables, published column types and widths,
+nullability, defaults and stored semantics, validated nondeferrable keys, and
+complete index definitions including key order, predicates and readiness.
+Later additive columns remain valid. Native controls exercise each actual
+prefix from 793 through 810, rolled-back schema faults reaching the owning
+drift alert, and projected invalid/not-ready index states. Future artifacts
+remain pending before their versions, and unavailable catalog evidence remains
+unknown. Matching schema does not attest extender releases, Embed enforcement,
+session behavior or fleet rollout. The coverage repair changes the monitor
+binary and requires a newly built and qualified watcher before promotion.
 
 With compatible writers and workers, a RunOnce schedule coalesces with an
 unclaimed owner. Each claim captures its wake generation in the lease UPDATE;
@@ -33912,6 +34190,28 @@ commit. Neither proves a failed settlement. False-negative qualifiers: old
 builds, missing scrapes, process exit before scrape, incomplete fleet coverage,
 and a stuck finalization that has not returned can conceal failure observations.
 Zero or absent counter rates and a ready worker are not proof of closure progress.
+
+### Finalization admission boundary counter
+
+`urnetwork_taskworker_finalization_admission_errors_total{task,stage,cause}`
+is the admission-only subset of failed finalization member attempts. It keeps
+registered target names and the existing bounded typed cause classifier. Stages
+are `precheck`, `probe`, `cleanup`, `acknowledged_busy_wait`, or `unknown`.
+`probe` includes the ownership Query, row decoding and final reply validation.
+`cleanup` means releasing acknowledged partial references before waiting.
+`acknowledged_busy_wait` is entered only after a complete known-busy reply and
+successful cleanup; it does not prove one key was continuously held. No key,
+backend identity or SQL text is exported, and known-busy TryOwnedTx false results
+are ordinary returns, not failed finalization attempts.
+
+A failed probe or cleanup can latch its original error on the retained session.
+A later finalization then fails during `preparation`, before another probe, and
+is excluded from this admission-only counter. A latched raw deadline can retain
+cause `deadline`; a generic uncertain-session marker has cause `other`. Existing
+phase/cause rates cannot join those separate attempts or identify their original
+owner. Use rate before summing across processes; absent or mixed-version series
+do not prove zero contention. Observation adds no SQL or change to ownership,
+transaction retry, admission timeout, minRunAt, or financial commit authority.
 
 ### Task submission, completion and RunOnce conflict counters
 

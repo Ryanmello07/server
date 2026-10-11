@@ -4,7 +4,6 @@ package work
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -181,10 +180,8 @@ func TestStartupContractClosurePagesKeepCapAndEarliestWake(t *testing.T) {
 			ownedKeys := map[server.PgOwnershipKey]bool{}
 			ctx := server.Testing_WithPgOwnershipObservation(baseCtx, func(event server.PgOwnershipEvent) {
 				stateLock.Lock()
-				publication := len(event.Keys) > 0
-				for _, key := range event.Keys {
-					publication = publication && childKeys[key]
-				}
+				childCount := startupCheckpointObservedChildren(event, childKeys)
+				publication := childCount > 0
 				if event.Kind == server.PgOwnershipAdmitted {
 					maxOwnedKeys = max(maxOwnedKeys, len(event.Keys))
 					for _, key := range event.Keys {
@@ -193,7 +190,7 @@ func TestStartupContractClosurePagesKeepCapAndEarliestWake(t *testing.T) {
 				}
 				closeNow := false
 				if event.Kind == server.PgOwnershipReleased && publication {
-					published += len(event.Keys)
+					published += childCount
 					if published == 1024 && !closedPrefix {
 						closedPrefix, closeNow = true, true
 					}
@@ -235,7 +232,7 @@ func TestStartupContractClosurePagesKeepCapAndEarliestWake(t *testing.T) {
 			ownedScan := ownedKeys[task.RunOnceOwnershipKey(task.RunOnce("schedule_open_contract_closures_on_startup"))] &&
 				ownedKeys[server.NewPgOwnershipKey("finished_task/task_id", first.id)]
 			stateLock.Unlock()
-			if maxKeys != 256 || !ownedScan || !closed || boundaryErr != nil {
+			if maxKeys != 257 || !ownedScan || !closed || boundaryErr != nil {
 				t.Fatal("single scan lost bounded publication, completion ownership or its real page boundary", maxKeys, ownedScan, closed, boundaryErr)
 			}
 			for _, id := range ids[:2] {
@@ -331,8 +328,8 @@ func TestScheduledContractClosureFutureWakeRetainsDeadline(t *testing.T) {
 }
 
 // A retained intent with unclassified owner hints and a malformed report still
-// receives its real owner and registration wake; only routing hints may change.
-func TestScheduledContractClosureWakesUnclassifiedIntentWithoutProofEdits(t *testing.T) {
+// receives its real owner and registration wake; startup never edits its proof.
+func TestScheduledContractClosureReconcilesUnclassifiedMalformedIntent(t *testing.T) {
 	env := server.DefaultTestEnv()
 	env.RerunCount = 0
 	env.Run(t, func(t testing.TB) {
@@ -365,8 +362,7 @@ func TestScheduledContractClosureWakesUnclassifiedIntentWithoutProofEdits(t *tes
 		})
 		read := func() (raw string) {
 			server.Db(ctx, func(conn server.PgConn) {
-				server.Raise(conn.QueryRow(ctx, `SELECT jsonb_build_array(outcome,usage_unverified,provider_usage,
-					(SELECT to_jsonb(i)-'payer_network_id'-'source_client_id' FROM legacy_settlement_intent i WHERE contract_id=$1),
+				server.Raise(conn.QueryRow(ctx, `SELECT jsonb_build_array(
 					(SELECT jsonb_agg(row_to_json(r) ORDER BY party) FROM contract_close r WHERE contract_id=$1))::text
 					FROM transfer_contract WHERE contract_id=$1`, id).Scan(&raw))
 			})
@@ -381,24 +377,19 @@ func TestScheduledContractClosureWakesUnclassifiedIntentWithoutProofEdits(t *tes
 		}, server.TxReadCommitted, server.OptNoRetry())
 		worker := startupClosureWorker(ctx, NewScheduledContractClosureTaskTarget())
 		defer worker.Close()
-		wakeBefore := server.NowUtc()
 		evalStartupClosureTask(t, ctx, worker, readExpiryRecoveryQueue(t, ctx)[key.String()].id)
-		wakeAfter := server.NowUtc()
 		queue := readExpiryRecoveryQueue(t, ctx)
-		actual, actualFound := queue[task.RunOnce("flush_legacy_source_settlements", sourceId).String()]
-		registration, registrationFound := queue[task.RunOnce(fmt.Sprintf("flush_legacy_settlements_%d", shard)).String()]
-		if !actualFound || !registrationFound || actual.runAt.Before(wakeBefore.Add(30*time.Second)) || actual.runAt.After(wakeAfter.Add(30*time.Second)) || registration.runAt.After(wakeAfter) || before != read() {
-			t.Fatal("accepted malformed intent lost wake or changed proof/authority")
+		if len(queue) != 0 || before != read() {
+			t.Fatal("malformed intent required another task or changed original reports")
+		}
+		if _, terminal := model.GetContractClose(ctx, id); !terminal {
+			t.Fatal("successful child left malformed contract open")
 		}
 		server.Db(ctx, func(conn server.PgConn) {
 			var capped time.Time
-			var registered bool
-			server.Raise(conn.QueryRow(ctx, `SELECT expiration_time,
-				EXISTS(SELECT 1 FROM legacy_settlement_intent WHERE contract_id=$1
-					AND source_client_id=$2 AND payer_network_id IS NULL)
-				FROM transfer_contract WHERE contract_id=$1`, id, sourceId).Scan(&capped, &registered))
-			if !capped.Equal(deadline) || !registered {
-				t.Fatal("accepted intent did not receive its due cap and exact routing hints")
+			server.Raise(conn.QueryRow(ctx, `SELECT expiration_time FROM transfer_contract WHERE contract_id=$1`, id).Scan(&capped))
+			if !capped.Equal(deadline) {
+				t.Fatal("accepted intent did not receive its due retirement cap")
 			}
 		})
 	})
@@ -442,7 +433,7 @@ func TestScheduledContractClosureEarlierDuplicateClosesAtMinimum(t *testing.T) {
 		server.Db(ctx, func(conn server.PgConn) {
 			var exact bool
 			server.Raise(conn.QueryRow(ctx, `SELECT expiration_time=$2
-				AND (SELECT count(*)=2 AND bool_and(NOT checkpoint AND used_transfer_byte_count=17) FROM contract_close WHERE contract_id=$1)
+				AND (SELECT count(*)=1 AND bool_and(checkpoint AND used_transfer_byte_count=17) FROM contract_close WHERE contract_id=$1)
 				AND NOT EXISTS(SELECT 1 FROM transfer_escrow WHERE contract_id=$1)
 				AND NOT EXISTS(SELECT 1 FROM transfer_debit_journal WHERE contract_id=$1)
 				AND NOT EXISTS(SELECT 1 FROM transfer_escrow_sweep WHERE contract_id=$1)
@@ -454,9 +445,9 @@ func TestScheduledContractClosureEarlierDuplicateClosesAtMinimum(t *testing.T) {
 	})
 }
 
-// The due child classifies a retained free intent with its owner wake. The
-// real source worker can close it before the compatibility dispatcher runs.
-func TestScheduledContractClosureRegistersAndClosesRetainedSourceIntent(t *testing.T) {
+// The due child finishes a retained source intent even when its dispatch hints
+// are missing. Task success now requires the actual terminal state.
+func TestScheduledContractClosureClosesRetainedSourceIntent(t *testing.T) {
 	env := server.DefaultTestEnv()
 	env.RerunCount = 0
 	env.Run(t, func(t testing.TB) {
@@ -489,8 +480,7 @@ func TestScheduledContractClosureRegistersAndClosesRetainedSourceIntent(t *testi
 		})
 		read := func() (raw string) {
 			server.Db(ctx, func(conn server.PgConn) {
-				server.Raise(conn.QueryRow(ctx, `SELECT jsonb_build_array(outcome,usage_unverified,provider_usage,
-					(SELECT to_jsonb(i)-'payer_network_id'-'source_client_id' FROM legacy_settlement_intent i WHERE contract_id=$1),
+				server.Raise(conn.QueryRow(ctx, `SELECT jsonb_build_array(
 					(SELECT jsonb_agg(row_to_json(r) ORDER BY party) FROM contract_close r WHERE contract_id=$1))::text
 					FROM transfer_contract WHERE contract_id=$1`, id).Scan(&raw))
 			})
@@ -507,27 +497,21 @@ func TestScheduledContractClosureRegistersAndClosesRetainedSourceIntent(t *testi
 		defer child.Close()
 		evalStartupClosureTask(t, ctx, child, readExpiryRecoveryQueue(t, ctx)[key.String()].id)
 		server.Db(ctx, func(conn server.PgConn) {
-			var nonterminal, verified, missingProof, exactCap, registered bool
+			var nonterminal, verified, missingProof, exactCap, unclassified bool
 			server.Raise(conn.QueryRow(ctx, `SELECT outcome IS NULL,NOT usage_unverified,provider_usage IS NULL,
 				expiration_time=$2,EXISTS(SELECT 1 FROM legacy_settlement_intent
-					WHERE contract_id=$1 AND source_client_id=$3 AND payer_network_id IS NULL)
-				FROM transfer_contract WHERE contract_id=$1`, id, deadline, sourceId).Scan(&nonterminal, &verified, &missingProof, &exactCap, &registered))
-			if !nonterminal || !verified || !missingProof || !exactCap || !registered {
-				t.Fatal("child lost atomic source registration or rewrote accepted proof", nonterminal, verified, missingProof, exactCap, registered)
+					WHERE contract_id=$1 AND source_client_id IS NULL AND payer_network_id IS NULL)
+				FROM transfer_contract WHERE contract_id=$1`, id, deadline).Scan(&nonterminal, &verified, &missingProof, &exactCap, &unclassified))
+			if nonterminal || verified || missingProof || !exactCap || unclassified {
+				t.Fatal("child did not finish accepted source intent", nonterminal, verified, missingProof, exactCap, unclassified)
 			}
 		})
 		if read() != before {
 			t.Fatal("child changed accepted source intent, reports or provider proof")
 		}
-		// Compatibility discovery has not run; the exact child owns this
-		// classification and publication, while its ordinary shard wake remains.
-		if _, found := readExpiryRecoveryQueue(t, ctx)[task.RunOnce(fmt.Sprintf("flush_legacy_settlements_%d", shard)).String()]; !found {
-			t.Fatal("exact child lost the ordinary registration successor")
+		if queue := readExpiryRecoveryQueue(t, ctx); len(queue) != 0 {
+			t.Fatal("child left a settlement handoff", queue)
 		}
-		sourceWorker := startupClosureWorker(ctx, model.NewLegacySourceSettlementTaskTarget())
-		defer sourceWorker.Close()
-		source := readExpiryRecoveryQueue(t, ctx)[task.RunOnce("flush_legacy_source_settlements", sourceId).String()]
-		evalStartupClosureTask(t, ctx, sourceWorker, source.id)
 		closed, terminal := model.GetContractClose(ctx, id)
 		if !terminal || closed.Outcome != model.ContractOutcomeSettled {
 			t.Fatal("registered source worker did not close its capped partial intent")
@@ -535,7 +519,7 @@ func TestScheduledContractClosureRegistersAndClosesRetainedSourceIntent(t *testi
 		server.Db(ctx, func(conn server.PgConn) {
 			var exact bool
 			server.Raise(conn.QueryRow(ctx, `SELECT usage_unverified
-				AND (SELECT count(*)=2 AND bool_and(NOT checkpoint AND used_transfer_byte_count=17) FROM contract_close WHERE contract_id=$1)
+				AND (SELECT count(*)=1 AND bool_and(checkpoint AND used_transfer_byte_count=17) FROM contract_close WHERE contract_id=$1)
 				AND NOT EXISTS(SELECT 1 FROM legacy_settlement_intent WHERE contract_id=$1)
 				AND NOT EXISTS(SELECT 1 FROM transfer_escrow WHERE contract_id=$1)
 				AND NOT EXISTS(SELECT 1 FROM transfer_debit_journal WHERE contract_id=$1)
@@ -549,7 +533,7 @@ func TestScheduledContractClosureRegistersAndClosesRetainedSourceIntent(t *testi
 }
 
 // A refusal on the second page retains the complete first page and its first
-// chunk. A retry rescans from the head and coalesces that committed prefix.
+// chunk. A retry resumes after the last atomically committed child/checkpoint.
 func TestStartupContractClosurePublicationRetryKeepsCommittedPrefix(t *testing.T) {
 	env := server.DefaultTestEnv()
 	env.RerunCount = 0
@@ -586,8 +570,13 @@ func TestStartupContractClosurePublicationRetryKeepsCommittedPrefix(t *testing.T
 		}
 		partial := readExpiryRecoveryQueue(t, ctx)
 		current, found := partial[key]
-		if !found || current.id != initial.id || current.args != initial.args || len(partial) != 1281 {
+		if !found || current.id != initial.id || startupCheckpointOriginalArgs(t, current.args) != initial.args || len(partial) != 1281 {
 			t.Fatal("failed page advanced its cursor or lost the committed 1280-child prefix", len(partial))
+		}
+		var progressArgs ScheduleOpenContractClosuresArgs
+		if json.Unmarshal([]byte(current.args), &progressArgs) != nil || progressArgs.Progress == nil ||
+			progressArgs.Progress.After != ids[1279] || progressArgs.Progress.RetryFrom != nil {
+			t.Fatal("failed publication advanced beyond its last committed chunk")
 		}
 		for index, id := range ids {
 			_, found := partial[task.RunOnce("close_scheduled_contract", id).String()]

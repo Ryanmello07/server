@@ -29,7 +29,6 @@ import (
 	"github.com/urnetwork/server/stats"
 	"github.com/urnetwork/server/stats/sample"
 	"github.com/urnetwork/server/task"
-	"github.com/urnetwork/server/taskworker/work"
 
 	"github.com/urnetwork/proxy"
 )
@@ -41,7 +40,7 @@ const bringyourctlUsage = `BringYour control.
 Usage:
     bringyourctl sn-transition-status
     bringyourctl db version
-    bringyourctl db migrate [--sn-schedule-sha256=<sha256>]
+    bringyourctl db migrate
     bringyourctl db vacuum [--exclude=<table>...]
     bringyourctl db maintenance (all|<epoch>) [--reindex] [--cleanup] [--analyze]
     bringyourctl db audit [--fix [--force-drop-indexes]]
@@ -92,6 +91,7 @@ Usage:
     bringyourctl payouts apply-bonus --plan_id=<plan_id> --amount_usd=<amount_usd> --adjustment_id=<adjustment_id> --reason=<reason>
     bringyourctl payouts plan [--send] [--dry-run] [--max_duration=<max_duration>]
     bringyourctl payouts populate-tx-hashes
+    bringyourctl payouts reconcile-legacy-attempts [--apply] [--group_limit=<group_limit>]
     bringyourctl wallet estimate-fee --amount_usd=<amount_usd> --destination_address=<destination_address> --blockchain=<blockchain>
     bringyourctl wallet transfer --amount_usd=<amount_usd> --destination_address=<destination_address> --blockchain=<blockchain>
 		bringyourctl wallets sync-circle
@@ -100,7 +100,7 @@ Usage:
     bringyourctl contracts repair-redis-expiry --private-stdin [--apply]
     bringyourctl contracts drain-legacy --private-stdin [--apply]
     bringyourctl contracts queue-expiry
-    bringyourctl contracts schedule-open-closures
+    bringyourctl contracts schedule-open-closures [--limit=<n>]
     bringyourctl contracts close-expired [-c <count>]
     bringyourctl contracts close --contract_id=<contract_id> --target_id=<target_id> --used_transfer_byte_count=<used_transfer_byte_count>
     bringyourctl contracts reconcile-net-escrow [--network_id=<network_id>] [--dry-run]
@@ -134,7 +134,6 @@ Usage:
     bringyourctl grafana load-defaults [--grafana_url=<grafana_url>]
 
 Options:
-    --sn-schedule-sha256=<sha256>  Prepare the immutable earning boundary from this exact reviewed sn.yml after migrations.
     -h --help     Show this screen.
     --version     Show version.
     -r --realm=<realm>  Search realm.
@@ -169,6 +168,7 @@ Options:
     --blockchain=<blockchain>  Blockchain.
     --max_duration=<max_duration>  Bound a payout plan to the first <max_duration> of contract close time after the most recent subsidy epoch, draining a backlog forward one slice per run, e.g. 14d, 1.5d, 336h.
     --store=<store>  Limit payment reconciliation to one store: stripe, apple, google, or solana.
+    --group_limit=<group_limit>  Look up at most this many Circle destination groups; omitted or 0 looks up every group.
     -c --count=<count>	Number to process [default: 1000].`
 
 func main() {
@@ -314,6 +314,8 @@ func main() {
 			server.Raise(payoutPlanApplyBonus(opts))
 		} else if ptxh, _ := opts.Bool("populate-tx-hashes"); ptxh {
 			populateTxHashes()
+		} else if reconcileLegacy, _ := opts.Bool("reconcile-legacy-attempts"); reconcileLegacy {
+			os.Exit(reconcileLegacyPayoutAttempts(opts))
 		}
 	} else if wallet, _ := opts.Bool("wallet"); wallet {
 		if send, _ := opts.Bool("transfer"); send {
@@ -324,7 +326,9 @@ func main() {
 		}
 	} else if contracts, _ := opts.Bool("contracts"); contracts {
 		if scheduleOpen, _ := opts.Bool("schedule-open-closures"); scheduleOpen {
-			os.Exit(runScheduleOpenContractClosures(context.Background(), os.Stdout, work.ScheduleOpenContractClosures))
+			limit, err := synchronousContractClosureLimit(opts)
+			server.Raise(err)
+			os.Exit(runSynchronousContractClosures(context.Background(), os.Stdout, limit, model.CloseOpenContractsSynchronously))
 		}
 		if queueExpiry, _ := opts.Bool("queue-expiry"); queueExpiry {
 			os.Exit(runContractExpiryRecovery(context.Background(), os.Stdout, invokeContractExpiryRecovery))
@@ -453,10 +457,12 @@ func dbVersion(opts docopt.Opts) {
 	fmt.Printf("Current DB version: %d\n", version)
 }
 
+// Applies every pending migration, then retains or prepares the provider
+// earning boundary (see migrateWithPayoutBoundary).
 func dbMigrate(opts docopt.Opts) {
 	fmt.Printf("Applying DB migrations ...\n")
 	server.DbMigrationVerbose = true
-	server.Raise(migrateWithPayoutBoundary(context.Background(), opts, os.Stdout, server.ApplyDbMigrations))
+	server.Raise(migrateWithPayoutBoundary(context.Background(), os.Stdout, server.ApplyDbMigrations, server.EnsureProviderPayoutBoundary))
 }
 
 // dbScrubClientAddresses re-runs the 20260807 raw-client-address scrub
@@ -1547,6 +1553,51 @@ func printPayoutLoopSummary(plans []*model.PaymentPlan) {
 		"drained %d slice(s): %d payment(s), %.4f USD total\n",
 		len(plans), totalPayments, model.NanoCentsToUsd(total),
 	)
+}
+
+// reconcileLegacyPayoutAttempts decides legacy keyed provider payments from
+// Circle's destination history (controller/account_payment_legacy_reconcile.go).
+// Without --apply it is a dry run that reads Circle and reports counts only.
+// The output carries counts only: no payment, network, wallet or amount.
+func reconcileLegacyPayoutAttempts(opts docopt.Opts) int {
+	apply, _ := opts.Bool("--apply")
+	groupLimit := 0
+	if groupLimitStr, _ := opts.String("--group_limit"); groupLimitStr != "" {
+		var err error
+		groupLimit, err = strconv.Atoi(groupLimitStr)
+		if err != nil || groupLimit < 0 {
+			fmt.Printf("invalid --group_limit %q\n", groupLimitStr)
+			return 2
+		}
+	}
+	settings := controller.DefaultLegacyProviderPaymentReconcileSettings()
+	settings.DryRun = !apply
+	settings.GroupLimit = groupLimit
+
+	ctx := context.Background()
+	clientSession := session.NewLocalClientSession(ctx, "0.0.0.0:0", nil)
+	defer clientSession.Cancel()
+	result, err := controller.ReconcileLegacyProviderPaymentAttempts(clientSession, settings)
+	if result != nil {
+		mode := "dry run (nothing written)"
+		if apply {
+			mode = "applied"
+		}
+		fmt.Printf("legacy provider payment attempts: %s\n", mode)
+		fmt.Printf("  attempts:              %d\n", result.AttemptCount)
+		fmt.Printf("  destination groups:    %d (looked up %d, deferred %d)\n", result.GroupCount, result.LookedUpGroupCount, result.DeferredGroupCount)
+		fmt.Printf("  found (record bound):  %d\n", result.FoundCount)
+		fmt.Printf("  absent (key released): %d\n", result.AbsentCount)
+		fmt.Printf("  held, ambiguous:       %d\n", result.AmbiguousCount)
+		fmt.Printf("  held, lookup error:    %d\n", result.LookupErrorCount)
+		fmt.Printf("  held, ineligible:      %d\n", result.IneligibleCount)
+		fmt.Printf("  held, changed:         %d\n", result.RefusedCount)
+	}
+	if err != nil {
+		fmt.Printf("legacy provider payment reconciliation err = %s\n", err)
+		return 1
+	}
+	return 0
 }
 
 func listPendingPayouts(opts docopt.Opts) {
