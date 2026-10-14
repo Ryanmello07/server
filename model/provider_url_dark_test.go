@@ -76,6 +76,9 @@ func TestProviderUrlDarkDecision(t *testing.T) {
 		connect.AssertEqual(t, decision, providerEgressDecision{reason: ProviderExcludedUrlDark, hardExcluded: true})
 		decision = decideProviderEgress(&providerEgressFacts{urlDark: true}, flag)
 		connect.AssertEqual(t, decision, providerEgressDecision{reason: ProviderExcludedUrlDark, hardExcluded: true})
+		// upstream's URL-success rule is soft; a dark exit stays hard excluded
+		decision = decideProviderEgress(&providerEgressFacts{urlDark: true, noUrlSuccess: true}, flag)
+		connect.AssertEqual(t, decision, providerEgressDecision{reason: ProviderExcludedUrlDark, hardExcluded: true})
 	}
 	connect.AssertEqual(t, decideProviderEgress(&providerEgressFacts{urlDark: true, tlsAuthenticationFailed: true}, true).reason, ProviderExcludedTls)
 	connect.AssertEqual(t, decideProviderEgress(&providerEgressFacts{urlDark: true, arinRisk: true}, true).reason, ProviderExcludedArinRisk)
