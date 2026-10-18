@@ -104,6 +104,19 @@ func winnerSourceSignificance(
 	result *controller.ScoreResult,
 	content []byte,
 ) (*sourceSignificance, error) {
+	return winnerSourceSignificanceForMode(result, content, false)
+}
+
+// winnerSourceSignificanceForMode projects unchanged score evidence while
+// retaining the distinct production and explicitly zero-margin staging rules.
+func winnerSourceSignificanceForMode(
+	result *controller.ScoreResult,
+	content []byte,
+	staging bool,
+) (*sourceSignificance, error) {
+	if result == nil || result.Significance == nil {
+		return nil, errors.New("winner score significance record is missing")
+	}
 	significance := result.Significance
 	if significance.BaselineSampleVariance == nil ||
 		significance.CandidateSampleVariance == nil ||
@@ -132,7 +145,7 @@ func winnerSourceSignificance(
 		NextEpochMinimumImprovementPercent:        *significance.NextEpochMinimumImprovementPercent,
 		RecommendedNextEpochTakeoverMarginPercent: *significance.RecommendedNextEpochTakeoverMarginPercent,
 	}
-	if err := validateSourceSignificance(source); err != nil {
+	if err := validateSourceSignificanceForMode(source, staging); err != nil {
 		return nil, err
 	}
 	return source, nil
@@ -323,6 +336,7 @@ func sourceRepositoriesFromCommits(repositoryCommits map[string]string) sourceRe
 		Sn:            sourceRepository{Commit: repositoryCommits["sn"]},
 		OperatorProxy: sourceRepository{Commit: repositoryCommits["operator-proxy"]},
 		Warp:          sourceRepository{Commit: repositoryCommits["warp"]},
+		Gvisor:        sourceRepository{Commit: repositoryCommits["gvisor"]},
 	}
 }
 
@@ -508,6 +522,9 @@ func runPromote(opts docopt.Opts) {
 	manifest, err := loadSourceManifest(sourceConfig)
 	if err != nil {
 		fatalf("promotion source config: %s", err)
+	}
+	if manifest.Schema != 1 {
+		fatalf("legacy promote is unavailable for a v2 source ledger; use the authorized source reconciler")
 	}
 	if len(manifest.EvaluationSource.Epochs) != epochNumber {
 		fatalf("epoch %d is not the next unconfigured epoch; ledger currently contains epochs 0..%d", epochNumber, len(manifest.EvaluationSource.Epochs)-1)

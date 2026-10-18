@@ -105,6 +105,12 @@ func pgSampleWriteCadence(dir string, state pgSampleCadenceState, syncFile func(
 	return nil
 }
 func pgSampleContinuousAdmission(dir string, now time.Time, syncFile func(*os.File) error) (bool, error) {
+	return pgSampleContinuousAdmissionObserved(dir, now, syncFile, nil)
+}
+
+// Only the accepted PG path supplies its own optional timing observation.
+// Keep the existing admission and durable writer behavior for all other callers.
+func pgSampleContinuousAdmissionObserved(dir string, now time.Time, syncFile func(*os.File) error, observation *pgSampleTransportObservation) (bool, error) {
 	state, err := pgSampleReadCadence(dir, now)
 	if err != nil {
 		return false, err
@@ -113,8 +119,11 @@ func pgSampleContinuousAdmission(dir string, now time.Time, syncFile func(*os.Fi
 		return false, nil
 	}
 	state = pgSampleCadenceState{Schema: 1, Mode: "continuous", AttemptedAt: now, CompletedAt: state.CompletedAt, NextEligibleAt: now.Add(pgQuerySampleBudget + pgQuerySampleCadence), Outcome: "attempting", ReceiptSHA256: state.ReceiptSHA256}
-	if err := pgSampleWriteCadence(dir, state, syncFile); err != nil {
-		return false, err
+	observation.beginLocalPhase(pgLocalCadencePublication)
+	writeErr := pgSampleWriteCadence(dir, state, syncFile)
+	observation.endLocalPhase(pgLocalCadencePublication)
+	if writeErr != nil {
+		return false, writeErr
 	}
 	return true, nil
 }
@@ -160,7 +169,7 @@ func pgSampleUnavailable(env *probeEnv, reason string) finding {
 			observed += fmt.Sprintf(" last_attempted_at=%s last_completed_at=%s next_eligible_at=%s due_age_s=%.3f", state.AttemptedAt.Format(time.RFC3339Nano), completed, state.NextEligibleAt.Format(time.RFC3339Nano), max(0, env.now().Sub(state.NextEligibleAt).Seconds()))
 		}
 	}
-	return finding{probeId: "pg/query-sample", tier: tierWarn, class: "pg-query-sample-unavailable", target: pgTarget(env), sustain: 1,
+	return finding{probeId: "pg/query-sample", tier: tierWarn, class: "pg-query-sample-unavailable", target: pgTarget(env), sustain: 1, configuredOff: reason == "configured-disabled",
 		symptom: "PostgreSQL query/load observation is unavailable", observed: observed,
 		mechanism: "An expired or incomplete observation cannot establish current slow-query or repeated-work coverage.",
 		baseline:  "Continuous mode collects one bounded catalog sample per 15-minute interval; expiry mode is one shot.",

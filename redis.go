@@ -49,6 +49,14 @@ func redisClusterDialer(authority string, nodeRoutes map[string]string, dial red
 	}
 }
 
+// The dial path of every Redis pool. A test process pins each node dial to its
+// launcher attestation (test_env_dial_guard.go). Every other process has a nil
+// guard, which hands dial back unchanged, so this is redisClusterDialer over
+// dial itself.
+func redisPoolDialer(guard *testEnvDialGuard, authority string, nodeRoutes map[string]string, dial redisDialFunc) redisDialFunc {
+	return redisClusterDialer(authority, nodeRoutes, guard.wrapDial("redis", dial))
+}
+
 // redisNodeDialAddr maps an announced node address to the address to dial:
 //   - a loopback authority is an ssh tunnel (xops/bin/by-patch-main-data)
 //     that forwards every node port to loopback, so every node is dialed there
@@ -186,11 +194,27 @@ func (self *safeRedisClient) open() redis.UniversalClient {
 			dialRetries, maxRetries, maxRedirects = 1, -1, 2
 			maxConnections = max(16, redisConfigKeys.RequireInt("max_connections"))
 		}
+		// go-redis refuses a dial with ErrPoolExhausted, without waiting for
+		// PoolTimeout, once its counted connections reach MaxActiveConns. Its
+		// refill of idle connections counts a slot before dialing it, so with
+		// the cap at the pool size a refill can take the last slot between a
+		// turn holder's miss and its dial. Pool turns already bound the pool,
+		// so a pool that keeps idle connections leaves the cap off; a raced
+		// dial is then used once and closed.
+		maxActiveConnections := maxConnections
+		if 0 < minConnections {
+			maxActiveConnections = 0
+		}
 
 		dialer := NewDialer(dialTimeout)
 		authority := redisKeys.RequireString("authority")
 		password := localEvaluationCredential("EVALUATION_REDIS_PASSWORD", redisKeys.RequireString("password"))
-		dialContext := redisClusterDialer(authority, redisNodeRoutes(LanHosts(), Routes()), dialer.DialContext)
+		dialContext := redisPoolDialer(
+			currentTestEnvDialGuard(),
+			authority,
+			redisNodeRoutes(LanHosts(), Routes()),
+			dialer.DialContext,
+		)
 
 		cluster := redisKeys.RequireBool("cluster")
 
@@ -202,7 +226,7 @@ func (self *safeRedisClient) open() redis.UniversalClient {
 				MinIdleConns:    minConnections,
 				MaxIdleConns:    maxConnections,
 				PoolSize:        maxConnections,
-				MaxActiveConns:  maxConnections,
+				MaxActiveConns:  maxActiveConnections,
 				ConnMaxLifetime: connectionMaxLifetimeDuration,
 				ConnMaxIdleTime: connectionMaxIdleTimeDuration,
 				// see https://redis.uptrace.dev/guide/go-redis-debugging.html#timeouts
@@ -236,7 +260,7 @@ func (self *safeRedisClient) open() redis.UniversalClient {
 				MinIdleConns:    minConnections,
 				MaxIdleConns:    maxConnections,
 				PoolSize:        maxConnections,
-				MaxActiveConns:  maxConnections,
+				MaxActiveConns:  maxActiveConnections,
 				ConnMaxLifetime: connectionMaxLifetimeDuration,
 				ConnMaxIdleTime: connectionMaxIdleTimeDuration,
 				// see https://redis.uptrace.dev/guide/go-redis-debugging.html#timeouts
@@ -451,15 +475,19 @@ func RedisDoOnce(ctx context.Context, callback func(RedisClient)) {
 	}
 }
 
-// RedisWithDeadline is the non-retrying boundary for optional cleanup with an
-// explicit caller deadline. Its dedicated pool applies that deadline to socket
-// reads and writes for both standalone and cluster clients. The callback must
-// pass the same ctx to every command. RedisReset and pool telemetry own this
-// pool just like the ordinary pools; no per-operation client is leaked.
-// This pool is restricted to PING, GET and same-slot EVAL operations; it bypasses
-// cluster command-policy discovery and must not route multi-shard operations.
-// EVAL callers must keep every declared key in one explicit Redis hash tag.
-func RedisWithDeadline(ctx context.Context, callback func(RedisClient) error) (returnErr error) {
+// RedisWithDeadline is the non-retrying boundary for work with an explicit
+// caller deadline: optional cleanup, admission, and the provider liveness
+// lease. Its dedicated pool applies that deadline to socket reads and writes for
+// both standalone and cluster clients. The callback must pass the same ctx to
+// every command. RedisReset and pool telemetry own this pool just like the
+// ordinary pools; no per-operation client is leaked.
+// The pool bypasses cluster command-policy discovery, so each command routes by
+// its own first key: PING, GET, same-slot EVAL and other single-key commands,
+// alone or pipelined across slots. It must not route a command whose keys span
+// slots. EVAL callers must keep every declared key in one explicit Redis hash
+// tag. Each call first pings an arbitrary node unless the caller passes
+// OptRedisNoPreflight.
+func RedisWithDeadline(ctx context.Context, callback func(RedisClient) error, options ...any) (returnErr error) {
 	if _, bounded := ctx.Deadline(); !bounded {
 		return fmt.Errorf("RedisWithDeadline requires an explicit deadline")
 	}
@@ -485,17 +513,33 @@ func RedisWithDeadline(ctx context.Context, callback func(RedisClient) error) (r
 	}()
 	redisWithClient(ctx, safeDeadlineClient, func(client RedisClient) {
 		returnErr = callback(client)
-	}, OptNoRetry())
+	}, append([]any{OptNoRetry()}, options...)...)
 	return
+}
+
+// Whether a call on the non-retrying or deadline-bound pools pings first.
+type RedisPreflightOptions struct {
+	skip bool
+}
+
+// Skips the preflight PING of the non-retrying and deadline-bound pools, for
+// idempotent commands whose results are judged one by one: the PING reaches an
+// arbitrary node, never necessarily the one a command routes to, and costs a
+// round trip per call.
+func OptRedisNoPreflight() RedisPreflightOptions {
+	return RedisPreflightOptions{skip: true}
 }
 
 func redisWithClient(ctx context.Context, pool *safeRedisClient, callback func(RedisClient), options ...any) {
 	retryOptions := OptRetryDefault()
+	preflight := true
 	// debugOptions := OptNoDebug()
 	for _, option := range options {
 		switch v := option.(type) {
 		case DbRetryOptions:
 			retryOptions = v
+		case RedisPreflightOptions:
+			preflight = !v.skip
 		}
 	}
 
@@ -516,7 +560,7 @@ func redisWithClient(ctx context.Context, pool *safeRedisClient, callback func(R
 		// cannot guarantee the next command succeeds. Dedicated non-retrying
 		// and deadline pools retain their existing preflight policy.
 		var connErr error
-		if pool.disableCommandRetry || pool.contextTimeoutEnabled {
+		if preflight && (pool.disableCommandRetry || pool.contextTimeoutEnabled) {
 			connErr = client.Ping(ctx).Err()
 		}
 		if connErr != nil {

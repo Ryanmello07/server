@@ -11,8 +11,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"slices"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/urfoundation/sn/stabi"
 	"github.com/urnetwork/server"
 	"github.com/urnetwork/server/model"
+	"github.com/urnetwork/server/router"
 	"github.com/urnetwork/server/session"
 	"github.com/urnetwork/server/startifact"
 )
@@ -100,13 +103,15 @@ func readStClientKeyAuthorityAt(ctx context.Context, client *ethclient.Client, d
 
 // Ordered failover restarts the complete read at an endpoint; it never splices
 // one endpoint's finality or chain ID into another endpoint's root signer.
+// Each endpoint's attempt is bounded, so a stalled first endpoint cannot hold
+// every registration past the point where the next endpoint would answer.
 func (self *stClientKeyAuthorityOwner) readBoundary(ctx context.Context, requested *protocol.ClientKeyEffectiveBoundary) (protocol.ClientKeyEffectiveBoundary, stabi.STCoordinatorOperatorVersion, error) {
 	if self == nil || self.client == nil || ctx == nil {
 		return protocol.ClientKeyEffectiveBoundary{}, stabi.STCoordinatorOperatorVersion{}, errors.New("client-key chain owner is absent")
 	}
 	var boundary protocol.ClientKeyEffectiveBoundary
 	var operator stabi.STCoordinatorOperatorVersion
-	err := self.client.eachRpcUrls(ctx, self.rpcURLs, func(ctx context.Context, client *ethclient.Client) error {
+	err := self.client.eachRpcUrlsWithin(ctx, self.rpcURLs, self.client.clientKeyAuthorityAttemptBudget(), func(ctx context.Context, client *ethclient.Client) error {
 		var err error
 		boundary, operator, err = readStClientKeyAuthorityAt(ctx, client, self.domain, requested)
 		return err
@@ -183,7 +188,7 @@ type SnClientKeyObservationResult = protocol.ClientKeyHistoryResponse
 // key endpoint. The same retained bytes are public through /sn/evidence.
 func SnClientKeyObservation(args *SnClientKeyObservationArgs, clientSession *session.ClientSession) (result *SnClientKeyObservationResult, resultErr error) {
 	if args == nil || clientSession == nil || clientSession.Ctx == nil || clientSession.ByJwt == nil || clientSession.ByJwt.ClientId == nil || *clientSession.ByJwt.ClientId == (server.Id{}) || args.ClientID == (server.Id{}) || len(args.Request) == 0 || len(args.Request) > protocol.MaxClientKeyStatementBytes {
-		return nil, errors.New("client-key observation authenticated request is incomplete")
+		return nil, errors.New("400 client-key observation authenticated request is incomplete")
 	}
 	ctx, cancel := context.WithTimeout(clientSession.Ctx, stCallTimeout)
 	defer cancel()
@@ -197,19 +202,21 @@ func SnClientKeyObservation(args *SnClientKeyObservationArgs, clientSession *ses
 	var request protocol.ClientKeyObservationRequest
 	decoder := json.NewDecoder(bytes.NewReader(requestBytes))
 	decoder.DisallowUnknownFields()
+	// Malformed requests are the caller's and declare 400. Every later failure
+	// declares no status: the API answers it with a fixed, retryable 503.
 	if err := decoder.Decode(&request); err != nil {
-		return nil, err
+		return nil, router.PrivateCause(http.StatusBadRequest, "client-key observation request is invalid", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, errors.New("client-key observation request has trailing JSON")
+		return nil, errors.New("400 client-key observation request has trailing JSON")
 	}
 	canonical, err := json.Marshal(request)
 	if err != nil || !bytes.Equal(canonical, requestBytes) || request.ClientID != [16]byte(clientID) {
-		return nil, errors.Join(errors.New("client-key observation request is noncanonical or names another client"), err)
+		return nil, router.PrivateCause(http.StatusBadRequest, "client-key observation request is noncanonical or names another client", err)
 	}
 	if err := request.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("400 %w", err)
 	}
 	owner, err := newStClientKeyAuthorityOwner()
 	if err != nil {

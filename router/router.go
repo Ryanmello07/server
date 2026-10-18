@@ -40,6 +40,10 @@ type Route struct {
 	// set by RefuseLagGuestCredentials: the route refuses a lag.dev guest's
 	// token before its handler runs
 	lagGuestRefused bool
+	// set by RefuseIntendedNetworkMismatch: the route refuses a request whose
+	// X-UR-Intended-Network-Id names another network than its credential's,
+	// before its handler runs
+	intendedNetworkRefused bool
 }
 
 func NewRoute(method string, pattern string, handler http.HandlerFunc) *Route {
@@ -166,7 +170,7 @@ func (self *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			func() {
 				// note the connection might be hijacked in this case
 				defer recover()
-				http.Error(writer, "Error. Please email support@ur.io for help.", http.StatusInternalServerError)
+				http.Error(writer, UnexpectedErrorMessage, http.StatusInternalServerError)
 			}()
 			if body != nil && !observation.writer.hijacked {
 				func() {

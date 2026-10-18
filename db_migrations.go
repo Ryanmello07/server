@@ -10379,4 +10379,125 @@ var migrations = []any{
 		ALTER TABLE network_extender_measurement_cert
 			ADD COLUMN publish_time timestamp NULL;
 	`),
+
+	// 836: the FP2 modern provider gate's evidence (FP2FIX.md, 2026-10-14,
+	// option 4: probe-verified, shadow first). One row per provider with
+	// what the URL prober last observed of its end of a real session:
+	// end-to-end post-quantum encryption and resizable transfer windows,
+	// when that was measured, when it first was, and how many runs advanced
+	// it (model.RecordProviderModernEvidence). The passes that decide the
+	// buckets read it by client id. A new table, with no index past its key
+	// so every newer observation can update its row in place: nothing
+	// existing is read, locked or rewritten, provider_egress_health_history
+	// included. A server built with it requires it, so it must be applied
+	// before any such server runs against a database.
+	newSqlMigration(`
+		CREATE TABLE provider_modern_evidence (
+			client_id uuid NOT NULL PRIMARY KEY,
+			post_quantum bool NOT NULL,
+			key_exchange varchar(64) NOT NULL DEFAULT '',
+			window_resizable bool NOT NULL,
+			max_receive_window_byte_count bigint NOT NULL DEFAULT 0,
+			measured_at timestamp NOT NULL,
+			first_measured_at timestamp NOT NULL,
+			run_count int NOT NULL DEFAULT 1
+		);
+	`),
+
+	// 837: the dual-database ARIN canary's rollup slots (arindbctl/ARINDB.md).
+	// The rollup carries the latest and the old database's facts with their
+	// epochs. Additive with constant defaults that read as unavailable, never
+	// clean. Only network_client_location_reliability is locked.
+	newSqlMigration(arinDatabaseCanaryRollupSchemaSql),
+
+	// 838: the dual-database ARIN canary's connection slots. Connect stamps each
+	// connection with the facts of the latest and the old database; the old
+	// slot has its own write guard so a writer predating it cannot keep an
+	// earlier positive. Only network_client_location is locked, so this never
+	// waits on the rollup while it holds the location rows.
+	newSqlMigration(arinDatabaseCanaryLocationSchemaSql),
+
+	// 839: when A8 first handed each measurement certificate to its extender
+	// (lag.dev/PLAN.md A8, A4, C10). The dns reconcile publishes a new name
+	// within a minute or two of its issuance, but the extender installs the
+	// chain only when its next A8 poll reads it, up to half an hour later,
+	// and its name answers without it until then. The lag.dev sample and the
+	// records' MeasurementId wait for this time. No existing column records a
+	// delivery. A nullable column on a small table: nothing is rewritten.
+	newSqlMigration(`
+		SET LOCAL lock_timeout = '5s';
+		ALTER TABLE network_extender_measurement_cert
+			ADD COLUMN deliver_time timestamp NULL;
+	`),
+
+	// 840: retain original registration authority for idempotent session replay.
+	// No historical binding is inferred or backfilled from mutable client rows.
+	newSqlMigration(clientRegistrationSessionSchemaSql),
+
+	// 841: immutable seed-window recovery metadata; signed receipt bytes stay
+	// unchanged. The existing original-transition trigger protects the column.
+	newSqlMigration(verifyOriginalWindowSchemaSql),
+
+	// 842: opt-in v2 seals, append-only reward revisions and fenced source automation.
+	newSqlMigration(competitionAutomationMigration),
+
+	// 843: independently scoped holds and explicit immutable integrity incidents.
+	newSqlMigration(competitionAutomationIncidentMigration),
+
+	// 844: independently fence source activation, review identity and cursor publication.
+	newSqlMigration(competitionAutomationGuardMigration),
+
+	// 845: retain safely abandoned unpublished source attempts and enforce review/revision consistency.
+	newSqlMigration(competitionAutomationFallbackMigration),
+
+	// 846: bind pre-admission source qualification to its reserved round identity.
+	newSqlMigration(competitionAutomationTargetMigration),
+
+	// 847: isolate explicit fee-free shadow staging automation without rewriting historical rounds.
+	newSqlMigration(competitionAutomationStagingMigration),
+
+	// 848: account_feedback is keyed only by feedback_id, so every read by
+	// network scans the whole table: NetworkHasFeedback in the onboarding
+	// campaign (15,804 calls at 9 ms each from the 2026-08-24 stats reset to
+	// 2026-10-12), the results job's first feedback, and the onboarding email
+	// tracker's feedback match, which since 89aa5103 reads the table once per
+	// rebuild rather than once per send. About 18 feedback rows are written a
+	// day, so the index adds no meaningful write load.
+	newRestartableOnlineSqlMigration(`
+		DROP INDEX CONCURRENTLY IF EXISTS account_feedback_network_id_feedback_time
+	`, `
+		CREATE INDEX CONCURRENTLY account_feedback_network_id_feedback_time
+		ON account_feedback (network_id, feedback_time)
+	`, `
+		DROP INDEX IF EXISTS account_feedback_network_id_feedback_time;
+		CREATE INDEX account_feedback_network_id_feedback_time
+		ON account_feedback (network_id, feedback_time)
+	`),
+
+	// 849: an account may hold one sign-in wallet per chain (a Solana and a
+	// Bittensor wallet), so network_user_auth_wallet is keyed by
+	// (user_id, blockchain) instead of user_id. The new key cannot fail on
+	// existing rows: the old one allowed at most one row per user. The key is
+	// byte exact; model.addWalletAuthInTx classifies the chain and refuses a
+	// second wallet of one chain. The foreign key and
+	// UNIQUE (wallet_address, blockchain) are unchanged, and no table
+	// references this key. Swapping it takes an exclusive lock on a small
+	// table (one row per wallet user) while its index is rebuilt.
+	//
+	// Deploy ordering: it must be applied in the same cutover that replaces
+	// every api server. A server built before it upserts with
+	// ON CONFLICT (user_id), which no constraint matches once it applies
+	// (SQLSTATE 42P10), so every wallet link and wallet network-create on
+	// such a server fails; stop them all before it applies. A server built
+	// with it needs it too: on the old key a second chain's wallet fails the
+	// insert. Rolling back to a server built before it is unsafe once any
+	// account holds two wallet rows: that server's RemoveAuth deletes every
+	// wallet row of the user, so removing one chain's wallet removes both
+	// and can leave a wallet-only account with no sign-in method.
+	newSqlMigration(`
+		SET LOCAL lock_timeout = '5s';
+		ALTER TABLE network_user_auth_wallet
+			DROP CONSTRAINT network_user_auth_wallet_pkey,
+			ADD CONSTRAINT network_user_auth_wallet_pkey PRIMARY KEY (user_id, blockchain);
+	`),
 }

@@ -71,6 +71,7 @@ func NewSignals() []Signal {
 		NewProviderCountSignal(),
 		NewProviderPickerSignal(),
 		NewProviderSelectionSignal(),
+		NewArindbCanarySignal(),
 		NewRetentionFanoutSignal(),
 		NewPgBouncerStallsSignal(),
 		NewWorkerMemorySignal(),
@@ -80,6 +81,8 @@ func NewSignals() []Signal {
 		NewReliabilityDriftSignal(),
 		NewReliabilityFreshnessSignal(),
 		NewConnectionOrphansSignal(),
+		NewConnectionReconcileSignal(),
+		NewConnectionLiveFailuresSignal(),
 		NewMissingOriginSignal(),
 		NewOriginWaitSignal(),
 		NewStaleDestinationSignal(),
@@ -89,6 +92,7 @@ func NewSignals() []Signal {
 		NewDerivedLocationsSignal(),
 		NewControlRoutePressureSignal(),
 		NewUrlProbeCoverageSignal(),
+		NewCapabilityProbeSignal(),
 		NewStaleContractsSignal(),
 		NewPaymentReconciliationSignal(),
 		NewPaymentFailuresSignal(),
@@ -98,6 +102,7 @@ func NewSignals() []Signal {
 		NewSignupQualitySignal(),
 		NewSubscriptionMetricsSignal(),
 		NewSignupLivenessSignal(),
+		NewModernGateReadinessSignal(),
 		NewRedisMemorySignal(),
 		NewRedisBuffersSignal(),
 		NewKeyFamiliesSignal(),
@@ -274,11 +279,13 @@ func visibilityAlert(settings SignalSettings, signal Signal, err error) Alert {
 	if signal.ID() == "pg/query-sample" {
 		return pgSampleFailureAlert(settings, signal, err)
 	}
+	var interrupted *signalContextError
+	parentEnded := errors.As(err, &interrupted)
 	var providerFailure interface{ monitorVisibilityClass() string }
-	if errors.As(err, &providerFailure) {
+	if !parentEnded && errors.As(err, &providerFailure) {
 		return providerFailureAlert(settings, signal, err, providerFailure.monitorVisibilityClass())
 	}
-	if target, ok := sshAdmissionResetTarget(err); ok {
+	if target, ok := sshAdmissionResetTarget(err); ok && !parentEnded {
 		return Alert{
 			SignalNumber: signal.Number(),
 			SignalKey:    signal.Key(),
@@ -290,6 +297,7 @@ func visibilityAlert(settings SignalSettings, signal Signal, err error) Alert {
 			Environment:  settings.Environment,
 			ObservedAt:   settings.Now(),
 			Sustain:      2,
+			unobservable: true,
 			Symptom:      fmt.Sprintf("SSH admission to %s was reset while running signal %s (%s)", target, signal.Number(), signal.ID()),
 			Mechanism:    "The SSH connection closed during key exchange, before the remote observation command could run. On this fleet the same signature occurred when slow public pre-auth clients occupied OpenSSH's global MaxStartups pool and concurrent monitor probes supplied the trip connection. An sshd reload/restart or a network reset can look similar; the host journal is the discriminator.",
 			Baseline:     "Every monitor SSH command authenticates without an sshd MaxStartups throttle, key-exchange reset, or connection close.",
@@ -312,11 +320,12 @@ func visibilityAlert(settings SignalSettings, signal Signal, err error) Alert {
 		Environment:  settings.Environment,
 		ObservedAt:   settings.Now(),
 		Sustain:      2,
+		unobservable: true,
 		Symptom:      fmt.Sprintf("Signal %s (%s) could not run (error_class=%s)", signal.Number(), signal.ID(), errorClass),
 		Mechanism:    "The monitor could not reach or parse a source of truth, so the associated production condition is currently unknown.",
 		Baseline:     "Every registered signal completes within its command timeout.",
-		Observed:     "error_class=" + errorClass,
-		Action:       observationFailureAction(errorClass, "Restore access to the signal source, then rerun the failed signal; also check whether the unreachable target is itself the incident."),
+		Observed:     observationFailureDetails(err, errorClass),
+		Action:       observationFailureAction(err, errorClass, "Restore access to the signal source, then rerun the failed signal; also check whether the unreachable target is itself the incident."),
 		Verify:       "The signal completes and reports either no alert or a concrete target alert.",
 		Playbook:     "SIGNALS.md §1.7 and MONITOR.md §3.6",
 	}
@@ -343,7 +352,7 @@ func providerFailureAlert(settings SignalSettings, signal Signal, err error, cla
 	return Alert{
 		SignalNumber: signal.Number(), SignalKey: signal.Key(), SignalID: "monitor/visibility", SignalName: signal.Name(),
 		Severity: SeverityWarn, Class: class, Target: signal.ID(), Environment: settings.Environment,
-		ObservedAt: settings.Now(), Sustain: 1,
+		ObservedAt: settings.Now(), Sustain: 1, unobservable: true,
 		Symptom: symptom, Mechanism: mechanism,
 		Baseline: "The configured external provider authenticates and publishes a complete, bounded, schema-valid observation on every signal cadence.",
 		Observed: errorText, Action: action, Verify: verify,

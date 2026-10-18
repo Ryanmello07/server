@@ -3,7 +3,7 @@
 # Both upstream images are pinned Docker Official Image indexes. A season
 # release publishes the resulting evaluator image and subsequently refers to
 # it only by its registry digest.
-ARG GO_IMAGE=golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+ARG GO_IMAGE=golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61
 ARG RUNTIME_IMAGE=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
 
 FROM ${GO_IMAGE} AS go-toolchain
@@ -55,13 +55,14 @@ COPY source/userwireguard /workspace/userwireguard
 COPY source/sn /workspace/sn
 COPY source/operator-proxy /workspace/operator-proxy
 COPY source/warp /workspace/warp
+COPY source/gvisor /workspace/gvisor
 COPY source-lock.json /opt/urnetwork/source-lock.json
 COPY sim-latency.yml /opt/urnetwork/sim-latency.yml
 COPY evaluator/entrypoint.sh /usr/local/libexec/competition-container
 COPY evaluator/official-run.sh /usr/local/libexec/competition-official-run
 
 # Scorers run unprivileged against the root-owned built-in tree, while runners
-# see equivalent remapped read-only mounts. Trust only the exact ten
+# see equivalent remapped read-only mounts. Trust only the exact eleven
 # repositories authenticated by source-lock.json.
 RUN test "$(git -C /workspace/server rev-parse HEAD)" = "${BASE_SHA}" \
     && source_status="$(git -C /workspace/server status --porcelain --untracked-files=all)" \
@@ -78,6 +79,7 @@ RUN test "$(git -C /workspace/server rev-parse HEAD)" = "${BASE_SHA}" \
     && git config --system --add safe.directory /workspace/sn \
     && git config --system --add safe.directory /workspace/operator-proxy \
     && git config --system --add safe.directory /workspace/warp \
+    && git config --system --add safe.directory /workspace/gvisor \
     && chmod 0555 /usr/local/libexec/competition-container /usr/local/libexec/competition-official-run \
     && install -d -m 0755 /opt/urnetwork/bin /opt/urnetwork/submission /opt/urnetwork/go
 

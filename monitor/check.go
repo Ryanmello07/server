@@ -21,6 +21,7 @@ import (
 type probeEnv struct {
 	cfg                          *monitorConfig
 	runner                       probeRunner
+	mimirQueryClient             grafanaHTTPClient
 	baseline                     *baselineStore
 	now                          func() time.Time
 	urlProbeCoverageObservation  *UrlProbeCoverageObservation
@@ -81,6 +82,23 @@ type finding struct {
 	action    string
 	verify    string
 	playbook  string
+
+	// the finding reports an unknown state although its class is an incident
+	// (see isUnobservable)
+	unobservable bool
+	// the configuration turned the observation off: a standing state of this
+	// watcher, not an incident
+	configuredOff bool
+}
+
+// An unobservable finding reports an unknown state in place of an incident:
+// part of its signal's source could not be observed or evaluated, so the
+// execution that produced it is no evidence that anything else is absent. Its
+// class says so (alertClassKinds), the probe id monitor/visibility is
+// reserved for such findings, and a finding sets unobservable when only its
+// state, not its class, makes it unknown.
+func (self finding) isUnobservable() bool {
+	return self.unobservable || self.probeId == "monitor/visibility" || isVisibilityAlertClass(self.class)
 }
 
 // probe is one SIGNALS.md signal encoded as an automated check.
@@ -112,8 +130,8 @@ func cannotObserveFinding(target string, err error) finding {
 		symptom:   "The monitor could not complete an observation for " + target + " (error_class=" + errorClass + ")",
 		mechanism: "The source command, parser, or network path failed, so this target's production state is unknown even if sibling checks completed.",
 		baseline:  "Every configured target returns a bounded, parseable observation at each signal cadence.",
-		observed:  "error_class=" + errorClass,
-		action:    observationFailureAction(errorClass, "Restore the observation path and rerun the named signal; also determine whether the unreachable target is the incident."),
+		observed:  observationFailureDetails(err, errorClass),
+		action:    observationFailureAction(err, errorClass, "Restore the observation path and rerun the named signal; also determine whether the unreachable target is the incident."),
 		verify:    "The same target returns a concrete healthy or broken observation on the next run.",
 		playbook:  "SIGNALS.md §1.7 and MONITOR.md §3.6",
 	}

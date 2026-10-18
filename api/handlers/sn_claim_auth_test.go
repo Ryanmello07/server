@@ -66,11 +66,7 @@ func newSnClaimAuthFixture(t testing.TB) *snClaimAuthFixture {
 	}
 	controller.SetStConfig(cfg)
 	t.Cleanup(func() { controller.SetStConfig(nil) })
-	blobRoot := t.TempDir()
-	popBlobConfig := server.Vault.PushSimpleResource("minio.yml", []byte(fmt.Sprintf(
-		"authority: local\npath: %s\nprefix: claim-auth\nmax_bytes: %d\n", blobRoot, 16*1024*1024,
-	)))
-	t.Cleanup(popBlobConfig)
+	blobRoot := useImplicitLocalBlobStore(t)
 	store, ok := server.LoadBlobStore()
 	if !ok {
 		t.Fatal("synthetic claim artifact store unavailable")
@@ -78,6 +74,29 @@ func newSnClaimAuthFixture(t testing.TB) *snClaimAuthFixture {
 	endpoint := httptest.NewServer(http.HandlerFunc(SnPoolClaim))
 	t.Cleanup(endpoint.Close)
 	return &snClaimAuthFixture{cfg: cfg, store: store, blobRoot: blobRoot, endpoint: endpoint}
+}
+
+// The claim fixture's artifact store loads, and the root the fixture corrupts
+// artifacts under is the one the store writes to. The explicit local
+// minio.yml the fixture wrote before selected the durable volume backend,
+// which refuses without a custody declaration, so every claim test failed
+// before reaching its handler.
+func TestSnClaimAuthFixtureStoresInAPrivateLocalBlobStore(t *testing.T) {
+	fixture := newSnClaimAuthFixture(t)
+	source := filepath.Join(t.TempDir(), "object")
+	if err := os.WriteFile(source, []byte("synthetic claim artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := fixture.store.Prefix() + "/fixture/object"
+	if err := fixture.store.Put(t.Context(), key, source, "application/octet-stream"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.blobRoot, filepath.FromSlash(key))); err != nil {
+		t.Fatalf("the artifact is not under the fixture's root: %v", err)
+	}
+	if !strings.HasPrefix(fixture.blobRoot, os.Getenv("WARP_SITE_HOME")+string(filepath.Separator)) {
+		t.Fatalf("the fixture's root %s is not under its private site home", fixture.blobRoot)
+	}
 }
 
 // Account and provider credentials have genuine active rows behind them.
@@ -506,6 +525,8 @@ func TestSnPoolClaimLegacyRefusesRetainedProviderArtifact(t *testing.T) {
 }
 
 // Missing or corrupt original bytes never downgrade to account-wallet selection.
+// The refusal names only its class: the store's own text, which holds its
+// paths or endpoint, stays in the server log.
 func TestSnPoolClaimArtifactReadFailureNeverFallsBackToLegacy(t *testing.T) {
 	env := server.DefaultTestEnv()
 	env.RerunCount = 0
@@ -538,7 +559,10 @@ func TestSnPoolClaimArtifactReadFailureNeverFallsBackToLegacy(t *testing.T) {
 				tb.Fatal(err)
 			}
 			response := fixture.request(tb, token, query)
-			if response.statusCode != http.StatusInternalServerError || !strings.Contains(string(response.body), "artifact integrity failure") {
+			if strings.Contains(string(response.body), fixture.blobRoot) || strings.Contains(string(response.body), "SnPoolClaim") {
+				tb.Fatalf("%s original sent its raw error text: status=%d body=%s", fault, response.statusCode, response.body)
+			}
+			if response.statusCode != http.StatusServiceUnavailable || string(response.body) != "payout artifact integrity failure\n" {
 				tb.Fatalf("%s original did not refuse the provider read: status=%d body=%s", fault, response.statusCode, response.body)
 			}
 			query.Set("legacy_coldkey", selector)
@@ -592,7 +616,7 @@ func TestSnPoolClaimRejectsArtifactOutsideOriginalScope(t *testing.T) {
 				fixture.retain(tb, epoch, artifact)
 			}
 			response := fixture.request(tb, token, url.Values{"epoch": {strconv.FormatUint(epoch, 10)}})
-			if response.statusCode != http.StatusInternalServerError || !strings.Contains(string(response.body), "original claim scope") {
+			if response.statusCode != http.StatusServiceUnavailable || string(response.body) != "payout artifact differs from its original claim scope\n" {
 				tb.Fatalf("%s mismatch did not refuse the original scope: status=%d body=%s", fault, response.statusCode, response.body)
 			}
 		}
@@ -617,8 +641,31 @@ func TestSnPoolClaimRejectsChangedPayoutLeafRoot(t *testing.T) {
 		leaves[0].ShareBps--
 		model.SetStPayoutLeaves(tb.Context(), fixture.cfg.DeploymentKey(), 50, fixture.cfg.NoId, leaves)
 		response := fixture.request(tb, token, url.Values{"epoch": {"50"}})
-		if response.statusCode != http.StatusInternalServerError || !strings.Contains(string(response.body), "retained artifact root") {
+		if response.statusCode != http.StatusServiceUnavailable || string(response.body) != "payout leaf set differs from its retained artifact root\n" {
 			tb.Fatalf("changed Sql tree escaped the retained root: status=%d body=%s", response.statusCode, response.body)
+		}
+	})
+}
+
+// A legacy selector that is not an ss58 address is the caller's error. It
+// declared no status, so it was answered as an internal failure, 500, with the
+// decoder's text and the handler's Go name.
+func TestSnPoolClaimRefusesMalformedLegacyColdkeyAsBadRequest(t *testing.T) {
+	env := server.DefaultTestEnv()
+	env.RerunCount = 0
+	env.Run(t, func(tb testing.TB) {
+		fixture := newSnClaimAuthFixture(tb)
+		account := snClaimAuthAccount(tb)
+		// A legacy pool: a finalized epoch with network-only leaves and no original.
+		model.UpsertStEpoch(tb.Context(), fixture.cfg.DeploymentKey(), &model.StEpoch{
+			Epoch: 70, StartBlock: 100, CommitDeadlineBlock: 200, TrailsDeadlineBlock: 210, FinalizeBlock: 220, Status: model.StEpochStatusFinalized,
+		})
+		model.SetStPayoutLeaves(tb.Context(), fixture.cfg.DeploymentKey(), 70, fixture.cfg.NoId, []*model.StPayoutLeaf{
+			{Epoch: 70, NoId: fixture.cfg.NoId, NetworkId: account.NetworkId, Coldkey: [32]byte{0xf1}, ShareBps: 10_000, LeafIndex: 0},
+		})
+		response := fixture.request(tb, account.Testing_Sign(), url.Values{"epoch": {"70"}, "legacy_coldkey": {"synthetic-not-ss58"}})
+		if response.statusCode != http.StatusBadRequest || string(response.body) != "legacy original coldkey is not an ss58 address\n" {
+			tb.Fatalf("malformed legacy selector was not refused as bad request: status=%d body=%s", response.statusCode, response.body)
 		}
 	})
 }

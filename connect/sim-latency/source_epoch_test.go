@@ -17,18 +17,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// sourceTestGit runs Git with test-local author identity.
+// sourceTestGit inherits the existing global Git identity.
 func sourceTestGit(t *testing.T, repositoryRoot string, args ...string) string {
 	t.Helper()
 	commandArgs := append([]string{"-C", repositoryRoot}, args...)
 	command := exec.Command("git", commandArgs...)
-	command.Env = append(
-		os.Environ(),
-		"GIT_AUTHOR_NAME=Source Test",
-		"GIT_AUTHOR_EMAIL=source-test@invalid",
-		"GIT_COMMITTER_NAME=Source Test",
-		"GIT_COMMITTER_EMAIL=source-test@invalid",
-	)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
@@ -48,6 +41,9 @@ func sourceTestRepository(t *testing.T, repositoriesRoot string, name string) st
 		t.Fatal(err)
 	}
 	if name == "server" {
+		if err := os.WriteFile(filepath.Join(repositoryRoot, "go.mod"), []byte("module module.example/server\n\ngo 1.23.0\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
 		protectedRoot := filepath.Join(repositoryRoot, "connect", "sim-latency")
 		if err := os.MkdirAll(protectedRoot, 0700); err != nil {
 			t.Fatal(err)
@@ -83,6 +79,7 @@ func sourceTestManifest(repositoryCommits map[string]string) *sourceManifest {
 					Sn:            sourceRepository{Commit: repositoryCommits["sn"]},
 					OperatorProxy: sourceRepository{Commit: repositoryCommits["operator-proxy"]},
 					Warp:          sourceRepository{Commit: repositoryCommits["warp"]},
+					Gvisor:        sourceRepository{Commit: repositoryCommits["gvisor"]},
 				},
 			}},
 		},
@@ -289,7 +286,7 @@ func TestSourceManifestRejectsMissingRepositoryCommit(t *testing.T) {
 }
 
 func TestSourceManifestRejectsMissingDependencyCommits(t *testing.T) {
-	for _, repository := range []string{"glog", "goidenticons", "userwireguard", "sn", "operator-proxy", "warp"} {
+	for _, repository := range []string{"glog", "goidenticons", "userwireguard", "sn", "operator-proxy", "warp", "gvisor"} {
 		repositoryCommits := sourceTestCommits(strings.Repeat("a", 40))
 		repositoryCommits[repository] = ""
 		err := validateSourceManifest(sourceTestManifest(repositoryCommits))
@@ -324,7 +321,7 @@ func TestEvaluatorSourceLockRequiresCompleteRepositorySet(t *testing.T) {
 
 // Reject extra names even when one has replaced a missing required dependency.
 func TestEvaluatorSourceLockRejectsUnexpectedRepositories(t *testing.T) {
-	for _, omittedRepository := range []string{"", "operator-proxy", "warp"} {
+	for _, omittedRepository := range []string{"", "operator-proxy", "warp", "gvisor"} {
 		repositoryCommits := sourceTestCommits(strings.Repeat("a", 40))
 		delete(repositoryCommits, omittedRepository)
 		repositoryCommits["unexpected"] = strings.Repeat("b", 40)

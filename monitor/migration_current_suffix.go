@@ -534,6 +534,54 @@ var migrationCurrentSuffixContracts = []snMainnetMigrationContract{
 	migrationCurrentSuffix(835, "lag.dev measurement certificate publish time",
 		snMainnetMigrationColumns("network_extender_measurement_cert",
 			snMainnetMigrationColumn{name: "publish_time", kind: "timestamp without time zone"})),
+	migrationCurrentSuffix(836, "fp2 modern provider evidence",
+		migrationFp2Table("provider_modern_evidence"),
+		snMainnetMigrationColumns("provider_modern_evidence",
+			snMainnetMigrationColumn{name: "client_id", kind: "uuid", notNull: true},
+			snMainnetMigrationColumn{name: "post_quantum", kind: "boolean", notNull: true},
+			snMainnetMigrationColumn{name: "key_exchange", kind: "character varying(64)", notNull: true, defaultExpression: "''::character varying"},
+			snMainnetMigrationColumn{name: "window_resizable", kind: "boolean", notNull: true},
+			snMainnetMigrationColumn{name: "max_receive_window_byte_count", kind: "bigint", notNull: true, defaultExpression: "0"},
+			snMainnetMigrationColumn{name: "measured_at", kind: "timestamp without time zone", notNull: true},
+			snMainnetMigrationColumn{name: "first_measured_at", kind: "timestamp without time zone", notNull: true},
+			snMainnetMigrationColumn{name: "run_count", kind: "integer", notNull: true, defaultExpression: "1"}),
+		snMainnetMigrationConstraints("provider_modern_evidence", "PRIMARY KEY (client_id)")),
+	migrationCurrentSuffix(arindbCanaryRollupMigrationVersion, "dual ARIN database canary rollup slots",
+		migrationArindbCanaryRollupArtifacts()...),
+	migrationCurrentSuffix(arindbCanaryLocationMigrationVersion, "dual ARIN database canary connection slots and old-slot write guard",
+		migrationArindbCanaryLocationArtifacts()...),
+	migrationCurrentSuffix(839, "lag.dev measurement certificate deliver time",
+		snMainnetMigrationColumns("network_extender_measurement_cert",
+			snMainnetMigrationColumn{name: "deliver_time", kind: "timestamp without time zone"})),
+	migrationCurrentSuffix(840, "retained original registration session authority",
+		snMainnetMigrationColumns("network_client_registration",
+			snMainnetMigrationColumn{name: "session_id", kind: "uuid"},
+			snMainnetMigrationColumn{name: "session_create_time", kind: "timestamp without time zone"},
+			snMainnetMigrationColumn{name: "session_accept_until", kind: "timestamp without time zone"})),
+	migrationCurrentSuffix(841, "retained original verification seed window",
+		snMainnetMigrationColumns("verify_original_transition",
+			snMainnetMigrationColumn{name: "head_window", kind: "character varying(32)"})),
+	migrationCurrentSuffix(842, "sealed competition evaluation and append-only automation custody", competitionMigration842ArtifactQuery),
+	migrationCurrentSuffix(843, "independent competition holds and immutable integrity incidents", competitionMigration843ArtifactQuery),
+	migrationCurrentSuffix(844, "competition source authority and atomic outbox custody", competitionMigration844ArtifactQuery),
+	migrationCurrentSuffix(845, "competition source abandonment and committed review custody", competitionMigration845ArtifactQuery),
+	migrationCurrentSuffix(846, "competition prospective round identity and readiness binding", competitionMigration846ArtifactQuery),
+	migrationCurrentSuffix(847, "isolated automation staging and current lifecycle guards", competitionMigration847ArtifactQuery),
+	migrationCurrentSuffix(848, "network-leading account feedback time index", competitionMigration848ArtifactQuery),
+	migrationCurrentSuffix(849, "wallet authentication key by user and chain",
+		migrationFp2Table("network_user_auth_wallet"),
+		snMainnetMigrationColumns("network_user_auth_wallet",
+			snMainnetMigrationColumn{name: "user_id", kind: "uuid", notNull: true},
+			snMainnetMigrationColumn{name: "blockchain", kind: "character varying(32)", notNull: true}),
+		`EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_index i ON i.indexrelid=k.conindid
+ WHERE k.conrelid=to_regclass('public.network_user_auth_wallet')
+ AND k.conname='network_user_auth_wallet_pkey' AND k.contype='p'
+ AND k.convalidated AND NOT k.condeferrable AND NOT k.condeferred
+ AND pg_get_constraintdef(k.oid)='PRIMARY KEY (user_id, blockchain)'
+ AND i.indrelid=k.conrelid AND i.indisprimary AND i.indisunique AND i.indimmediate
+ AND i.indisvalid AND i.indisready
+ AND pg_get_indexdef(i.indexrelid)='CREATE UNIQUE INDEX network_user_auth_wallet_pkey ON public.network_user_auth_wallet USING btree (user_id, blockchain)'
+ AND i.indexprs IS NULL AND i.indpred IS NULL)`),
 }
 
 // Vacuum truncation holds AccessExclusiveLock while it drops the cut pages

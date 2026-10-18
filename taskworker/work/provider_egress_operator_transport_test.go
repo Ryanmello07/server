@@ -212,7 +212,20 @@ settings:
 candidates: []
 `
 
-// One provider due for its first URL turn: connected, placed and providing.
+// Seeds passing one hour and 12 hour scores per client: the hour witnesses the
+// current history URL probe admission needs before a provider's first cycle,
+// and a client observed within the hour always also has its 12 hour score.
+func testPassingReliabilityHistory(ctx context.Context, clientIds ...server.Id) {
+	server.Tx(ctx, func(tx server.PgTx) {
+		server.RaisePgResult(tx.Exec(ctx, `INSERT INTO client_connection_reliability_score
+			(client_id,lookback_index,independent_reliability_score,independent_reliability_weight,reliability_score,reliability_weight)
+			SELECT client_id,lookback_index,1,1,1,1 FROM unnest($1::uuid[]) AS client_id
+			CROSS JOIN (VALUES (1),(2)) AS lookback(lookback_index)`, clientIds))
+	})
+}
+
+// One provider due for its first URL turn: connected, placed, providing and
+// with passing reliability history.
 func testOperatorTransportDueProvider(tb testing.TB, ctx context.Context) server.Id {
 	city := &model.Location{
 		LocationType: model.LocationTypeCity,
@@ -232,6 +245,7 @@ func testOperatorTransportDueProvider(tb testing.TB, ctx context.Context) server
 		tb.Fatalf("set connection location: %s", err)
 	}
 	model.SetProvide(ctx, clientId, map[model.ProvideMode][]byte{model.ProvideModePublic: []byte("provide-secret")})
+	testPassingReliabilityHistory(ctx, clientId)
 	model.UpdateClientLocationReliabilities(ctx, server.NowUtc().Add(-time.Hour), server.NowUtc())
 	return clientId
 }

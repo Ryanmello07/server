@@ -6,6 +6,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/urnetwork/server"
 )
 
@@ -79,5 +82,51 @@ func TestSettlementPageCancellationRejectsIncompleteAndForeignCauses(t *testing.
 	}
 	if !isSettlementPageCancellation(&settlementPageTestCauses{causes: wide[:127]}) {
 		t.Fatal("complete cancellation graph at the exact node bound was refused")
+	}
+}
+
+// A statement the page's stop let finish can end in its own lock or
+// statement timeout. Joined with the stop, that ending yields as the stop
+// alone does. Without the stop, or beside any other failure, it cannot.
+func TestSettlementPageCancellationAcceptsAStoppedStatementsOwnTimeout(t *testing.T) {
+	lockTimeout := &pgconn.PgError{Code: pgerrcode.LockNotAvailable, Message: "canceling statement due to lock timeout"}
+	statementTimeout := &pgconn.PgError{Code: pgerrcode.QueryCanceled, Message: "canceling statement due to statement timeout"}
+	for index, cause := range []error{
+		errors.Join(statementTimeout, context.Canceled),
+		errors.Join(lockTimeout, context.Canceled),
+		errors.Join(statementTimeout, server.DbContextDoneError, context.DeadlineExceeded),
+	} {
+		if !isSettlementPageCancellation(cause) {
+			t.Fatal("a stopped statement's own timeout refused its page's yield", index)
+		}
+	}
+	for index, cause := range []error{
+		statementTimeout,
+		lockTimeout,
+		errors.Join(statementTimeout, lockTimeout),
+		errors.Join(&pgconn.PgError{Code: pgerrcode.SerializationFailure}, context.Canceled),
+		errors.Join(statementTimeout, errors.New("synthetic physical failure"), context.Canceled),
+	} {
+		if isSettlementPageCancellation(cause) {
+			t.Fatal("a timeout without the stop, or beside another failure, authorized a yield", index)
+		}
+	}
+}
+
+// An operator's cancel shares 57014 with a statement timeout but is not the
+// statement's own timeout, so it refuses the yield even beside the stop, as
+// the grant wait refuses it.
+func TestSettlementPageCancellationRejectsAnOperatorCancelBesideTheStop(t *testing.T) {
+	operatorCancel := &pgconn.PgError{Code: pgerrcode.QueryCanceled, Message: "canceling statement due to user request"}
+	for index, cause := range []error{
+		errors.Join(operatorCancel, context.Canceled),
+		errors.Join(operatorCancel, server.DbContextDoneError, context.DeadlineExceeded),
+	} {
+		if isSettlementPageCancellation(cause) {
+			t.Fatal("an operator cancel beside the stop authorized a yield", index)
+		}
+	}
+	if legacySettlementGrantWaitExpired(operatorCancel) {
+		t.Fatal("the grant wait accepted an operator cancel")
 	}
 }

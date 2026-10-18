@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -16,69 +17,67 @@ import (
 	"testing"
 )
 
-// Reads the network-free `go mod edit -json` shape. Modules below a sibling
-// belong to that repository's commit, not a new independently locked source.
-// A moving main checkout cannot remove repositories from an existing lock.
-func requiredLocalSourceRepositories(moduleBytes []byte) ([]string, error) {
-	var module sourceModuleGraphFixture
-	if err := json.Unmarshal(moduleBytes, &module); err != nil {
-		return nil, err
-	}
-	requiredVersions := map[string]string{}
-	for _, requirement := range module.Require {
-		requiredVersions[requirement.Path] = requirement.Version
-	}
-	repositoryNames := []string{filepath.Base(module.Module.Path)}
-	for _, replacement := range module.Replace {
-		requiredVersion, required := requiredVersions[replacement.Old.Path]
-		if !required || replacement.New.Version != "" ||
-			(replacement.Old.Version != "" && replacement.Old.Version != requiredVersion) {
-			continue
-		}
-		repositoryPath, sibling := strings.CutPrefix(replacement.New.Path, "../")
-		components := strings.Split(repositoryPath, "/")
-		if !sibling || strings.Contains(replacement.New.Path, "\\") ||
-			slices.Contains(components, "") || slices.Contains(components, ".") || slices.Contains(components, "..") {
-			return nil, fmt.Errorf("required local module %s is outside the sibling-repository layout: %s", replacement.Old.Path, replacement.New.Path)
-		}
-		repositoryNames = append(repositoryNames, components[0])
-	}
-	slices.Sort(repositoryNames)
-	return slices.Compact(repositoryNames), nil
-}
-
-// Main can shed a dependency that the frozen evaluator still needs. A newly
-// required unpinned local repository must nevertheless fail closed.
-func requireLocalSourceRepositoryCoverage(moduleBytes []byte, lockedRepositoryNames []string) error {
-	repositoryNames, err := requiredLocalSourceRepositories(moduleBytes)
-	if err != nil {
-		return err
-	}
-	for _, repository := range repositoryNames {
-		if !slices.Contains(lockedRepositoryNames, repository) {
-			return fmt.Errorf("required local repository %s is absent from frozen source repositories %v", repository, lockedRepositoryNames)
-		}
-	}
-	return nil
-}
-
-// A real local module read catches newly required dependencies. The exact
-// evaluator graph comes from the source protocol/checkpoint, not current main.
+// Audit the repository under test through a private immutable Git object. The
+// operator's deployed checkpoint may intentionally preserve historical pins;
+// it must never choose this regression's input or require live Git access.
 func TestSourceRepositorySetMatchesRequiredLocalModules(t *testing.T) {
-	command := exec.Command("go", "mod", "edit", "-json", filepath.Join("..", "..", "go.mod"))
-	moduleBytes, err := command.Output()
+	moduleBytes, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := requireLocalSourceRepositoryCoverage(moduleBytes, sourceRepositoryNames()); err != nil {
+	root := t.TempDir()
+	sourceTestRepository(t, root, "server")
+	serverRoot := filepath.Join(root, "server")
+	if err := os.WriteFile(filepath.Join(serverRoot, "go.mod"), moduleBytes, 0o600); err != nil {
 		t.Fatal(err)
+	}
+	sourceTestGit(t, serverRoot, "add", "--", "go.mod")
+	sourceTestGit(t, serverRoot, "commit", "--quiet", "--no-gpg-sign", "-m", "synthetic repository-under-test module snapshot")
+	commit := sourceTestGit(t, serverRoot, "rev-parse", "HEAD")
+	if err := verifyFrozenSourceGraph(context.Background(), serverRoot, commit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Removing the operational-checkpoint dependency from the graph test must not
+// make historical ten-repository manifests eligible for a new activation.
+func TestSourceRepositoryManifestRejectsMissingGvisorForNewActivation(t *testing.T) {
+	production := reviewedSourceTestManifest(t)
+	production.EvaluationSource.Epochs = nil
+	staging := stagingSourceTestManifest(t)
+	for _, manifest := range []*sourceManifest{production, staging} {
+		manifest.EvaluationSource.Generations[0].Repositories.Gvisor.Commit = ""
+		if err := validateSourceManifest(manifest); err == nil || !strings.Contains(err.Error(), "repository gvisor has an invalid commit") {
+			t.Fatalf("staging=%t: new activation accepted missing required gvisor pin: %v", manifest.Staging, err)
+		}
+	}
+}
+
+// A local fork added only to main cannot rewrite the old evaluator graph.
+// Freezing that same changed commit must still reject the missing repository.
+func TestSourceRepositoryCoverageReadsPinnedCommitNotMovingMain(t *testing.T) {
+	root := t.TempDir()
+	frozen := sourceTestRepository(t, root, "server")
+	serverRoot := filepath.Join(root, "server")
+	content := "module module.example/server\n\ngo 1.23.0\n\nrequire module.example/synthetic-new-dependency v0.0.0\n\nreplace module.example/synthetic-new-dependency => ../synthetic-new-dependency\n"
+	if err := os.WriteFile(filepath.Join(serverRoot, "go.mod"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceTestGit(t, serverRoot, "add", "go.mod")
+	sourceTestGit(t, serverRoot, "commit", "--quiet", "--no-gpg-sign", "-m", "synthetic moving main dependency")
+	current := sourceTestGit(t, serverRoot, "rev-parse", "HEAD")
+	if err := verifyFrozenSourceGraph(context.Background(), serverRoot, frozen); err != nil {
+		t.Fatalf("moving main contaminated frozen dependency audit: %v", err)
+	}
+	if err := verifyFrozenSourceGraph(context.Background(), serverRoot, current); err == nil || !strings.Contains(err.Error(), "synthetic-new-dependency is absent") {
+		t.Fatalf("new frozen base accepted an unpinned dependency: %v", err)
 	}
 }
 
 // This independent fixture prevents a removed main dependency from silently
 // shrinking every serializer, validator, image copy, and source ledger together.
 func TestSourceRepositorySetPreservesFrozenEvaluatorGraph(t *testing.T) {
-	want := []string{"server", "connect", "sdk", "proxy", "glog", "goidenticons", "userwireguard", "sn", "operator-proxy", "warp"}
+	want := []string{"server", "connect", "sdk", "proxy", "glog", "goidenticons", "userwireguard", "sn", "operator-proxy", "warp", "gvisor"}
 	if got := sourceRepositoryNames(); !slices.Equal(got, want) {
 		t.Fatalf("frozen evaluator repositories = %v, want %v", got, want)
 	}
@@ -86,21 +85,11 @@ func TestSourceRepositorySetPreservesFrozenEvaluatorGraph(t *testing.T) {
 
 // Synthetic module inputs contain no checkout paths, remote Git, or network
 // resolution; they exercise required/local/versioned replacement semantics.
-type sourceModuleVersionFixture struct {
-	Path    string
-	Version string
-}
+type sourceModuleVersionFixture = sourceModuleVersion
 
-type sourceModuleReplacementFixture struct {
-	Old sourceModuleVersionFixture
-	New sourceModuleVersionFixture
-}
+type sourceModuleReplacementFixture = sourceModuleReplacement
 
-type sourceModuleGraphFixture struct {
-	Module  sourceModuleVersionFixture
-	Require []sourceModuleVersionFixture
-	Replace []sourceModuleReplacementFixture
-}
+type sourceModuleGraphFixture = sourceModuleGraph
 
 func sourceModuleGraphBytes(t *testing.T, repositories []string) []byte {
 	t.Helper()
@@ -122,7 +111,7 @@ func sourceModuleGraphBytes(t *testing.T, repositories []string) []byte {
 	return encoded
 }
 
-// Removing Warp on main must not change the ten-repository evaluator lock.
+// Removing Warp on main must not change the eleven-repository evaluator lock.
 func TestSourceRepositoryCoverageRetainsFrozenDependencyRemovedFromMain(t *testing.T) {
 	locked := sourceRepositoryNames()
 	frozen := slices.Clone(locked)
@@ -452,6 +441,7 @@ write_evidence() { [[ $1 == staging-source.json ]]; printf '%s\n' "$2"; }
 		{name: "complete"},
 		{name: "missing-operator-proxy", omit: "operator-proxy"},
 		{name: "missing-warp", omit: "warp"},
+		{name: "missing-gvisor", omit: "gvisor"},
 		{name: "unexpected", extra: "unexpected"},
 		{name: "substituted", omit: "warp", extra: "unexpected"},
 		{name: "malformed-commit", change: "operator-proxy"},
@@ -529,6 +519,7 @@ case $1 in
         [[ $2 == inspect && $3 == --format ]]
         case $4 in
             '{{.Id}}') printf '%s\n' "$SOURCE_TEST_IMAGE_ID" ;;
+            *competition.staging*) printf '%s\n' "$SOURCE_TEST_IMAGE_STAGING" ;;
             *image-kind*) printf '%s\n' evaluator-base ;;
             *base-sha*) git -C "$SOURCE_TEST_IMAGE_ROOT/server" rev-parse HEAD ;;
             *source-epoch*) printf '%s\n' 0 ;;
@@ -575,16 +566,23 @@ exec "$SOURCE_TEST_REAL_GIT" "$@"
 		extra      string
 		change     string
 		failStatus bool
+		staging    bool
+		imageStage bool
 		wantErr    string
 	}{
 		{name: "complete"},
+		{name: "explicit-staging", staging: true, imageStage: true},
+		{name: "staging-rejects-production-image", staging: true, wantErr: "staging source requires an explicitly staging evaluator image"},
+		{name: "production-rejects-staging-image", imageStage: true, wantErr: "production source cannot use a staging evaluator image"},
 		{name: "git-status-failure", failStatus: true, wantErr: "synthetic Git status failure"},
 		{name: "missing-operator-proxy", omit: "operator-proxy", wantErr: "source lock is malformed"},
 		{name: "missing-warp", omit: "warp", wantErr: "source lock is malformed"},
+		{name: "missing-gvisor", omit: "gvisor", wantErr: "source lock is malformed"},
 		{name: "unexpected", extra: "unexpected", wantErr: "source lock is malformed"},
 		{name: "substituted", omit: "warp", extra: "unexpected", wantErr: "source lock is malformed"},
 		{name: "operator-proxy-mismatch", change: "operator-proxy", wantErr: "repository operator-proxy does not match the source lock"},
 		{name: "warp-mismatch", change: "warp", wantErr: "repository warp does not match the source lock"},
+		{name: "gvisor-mismatch", change: "gvisor", wantErr: "repository gvisor does not match the source lock"},
 	} {
 		lockedCommits := maps.Clone(repositoryCommits)
 		if fixture.omit != "" {
@@ -604,11 +602,16 @@ exec "$SOURCE_TEST_REAL_GIT" "$@"
 			t.Fatal(err)
 		}
 		destination := filepath.Join(root, fixture.name)
-		command := exec.Command("bash", "evaluator/container/prepare-evaluation-source.sh", "--base-image", imageId, "--destination", destination)
+		arguments := []string{"evaluator/container/prepare-evaluation-source.sh", "--base-image", imageId, "--destination", destination}
+		if fixture.staging {
+			arguments = append(arguments, "--staging")
+		}
+		command := exec.Command("bash", arguments...)
 		command.Env = append(os.Environ(),
 			"PATH="+commandRoot+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"SOURCE_TEST_IMAGE_ROOT="+imageRoot,
 			"SOURCE_TEST_IMAGE_ID="+imageId,
+			fmt.Sprintf("SOURCE_TEST_IMAGE_STAGING=%t", fixture.imageStage),
 			"SOURCE_TEST_REAL_GIT="+gitPath,
 			fmt.Sprintf("SOURCE_TEST_FAIL_STATUS=%t", fixture.failStatus),
 		)
@@ -626,13 +629,15 @@ exec "$SOURCE_TEST_REAL_GIT" "$@"
 			t.Fatalf("prepare complete source: %v: %s", err, output)
 		}
 		var identity struct {
+			Staging      bool              `json:"staging"`
+			Branch       string            `json:"branch"`
 			BaseImageId  string            `json:"base_image_id"`
 			Repositories map[string]string `json:"repositories"`
 		}
 		if err := json.Unmarshal(output, &identity); err != nil {
 			t.Fatal(err)
 		}
-		if identity.BaseImageId != imageId || !maps.Equal(identity.Repositories, repositoryCommits) {
+		if identity.Staging != fixture.staging || identity.Branch != sourceBranch(fixture.staging) || identity.BaseImageId != imageId || !maps.Equal(identity.Repositories, repositoryCommits) {
 			t.Fatalf("prepared source identity = %+v, want image %s and repositories %v", identity, imageId, repositoryCommits)
 		}
 		moduleBytes, err := os.ReadFile(filepath.Join(destination, "connect", nestedModulePath))
@@ -641,7 +646,7 @@ exec "$SOURCE_TEST_REAL_GIT" "$@"
 		}
 		for _, repository := range sourceRepositoryNames() {
 			preparedRoot := filepath.Join(destination, repository)
-			if branch := sourceTestGit(t, preparedRoot, "symbolic-ref", "--short", "HEAD"); branch != "sim-latency" {
+			if branch := sourceTestGit(t, preparedRoot, "symbolic-ref", "--short", "HEAD"); branch != sourceBranch(fixture.staging) {
 				t.Errorf("prepared %s branch = %s", repository, branch)
 			}
 			if status := sourceTestGit(t, preparedRoot, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {

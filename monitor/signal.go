@@ -31,6 +31,21 @@ type signalAdapter struct {
 	accept func(finding) bool
 }
 
+// A completed probe can return a source failure after its parent ends. Keep
+// both causes without replacing the parent's lifecycle verdict or error text.
+type signalContextError struct {
+	contextErr error
+	sourceErr  error
+}
+
+// Rendering an interrupted run must not expose its private source error.
+func (self *signalContextError) Error() string { return self.contextErr.Error() }
+
+// The source has already returned; retaining it requires no wait or contact.
+func (self *signalContextError) Unwrap() []error {
+	return []error{self.contextErr, self.sourceErr}
+}
+
 func (s *signalAdapter) Number() string         { return s.number }
 func (s *signalAdapter) Key() string            { return s.key }
 func (s *signalAdapter) ID() string             { return s.probe.id() }
@@ -65,8 +80,11 @@ func (s *signalAdapter) Run(ctx context.Context, settings SignalSettings) (Alert
 	}
 	findings, err := s.probe.check(ctx, env)
 	if scoped, ok := env.runner.(*hostScopeRunner); ok {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if contextErr := ctx.Err(); contextErr != nil {
+			if err == nil || err == contextErr {
+				return nil, contextErr
+			}
+			return nil, &signalContextError{contextErr: contextErr, sourceErr: err}
 		}
 		if hostScopeOnlyError(err) {
 			err = nil
@@ -78,7 +96,10 @@ func (s *signalAdapter) Run(ctx context.Context, settings SignalSettings) (Alert
 	}
 	alerts := make(Alerts, 0, len(findings))
 	for _, finding := range findings {
-		if finding.healthy || (s.accept != nil && finding.class != "monitor-host-scope-partial" && !s.accept(finding)) {
+		// An accept filter selects this signal's detections. A shared probe's
+		// unobservable finding still says this signal's own evidence may be
+		// missing, so it passes: without it the execution would look complete.
+		if finding.healthy || (s.accept != nil && finding.class != "monitor-host-scope-partial" && !finding.isUnobservable() && !s.accept(finding)) {
 			continue
 		}
 		alerts = append(alerts, alertFromFinding(settings, s.number, s.key, s.name, finding))
@@ -130,7 +151,7 @@ func alertFromFinding(settings SignalSettings, number, key, name string, f findi
 		// Use the public probe key, never selectors or changing coverage counts.
 		f.frame = key
 	}
-	return Alert{
+	alert := Alert{
 		SignalNumber: number,
 		SignalKey:    key,
 		SignalID:     f.probeId,
@@ -152,7 +173,10 @@ func alertFromFinding(settings SignalSettings, number, key, name string, f findi
 		Action:       action,
 		Verify:       verify,
 		Playbook:     f.playbook,
+		unobservable: f.isUnobservable(),
 	}
+	alert.configuredOff = f.configuredOff
+	return alert
 }
 
 func acceptProbeIDs(ids ...string) func(finding) bool {
