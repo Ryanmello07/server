@@ -85,6 +85,28 @@ func TestProviderUrlDarkDecision(t *testing.T) {
 	connect.AssertEqual(t, decideProviderEgress(&providerEgressFacts{urlDark: true, reliabilityFailed: true}, true).reason, ProviderExcludedReliability)
 	connect.AssertEqual(t, slices.Index(ProviderExcludedReasons, ProviderExcludedUrlDark), slices.Index(ProviderExcludedReasons, ProviderExcludedTls)+1)
 
+	// Upstream's later facts (the native URL-run minimums, the modern provider
+	// gate and the Online URL ratio) all read after the hard exclusions: a
+	// dark exit with every one of them in its favour, or against it, is still
+	// out of every bucket, the gate's shadow and the capability probe's
+	// population included (sync 2026-10-18).
+	for _, flag := range []bool{false, true} {
+		for _, gate := range []bool{false, true} {
+			for _, low := range []bool{false, true} {
+				decision := decideProviderEgress(&providerEgressFacts{
+					urlDark:        true,
+					egressQuality:  &quality,
+					qualityRunsMet: true,
+					speedRunsMet:   true,
+					modernOutcome:  ProviderModernOutcomeModern,
+					modernGate:     gate,
+					noUrlSuccess:   low,
+					lowUrlSuccess:  low,
+				}, flag)
+				connect.AssertEqual(t, decision, providerEgressDecision{reason: ProviderExcludedUrlDark, hardExcluded: true})
+			}
+		}
+	}
 	clientId := server.NewId()
 	filter := providerCountFilter{urlDark: map[server.Id]bool{clientId: true}}
 	connect.AssertEqual(t, filter.hasHardEgressFailure(clientId), true)
